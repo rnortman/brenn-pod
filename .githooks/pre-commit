@@ -49,13 +49,19 @@ route_plan() {
             scripts/*)   have_scripts=1 ;;
             docs/*)      : ;;
             .claude/*)   : ;;
+            # CI workflow config — no local lane. GitHub does not reject a
+            # malformed workflow at push; it surfaces as a failed or
+            # never-reporting run, and branch protection on the job names is
+            # what keeps that fail-closed for PRs.
+            .github/*)   : ;;
             */*)         route_fail "$path" ;;
             *)
                 # Root-level file: benign only if a dotfile, a *.md file, the
                 # root Makefile, or LICENSE/NOTICE (covers README.md, CLAUDE.md,
                 # TODO.md, handoff.md, .gitignore, .gitleaks.toml). The root
-                # Makefile carries scrub targets only — no build logic a lane
-                # could check; LICENSE/NOTICE are static release paperwork.
+                # Makefile's one piece of logic is `check`, the union gate CI
+                # runs — validated by CI running it, the same rationale as
+                # .github/* above; LICENSE/NOTICE are static release paperwork.
                 case "$path" in
                     .* | *.md | Makefile | LICENSE | NOTICE) : ;;
                     *)                                        route_fail "$path" ;;
@@ -152,17 +158,6 @@ run_script() {
     fi
 }
 
-run_shellcheck() {
-    if ! command -v shellcheck >/dev/null 2>&1; then
-        echo "pre-commit: shellcheck not installed — SKIPPED for $*"
-        return 0
-    fi
-    echo "pre-commit: running shellcheck $*"
-    if ! shellcheck "$@"; then
-        check_failed "shellcheck $*"
-    fi
-}
-
 # Scrub the staged diff for disallowed strings. Independent of the lane routing:
 # it scans staged content, not subprojects, so it runs on every commit including
 # docs-only ones.
@@ -213,8 +208,7 @@ lane_githooks() {
 
 lane_scripts() {
     worktree_warn "scripts/"
-    run_script "scripts/test-hil-firewall.sh"
-    run_shellcheck scripts/*.sh
+    run_script "scripts/check.sh"
 }
 
 # --- entry point --------------------------------------------------------------

@@ -77,6 +77,7 @@ assert_hardfail() {
 assert_plan "empty staged set -> skip"                "skip"
 assert_plan "docs-only -> skip"                       "skip"      "docs/adr/foo.md"
 assert_plan ".claude-only -> skip"                    "skip"      ".claude/settings.json"
+assert_plan ".github-only -> skip"                    "skip"      ".github/workflows/ci.yml"
 assert_plan "root markdown -> skip"                   "skip"      "CLAUDE.md"
 assert_plan "root dotfile -> skip"                    "skip"      ".gitignore"
 assert_plan "root scrub config -> skip"               "skip"      ".gitleaks.toml"
@@ -102,6 +103,81 @@ assert_hardfail "unknown top-level dir -> hard fail"  "weird-subproject/thing.rs
 assert_hardfail "unknown root file -> hard fail"      "Cargo.toml"
 
 # ---------------------------------------------------------------------------
+# Static wiring tests. These relate two files that must agree but have no
+# runtime coupling, so nothing else can catch them drifting apart.
+# ---------------------------------------------------------------------------
+
+# Every run_script binding in the router must name a real executable. Rename a
+# runner or drop its +x bit and every other test here stays green; the breakage
+# surfaces later as "internal error" on the next commit touching that lane.
+mapfile -t RUNNER_PATHS < <(
+    grep -oE 'run_script "[^"]+"' "$PRECOMMIT" | sed 's/^run_script "//; s/"$//' | sort -u
+)
+if [ "${#RUNNER_PATHS[@]}" -eq 0 ]; then
+    fail "lane runners: no run_script bindings found in $PRECOMMIT — extraction is broken"
+else
+    for rp in "${RUNNER_PATHS[@]}"; do
+        if [ -x "$REPO_ROOT/$rp" ]; then
+            pass "lane runner is present and executable: $rp"
+        else
+            fail "lane runner missing or not executable: $rp"
+        fi
+    done
+fi
+
+# The root `check` target claims to be the union of every lane CI runs, but it
+# hardcodes its steps while the router derives lanes from staged paths. Add a
+# lane to the router and CI silently stops covering it — the exact drift this
+# repo's gate exists to prevent, one level up. Both sides are derived here.
+#
+# A token with no step and no exemption is a hard fail: the map below must be
+# extended deliberately, which is the point.
+gate_step_for_token() {
+    case "$1" in
+        # host/ is reached transitively: firmware's check-host runs it via
+        # check-host-arch, so one step covers both workspaces.
+        firmware|host)     echo '-C firmware check-host' ;;
+        githooks)          echo '.githooks/self-test.sh' ;;
+        scripts)           echo 'scripts/check.sh' ;;
+        # Not lanes: a coverage announcement and the no-lane-touched token.
+        host-covered|skip) echo '' ;;
+        *)                 return 1 ;;
+    esac
+}
+
+# Deliberate gaps in the public gate, each named with the slug that closes it.
+gate_exempt_token() {
+    case "$1" in
+        firmware-device) echo 'TODO(ci-esp-clippy) — device clippy needs the esp toolchain' ;;
+        *)               return 1 ;;
+    esac
+}
+
+mapfile -t PLAN_TOKENS < <(
+    sed -n '/^    local emitted=0$/,/^}$/p' "$PRECOMMIT" \
+        | grep -oE '\becho [a-z-]+' | awk '{print $2}' | sort -u
+)
+CHECK_RECIPE="$(sed -n '/^check:$/,/^$/p' "$REPO_ROOT/Makefile")"
+
+if [ "${#PLAN_TOKENS[@]}" -eq 0 ] || [ -z "$CHECK_RECIPE" ]; then
+    fail "gate union: could not derive plan tokens or the root check recipe — extraction is broken"
+else
+    for tok in "${PLAN_TOKENS[@]}"; do
+        if exemption="$(gate_exempt_token "$tok")"; then
+            pass "gate union: '$tok' deliberately exempt — $exemption"
+        elif ! step="$(gate_step_for_token "$tok")"; then
+            fail "gate union: plan token '$tok' maps to no step in the root check target — add the step to Makefile's check, or declare an exemption naming its TODO slug"
+        elif [ -z "$step" ]; then
+            pass "gate union: '$tok' needs no step of its own"
+        elif printf '%s\n' "$CHECK_RECIPE" | grep -qF -- "$step"; then
+            pass "gate union: '$tok' -> '$step' present in root check"
+        else
+            fail "gate union: '$tok' expects '$step' in the root check recipe, which is missing it — public CI would not run this lane"
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # Execute-mode tests: drive the whole hook with PATH-stubbed git/make/rustup.
 # These reach the parts --plan never touches: collect_staged, the lane-dispatch
 # loop, run_make, the esp-toolchain policy/degraded branch, and the failure
@@ -116,7 +192,20 @@ STUBDIR="$(mktemp -d)"
 NOSCRUBDIR="$(mktemp -d)"
 # Throwaway git repo for the real-rules tier; created there, cleaned up here.
 RULEDIR=""
-trap 'rm -rf "$STUBDIR" "$NOSCRUBDIR" ${RULEDIR:+"$RULEDIR"}' EXIT
+# Two PATHs for exercising scripts/check.sh's optional-shellcheck branch: one
+# with no shellcheck at all, one where it exists and fails. Each holds a bash so
+# the script's `env bash` shebang still resolves under the replaced PATH.
+NOSCDIR="$(mktemp -d)"
+SCFAILDIR="$(mktemp -d)"
+trap 'rm -rf "$STUBDIR" "$NOSCRUBDIR" "$NOSCDIR" "$SCFAILDIR" ${RULEDIR:+"$RULEDIR"}' EXIT
+ln -s "$(command -v bash)" "$NOSCDIR/bash"
+ln -s "$(command -v bash)" "$SCFAILDIR/bash"
+cat > "$SCFAILDIR/shellcheck" <<'STUB'
+#!/usr/bin/env bash
+echo "STUB-SHELLCHECK failing on $*"
+exit 1
+STUB
+chmod +x "$SCFAILDIR/shellcheck"
 
 cat > "$STUBDIR/git" <<'STUB'
 #!/usr/bin/env bash
@@ -287,8 +376,9 @@ PUSH_REFLINE="$(printf 'refs/heads/main %s refs/heads/main %s\n' "$ZERO_SHA" "$Z
 PUSH_OUT="$(printf '%s\n' "$PUSH_REFLINE" \
     | env PATH="$STUBDIR:$PATH" "$PREPUSH" 2>&1)" && PUSH_RC=0 || PUSH_RC=$?
 # Dirty scrub: the non-zero exit must propagate and block the push.
-PUSH_BLOCK_OUT="$(printf '%s\n' "$PUSH_REFLINE" \
-    | env STUB_SCRUB_RC=1 PATH="$STUBDIR:$PATH" "$PREPUSH" 2>&1)" && PUSH_BLOCK_RC=0 || PUSH_BLOCK_RC=$?
+printf '%s\n' "$PUSH_REFLINE" \
+    | env STUB_SCRUB_RC=1 PATH="$STUBDIR:$PATH" "$PREPUSH" >/dev/null 2>&1 \
+    && PUSH_BLOCK_RC=0 || PUSH_BLOCK_RC=$?
 if [ "$PUSH_RC" -eq 0 ] \
     && printf '%s\n' "$PUSH_OUT" | grep -qxF -- "STUB-SCRUB range" \
     && [ "$PUSH_BLOCK_RC" -ne 0 ]; then
@@ -310,6 +400,33 @@ if [ "$SC_RC" -eq 1 ] && printf '%s' "$SC_OUT" | grep -qF -- "not on PATH"; then
     pass "scrub-check: absent binary -> exit 1 (non-blocking), not 0 or 2"
 else
     fail "scrub-check: absent binary -> exit 1 — rc=$SC_RC out=[$SC_OUT]"
+fi
+
+# ---------------------------------------------------------------------------
+# scripts/check.sh's optional-shellcheck branch, both directions. The dangerous
+# one is silent: invert the guard or mistype the binary name and CI prints a
+# SKIP line nobody reads while scripts/*.sh goes unlinted behind a green run.
+# --shellcheck-only isolates the branch from the hil-firewall test, which is
+# slow and irrelevant here.
+# ---------------------------------------------------------------------------
+SCRIPTS_CHECK="$REPO_ROOT/scripts/check.sh"
+
+SC_SKIP_OUT="$(env PATH="$NOSCDIR" "$SCRIPTS_CHECK" --shellcheck-only 2>&1)" \
+    && SC_SKIP_RC=0 || SC_SKIP_RC=$?
+if [ "$SC_SKIP_RC" -eq 0 ] \
+    && printf '%s' "$SC_SKIP_OUT" | grep -qF -- "SKIPPED for scripts/*.sh"; then
+    pass "scripts/check.sh: shellcheck absent -> visible SKIP, rc 0"
+else
+    fail "scripts/check.sh: shellcheck absent -> visible SKIP — rc=$SC_SKIP_RC out=[$SC_SKIP_OUT]"
+fi
+
+SC_FAIL_OUT="$(env PATH="$SCFAILDIR" "$SCRIPTS_CHECK" --shellcheck-only 2>&1)" \
+    && SC_FAIL_RC=0 || SC_FAIL_RC=$?
+if [ "$SC_FAIL_RC" -ne 0 ] \
+    && printf '%s' "$SC_FAIL_OUT" | grep -qF -- "STUB-SHELLCHECK"; then
+    pass "scripts/check.sh: shellcheck present and failing -> non-zero exit"
+else
+    fail "scripts/check.sh: shellcheck failure must red — rc=$SC_FAIL_RC out=[$SC_FAIL_OUT]"
 fi
 
 # ---------------------------------------------------------------------------
@@ -346,12 +463,17 @@ if command -v brenn-scrub >/dev/null 2>&1 && command -v gitleaks >/dev/null 2>&1
 
     # rule_case: assert whether a fixture is flagged. WANT is flagged|clean.
     rule_case() {
-        local label="$1" want="$2" name="$3" content="$4" rc=0
+        local label="$1" want="$2" name="$3" content="$4" rc=0 ok=0
         scrub_flags "$name" "$content" || rc=$?
         case "$want" in
-            flagged) [ "$rc" -ne 0 ] ;;
-            clean)   [ "$rc" -eq 0 ] ;;
-        esac && pass "$label" || fail "$label — want $want, scrub rc=$rc"
+            flagged) if [ "$rc" -ne 0 ]; then ok=1; fi ;;
+            clean)   if [ "$rc" -eq 0 ]; then ok=1; fi ;;
+        esac
+        if [ "$ok" -eq 1 ]; then
+            pass "$label"
+        else
+            fail "$label — want $want, scrub rc=$rc"
+        fi
     }
 
     # The section symbol is assembled from its UTF-8 bytes rather than written

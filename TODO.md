@@ -4,6 +4,25 @@
 
 This is a placeholder entry. Leave it here so the file is never empty. It is not a real TODO. You would reference it in code with `// TODO(example-placeholder)` comments. This is the basic TODO system design: An entry here with a slug used to join to code comments. Add real TODOs below this one in this format.
 
+## `ci-esp-clippy`
+
+Public CI runs the espup-free lane (`make -C firmware check-host`, via the root `make check`),
+so the device crate `firmware/devices/respeaker-pod/` gets no clippy coverage in CI — only the
+maintainer's local `make -C firmware check` lints it under the esp toolchain. Closing the gap
+means installing espup on the runner and switching the `check` job's delegation to
+`make -C firmware check` (whose final step is the device-crate clippy pass,
+`firmware/Makefile:38`).
+
+Deferred at CI bring-up because espup's installability and download cost on a public GitHub
+runner are unverified, and the payoff is one additional clippy view of one crate with zero
+additional tests — a poor trade for the first CI iteration, and heavy enough to risk either
+bloating the `check` job or breaking the two-job house shape shared with the sibling repos.
+
+Done = the device crate's esp-toolchain clippy view runs in CI, green, with the two job names
+(`check (fmt, clippy, test)` and `scrub`) unchanged, since branch protection joins on them.
+
+See `TODO(ci-esp-clippy)` at the `make check` step in `.github/workflows/ci.yml`.
+
 ## `podctl-dfu-serial` — BLOCKED as of 2026-07-18 (hardware observation: DFU-mode USB serial-number exposure unverified)
 
 In `podctl`'s device-selection policy (`select()`, the `--serial`→DFU→AC4 branch — see

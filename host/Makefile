@@ -10,8 +10,15 @@
 
 # Full host-workspace lint + tests. All three crates are default members, so
 # --workspace and no-flag invocations cover the same set.
+#
+# fetch-models is a real prerequisite, not a convenience: the speech-pipeline
+# tests load the openWakeWord weights and panic on their absence, so a check on a
+# fresh clone reds without them. Declaring the edge here fixes every caller at
+# once — direct invocation, firmware's check-host-arch, the pre-commit host lane
+# and CI. The fetch is idempotent and sha256-verified, so a warm run is a
+# sub-second no-op that touches no network.
 .PHONY: check
-check:
+check: fetch-models
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace

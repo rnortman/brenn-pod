@@ -182,8 +182,8 @@ chmod +x "$TMPDIR_TEST/firewall-cmd"
 export PATH="$TMPDIR_TEST:$PATH"
 
 reset_state() {
-    > "$FAKE_CALLS_FILE"
-    > "$FAKE_OPEN_PORTS_FILE"
+    : > "$FAKE_CALLS_FILE"
+    : > "$FAKE_OPEN_PORTS_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ assert_contains "open: console mentions 7380/tcp"  "7380/tcp"  "$out1"
 reset_state
 printf 'udp_port=19000/udp\ntcp_port=19001/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
-out2="$("$FIREWALL_SCRIPT" open 2>&1)"
+"$FIREWALL_SCRIPT" open >/dev/null 2>&1
 calls2="$(cat "$FAKE_CALLS_FILE")"
 
 assert_contains     "open(override): adds 19000/udp"          "--add-port=19000/udp" "$calls2"
@@ -231,7 +231,7 @@ printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nb
 # Pre-populate the fake open-ports set so close finds something to remove.
 printf '17380/udp\n17381/tcp\n7380/tcp\n' >> "$FAKE_OPEN_PORTS_FILE"
 
-out3="$("$FIREWALL_SCRIPT" close 2>&1)"
+"$FIREWALL_SCRIPT" close >/dev/null 2>&1
 calls3="$(cat "$FAKE_CALLS_FILE")"
 
 assert_contains "close: removes 17380/udp" "--remove-port=17380/udp" "$calls3"
@@ -246,7 +246,7 @@ reset_state
 printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 export FAKE_MAKE_EXIT_CODE=0
 
-out4="$("$FIREWALL_SCRIPT" run 2>&1)" && exit4=0 || exit4=$?
+"$FIREWALL_SCRIPT" run >/dev/null 2>&1 && exit4=0 || exit4=$?
 calls4="$(cat "$FAKE_CALLS_FILE")"
 
 assert_contains "run: opens 17380/udp"   "--add-port=17380/udp"    "$calls4"
@@ -271,7 +271,7 @@ reset_state
 printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 export FAKE_MAKE_EXIT_CODE=1
 
-out5="$("$FIREWALL_SCRIPT" run 2>&1)" && exit5=0 || exit5=$?
+"$FIREWALL_SCRIPT" run >/dev/null 2>&1 && exit5=0 || exit5=$?
 calls5="$(cat "$FAKE_CALLS_FILE")"
 
 assert_contains "run(fail): still removes 17380/udp after failure" \
@@ -361,7 +361,7 @@ reset_state
 export FAKE_PRINT_PORTS_EXIT_CODE=1
 printf 'build error: could not compile\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
-out8="$("$FIREWALL_SCRIPT" open 2>&1)" && exit8=0 || exit8=$?
+"$FIREWALL_SCRIPT" open >/dev/null 2>&1 && exit8=0 || exit8=$?
 calls8="$(cat "$FAKE_CALLS_FILE")"
 unset FAKE_PRINT_PORTS_EXIT_CODE
 printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
@@ -415,7 +415,7 @@ esac
 FWEOF
 chmod +x "$TMPDIR_TEST/firewall-cmd"
 
-out10="$("$FIREWALL_SCRIPT" open 2>&1)" && exit10=0 || exit10=$?
+"$FIREWALL_SCRIPT" open >/dev/null 2>&1 && exit10=0 || exit10=$?
 calls10="$(cat "$FAKE_CALLS_FILE")"
 
 if [[ "$exit10" != "0" ]]; then
