@@ -33,6 +33,29 @@ jobs:
             firmware
             host
 
+      # `make check` invokes shellcheck (the scripts and hook-script lint
+      # lanes). ubuntu-latest preinstalls one, but its version drifts with the
+      # runner image, so a tree that lints clean on a developer's machine can
+      # red in CI on a rule an older shellcheck emits (and vice versa). Pin it —
+      # same discipline as the scrub job's gitleaks — so the gate is
+      # reproducible against a version a developer can install. The sha256 is
+      # the real gate (release assets are mutable); the version check is a
+      # secondary sanity line.
+      - name: Install shellcheck
+        env:
+          SHELLCHECK_VERSION: 0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xJf shellcheck.tar.xz -O "shellcheck-v${SHELLCHECK_VERSION}/shellcheck" > "$RUNNER_TEMP/bin/shellcheck"
+          chmod +x "$RUNNER_TEMP/bin/shellcheck"
+          "$RUNNER_TEMP/bin/shellcheck" --version | grep -qx "version: ${SHELLCHECK_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
       # The gate's contents live in the root `check` target, not here, so the
       # whole thing is reproducible locally on a fresh clone.
       # TODO(ci-esp-clippy): the device crate's esp-toolchain clippy view would

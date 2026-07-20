@@ -456,7 +456,7 @@ if command -v brenn-scrub >/dev/null 2>&1 && command -v gitleaks >/dev/null 2>&1
         local name="$1" content="$2" rc=0
         printf '%s\n' "$content" > "$RULEDIR/$name"
         ( cd "$RULEDIR" && git add "$name" && brenn-scrub staged ) >/dev/null 2>&1 || rc=$?
-        ( cd "$RULEDIR" && git rm -q -f --cached "$name" >/dev/null 2>&1 || true )
+        ( cd "$RULEDIR" && git rm -q -f --cached "$name" >/dev/null 2>&1 ) || true
         rm -f "$RULEDIR/$name"
         return "$rc"
     }
