@@ -1,6 +1,6 @@
 # firmware
 
-Rust firmware workspace for the reSpeaker project. Target: Seeed XIAO ESP32-S3.
+Rust firmware workspace for the brenn-pod project. Target: Seeed XIAO ESP32-S3.
 
 ## Quickstart
 

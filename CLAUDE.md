@@ -1,4 +1,4 @@
-# respeaker
+# brenn-pod
 
 A Rust firmware platform for home-built smart-home devices, and the devices built on it. We're replacing what ESPHome provides (firmware-as-YAML on ESP32, OTA, discovery) with a real-code, single-language, testable ecosystem we fully control.
 

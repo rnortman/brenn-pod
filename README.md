@@ -1,4 +1,4 @@
-# respeaker
+# brenn-pod
 
 A Rust firmware platform for home-built smart-home devices — and the devices built on it.
 

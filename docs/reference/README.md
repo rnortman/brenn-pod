@@ -1,13 +1,14 @@
-# reSpeaker firmware reference
+# brenn-pod firmware reference
 
-Living, firmware-facing reference for the reSpeaker pod. These docs consolidate
-the scattered spike research into durable, implementation-oriented fact sheets.
+Living, firmware-facing reference for the pod hardware — the Seeed reSpeaker
+Flex (XVF3800) paired with a XIAO ESP32-S3. These docs consolidate the scattered
+bring-up research into durable, implementation-oriented fact sheets.
 
-The dated ADR / research docs under `docs/adr/2026/06/05-respeaker-bringup/`
-remain the historical record and the provenance for everything here; this
-directory cites them (as `doc:line`) but does not replace them. When a fact and
-its ADR disagree, the ADR is the dated source-of-truth and this doc is stale —
-fix it.
+The dated ADR / research docs that are the provenance for everything here are
+not published with this repository, so citations of the form `doc:line` refer to
+sources you will not find in this tree. Within the public repo these fact sheets
+are the reference; where one disagrees with the hardware, the hardware wins —
+confirm against the device and fix the doc.
 
 ## Topics
 
@@ -34,9 +35,7 @@ arbitrator, multi-talker tracking, beam-attribution-over-time, the homelab
 STT/LLM/TTS pipeline, and transport/arbitration policy. Where a control command
 produces telemetry that an off-board tracker consumes (e.g. per-tracker
 azimuths), this reference documents *the command and its wire semantics* and
-stops there. For the higher-level logic see
-`docs/adr/2026/06/05-respeaker-bringup/STATUS.md` and
-`architecture-arc-and-deferred-paths.md`.
+stops there. The higher-level logic lives outside this repository.
 
 Confidence labels used throughout: **[confirmed]** = verified empirically on the
 device during the spike; **[documented]** = stated in vendor docs / source but
