@@ -1,0 +1,15 @@
+# Crate-scoped toolchain override: esp channel (Xtensa + RISC-V ESP, LLVM fork).
+# Overrides the workspace-root rust-toolchain.toml (channel = "stable") when
+# cargo/rustup is invoked from this directory or below.
+# IMPORTANT: must invoke cargo from this directory (cd firmware/devices/respeaker-pod)
+# for this override to take effect — rustup resolves toolchain from CWD upward.
+#
+# Stock `esp` channel. The esp Xtensa backend still carries the frame-realign /
+# stack-arg miscompile (mechanism: TODO(xtensa-realign-stack-args)). The defense is
+# source-level plus a build gate, not a patched compiler: (a) no Rust function in the
+# image both realigns and takes stack-passed arguments — see the RtdSegmentIo
+# constraint in net_tests.rs; and (b) tools/check-realign-args.sh audits the release
+# ELF on every `make check-realign` / `make flash`, failing the build if any realigned
+# Rust function reads a stack argument. See TODO(xtensa-realign-stack-args).
+[toolchain]
+channel = "esp"

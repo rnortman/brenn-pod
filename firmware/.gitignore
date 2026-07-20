@@ -1,0 +1,2 @@
+# Cargo build artifacts — not committed (Cargo.lock IS committed for reproducibility)
+/target/

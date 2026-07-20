@@ -1,0 +1,16 @@
+[package]
+name = "wifi-reconnect"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# no_std-compatible pure helper crate for WiFi supervisor backoff logic.
+# Contains Backoff struct and next-wait computation; host-buildable so unit tests
+# run in the host lane (make check-host / plain cargo test).
+# The WiFi supervisor thread lives in respeaker-pod/src/main.rs (touches WIFI_STACK /
+# ESP-IDF types) and uses Backoff from here.
+
+[features]
+default = []
+
+[dependencies]

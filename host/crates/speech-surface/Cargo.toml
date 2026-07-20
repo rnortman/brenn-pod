@@ -1,0 +1,49 @@
+[package]
+name = "speech-surface"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+pod-ingest = { path = "../pod-ingest" }
+speech-pipeline = { path = "../speech-pipeline" }
+# Wire decode (`decode_frame`) for replaying recorded frame logs offline.
+audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std"] }
+# The brain response channel: `ResponseSink` wraps a `futures::channel::mpsc`
+# sender, so the pipeline holds the matching sender type in `BrainWiring`.
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+# JSONL sink: `rt`+`sync` for the writer task and its bounded channel,
+# `io-util`/`io-std`/`fs` for async stdout/file writes. The server adds `net`
+# (TCP accept/read), `macros` (`select!` on the accept/shutdown pair), and
+# `time` (per-connection read/`Hello` deadlines + accept-error backoff). The
+# daemon bin adds `rt-multi-thread` (the multi-threaded runtime the server runs
+# on) and `signal` (SIGINT/SIGTERM graceful shutdown).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "io-util", "io-std", "fs", "net", "macros", "time", "signal"] }
+# Cancellation tokens driving per-pod supersede (and later graceful shutdown).
+tokio-util = { version = "0.7", features = ["rt"] }
+# `segments-export` bin: CLI parsing, `.wav` output, bin-level error context.
+clap = { version = "4", features = ["derive", "env"] }
+hound = "3"
+anyhow = "1"
+# Cross-process advisory file lock (flock) serializing sidecar read-modify-writes
+# across the daemon and the out-of-process `pin` subcommand, plus the pruner's
+# re-check-before-delete, so an explicitly-pinned recording is never lost to a
+# concurrent rewrite race.
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+# `#[tokio::test]` runtime for the file-sink writer test; `tempfile` for its dir.
+# `time` drives the connection-cap test's brief accept-settle sleep.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tempfile = "3"
+# Wire fixtures (`heapless::Vec`/`String`) for the segments-export round-trip test.
+heapless = "0.9"
+# Shared frame-log/wire-frame test fixtures (`test_fixtures`).
+pod-ingest = { path = "../pod-ingest", features = ["test-util"] }
+# SIGTERM (via `process`) for the replay round-trip test's graceful-shutdown
+# assertion. Feature-unified with the normal-dep `rustix` (`fs`) in test builds.
+rustix = { version = "1", features = ["process"] }

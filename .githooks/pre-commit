@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Repo-wide pre-commit router.
+#
+# Runs the scrub gate over the staged diff first — it is lane-independent and
+# fails in seconds, where the check lanes take minutes — then computes the set of
+# staged top-level paths, maps each to a check lane, runs
+# every affected lane's `make check` (or script self-check), and prints an
+# explicit one-line notice for anything it does not run. "Nothing to check" is
+# legal only for commits touching no checkable subproject, and it says so.
+#
+# Every staged path must match a check lane or an explicitly known-benign
+# prefix; anything else is a hard fail. A new subproject cannot silently fall
+# through a catch-all — the first commit touching it fails with instructions.
+#
+# The check runners are `make -C <dir> check`; the router holds routing logic
+# only, never inline cargo commands. Two lanes are script-based by nature:
+# .githooks/ runs the hook self-test, scripts/ runs its existing self-check.
+#
+# --plan seam: `pre-commit --plan` reads a NUL-delimited path list on stdin and
+# prints the routing plan (one token per line) without executing. Production
+# execute mode feeds route_plan the exact same NUL stream, so the tests exercise
+# the real classifier and the real input parser. Plan tokens:
+#   firmware | firmware-device | host | host-covered
+#   githooks | scripts | skip
+# `skip` means no checkable subproject was touched. `firmware-device` is emitted
+# instead of `firmware` when firmware/devices/respeaker-pod/ is staged (device
+# clippy needs the esp toolchain). `host-covered` is emitted alongside firmware
+# when host/ is also staged — firmware's check covers host via check-host-arch,
+# so the host lane is not run separately but the coverage is announced, not
+# silently dropped.
+
+# --- pure routing: NUL-delimited paths on stdin -> plan tokens on stdout ------
+route_plan() {
+    local have_firmware=0 have_device=0 have_host=0
+    local have_githooks=0 have_scripts=0
+    local path
+    # `|| [ -n "$path" ]` keeps a final record that lacks a trailing NUL (git -z
+    # always terminates, but the --plan seam must not silently drop a partial
+    # record fed by hand).
+    while IFS= read -r -d '' path || [ -n "$path" ]; do
+        [ -z "$path" ] && continue
+        case "$path" in
+            firmware/devices/respeaker-pod/*) have_firmware=1; have_device=1 ;;
+            firmware/*)  have_firmware=1 ;;
+            host/*)      have_host=1 ;;
+            .githooks/*) have_githooks=1 ;;
+            scripts/*)   have_scripts=1 ;;
+            docs/*)      : ;;
+            .claude/*)   : ;;
+            */*)         route_fail "$path" ;;
+            *)
+                # Root-level file: benign only if a dotfile, a *.md file, the
+                # root Makefile, or LICENSE/NOTICE (covers README.md, CLAUDE.md,
+                # TODO.md, handoff.md, .gitignore, .gitleaks.toml). The root
+                # Makefile carries scrub targets only — no build logic a lane
+                # could check; LICENSE/NOTICE are static release paperwork.
+                case "$path" in
+                    .* | *.md | Makefile | LICENSE | NOTICE) : ;;
+                    *)                                        route_fail "$path" ;;
+                esac
+                ;;
+        esac
+    done
+
+    local emitted=0
+    if [ "$have_firmware" -eq 1 ]; then
+        if [ "$have_device" -eq 1 ]; then echo firmware-device; else echo firmware; fi
+        emitted=1
+        if [ "$have_host" -eq 1 ]; then echo host-covered; fi
+    elif [ "$have_host" -eq 1 ]; then
+        echo host; emitted=1
+    fi
+    if [ "$have_githooks" -eq 1 ]; then echo githooks; emitted=1; fi
+    if [ "$have_scripts" -eq 1 ]; then echo scripts; emitted=1; fi
+    if [ "$emitted" -eq 0 ]; then echo skip; fi
+}
+
+route_fail() {
+    echo "pre-commit: unknown top-level path '$1' — add it to the routing table in .githooks/pre-commit" >&2
+    exit 1
+}
+
+# --- staged-path collection (execute mode) -----------------------------------
+collect_staged() {
+    # Prints NUL-delimited staged paths. --no-renames decomposes renames into
+    # A(dest)+D(source) so both sides route; ACMD includes deletions.
+    if git rev-parse --verify -q HEAD >/dev/null; then
+        git diff --cached --name-only --diff-filter=ACMD --no-renames -z
+    else
+        # Unborn HEAD: diff the index against the empty tree.
+        git diff --cached --name-only --diff-filter=ACMD --no-renames -z \
+            "$(git hash-object -t tree /dev/null)"
+    fi
+}
+
+# --- failure vocabulary -------------------------------------------------------
+check_failed() {
+    echo ""
+    echo "pre-commit: '$1' failed."
+    echo "Fix the issues above and re-commit. (Humans may bypass with 'git commit --no-verify'; agents must fix the failure — never bypass.)"
+    exit 1
+}
+
+# The hook could not do its job: a runner is missing/unlaunchable, or an internal
+# invariant (e.g. an unknown plan token) is violated. Distinct from check_failed
+# (a check ran and failed) and policy_fail (an environment gap the committer must
+# resolve). Never swallowed into a skip.
+fail_hook_bug() {
+    echo "pre-commit: internal error — $1" >&2
+    exit 1
+}
+
+# A deliberate policy refusal: the environment is missing something the committer
+# must supply (e.g. the esp toolchain for a device-crate change). Not a hook bug
+# and not a failed check — so it does not wear the "internal error" prefix, which
+# would wrongly train committers to blame the hook.
+policy_fail() {
+    echo "pre-commit: $1" >&2
+    exit 1
+}
+
+# --- lane helpers -------------------------------------------------------------
+worktree_warn() {
+    local prefix="$1" dirty
+    dirty=$(git status --porcelain -- "$prefix" 2>/dev/null | grep -E '^.[MD]' || true)
+    if [ -n "$dirty" ]; then
+        echo "pre-commit: warning — unstaged changes under $prefix; check results reflect the worktree, not the staged snapshot"
+    fi
+}
+
+run_make() {
+    local dir="$1" target="$2"
+    if ! command -v make >/dev/null 2>&1; then
+        fail_hook_bug "make not found — cannot run 'make -C $dir $target'"
+    fi
+    echo "pre-commit: running make -C $dir $target"
+    if ! make -C "$dir" "$target"; then
+        check_failed "make -C $dir $target"
+    fi
+}
+
+run_script() {
+    local script="$1"
+    if [ ! -x "$script" ]; then
+        fail_hook_bug "$script missing or not executable"
+    fi
+    echo "pre-commit: running $script"
+    if ! "$script"; then
+        check_failed "$script"
+    fi
+}
+
+run_shellcheck() {
+    if ! command -v shellcheck >/dev/null 2>&1; then
+        echo "pre-commit: shellcheck not installed — SKIPPED for $*"
+        return 0
+    fi
+    echo "pre-commit: running shellcheck $*"
+    if ! shellcheck "$@"; then
+        check_failed "shellcheck $*"
+    fi
+}
+
+# Scrub the staged diff for disallowed strings. Independent of the lane routing:
+# it scans staged content, not subprojects, so it runs on every commit including
+# docs-only ones.
+#
+# A missing binary is a policy refusal, not a skip. Degrading to "no scrub ran"
+# is the one outcome a secret gate must never have.
+run_scrub_staged() {
+    if ! command -v brenn-scrub >/dev/null 2>&1; then
+        policy_fail "brenn-scrub not on PATH — the scrub gate cannot run. Install it from the brenn repo (cargo install --path scrub) and re-commit."
+    fi
+    echo "pre-commit: running brenn-scrub staged"
+    if ! brenn-scrub staged; then
+        check_failed "brenn-scrub staged"
+    fi
+}
+
+esp_toolchain_present() {
+    local list
+    list=$(rustup toolchain list 2>/dev/null) || return 1
+    grep -q '^esp' <<< "$list"
+}
+
+# --- lanes --------------------------------------------------------------------
+# $1 = 1 when firmware/devices/respeaker-pod/ is staged (device clippy needed).
+lane_firmware() {
+    local device="$1"
+    worktree_warn "firmware/"
+    if esp_toolchain_present; then
+        run_make firmware check
+    else
+        if [ "$device" -eq 1 ]; then
+            policy_fail "esp toolchain not installed and device-crate changes are staged — cannot lint firmware/devices/respeaker-pod/. Install espup or commit from a machine with the esp toolchain."
+        fi
+        echo "pre-commit: esp toolchain not installed — device-crate clippy SKIPPED"
+        run_make firmware check-host
+    fi
+}
+
+lane_host() {
+    worktree_warn "host/"
+    run_make host check
+}
+
+lane_githooks() {
+    worktree_warn ".githooks/"
+    run_script ".githooks/self-test.sh"
+}
+
+lane_scripts() {
+    worktree_warn "scripts/"
+    run_script "scripts/test-hil-firewall.sh"
+    run_shellcheck scripts/*.sh
+}
+
+# --- entry point --------------------------------------------------------------
+if [ "${1:-}" = "--plan" ]; then
+    route_plan
+    exit 0
+fi
+
+run_scrub_staged
+
+# Collect via a temp file so a failing `git diff` is caught explicitly. A process
+# substitution or the tail of a pipe would hide the git exit status (set -e /
+# pipefail do not observe it), turning a collection failure into an empty plan —
+# a silent, reassuring "skip" on an error path. That is the exact fail-open this
+# router exists to prevent.
+staged_tmp="$(mktemp)"
+trap 'rm -f "$staged_tmp"' EXIT
+if ! collect_staged > "$staged_tmp"; then
+    fail_hook_bug "git diff --cached failed while collecting staged paths"
+fi
+
+# route_plan reads the same NUL stream the --plan seam does. A route_fail on an
+# unknown path exits non-zero inside the command substitution; set -e aborts the
+# assignment, so the hook stops and the commit is refused.
+plan="$(route_plan < "$staged_tmp")"
+
+# Read the plan on fd 3 so lane children (make, cargo test, scripts) inherit the
+# hook's own stdin, not the plan stream — a stdin-reading child must not be able
+# to swallow the remaining plan tokens.
+while IFS= read -r -u 3 action; do
+    case "$action" in
+        firmware)        lane_firmware 0 ;;
+        firmware-device) lane_firmware 1 ;;
+        host)            lane_host ;;
+        host-covered)    echo "pre-commit: host/ covered by firmware check (check-host-arch) — not run separately" ;;
+        githooks)        lane_githooks ;;
+        scripts)         lane_scripts ;;
+        skip)            echo "pre-commit: no checkable subproject touched — skipping checks (docs/meta-only commit)" ;;
+        "")              : ;;
+        *)               fail_hook_bug "unknown plan token '$action' — executor and route_plan are out of sync" ;;
+    esac
+done 3<<< "$plan"

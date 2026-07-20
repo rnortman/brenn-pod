@@ -1,0 +1,3 @@
+# The wake-phrase fixture is a deliberately committed test asset, exempt from
+# the repo-wide *.wav ignore.
+!wake-phrase.wav

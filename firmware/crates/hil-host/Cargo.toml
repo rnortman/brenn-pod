@@ -1,0 +1,24 @@
+[package]
+name = "hil-host"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Host-only binary; not in default-members (avoids serialport dep on default builds).
+# Build and run via: make hil-test  (from firmware/)
+
+[[bin]]
+name = "hil-host"
+path = "src/main.rs"
+
+[dependencies]
+device-protocol = { path = "../device-protocol", features = ["framing"] }
+audio-pipeline = { path = "../audio-pipeline", features = ["std"] }
+build-id = { path = "../build-id" }
+pod-transport = { path = "../pod-transport" }
+heapless = { version = "0.9", features = ["serde"] }
+serialport = { version = "4", default-features = false }
+postcard = { version = "1", features = ["alloc"] }
+
+[dev-dependencies]
+pod-transport = { path = "../pod-transport", features = ["test-helpers"] }

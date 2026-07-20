@@ -1,0 +1,18 @@
+[package]
+name = "wifi-diag"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# no_std-compatible pure helper crate for WiFi diagnostic formatting.
+# Contains WifiSnapshot and its string renderer; host-buildable so unit tests
+# run in the host lane (make check-host / plain cargo test).
+# snapshot_wifi_state() lives in respeaker-pod/src/main.rs (touches WIFI_STACK / ESP-IDF
+# types) and hands a WifiSnapshot to the render helpers here.
+
+[features]
+default = []
+
+[dependencies]
+heapless = "0.9"
+truncfmt = { path = "../truncfmt" }

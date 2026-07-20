@@ -1,0 +1,20 @@
+[package]
+name = "pod-ingest"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[features]
+# Exposes `test_fixtures`, the shared wire-frame/framelog fixture builders,
+# to downstream crates' test modules. Never enabled in a production build.
+test-util = []
+
+[dependencies]
+audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std"] }
+heapless = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

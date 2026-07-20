@@ -1,0 +1,21 @@
+# udev rules for Seeed XIAO ESP32-S3 USB-serial-JTAG access without sudo.
+#
+# VID 0x303a = Espressif Systems (ESP32-S3 native USB-serial-JTAG):
+#   PID 0x1001 = app running (USB-serial-JTAG, used by cargo espflash monitor)
+#   PID 0x0002 = ROM USB download mode (DFU, used by cargo espflash flash)
+# Both PIDs live under the same VID; match by VID only to cover both.
+#
+# Access is granted two ways so it works both on a desktop and headless:
+#   GROUP="plugdev"  — any user in the plugdev group gets r/w (works headless,
+#                      no active login session required).
+#   TAG+="uaccess"   — grants the user of an active local seat (desktop case).
+# (The default node owner is root:dialout, which excludes non-dialout users; the
+#  GROUP override is what makes this work for a plugdev user over SSH.)
+#
+# After adding this file:
+#   sudo cp 99-xiao-esp32s3.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Then re-plug the USB-C cable. No sudo required for subsequent flash/monitor
+# (for a user in the plugdev group; check with `id -Gn`).
+
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="303a", MODE="0660", GROUP="plugdev", TAG+="uaccess"

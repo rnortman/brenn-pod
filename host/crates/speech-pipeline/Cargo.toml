@@ -1,0 +1,45 @@
+[package]
+name = "speech-pipeline"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+pod-ingest = { path = "../pod-ingest" }
+# `rc` so `SpeakBody::Pcm(Arc<[i16]>)` serializes; `derive` for the spine types.
+serde = { version = "1", features = ["derive", "rc"] }
+# `BoxStream`/`BoxFuture` in the stage-trait signatures; `channel` for `ResponseSink`.
+futures = "0.3"
+# `Notify` for the drop-oldest queue; `rt` so `PlaybackWriter::spawn` can spawn its
+# writer task; `time` for the pacer clock + per-write timeouts; `io-util` for the
+# `AsyncWrite` playback sink (`OwnedWriteHalf` in prod, `duplex` in tests).
+tokio = { version = "1", features = ["sync", "rt", "time", "io-util"] }
+# `CancellationToken` cancels a `PlaybackWriter` when its owning connection closes.
+tokio-util = "0.7"
+# Shared wire schema: `encode_frame`/`StreamFrame`/`Hello`/frame constants for the
+# playback sender. Same cross-workspace edge `pod-ingest` uses (host consumes it).
+audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std"] }
+# `Hello`'s heapless string fields; version-matched to `audio-pipeline`'s.
+heapless = "0.9"
+# Derived `Display`/`Error` for the wake error types (workspace error convention).
+thiserror = "2"
+# openWakeWord inference for `OwwGate`, on the dedicated wake thread (CPU EP).
+ort = { workspace = true }
+# `WavSpec` for the shared spine-format check; WAV encode/decode for the HTTP stages.
+hound = "3"
+# HTTP client for the `HttpTranscriber` / `HttpSynthesizer` stages (LAN, no TLS).
+reqwest = { workspace = true }
+# Parse the STT JSON response from a size-capped byte buffer (not reqwest's
+# `json()`, which reads the body uncapped).
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
+# `AudioSpan::resolve` tests plant a frame log in a scratch store root.
+tempfile = "3"
+# Shared frame-log/wire-frame test fixtures (`test_fixtures`).
+pod-ingest = { path = "../pod-ingest", features = ["test-util"] }
+# The queue tests drive `recv().await`; the macro + `test-util` paused clock back
+# the playback pacing/timeout tests. `io-util` supplies `duplex` for the fake device;
+# `net` backs the in-process fake HTTP server the STT/TTS stage tests bind.
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util", "io-util", "net"] }

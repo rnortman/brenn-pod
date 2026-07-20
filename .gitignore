@@ -1,0 +1,48 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.ruff_cache/
+.mypy_cache/
+firmware/.embuild/
+
+# Captured audio — not source
+*.wav
+
+# Capture artifacts — device log dumps, packet captures, and host-side pipeline
+# traces. These carry real network metadata and household audio derivatives, so
+# the globs are deliberately wide: an uncovered capture file is one `git add .`
+# away from becoming tracked content that has to be scrubbed out again.
+firmware/pod*.log
+firmware/pod*.jsonl
+firmware/pod*.json
+firmware/*.pcap
+firmware/*.out
+firmware/build-*.log
+host/*.jsonl
+host/framelogs/
+host/segments/
+
+host/config/*.toml
+
+# openWakeWord model weights — CC BY-NC-SA 4.0 (NonCommercial), incompatible with
+# this repo's Apache-2.0 license, so fetched from upstream, not redistributed.
+# Run `make -C host fetch-models`. (Silero VAD is committed — it is MIT.)
+host/models/oww/*.onnx
+
+# Personal Claude Code settings (settings.json is shared)
+.claude/settings.local.json
+
+# Private scrub rule overlay — a symlink into the ops annex, never content.
+.gitleaks.local.toml
+
+# Private per-repo agent context (CLAUDE.md is shared)
+CLAUDE.local.md
+
+# HIL secrets — WiFi credentials and TLS target; never committed (AC-B1.3)
+firmware/crates/hil-host/.hil-secrets
+
+# Editor noise
+*.swp
+.vscode/
+.idea/

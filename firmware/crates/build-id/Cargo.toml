@@ -1,0 +1,13 @@
+[package]
+name = "build-id"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Provides the compiled-in build identity (git commit + dirty flag) to both the
+# host harness and the device firmware. build.rs runs unconditionally every build
+# (no rerun-if-changed) to satisfy the fresh-stamp invariant.
+
+[dependencies]
+device-protocol = { path = "../device-protocol" }
+heapless = { version = "0.9", features = ["serde"] }

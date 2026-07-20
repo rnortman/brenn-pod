@@ -1,0 +1,13 @@
+[package]
+name = "truncfmt"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Tiny no_std helper crate: graceful char-boundary truncation when formatting into
+# fixed heapless::String buffers. References only core::fmt + heapless::String, no
+# platform/protocol deps, so its truncation behaviour is host-unit-testable and it
+# stays serde-free for heapless-only consumers (e.g. wifi-diag).
+
+[dependencies]
+heapless = "0.9"

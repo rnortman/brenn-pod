@@ -1,0 +1,7 @@
+# Workspace-scoped toolchain: stable for the host-architecture crates.
+# firmware/rust-toolchain.toml covers only the firmware workspace (rustup resolves
+# toolchain files from the invocation directory upward, and host/ is a sibling of
+# firmware/), so host/ needs its own pin — otherwise check-host-arch would run under
+# the machine's drifting rustup default, possibly the esp channel.
+[toolchain]
+channel = "stable"

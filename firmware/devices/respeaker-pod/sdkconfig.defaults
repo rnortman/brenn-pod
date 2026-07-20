@@ -1,0 +1,133 @@
+# Route ESP-IDF console output to built-in USB-serial-JTAG over the single USB-C port.
+# No external UART bridge required; cargo espflash monitor reads over the same connection.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Increase main task stack to handle Rust std::format! in log backend and
+# the protocol service loop (blocking stdin + COBS accumulator on-stack).
+# Default 3584 bytes is too small; 16 KiB is sufficient.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Hardware is 8 MB flash — declare it so esptool programs the correct Flash size register
+# and the partition table generator validates against the real chip size.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Custom single-app partition table: nvs (24 KB) + phy_init (4 KB) + factory (4 MB).
+# Gives the current ~1.18 MB image comfortable headroom without adding OTA slots
+# (A/B OTA is a future milestone).  See partitions.csv in this directory.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Raise the lwIP TCP receive window from the ESP-IDF default 5760 (4xMSS) to
+# 11520 (8xMSS, MSS=1440).  Design-delta-1 D2 shrank this from the original
+# 16xMSS (23040) after the step-1 heap gate FAILED on hardware (design-delta-1
+# §1: under saturated playback heap_free=2876, tx_write_failures=1086 against
+# the 36864 B floor — the 16xMSS window's lwIP pbuf backlog was the runtime-only
+# collapse the frozen §2 said could not be seen post-boot).  Rationale (D2): the
+# window is a GLOBAL default and a second concurrent TCP connection is
+# anticipated, so every backpressured socket holds its own window's pbuf backlog
+# and a large default multiplies.  The user's directive puts the reservoir in
+# deterministic, single-owner static ring memory (INBOUND_PCM_RING_BYTES), not
+# in dynamic, globally shared lwIP window pbufs — the ring is the reservoir; the
+# window stays modest.  Throughput: 8xMSS sustains >=2x real-time (64 KB/s raw
+# mono) up to ~180 ms RTT and >=1x up to ~360 ms; the frozen ">=2x at 300 ms"
+# target was the power-save-inflated-RTT regime that WIFI_PS_NONE removed (D4),
+# and residual transient RTTs beyond ~360 ms are absorbed by the ring, not
+# outrun by the window.
+# The PCM reservoir lives in the PSRAM-backed ring (INBOUND_PCM_RING_BYTES), not in this
+# window; the 8xMSS window here is unchanged from the original design-delta-1 shrink. Heap
+# gate discharged 2026-07-20 (post-feed min_heap=77112 against HEAP_MIN_EVER_FLOOR); full
+# report lines live in docs/adr/2026/07/19-heap-gate-measure/implementation-log.md.
+CONFIG_LWIP_TCP_WND_DEFAULT=11520
+
+# Size the per-socket TCP receive mailbox to match the raised window.  ESP-IDF's
+# lwIP Kconfig recommends LWIP_TCP_WND_DEFAULT/TCP_MSS + 2 = 11520/1440 + 2 = 10
+# (design-delta-1 D2, same rule the comment applied at 16xMSS); the default is 6
+# (sized for the 4xMSS default window).  The recvmbox is the queue between the
+# lwIP core and the app: if it is left at 6 while the window advertises 8
+# segments, a backpressured (app-not-reading) socket caches only ~6 segments
+# (~10 KB) and lwIP DROPS every further in-window segment, forcing retransmits —
+# the raised window's reservoir would not materialize and recovery could be
+# slower than the old 4xMSS config.
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=10
+
+# Trim the per-socket TCP send buffer to the lwIP minimum of 2xMSS. This is the
+# second half of the in-flight budget (see CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM
+# below): SND_BUF caps the app-side unacked bytes lwIP will hold for one socket,
+# so it bounds the send-queue contribution to the stall-time heap appetite.
+# MSS is the in-tree default 1440 (CONFIG_LWIP_TCP_MSS unset), so 2xMSS = 2880;
+# the IDF default of 5760 (4xMSS) is trimmed to 2880 = ~2.88 KB. lwIP asserts
+# SND_BUF >= 2xMSS at runtime and the Kconfig range floor is 2440, so 2880 is the
+# tightest legal value. The combined stall-time appetite and the engineered
+# free-heap floor are derived in the in-flight budget block on
+# CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM below.
+# Throughput headroom: the 4x-paced catch-up drain is ~128 KB/s (640 B / 5 ms);
+# a 2880 B window sustains that whenever RTT <= 2880/131072 s = ~22 ms, comfortably
+# above LAN RTTs, so the smaller buffer does not threaten the host keep-up ceiling
+# (RTD_CATCH_UP_MAX_MS in hil-host) — the catch-up drain is bound by the 4x pace
+# cadence, not window throughput.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+
+# Corruption-attribution tripwires. Light heap poisoning writes head/tail canaries on every
+# allocation and validates them on free, so a heap overrun is attributed to the exact block
+# instead of surfacing later as a free-list assert in an unrelated thread. The end-of-stack
+# watchpoint arms a hardware store-watchpoint on the current task's last stack words (watchpoint
+# slot 1; slot 0 holds the WRITER-corruption tripwire armed in main.rs), turning a silent stack
+# overflow into an immediate trap that names the overflowing task. Both cost a few bytes per
+# allocation and a few cycles per context switch and stay enabled through bring-up.
+CONFIG_HEAP_POISONING_LIGHT=y
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+
+# Cap the Wi-Fi dynamic TX buffer pool. With TX_BUFFER_TYPE=1 (dynamic) these
+# ~1.6 KB DMA buffers are heap-allocated on demand; the IDF default of 32 lets the
+# pool grow to ~51 KB. Under a link stall that pool is the prime suspect for the
+# observed dive to ~1.4 KB free within <1 s of segment start.
+#
+# In-flight budget (paired with CONFIG_LWIP_TCP_SND_BUF_DEFAULT above — the two
+# knobs express one quantity, the bytes in flight when the link stalls):
+#   appetite = TX_BUFFER_NUM x ~1.6 KB + N_sending_sockets x SND_BUF
+# TX_BUFFER_NUM is a global pool cap; SND_BUF is a per-socket default, so each
+# concurrently-sending socket under a stall holds up to one SND_BUF of unacked
+# pbufs. The RTD burst window has one streaming socket (one TcpStream per
+# scenario), so:
+#   appetite = 4 x 1.6 KB + 1 x 2.88 KB = ~9.3 KB
+# Against ~24 KB free entering the segment-start burst window, that engineers a
+# free-heap floor of ~24 - 9.3 = ~15 KB — the discriminating headroom for the
+# single-socket case. A second concurrent sender (anticipated, see the TCP_WND
+# block above) adds ~2.88 KB and lowers the floor to ~12 KB.
+# Trade-off: fewer in-flight TX buffers means backpressure lands earlier onto lwIP
+# and our writes — that is the intended behavior, not a regression.
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=4
+
+# Enable the on-module octal PSRAM (XIAO ESP32-S3 R8: 8 MB octal SPI PSRAM) and put it
+# in the heap as a CAPS-only pool. The five product-config cold runs showed the internal
+# heap starved (min-ever floors 848-3004, alloc_fail non-zero in all five, every failing
+# request demanding INTERNAL RAM): freeing internal RAM is the lever. The capture ring
+# (64 KB, CPU-access-only) moves onto this pool via MALLOC_CAP_SPIRAM; see src/psram.rs.
+#
+# MODE_OCT: the R8 part is octal; the Kconfig default is QUAD and would misconfigure it.
+# SPEED_80M: default is 40 MHz; 120 MHz needs quad-or-experimental, so 80 MHz is the
+#   practical octal ceiling.
+# USE_CAPS_ALLOC: PSRAM is reachable ONLY via heap_caps_malloc(..., MALLOC_CAP_SPIRAM);
+#   plain malloc() stays internal, so Wi-Fi, lwIP, DMA descriptors, and task stacks are
+#   unaffected. (The SPIRAM_USE choice DEFAULTS to USE_MALLOC — full integration — so this
+#   must be set explicitly; leaving it unset would route malloc() into PSRAM.)
+#
+# Left at documented defaults (recorded so drift is detectable): SPIRAM_TRY_ALLOCATE_WIFI_LWIP
+# stays n (Wi-Fi/lwIP buffers internal; the Wi-Fi TX-cache/AMSDU drift symbols depend on it,
+# so keeping it n neutralizes that drift path). SPIRAM_MEMTEST stays y (boot-time RAM test,
+# aborts on failure). SPIRAM_IGNORE_NOTFOUND stays n (missing PSRAM aborts boot rather than
+# silently degrading).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+# ALLOW_STACK_EXTERNAL_MEMORY: not ours — the generated sdkconfig arrived with this =y
+# from upstream defaults the moment SPIRAM=y was set. Force it n. Task stacks must NEVER
+# live in PSRAM (the stack-corruption saga: PSRAM-latency stack access under an ISR/DMA
+# window is a corruption source we spent this whole ADR chain hardening against). Hypothesis
+# under test: this flag may also be what licenses a plain heap_caps_malloc(MALLOC_CAP_DEFAULT)
+# to spill to external RAM — the malloc_probe=external seen in warm run 3 — even under
+# USE_CAPS_ALLOC. Setting it n is the empirical "try it and see" for that. The PsramIdentity
+# malloc-probe assertion is the detector for this and MUST NOT be weakened; if it still reports
+# external after this, that is a fresh discovery for human review.
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=n

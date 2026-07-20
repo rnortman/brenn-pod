@@ -1,0 +1,13 @@
+# Single-app partition table for 8 MB flash (XIAO ESP32-S3 / respeaker-pod).
+# No OTA slots — single factory image only. OTA is a future milestone.
+#
+# Layout (offsets auto-assigned by esp-idf after the 0x8000 partition table):
+#   nvs      : 24 KB  — NVS key-value store (WiFi creds, peer config, etc.)
+#   phy_init : 4 KB   — RF calibration blob (esp-idf internal)
+#   factory  : 4 MB   — application image; current image ~1.18 MB, 4 MB gives
+#                        comfortable headroom for this milestone and beyond.
+#
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     ,        0x6000,
+phy_init, data, phy,     ,        0x1000,
+factory,  app,  factory, ,        0x400000,

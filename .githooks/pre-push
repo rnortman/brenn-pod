@@ -1,0 +1,5 @@
+#!/bin/bash
+# Client-side push gate. Reads the git pre-push stdin contract.
+set -e
+
+exec brenn-scrub range

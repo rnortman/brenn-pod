@@ -1,0 +1,5 @@
+# Workspace-root cargo config. Intentionally carries NO default [build] target —
+# this ensures host/library crates build for the native host target.
+# NOTE: per cargo's CWD-upward resolution, a build invoked from this directory
+# will NOT pick up the device crate's .cargo/config.toml. Build device crates
+# by cd-ing into firmware/devices/respeaker-pod/ before invoking cargo.

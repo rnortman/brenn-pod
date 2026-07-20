@@ -1,0 +1,24 @@
+[package]
+name = "pod-transport"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Host-only library; not in default-members (avoids serialport dep on default builds).
+# Consumed by hil-host and podctl.
+
+[lib]
+name = "pod_transport"
+path = "src/lib.rs"
+
+[features]
+# Exposes `test_support` (in-memory FakePort etc.) to dependents' test builds.
+test-helpers = []
+
+[dependencies]
+device-protocol = { path = "../device-protocol", features = ["framing"] }
+serialport = { version = "4", default-features = false }
+postcard = { version = "1", features = ["alloc"] }
+
+[dev-dependencies]
+heapless = { version = "0.9", features = ["serde"] }

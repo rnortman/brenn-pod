@@ -1,0 +1,46 @@
+# Device-crate cargo config. Effective only when cargo is invoked from this
+# directory or below (CWD-upward resolution). Do NOT invoke from workspace root
+# for device builds — see firmware/.cargo/config.toml header.
+
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+runner = "cargo espflash flash --monitor"
+
+# esp-idf-svc requires nightly/unstable features for std support on Xtensa.
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+# ESP-IDF version. Design called for v5.3.x LTS; however, esp-idf-hal 0.46.2
+# and esp-idf-svc 0.52.x target the ESP-IDF v5.5 line (see their .cargo/config.toml).
+# Attempting v5.3 produces a compile error in esp-idf-hal's rmt driver due to a
+# struct rename (rmt_receive_config_t_extra_rmt_receive_flags
+# → rmt_receive_config_t_extra_flags). Using the v5.5 line per ecosystem
+# recommendation; v5.5.4 is the current patch tag on that line (ESP_IDF_VERSION is
+# a free-form git tag consumed by esp-idf-sys, not hardcoded per-patch by the crates).
+# TODO(espidf-lts-pin): revisit pinning to an LTS line once an ESP-IDF LTS and
+# the esp-idf-svc/hal ecosystem's tested version align and OTA-longevity matters.
+ESP_IDF_VERSION = "v5.5.4"
+# ESP-IDF tools install to the user-global ~/.rustup/toolchains/esp location
+# (populated by espup install). ESP_IDF_TOOLS_INSTALL_DIR="global" tells
+# embuild to use ~/.espressif for any additional tools; we use "global" to
+# stay consistent with the espup-managed location.
+ESP_IDF_TOOLS_INSTALL_DIR = "global"
+# Tell esp-idf-sys where to find this device's sdkconfig.defaults. The default
+# lookup is workspace-root-relative ("sdkconfig.defaults") but our file lives
+# in the device crate dir. An absolute path guarantees it is found regardless
+# of which directory cargo is invoked from.
+ESP_IDF_SDKCONFIG_DEFAULTS = { value = "sdkconfig.defaults", relative = true }
+# Copy partitions.csv into esp-idf-sys's OUT_DIR so that the relative filename
+# "partitions.csv" in sdkconfig.defaults resolves correctly (esp-idf resolves
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME relative to CMAKE_SOURCE_DIR = OUT_DIR).
+#
+# embuild naming convention: ESP_IDF_GLOB[_XXX]_BASE + ESP_IDF_GLOB[_XXX]_YYY
+# where _XXX is a unique group id and _YYY is any non-BASE suffix (arbitrary name).
+# Use a crate-scoped group id (RESPEAKER_POD) to avoid collision when additional
+# device crates add their own ESP_IDF_GLOB entries. See embuild BUILD-OPTIONS.md.
+ESP_IDF_GLOB_RESPEAKER_POD_BASE = { value = ".", relative = true }
+ESP_IDF_GLOB_RESPEAKER_POD_PARTITIONS = "partitions.csv"

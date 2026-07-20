@@ -1,0 +1,5 @@
+# Workspace-scoped toolchain: stable for host/library crates.
+# The device crate overrides this with its own rust-toolchain.toml (channel = "esp")
+# when invoked from the crate directory.
+[toolchain]
+channel = "stable"

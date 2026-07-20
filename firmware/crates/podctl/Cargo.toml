@@ -1,0 +1,23 @@
+[package]
+name = "podctl"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Host-only binary; not in default-members (avoids serialport+clap dep on default builds).
+# Build via `cargo build -p podctl` or `make podctl`.
+
+[[bin]]
+name = "podctl"
+path = "src/main.rs"
+
+[dependencies]
+pod-transport  = { path = "../pod-transport" }
+device-protocol = { path = "../device-protocol", features = ["framing"] }
+heapless        = { version = "0.9", features = ["serde"] }
+clap            = { version = "4", features = ["derive", "env"] }
+serde           = { version = "1", features = ["derive"] }
+serde_json      = "1"
+
+[dev-dependencies]
+tempfile = "3"

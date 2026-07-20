@@ -1,0 +1,39 @@
+[package]
+name = "respeaker-pod"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+# ESP-IDF version is pinned via ESP_IDF_VERSION="v5.5.4" in .cargo/config.toml [env].
+# v5.3.x LTS was abandoned: esp-idf-hal 0.46 / esp-idf-svc 0.52 target v5.5.4 and are
+# incompatible with v5.3 (struct rename in the rmt driver breaks compilation).
+# The esp-idf-version-v5_N feature mechanism was removed in esp-idf-svc 0.50+.
+log = { workspace = true }
+device-protocol = { path = "../../crates/device-protocol", features = ["framing"] }
+audio-pipeline = { path = "../../crates/audio-pipeline", features = ["std"] }
+build-id = { path = "../../crates/build-id" }
+wifi-diag = { path = "../../crates/wifi-diag" }
+wifi-reconnect = { path = "../../crates/wifi-reconnect" }
+heapless = { version = "0.9", features = ["serde"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+# esp-idf-svc is FFI to the ESP-IDF C SDK and only builds for the Xtensa device target.
+# Target-gating it lets the crate compile for the host triple (from the workspace root, where
+# the device .cargo/config.toml does not apply) so `cargo test -p respeaker-pod` runs the
+# host-logic unit suite. The espidf target sets `target_os = "espidf"` automatically.
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-svc = { workspace = true }
+
+[build-dependencies]
+# `espidf` is requested explicitly rather than picked up from esp-idf-svc's feature
+# unification, which no longer reaches the host build now that esp-idf-svc is
+# target-gated. build.rs must still *compile* for the host; the target check inside it
+# decides whether the sysenv work actually runs.
+embuild = { version = "0.33", features = ["espidf"] }
+
+[dev-dependencies]
+# Test-only: enable `audio-pipeline`'s shared `test_support` helpers (e.g.
+# `audio_frame`) for the device-crate `#[cfg(test)]` tests, without dragging them
+# into the production build (partial-write-fix design §2.3a, design-2).
+audio-pipeline = { path = "../../crates/audio-pipeline", features = ["std", "test-support"] }

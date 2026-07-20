@@ -1,0 +1,37 @@
+[package]
+name = "audio-pipeline"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# no_std by default; enable `std` feature for host-side use (tests, host tools).
+# Wire schema, framing codec, VAD state machine, and ring-buffer index math are all
+# here so device-testable logic lives in a host-unit-testable crate.
+
+[features]
+default = []
+# Enable the `std` allocator and standard library (for host binaries and tests).
+std = []
+# Expose `test_support` (shared test-only helpers, e.g. `audio_frame`) to downstream
+# crates' tests.  Test-only: the device crate enables it as a `[dev-dependencies]`
+# feature so its `#[cfg(test)]` `drain_*` tests share one `audio_frame` definition
+# without dragging it into the production build (partial-write-fix design §2.3a).
+test-support = ["std"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+heapless = { version = "0.9", features = ["serde"] }
+postcard = { version = "1", default-features = false, features = ["experimental-derive"] }
+# The `std`-gated `playback` module's inbound sink emits rate-limited warn/info logs
+# (relocated from the device crate, speaker-rx-audio design §6). `log` is a facade with
+# no allocator/std requirement, so it is safe in the `no_std`-by-default crate; only the
+# `std`-gated `playback` module references it.
+log = { workspace = true }
+
+[dev-dependencies]
+postcard = { version = "1", features = ["alloc"] }
+# Host-only: the stream_send host-socket integration test backs its `wait_writable`
+# closure with `poll(POLLOUT)` against a real localhost socket (mirroring the device
+# `poll_writable`).  A `[dev-dependencies]`, so it never reaches the device build
+# (partial-write-fix design §4 "Client side").
+libc = "0.2"

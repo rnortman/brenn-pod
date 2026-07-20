@@ -1,0 +1,23 @@
+[package]
+name = "device-protocol"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Pure serde types: no platform/hardware deps; no_std-compatible.
+# Consumed by both the host harness and the device firmware.
+
+[features]
+# Enables the `device_protocol::framing` module with `encode_device_frame` and
+# `encode_request`. Not enabled by default so schema-only consumers (e.g. build-id)
+# carry zero postcard/encoding dependency.
+framing = ["dep:postcard"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+heapless = { version = "0.9", features = ["serde"] }
+postcard = { version = "1", default-features = false, optional = true }
+truncfmt = { path = "../truncfmt" }
+
+[dev-dependencies]
+postcard = { version = "1", features = ["alloc"] }

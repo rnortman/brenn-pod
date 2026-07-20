@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "devices/respeaker-pod",
+    "crates/audio-pipeline",
+    "crates/device-protocol",
+    "crates/build-id",
+    "crates/hil-host",
+    "crates/pod-transport",
+    "crates/podctl",
+    "crates/truncfmt",
+    "crates/wifi-diag",
+    "crates/wifi-reconnect",
+]
+# default-members lists only host-buildable crates so no-flag `cargo build`/`cargo test`
+# runs host builds/tests without building the device crate or requiring espup.
+# The device crate stays out of default-members permanently; build it from its own
+# directory (`cd devices/respeaker-pod && cargo build --release`) where the crate-scoped
+# rust-toolchain.toml and .cargo/config.toml select the esp channel and Xtensa target.
+# hil-host is a workspace member but NOT a default member (pulls serialport; keep it
+# out of the default lane so `make check-host` stays light).
+default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect"]
+resolver = "2"
+
+[workspace.package]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+esp-idf-svc = { version = "0.52.1" }
+log = "0.4"
+
+[profile.release]
+opt-level = "s"

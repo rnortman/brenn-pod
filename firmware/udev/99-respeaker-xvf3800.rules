@@ -1,0 +1,23 @@
+# udev rules for the reSpeaker Flex XVF3800 (XMOS) USB access without sudo.
+#
+# VID 0x2886 = Seeed Technology (the XVF3800 on the reSpeaker Flex):
+#   PID 0x0022 = app mode, USB-audio firmware ("reSpeaker Flex XVF3800 L16K6Ch")
+#   PID 0x801c = Safe/DFU mode (used by dfu-util to flash XMOS firmware)
+# Both PIDs live under the same VID; match by VID only to cover both.
+# (The XVF3800 is a distinct USB device from the XIAO ESP32-S3 (VID 0x303a) on
+#  the same physical connector; that device has its own rules file.)
+#
+# Access is granted two ways so it works both on a desktop and headless:
+#   GROUP="plugdev"  — any user in the plugdev group gets r/w (works headless,
+#                      no active login session required).
+#   TAG+="uaccess"   — grants the user of an active local seat (desktop case).
+# (The default node owner is root, which excludes ordinary users; the GROUP
+#  override is what makes this work for a plugdev user over SSH.)
+#
+# After adding this file:
+#   sudo cp 99-respeaker-xvf3800.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Then re-enter DFU mode / re-plug the USB-C cable. No sudo required for
+# subsequent dfu-util (for a user in the plugdev group; check with `id -Gn`).
+
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="2886", MODE="0660", GROUP="plugdev", TAG+="uaccess"

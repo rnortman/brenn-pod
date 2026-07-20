@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/*"]
+# All three crates are default members: none carries a dependency worth excluding
+# from the default `cargo build`/`cargo test` lane (unlike firmware/, whose device
+# crate and hil-host stay out of default-members). host/ is a second standalone
+# workspace beside firmware/, with no repo-root Cargo.toml joining them; the
+# cross-workspace edge points one way only (host consumes firmware/crates/audio-pipeline
+# by path; nothing in firmware/ ever depends into host/).
+resolver = "2"
+
+[workspace.package]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# openWakeWord inference (CPU execution provider). The 2.x line is
+# release-candidate-only on crates.io; a caret requirement would not match a
+# prerelease, so this is an exact pin on the current rc. The default
+# `download-binaries` feature fetches the ONNX Runtime prebuilt at first build.
+ort = "=2.0.0-rc.12"
+# HTTP client for the STT/TTS stages against a LAN speaches container. No TLS
+# stack: the container is plain-HTTP on the LAN, and `https://` URLs are rejected
+# at config validation, so `default-features = false` drops native-tls. `multipart`
+# posts the WAV to `/v1/audio/transcriptions`; `json` (de)serializes request/response.
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "json"] }
