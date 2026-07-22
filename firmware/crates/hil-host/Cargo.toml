@@ -19,6 +19,11 @@ pod-transport = { path = "../pod-transport" }
 heapless = { version = "0.9", features = ["serde"] }
 serialport = { version = "4", default-features = false }
 postcard = { version = "1", features = ["alloc"] }
+# TLS-PSK listener fixture for the TlsPskHandshake / TlsPskWrongKeyRejected self-tests.
+# System OpenSSL, matching the host workspace's audio-link server; no `vendored`.
+openssl = "0.10"
+# OS CSPRNG for the generated audio PSK.
+getrandom = "0.4"
 
 [dev-dependencies]
 pod-transport = { path = "../pod-transport", features = ["test-helpers"] }

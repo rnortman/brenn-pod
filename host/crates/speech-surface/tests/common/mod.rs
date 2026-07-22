@@ -18,6 +18,7 @@ use audio_pipeline::wire::{
     MAX_FRAME_BYTES,
 };
 use heapless::Vec as HVec;
+use openssl::ssl::{Ssl, SslContext, SslStream};
 use pod_ingest::{
     synth_session, FrameLogReader, FrameLogWriter, HostMicros, LogItem, LogMeta, SynthParams,
 };
@@ -503,6 +504,10 @@ fn run_replay_with(
     Command::new(env!("CARGO_BIN_EXE_replay-pod"))
         .arg("--connect")
         .arg(addr)
+        .arg("--pod-id")
+        .arg(POD_ID)
+        .arg("--psk-file")
+        .arg(harness_psk_hex_file())
         .arg("--pace")
         .arg(pace)
         .args(extra_args)
@@ -556,9 +561,59 @@ pub fn assert_replay_ok(out: &std::process::Output, daemon: &DaemonChild) {
 /// table). The single skeleton every `*_daemon_config` builder is built on.
 fn daemon_config_with(record_dir: Option<&Path>, extra: &str) -> String {
     format!(
-        "listen_addr = \"127.0.0.1:0\"\n{}{extra}",
+        "listen_addr = \"127.0.0.1:0\"\npod_psk_file = {:?}\n{}{extra}",
+        harness_psk_file(),
         record_block(record_dir),
     )
+}
+
+/// Every pod identity the harness authenticates as. Each fixture's `Hello.pod_id`
+/// must match its PSK identity, so every id used in a `Hello` needs a key here.
+pub const HARNESS_POD_IDS: [&str; 3] = [POD_ID, BARGE_POD_ID, "pod-x"];
+/// The one key behind all of them — per-pod keys are the production posture; a
+/// test fleet sharing one key still exercises the same handshake.
+pub const HARNESS_PSK: [u8; 32] = [0x5a; 32];
+
+/// Path to the process-wide 0600 PSK file naming [`HARNESS_POD_IDS`]. Its
+/// tempdir is leaked deliberately: it must outlive every daemon and pod in the
+/// test binary, and the process exit reclaims it.
+pub fn harness_psk_file() -> &'static Path {
+    static PSK_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PSK_FILE.get_or_init(|| {
+        let dir = Box::leak(Box::new(tempfile::tempdir().expect("psk tempdir")));
+        let path = dir.path().join("psk.toml");
+        let hex = harness_psk_hex();
+        let body: String = HARNESS_POD_IDS
+            .iter()
+            .map(|pod| format!("{pod} = \"{hex}\"\n"))
+            .collect();
+        speech_surface::psk::write_secret_file(&path, &body).expect("write harness psk file");
+        path
+    })
+}
+
+/// The harness PSK as the 64 hex characters `replay-pod --psk-file` reads.
+pub fn harness_psk_hex() -> String {
+    speech_surface::psk::psk_hex(&HARNESS_PSK)
+}
+
+/// Path to a process-wide 0600 file holding just the harness key in hex — what
+/// `replay-pod --psk-file` takes.
+pub fn harness_psk_hex_file() -> &'static Path {
+    static KEY_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    KEY_FILE.get_or_init(|| {
+        let dir = Box::leak(Box::new(tempfile::tempdir().expect("key tempdir")));
+        let path = dir.path().join("pod.key");
+        speech_surface::psk::write_secret_file(&path, &harness_psk_hex())
+            .expect("write harness key file");
+        path
+    })
+}
+
+/// A TLS-PSK client context presenting `pod_id` with the harness key — the
+/// client half of what the pod's `tls_link` speaks, from the one shared builder.
+pub fn psk_client_context(pod_id: &str) -> SslContext {
+    speech_surface::psk::client_context(pod_id, HARNESS_PSK).expect("client context")
 }
 
 /// A harness daemon config: ephemeral loopback listener, recording off unless
@@ -824,6 +879,10 @@ pub fn import_wav_to_framelog(dir: &Path, wav: &Path, segment_id: u32) -> PathBu
         .arg(&out)
         .arg("--segment-id")
         .arg(segment_id.to_string())
+        // `Hello.pod_id` must match the PSK identity `run_replay` authenticates
+        // as (`POD_ID`), so the imported log must carry that id.
+        .arg("--pod-id")
+        .arg(POD_ID)
         .status()
         .expect("run wav-import");
     assert!(
@@ -989,14 +1048,33 @@ impl PodSignal {
 /// and signalling the first `Audio` and first `FlushPlayback`. Mirrors the
 /// `replay-pod` drain's `[u16 len][postcard]` framing, adding `FlushPlayback`
 /// recognition the barge assertion turns on.
-fn drain_playback(mut read: TcpStream, signal: Arc<PodSignal>) -> PlaybackTally {
+fn drain_playback(tls: Arc<Mutex<SslStream<TcpStream>>>, signal: Arc<PodSignal>) -> PlaybackTally {
     let mut tally = PlaybackTally::default();
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let n = match read.read(&mut chunk) {
+        // One TLS session serves both directions, so the drain holds the session
+        // lock only for the length of one read. The socket's receive timeout
+        // (set at connect) bounds that hold, which is what lets the test thread
+        // interleave its `send_frames` writes.
+        let read = {
+            let mut session = tls.lock().expect("fake pod tls poisoned");
+            session.read(&mut chunk)
+        };
+        let n = match read {
             Ok(0) => break,
             Ok(n) => n,
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Receive timeout with no plaintext ready: yield the lock so a
+                // writer can take it, then poll again.
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
@@ -1048,23 +1126,53 @@ fn drain_playback(mut read: TcpStream, signal: Arc<PodSignal>) -> PlaybackTally 
 /// (verbatim replay, then FIN) it stays interactive, so the barge scenario can
 /// inject the interrupting segment only once playback is audible.
 pub struct FakePod {
-    write: TcpStream,
+    /// The one TLS session, shared with the drain thread. TLS has no independent
+    /// read/write halves the way a `TcpStream` clone does — record framing and
+    /// sequence numbers are session state — so both directions go through this
+    /// mutex rather than two handles onto the same socket.
+    tls: Arc<Mutex<SslStream<TcpStream>>>,
     drain: Option<thread::JoinHandle<PlaybackTally>>,
     signal: Arc<PodSignal>,
 }
 
+/// How long the fake pod's socket waits for bytes before the drain releases the
+/// session lock. Short enough that an injected frame is never held up long,
+/// long enough that idle polling stays cheap.
+const FAKE_POD_READ_TIMEOUT: Duration = Duration::from_millis(20);
+
 impl FakePod {
-    /// Connect to the daemon's ingest address and start draining its playback
-    /// stream. `TCP_NODELAY` is set so injected frames are not Nagle-batched.
+    /// Connect to the daemon's ingest address, complete the TLS-PSK handshake as
+    /// [`BARGE_POD_ID`] (the identity its `Hello` carries), and start draining the
+    /// playback stream. `TCP_NODELAY` is set so injected frames are not
+    /// Nagle-batched.
     pub fn connect(addr: &str) -> FakePod {
-        let write = TcpStream::connect(addr).expect("connect fake pod");
-        write.set_nodelay(true).ok();
-        let read = write.try_clone().expect("clone read half");
+        let tcp = TcpStream::connect(addr).expect("connect fake pod");
+        tcp.set_nodelay(true).ok();
+        tcp.set_read_timeout(Some(FAKE_POD_READ_TIMEOUT))
+            .expect("set read timeout");
+        let ctx = psk_client_context(BARGE_POD_ID);
+        let session = Ssl::new(&ctx).expect("client ssl");
+        let mut tls = SslStream::new(session, tcp).expect("wrap fake pod socket");
+        // The handshake reads under the same receive timeout the drain relies on,
+        // so a timed-out read mid-handshake is a retry, not a failure.
+        loop {
+            match tls.connect() {
+                Ok(()) => break,
+                Err(e)
+                    if matches!(
+                        e.io_error().map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::WouldBlock) | Some(std::io::ErrorKind::TimedOut)
+                    ) => {}
+                Err(e) => panic!("fake pod tls handshake: {e}"),
+            }
+        }
+        let tls = Arc::new(Mutex::new(tls));
         let signal = Arc::new(PodSignal::new());
         let sig = Arc::clone(&signal);
-        let drain = thread::spawn(move || drain_playback(read, sig));
+        let drain_tls = Arc::clone(&tls);
+        let drain = thread::spawn(move || drain_playback(drain_tls, sig));
         FakePod {
-            write,
+            tls,
             drain: Some(drain),
             signal,
         }
@@ -1073,11 +1181,12 @@ impl FakePod {
     /// Encode and send each frame verbatim, in order.
     pub fn send_frames(&mut self, frames: &[StreamFrame]) {
         let mut buf = [0u8; MAX_FRAME_BYTES + 2];
+        let mut session = self.tls.lock().expect("fake pod tls poisoned");
         for frame in frames {
             let n = encode_frame(frame, &mut buf).expect("encode frame");
-            self.write.write_all(&buf[..n]).expect("send frame");
+            session.write_all(&buf[..n]).expect("send frame");
         }
-        self.write.flush().expect("flush frames");
+        session.flush().expect("flush frames");
     }
 
     /// Block until the daemon's playback stream carries its first `Audio` frame —
@@ -1098,9 +1207,14 @@ impl FakePod {
             .flush_seen
     }
 
-    /// FIN the write half and join the drain, returning its final playback tally.
+    /// Close the session (close_notify, then FIN on the write half) and join the
+    /// drain, returning its final playback tally.
     pub fn finish(mut self) -> PlaybackTally {
-        let _ = self.write.shutdown(Shutdown::Write);
+        {
+            let mut session = self.tls.lock().expect("fake pod tls poisoned");
+            let _ = session.shutdown();
+            let _ = session.get_ref().shutdown(Shutdown::Write);
+        }
         self.drain
             .take()
             .expect("drain present")
@@ -1113,7 +1227,9 @@ impl Drop for FakePod {
     fn drop(&mut self) {
         // A panicking test drops the pod without `finish`; close the socket so
         // the daemon reads EOF and the drain thread exits rather than leaking.
-        let _ = self.write.shutdown(Shutdown::Both);
+        if let Ok(session) = self.tls.lock() {
+            let _ = session.get_ref().shutdown(Shutdown::Both);
+        }
         if let Some(h) = self.drain.take() {
             let _ = h.join();
         }

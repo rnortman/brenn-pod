@@ -20,6 +20,8 @@ use crate::netpoll::poll_one;
 #[cfg(target_os = "espidf")]
 use crate::nvs::{nvs_get_blob4, open_wifi_nvs};
 #[cfg(target_os = "espidf")]
+use crate::tls_link::LinkStream;
+#[cfg(target_os = "espidf")]
 use crate::{build_inbound_stream_sink, send_frame_bp, send_frame_bp_counted};
 #[cfg(target_os = "espidf")]
 use audio_pipeline::stream_send::SendOutcome;
@@ -259,13 +261,13 @@ fn connect_inbound_source(
         Ok(None) => {
             return Err(test_report_fail(
                 "no peer_inb_tcp in NVS — run ProvisionPeer first",
-            ))
+            ));
         }
         Err(e) => {
             return Err(test_report_fail_detail(
                 "nvs get_u16 peer_inb_tcp failed",
                 &e,
-            ))
+            ));
         }
     };
     drop(nvs);
@@ -280,7 +282,7 @@ fn connect_inbound_source(
             return Err(test_report_fail_detail(
                 &format!("{err_prefix} connect failed"),
                 &e,
-            ))
+            ));
         }
     };
 
@@ -669,7 +671,7 @@ fn run_bp_subcase(
             return Err(test_report_fail_detail(
                 "FAIL backpressure[A] connect failed",
                 &e,
-            ))
+            ));
         }
     };
     // Write the selector byte while still blocking so it precedes any frame.
@@ -768,7 +770,7 @@ fn bp_confirm_reusable(
                 return Err(test_report_fail_detail(
                     "FAIL backpressure post-backpressure send error",
                     &e,
-                ))
+                ));
             }
         }
     }
@@ -867,7 +869,7 @@ pub(crate) fn run_poll_readiness_bidir() -> (Status, Payload) {
         let revents = match poll_one(fd, POLLIN | POLLOUT, POLL_TIMEOUT_MS) {
             Ok(r) => r,
             Err(e) => {
-                return test_report_fail_detail("FAIL poll-readiness POLLIN poll() errno", &e)
+                return test_report_fail_detail("FAIL poll-readiness POLLIN poll() errno", &e);
             }
         };
         if revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
@@ -895,7 +897,7 @@ pub(crate) fn run_poll_readiness_bidir() -> (Status, Payload) {
             return test_report_fail(
                 "FAIL poll-readiness POLLIN reported ready but read returned EOF (0 bytes) — \
                  peer closed; readiness did not back real data",
-            )
+            );
         }
         Ok(n) => n,
         Err(e) => {
@@ -903,7 +905,7 @@ pub(crate) fn run_poll_readiness_bidir() -> (Status, Payload) {
                 "FAIL poll-readiness read after POLLIN failed (WouldBlock here would mean a \
                  false POLLIN readiness signal)",
                 &e,
-            )
+            );
         }
     };
 
@@ -1599,6 +1601,287 @@ fn rtd_send_blocking(
             "{what} backpressured at onset (buffer should be empty)"
         )),
         Err(e) => Err(format!("onset send {what} failed: {e:?}")),
+    }
+}
+
+// ── TLS-PSK audio-link self-tests ─────────────────────────────────────────────
+
+/// Wall-clock bound on the echo round-trip through the tunnel, after the
+/// handshake. Generous against a LAN turnaround so a failure names the echo, not
+/// a tight budget.
+#[cfg(target_os = "espidf")]
+const TLS_PSK_ECHO_TIMEOUT_SECS: u64 = 5;
+
+/// Payload echoed through the tunnel by `TlsPskHandshake`.
+#[cfg(target_os = "espidf")]
+const TLS_PSK_ECHO_NONCE: [u8; 16] = *b"pod-tls-psk-echo";
+
+/// Everything one TLS-PSK self-test needs to open its session.
+#[cfg(target_os = "espidf")]
+struct TlsPskInputs {
+    /// HIL host address, shared by both listeners.
+    peer_ip: [u8; 4],
+    /// Port of the listener this test connects to.
+    peer_port: u16,
+    /// The provisioned audio-link key.
+    psk: [u8; crate::tls_link::PSK_LEN],
+    /// This pod's id, which is also the PSK identity.
+    pod_id: heapless::String<32>,
+}
+
+/// Read the audio-link key, this pod's identity, and the peer endpoint for one of
+/// the two TLS-PSK listeners (`port_key` selects which).
+#[allow(clippy::result_large_err)]
+#[cfg(target_os = "espidf")]
+fn tls_psk_inputs(port_key: &str) -> Result<TlsPskInputs, (Status, Payload)> {
+    let nvs = open_wifi_nvs(false).map_err(test_report_fail_msg)?;
+    let peer_ip = nvs_get_blob4(&nvs, "peer_ip").map_err(test_report_fail_msg)?;
+    let peer_port = match nvs.get_u16(port_key) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(test_report_fail_fmt(format_args!(
+                "no {port_key} in NVS — run ProvisionPeer first"
+            )));
+        }
+        Err(e) => {
+            return Err(test_report_fail_fmt(format_args!(
+                "nvs get_u16 {port_key} failed: {e:?}"
+            )));
+        }
+    };
+    let psk = crate::nvs::nvs_get_blob32(&nvs, "audio_psk").map_err(test_report_fail_msg)?;
+    drop(nvs);
+
+    let Some(pod_id) = crate::streamer::pod_id_snapshot() else {
+        return Err(test_report_fail(
+            "pod identity not yet initialized — run WifiAssociate first",
+        ));
+    };
+    Ok(TlsPskInputs {
+        peer_ip,
+        peer_port,
+        psk,
+        pod_id,
+    })
+}
+
+/// Wait for the tunnel to be ready in `direction` (a `poll()` event mask), or
+/// report the fault/timeout as a failed report.
+#[allow(clippy::result_large_err)]
+#[cfg(target_os = "espidf")]
+fn tls_psk_wait(
+    stream: &crate::tls_link::TlsStream,
+    readable: bool,
+    deadline: std::time::Instant,
+) -> Result<(), (Status, Payload)> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let timeout_ms =
+        remaining.as_millis().min(std::os::raw::c_int::MAX as u128) as std::os::raw::c_int;
+    let events = stream.poll_events(readable, !readable);
+    match crate::netpoll::poll_readiness(stream.link_fd(), events, timeout_ms) {
+        crate::netpoll::Readiness::Fault(e) => {
+            Err(test_report_fail_detail("tls-psk socket fault", &e))
+        }
+        crate::netpoll::Readiness::TimedOut | crate::netpoll::Readiness::Ready { .. } => Ok(()),
+    }
+}
+
+/// Write every byte of `buf` through the tunnel under `deadline`.
+///
+/// Poll discipline rule 2: a `WouldBlock` retry re-presents the same unsent
+/// slice, never a differently-sliced buffer.
+#[allow(clippy::result_large_err)]
+#[cfg(target_os = "espidf")]
+fn tls_psk_write_all(
+    stream: &mut crate::tls_link::TlsStream,
+    buf: &[u8],
+    deadline: std::time::Instant,
+) -> Result<(), (Status, Payload)> {
+    use std::io::Write as _;
+    let mut sent = 0usize;
+    while sent < buf.len() {
+        match stream.write(&buf[sent..]) {
+            Ok(0) => return Err(test_report_fail("tls-psk write made no progress")),
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tls_psk_wait(stream, false, deadline)?
+            }
+            Err(e) => return Err(test_report_fail_detail("tls-psk write failed", &e)),
+        }
+        if sent < buf.len() && std::time::Instant::now() >= deadline {
+            return Err(test_report_fail_fmt(format_args!(
+                "tls-psk write timed out after {sent}/{} bytes",
+                buf.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Fill `buf` from the tunnel under `deadline`.
+///
+/// Poll discipline rule 1: reads are attempted until `WouldBlock`, because
+/// decrypted plaintext can sit in the session buffer with no `POLLIN` to reveal
+/// it.
+#[allow(clippy::result_large_err)]
+#[cfg(target_os = "espidf")]
+fn tls_psk_read_exact(
+    stream: &mut crate::tls_link::TlsStream,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+) -> Result<(), (Status, Payload)> {
+    use std::io::Read as _;
+    let want = buf.len();
+    let mut got = 0usize;
+    while got < want {
+        match stream.read(&mut buf[got..]) {
+            Ok(0) => {
+                return Err(test_report_fail_fmt(format_args!(
+                    "tls-psk peer closed after {got}/{want} echoed bytes"
+                )));
+            }
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                tls_psk_wait(stream, true, deadline)?
+            }
+            Err(e) => return Err(test_report_fail_detail("tls-psk read failed", &e)),
+        }
+        if got < want && std::time::Instant::now() >= deadline {
+            return Err(test_report_fail_fmt(format_args!(
+                "tls-psk read timed out after {got}/{want} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// TLS-PSK handshake proof over the production audio-link client.
+///
+/// Connects to the HIL host's TLS-PSK listener with `tls_connect_psk` — the same
+/// call the streamer makes — using the key `ProvisionAudioPsk` wrote and this
+/// pod's id as the PSK identity, then echoes one payload through the tunnel.
+/// Reports the negotiated version and ciphersuite so the host asserts them
+/// against the pinned expectation.
+#[cfg(target_os = "espidf")]
+pub(crate) fn run_tls_psk_handshake() -> (Status, Payload) {
+    use device_protocol::{TlsSuiteStr, TlsVersionStr};
+
+    let TlsPskInputs {
+        peer_ip,
+        peer_port,
+        psk,
+        pod_id,
+    } = match tls_psk_inputs("peer_psk_tcp") {
+        Ok(v) => v,
+        Err(report) => return report,
+    };
+    let peer = std::net::SocketAddr::from((peer_ip, peer_port));
+
+    let started = std::time::Instant::now();
+    let mut stream = match crate::tls_link::tls_connect_psk(&crate::tls_link::TlsConnectParams {
+        peer: &peer,
+        pod_id: pod_id.as_str(),
+        key: &psk,
+        connect_timeout: std::time::Duration::from_secs(2),
+        write_timeout: std::time::Duration::from_secs(2),
+    }) {
+        Ok(s) => s,
+        Err(e) => return test_report_fail_detail("tls-psk handshake failed", &e),
+    };
+    let handshake_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+
+    let (version, ciphersuite) = {
+        let (v, c) = stream.negotiated();
+        let mut vs = TlsVersionStr::new();
+        let _ = vs.push_str(v);
+        let mut cs = TlsSuiteStr::new();
+        let _ = cs.push_str(c);
+        (vs, cs)
+    };
+
+    let deadline = started + std::time::Duration::from_secs(TLS_PSK_ECHO_TIMEOUT_SECS);
+    if let Err(report) = tls_psk_write_all(&mut stream, &TLS_PSK_ECHO_NONCE, deadline) {
+        return report;
+    }
+    let mut reply = [0u8; TLS_PSK_ECHO_NONCE.len()];
+    if let Err(report) = tls_psk_read_exact(&mut stream, &mut reply, deadline) {
+        return report;
+    }
+    if reply != TLS_PSK_ECHO_NONCE {
+        return test_report_fail("tls-psk echo mismatch through the tunnel");
+    }
+
+    test_report_ok(TestData::TlsPskHandshake {
+        peer_ip,
+        peer_port,
+        handshake_ms,
+        version,
+        ciphersuite,
+        echo_bytes: TLS_PSK_ECHO_NONCE.len() as u32,
+    })
+}
+
+/// TLS-PSK identity-negative self-test: the wrong key must not open the tunnel.
+///
+/// Connects to the listener that holds a *different* key for this pod's identity
+/// and asserts the handshake fails. Nothing is ever written, so no application
+/// byte can cross a link that was not authenticated; a completed handshake here
+/// means the key is not what gates the link and is a hard failure.
+///
+/// The refusal only means something if TLS was actually spoken, so the two ways
+/// a broken fixture would otherwise look like a pass are failures here: an
+/// unreachable listener (proved reachable by a TCP probe first — a firewalled or
+/// absent port times out rather than refusing) and a handshake that ends by
+/// consuming its deadline instead of by an alert.
+#[cfg(target_os = "espidf")]
+pub(crate) fn run_tls_psk_wrong_key_rejected() -> (Status, Payload) {
+    let TlsPskInputs {
+        peer_ip,
+        peer_port,
+        psk,
+        pod_id,
+    } = match tls_psk_inputs("peer_psk_bad") {
+        Ok(v) => v,
+        Err(report) => return report,
+    };
+    let peer = std::net::SocketAddr::from((peer_ip, peer_port));
+
+    // Reachability first, as its own phase: a listener that is not there cannot
+    // refuse anything, and its connect error must not be read as a rejection.
+    match std::net::TcpStream::connect_timeout(&peer, std::time::Duration::from_secs(2)) {
+        Ok(probe) => drop(probe),
+        Err(e) => return test_report_fail_detail("tls-psk wrong-key listener unreachable", &e),
+    }
+
+    let started = std::time::Instant::now();
+    let outcome = crate::tls_link::tls_connect_psk(&crate::tls_link::TlsConnectParams {
+        peer: &peer,
+        pod_id: pod_id.as_str(),
+        key: &psk,
+        connect_timeout: std::time::Duration::from_secs(2),
+        write_timeout: std::time::Duration::from_secs(2),
+    });
+    let reject_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+
+    match outcome {
+        Ok(_) => test_report_fail(
+            "tls-psk handshake COMPLETED against a peer holding a different key — \
+             the key does not gate the link",
+        ),
+        // Deadline, not alert: the peer never refused, so this run proves nothing
+        // about the key.
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => test_report_fail_detail(
+            "tls-psk wrong-key handshake hit the deadline instead of being refused",
+            &e,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            test_report_fail_detail("tls-psk wrong-key listener unreachable", &e)
+        }
+        Err(_) => test_report_ok(TestData::TlsPskRejected {
+            peer_ip,
+            peer_port,
+            reject_ms,
+        }),
     }
 }
 

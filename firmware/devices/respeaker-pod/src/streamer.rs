@@ -18,7 +18,9 @@ use crate::netpoll::{
     OUTBOUND_FRAMES_PER_WAKE,
 };
 #[cfg(target_os = "espidf")]
-use crate::nvs::{nvs_get_blob4, open_wifi_nvs};
+use crate::nvs::{nvs_get_blob32, nvs_get_blob4, open_wifi_nvs};
+#[cfg(target_os = "espidf")]
+use crate::tls_link::{tls_connect_psk, LinkStream, TlsConnectParams, TlsStream, PSK_LEN};
 #[cfg(target_os = "espidf")]
 use crate::wifi::{jitter_seed, monotonic_secs, snapshot_wifi_state, wifi_is_up_nonblocking};
 #[cfg(target_os = "espidf")]
@@ -55,6 +57,25 @@ const REPROVISION_POLL: Duration = Duration::from_secs(5);
 /// `heapless::String<32>` matches `Hello::pod_id` capacity.
 #[cfg(target_os = "espidf")]
 pub(crate) static POD_ID: Mutex<heapless::String<32>> = Mutex::new(heapless::String::new());
+
+/// A copy of [`POD_ID`], or `None` while it is still empty — i.e. before the
+/// WiFi stack has derived it from the STA MAC.
+///
+/// Every consumer needs the same two decisions (a poisoned mutex is
+/// unrecoverable; an empty id means "asked too early"), so they live here and
+/// callers supply only their own error framing.
+#[cfg(target_os = "espidf")]
+pub(crate) fn pod_id_snapshot() -> Option<heapless::String<32>> {
+    let guard = POD_ID
+        .lock()
+        .unwrap_or_else(|_| panic!("POD_ID mutex poisoned"));
+    if guard.is_empty() {
+        return None;
+    }
+    let mut id = heapless::String::<32>::new();
+    let _ = id.push_str(guard.as_str());
+    Some(id)
+}
 
 // ── Streamer message channel ──────────────────────────────────────────────────
 
@@ -147,31 +168,12 @@ const PENDING_TELEMETRY_CAP: usize = 8;
 
 // ── Streamer helpers ──────────────────────────────────────────────────────────
 
-/// Encode `frame` into `buf` and write the whole thing to `stream`.
-///
-/// `buf` is reused across calls (its contents are overwritten on each call).
-/// The buffer must be pre-sized to at least `MAX_FRAME_BYTES`; `encode_frame`
-/// writes into the slice and returns the used length.
-#[cfg(target_os = "espidf")]
-fn send_streamer_frame(
-    stream: &mut std::net::TcpStream,
-    frame: &audio_pipeline::wire::StreamFrame,
-    buf: &mut [u8],
-) -> std::io::Result<()> {
-    use audio_pipeline::wire::encode_frame;
-    use std::io::Write as _;
-    match encode_frame(frame, buf) {
-        Ok(n) => stream.write_all(&buf[..n]),
-        Err(_) => Err(std::io::Error::other("encode_frame failed")),
-    }
-}
-
 /// Encode `frame` and write it to `stream` with bounded backpressure via
 /// [`write_frame_classified`] + [`poll_writable`]. Discards the resume-cycle
 /// count (production path); see [`send_frame_bp_counted`] for the HIL variant.
 #[cfg(target_os = "espidf")]
 pub(crate) fn send_frame_bp(
-    stream: &mut std::net::TcpStream,
+    stream: &mut dyn LinkStream,
     frame: &audio_pipeline::wire::StreamFrame,
     buf: &mut [u8],
 ) -> std::io::Result<SendOutcome> {
@@ -183,50 +185,63 @@ pub(crate) fn send_frame_bp(
 /// resumed partial writes from immediate sends.
 #[cfg(target_os = "espidf")]
 pub(crate) fn send_frame_bp_counted(
-    stream: &mut std::net::TcpStream,
+    stream: &mut dyn LinkStream,
     frame: &audio_pipeline::wire::StreamFrame,
     buf: &mut [u8],
 ) -> (std::io::Result<SendOutcome>, u32) {
-    use std::os::fd::AsRawFd as _;
-    let fd = stream.as_raw_fd();
-    write_frame_classified(stream, frame, buf, |deadline| poll_writable(fd, deadline))
+    let fd = stream.link_fd();
+    write_frame_classified(stream.as_write(), frame, buf, |deadline| {
+        poll_writable(fd, deadline)
+    })
 }
 
-/// Open a fresh TCP connection to `peer_addr`, configure socket options, and
-/// send a `Hello` frame identifying this pod.
-///
-/// Returns the connected `TcpStream` on success, or an `io::Error` if the
-/// connect or the `Hello` send fails. Times out after `CONNECT_TIMEOUT_MS`.
+/// The per-connection inputs of [`connect_and_hello`], bundled to stay inside
+/// the Xtensa realign-miscompile guard's argument-word budget.
 #[cfg(target_os = "espidf")]
-fn connect_and_hello(
-    peer_addr: &std::net::SocketAddr,
-    pod_id: &str,
-    encode_buf: &mut [u8],
-) -> std::io::Result<std::net::TcpStream> {
+struct ConnectInputs<'a> {
+    /// Audio host to connect to.
+    peer_addr: &'a std::net::SocketAddr,
+    /// This pod's id — both the `Hello` field and the TLS PSK identity.
+    pod_id: &'a str,
+    /// The provisioned audio-link key.
+    psk: &'a [u8; PSK_LEN],
+}
+
+/// Open a fresh TLS-PSK connection to the audio host and send the `Hello` frame
+/// identifying this pod.
+///
+/// Returns the ready session, or an `io::Error` if connect, handshake, or
+/// `Hello` fails. The returned stream is already non-blocking: esp-tls owns
+/// the fd and the mode must be set before the handoff.
+#[cfg(target_os = "espidf")]
+fn connect_and_hello(inputs: &ConnectInputs, encode_buf: &mut [u8]) -> std::io::Result<TlsStream> {
     use audio_pipeline::wire::{ChannelSource, Hello, StreamFrame, AUDIO_PROTOCOL_VERSION};
-    let stream = std::net::TcpStream::connect_timeout(
-        peer_addr,
-        std::time::Duration::from_millis(CONNECT_TIMEOUT_MS),
-    )?;
-    if let Err(e) = stream.set_nodelay(true) {
-        log::warn!("streamer: set_nodelay failed: {:?}", e);
-    }
-    let wt = std::time::Duration::from_millis(WRITE_TIMEOUT_MS);
-    if let Err(e) = stream.set_write_timeout(Some(wt)) {
-        log::warn!("streamer: set_write_timeout failed: {:?}", e);
-    }
+    let mut stream = tls_connect_psk(&TlsConnectParams {
+        peer: inputs.peer_addr,
+        pod_id: inputs.pod_id,
+        key: inputs.psk,
+        connect_timeout: std::time::Duration::from_millis(CONNECT_TIMEOUT_MS),
+        write_timeout: std::time::Duration::from_millis(WRITE_TIMEOUT_MS),
+    })?;
     let hello = StreamFrame::Hello(Hello {
         version: AUDIO_PROTOCOL_VERSION,
-        pod_id: heapless::String::try_from(pod_id).unwrap_or_else(|_| heapless::String::new()),
+        pod_id: heapless::String::try_from(inputs.pod_id)
+            .unwrap_or_else(|_| heapless::String::new()),
         sample_rate_hz: DEVICE_PLAYBACK_FORMAT.sample_rate_hz,
         bits_per_sample: DEVICE_PLAYBACK_FORMAT.bits_per_sample,
         channels: DEVICE_PLAYBACK_FORMAT.channels,
         codec: DEVICE_PLAYBACK_FORMAT.codec,
         channel_source: ChannelSource::CommunicationBeam,
     });
-    let mut stream = stream;
-    send_streamer_frame(&mut stream, &hello, encode_buf)?;
-    Ok(stream)
+    // The socket is non-blocking from the handoff on, so `Hello` goes out
+    // through the same bounded-backpressure path as every other frame rather
+    // than a blocking `write_all`.
+    match send_frame_bp(&mut stream, &hello, encode_buf)? {
+        SendOutcome::Sent => Ok(stream),
+        SendOutcome::BackpressureAligned => Err(std::io::Error::other(
+            "Hello stalled on write backpressure — dropping the fresh connection",
+        )),
+    }
 }
 
 /// Tags the single in-flight outbound frame so post-send bookkeeping knows what to
@@ -292,22 +307,20 @@ fn note_connect_success(backoff: &mut Backoff, reconnect_deadline_secs: &mut u64
     *reconnect_deadline_secs = 0;
 }
 
-/// Route every socket-teardown site through one place (design §3.4 "Fully dropped
-/// connection"): clear the socket, reset the inbound framing state so stale partial
-/// bytes cannot corrupt the next connection's first frame, and signal end-of-audio to
-/// playback so the banked tail plays out and *then* the DAC mutes.
+/// Route every socket-teardown site through one place: clear the socket, reset
+/// the inbound framing state so stale partial bytes cannot corrupt the next
+/// connection's first frame, and signal end-of-audio to playback so the banked
+/// tail plays out and *then* the DAC mutes.
 ///
-/// A subsequent reconnect bumps the ring generation (`send_stream_reset`), which
-/// discards any un-played tail and the just-pushed EOA mark — so a drop followed by an
-/// immediate reconnect is seamless (no spurious mute), while a drop that stays down
-/// plays the banked tail out and mutes, exactly the design's drop semantics. Marks are
-/// generation-tagged, so the reconnect's `apply_reset` discards this dead-generation
-/// mark even if the tail had not yet drained. Centralizing here also collapses the
-/// previously duplicated `held_socket = None` + `inbound_accum`/`inbound_state` reset
-/// blocks the analysis §4 flagged.
+/// A subsequent reconnect bumps the ring generation (`send_stream_reset`),
+/// which discards any un-played tail and the just-pushed EOA mark — so a drop
+/// followed by an immediate reconnect is seamless (no spurious mute), while a
+/// drop that stays down plays the banked tail out and mutes. Marks are
+/// generation-tagged, so the reconnect's `apply_reset` discards this
+/// dead-generation mark even if the tail had not yet drained.
 #[cfg(target_os = "espidf")]
 fn note_socket_lost(
-    held_socket: &mut Option<std::net::TcpStream>,
+    held_socket: &mut Option<TlsStream>,
     inbound_accum: &mut FrameAccumulator,
     inbound_state: &mut InboundConnectionState,
     inbound_sink: &mut I2sStreamSink,
@@ -323,8 +336,8 @@ fn note_socket_lost(
 /// A fresh socket is a fresh inbound stream (see `InboundConnectionState`).
 #[cfg(target_os = "espidf")]
 fn note_socket_established(
-    held_socket: &mut Option<std::net::TcpStream>,
-    stream: std::net::TcpStream,
+    held_socket: &mut Option<TlsStream>,
+    stream: TlsStream,
     inbound_accum: &mut FrameAccumulator,
     inbound_state: &mut InboundConnectionState,
     inbound_sink: &mut I2sStreamSink,
@@ -343,14 +356,13 @@ fn note_socket_established(
 #[cfg(target_os = "espidf")]
 #[allow(clippy::too_many_arguments)]
 fn ensure_connected(
-    held_socket: &mut Option<std::net::TcpStream>,
+    held_socket: &mut Option<TlsStream>,
     backoff: &mut Backoff,
     reconnect_deadline_secs: &mut u64,
     attempt_counter: &mut u32,
     now_secs: impl Fn() -> u64,
     jitter_seed_base: u32,
-    peer_addr: &std::net::SocketAddr,
-    pod_id: &str,
+    connect: &ConnectInputs,
     inbound_accum: &mut FrameAccumulator,
     inbound_state: &mut InboundConnectionState,
     inbound_sink: &mut I2sStreamSink,
@@ -368,19 +380,8 @@ fn ensure_connected(
         return;
     }
 
-    // TODO(audio-auth): plain TCP; TLS/PSK deferred.
-    match connect_and_hello(peer_addr, pod_id, encode_buf) {
+    match connect_and_hello(connect, encode_buf) {
         Ok(stream) => {
-            // Blocking socket would stall the drain loop, so treat this as a connect failure.
-            if let Err(e) = stream.set_nonblocking(true) {
-                log::warn!(
-                    "streamer: idle connect set_nonblocking failed for {}: {:?} — discarding socket, backing off",
-                    peer_addr, e
-                );
-                *reconnect_deadline_secs =
-                    arm_reconnect_deadline(now, backoff, attempt_counter, jitter_seed_base);
-                return;
-            }
             // Fresh socket = fresh inbound stream.
             note_socket_established(
                 held_socket,
@@ -390,13 +391,16 @@ fn ensure_connected(
                 inbound_sink,
             );
             note_connect_success(backoff, reconnect_deadline_secs);
-            log::info!("streamer: idle connect established to {}", peer_addr);
+            log::info!(
+                "streamer: idle connect established to {}",
+                connect.peer_addr
+            );
         }
         Err(e) => {
             let snap = snapshot_wifi_state();
             log::warn!(
                 "streamer: idle connect/Hello failed: dst={} {} err={:?} — backing off",
-                peer_addr,
+                connect.peer_addr,
                 fmt_wifi_snapshot(&snap),
                 e
             );
@@ -435,7 +439,7 @@ fn park_drain(rx: &std::sync::mpsc::Receiver<StreamerMsg>, timeout: Duration) ->
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return ParkOutcome::TimedOut,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return ParkOutcome::Disconnected
+                return ParkOutcome::Disconnected;
             }
         }
     }
@@ -453,9 +457,14 @@ fn should_log_provisioning_failure(last: Option<&str>, current: &str) -> bool {
 ///
 /// Opens the NVS handle fresh per call and drops it on return, so each attempt
 /// observes current flash contents and no handle is held across a park.
+///
+/// The audio-link PSK is part of provisioning, not an optional extra: without
+/// it there is no way to reach the host at all, so a keyless pod parks on the
+/// reprovision poll exactly as an addressless one does.
 #[cfg(target_os = "espidf")]
 #[allow(clippy::result_large_err)] // device_protocol::TestResultMsg is the no-alloc error type on no_std
-fn read_audio_provisioning() -> Result<([u8; 4], u16), device_protocol::TestResultMsg> {
+fn read_audio_provisioning() -> Result<([u8; 4], u16, [u8; PSK_LEN]), device_protocol::TestResultMsg>
+{
     let nvs = open_wifi_nvs(false)
         .map_err(|msg| fmt_msg(format_args!("cannot open NVS — {}", msg.as_str())))?;
     let ip = nvs_get_blob4(&nvs, "audio_ip")
@@ -465,15 +474,17 @@ fn read_audio_provisioning() -> Result<([u8; 4], u16), device_protocol::TestResu
         Ok(None) => {
             return Err(lit_msg(
                 "audio_port not provisioned (run podctl provision-audio)",
-            ))
+            ));
         }
         Err(e) => {
             return Err(fmt_msg(format_args!(
                 "audio_port NVS read error: {e:?} (NVS may be corrupt)"
-            )))
+            )));
         }
     };
-    Ok((ip, port))
+    let psk = nvs_get_blob32(&nvs, "audio_psk")
+        .map_err(|msg| fmt_msg(format_args!("audio_psk unavailable: {}", msg.as_str())))?;
+    Ok((ip, port, psk))
 }
 
 /// Format into the no-alloc message type, cutting at a UTF-8 char boundary on
@@ -510,9 +521,6 @@ fn lit_msg(msg: &str) -> device_protocol::TestResultMsg {
 pub(crate) fn spawn_streamer_thread() {
     use audio_pipeline::ring::{PREROLL_SAMPLES, RING_CAPACITY_SAMPLES};
     use audio_pipeline::wire::{SegmentStart, StreamFrame};
-    use esp_idf_svc::sys::POLLIN;
-    use std::net::TcpStream;
-    use std::os::fd::AsRawFd as _;
 
     // ESP-IDF's std::thread::Builder::name() does NOT propagate to the FreeRTOS
     // task name (the espidf target's set_name is a no-op). Without the workaround
@@ -540,7 +548,12 @@ pub(crate) fn spawn_streamer_thread() {
 
         std::thread::Builder::new()
         .name("streamer".into())
-        .stack_size(20480)
+        // The ECDHE-PSK handshake runs on this thread and mbedTLS ECC wants
+        // several KB of stack beyond what the segment loop needs. Sized to err
+        // safe: an overflow trips the armed end-of-stack watchpoint, and the
+        // health report's stack HWM is what says how much of this is used.
+        // TODO(tls-link-bench-measure): confirm or tune against a bench run.
+        .stack_size(28672)
         .spawn(move || {
             // ── Take the channel receiver ────────────────────────────────────
             let rx = {
@@ -551,7 +564,7 @@ pub(crate) fn spawn_streamer_thread() {
             };
 
             // ── Read provisioning, polling until it appears ──────────────────
-            let (audio_ip, audio_port): ([u8; 4], u16) = {
+            let (audio_ip, audio_port, audio_psk): ([u8; 4], u16, [u8; PSK_LEN]) = {
                 let mut last_err: Option<device_protocol::TestResultMsg> = None;
                 loop {
                     match read_audio_provisioning() {
@@ -589,12 +602,9 @@ pub(crate) fn spawn_streamer_thread() {
                 }
             };
 
-            let pod_id: heapless::String<32> = {
-                let guard = POD_ID.lock().unwrap_or_else(|_| panic!("POD_ID mutex poisoned"));
-                let mut s = heapless::String::<32>::new();
-                let _ = s.push_str(guard.as_str());
-                s
-            };
+            // Empty is not reachable here — the streamer thread starts after WiFi
+            // init — and an empty identity simply fails the handshake if it ever were.
+            let pod_id: heapless::String<32> = pod_id_snapshot().unwrap_or_default();
 
             log::info!(
                 "streamer: audio receiver {}:{} pod_id={}",
@@ -602,6 +612,11 @@ pub(crate) fn spawn_streamer_thread() {
             );
 
             let peer_addr = std::net::SocketAddr::from((audio_ip, audio_port));
+            let connect = ConnectInputs {
+                peer_addr: &peer_addr,
+                pod_id: pod_id.as_str(),
+                psk: &audio_psk,
+            };
             let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
 
             // ── Reconnect pacing ─────────────────────────────────────────────
@@ -612,7 +627,7 @@ pub(crate) fn spawn_streamer_thread() {
             let mut attempt_counter: u32 = 0;
 
             // ── Persistent state across segments ─────────────────────────────
-            let mut held_socket: Option<TcpStream> = None;
+            let mut held_socket: Option<TlsStream> = None;
             let mut segment_counter: u32 = 0;
             // Carries "the idle inbound pump stopped at its cap" into the next idle poll
             // so a backlog drains with timeout-0 re-polls instead of one frame per tick.
@@ -636,8 +651,7 @@ pub(crate) fn spawn_streamer_thread() {
                     &mut attempt_counter,
                     now_secs,
                     jitter_seed_base,
-                    &peer_addr,
-                    pod_id.as_str(),
+                    &connect,
                     &mut inbound_accum,
                     &mut inbound_state,
                     &mut inbound_sink,
@@ -646,11 +660,16 @@ pub(crate) fn spawn_streamer_thread() {
 
                 // ── Idle readiness wait ──────────────────────────────────────
                 // POLLIN de-armed while accumulator is full (backpressure) to avoid spinning.
+                // TODO(tls-link-run-segment-hil-coverage): no test drives this loop over a
+                // `TlsStream` — the direction-substitution and buffered-plaintext branches
+                // are only exercised against a plain `TcpStream`.
                 let inbound_armed = held_socket.is_some() && inbound_has_room(&inbound_accum);
 
                 let mut readable = false;
-                let vad_write_head = if let Some(fd) = held_socket.as_ref().map(|s| s.as_raw_fd()) {
-                    let events: u32 = if inbound_armed { POLLIN } else { 0 };
+                let vad_write_head = if let Some((fd, events)) = held_socket
+                    .as_ref()
+                    .map(|s| (s.link_fd(), s.poll_events(inbound_armed, false)))
+                {
                     let now = std::time::Instant::now();
                     let timeout = poll_timeout(now, None, idle_work_pending);
                     match poll_readiness(fd, events, timeout) {
@@ -693,11 +712,20 @@ pub(crate) fn spawn_streamer_thread() {
                 // Pumps until the socket blocks (or the cap) rather than one frame per
                 // tick — the common TTS-playback path. Also runs when POLLIN is de-armed
                 // — re-offers held frame so a freed slot re-arms POLLIN next iteration.
+                // Poll discipline rule 1: a TLS session can hold decrypted
+                // plaintext that no POLLIN will ever reveal, so on that
+                // transport a read is attempted every wake rather than only on
+                // readiness. `idle_work_pending` carries a cap-stopped pump
+                // into the next wake for the same reason.
+                let must_drain = readable
+                    || !inbound_armed
+                    || idle_work_pending
+                    || held_socket.as_ref().is_some_and(|s| s.buffers_plaintext());
                 idle_work_pending = false;
-                if readable || !inbound_armed {
+                if must_drain {
                     if let Some(ref mut s) = held_socket {
                         match pump_inbound(
-                            s,
+                            s.as_read(),
                             &mut inbound_accum,
                             &mut inbound_sink,
                             &mut inbound_state,
@@ -734,13 +762,9 @@ pub(crate) fn spawn_streamer_thread() {
                 // on a socket we just opened.
                 let mut fresh_connect = false;
                 if held_socket.is_none() {
-                    // TODO(audio-auth): plain TCP; TLS/PSK deferred.
                     log::info!("streamer: connecting to {}:{}", fmt_ipv4(audio_ip), audio_port);
-                    match connect_and_hello(&peer_addr, pod_id.as_str(), &mut encode_buf) {
+                    match connect_and_hello(&connect, &mut encode_buf) {
                         Ok(stream) => {
-                            if let Err(e) = stream.set_nonblocking(true) {
-                                log::warn!("streamer: set_nonblocking failed: {:?}", e);
-                            }
                             // The `inbound_state` reset inside the helper is a no-op here today:
                             // state is provably clean whenever `held_socket` is `None`. Routed
                             // through the helper so the "fresh socket = fresh inbound stream"
@@ -823,8 +847,7 @@ pub(crate) fn spawn_streamer_thread() {
                         "streamer: SegmentStart send failed on held socket: dst={}:{} {} err={:?} — one reconnect attempt",
                         fmt_ipv4(audio_ip), audio_port, fmt_wifi_snapshot(&snap), e
                     );
-                    // TODO(audio-auth): plain TCP; TLS/PSK deferred.
-                    match connect_and_hello(&peer_addr, pod_id.as_str(), &mut encode_buf) {
+                    match connect_and_hello(&connect, &mut encode_buf) {
                         Ok(mut stream) => {
                             let resend = send_frame_bp(&mut stream, &seg_start, &mut encode_buf);
                             match resend {
@@ -832,9 +855,6 @@ pub(crate) fn spawn_streamer_thread() {
                                     // Both keep the socket: install it, then Sent falls
                                     // through to run the segment while BackpressureAligned
                                     // drops the segment (host still stalled).
-                                    if let Err(e) = stream.set_nonblocking(true) {
-                                        log::warn!("streamer: set_nonblocking (reconnect) failed: {:?}", e);
-                                    }
                                     note_socket_established(
                                         &mut held_socket,
                                         stream,
@@ -931,8 +951,8 @@ pub(crate) fn spawn_streamer_thread() {
 /// policy and reacts to the returned [`SegmentExit`].
 #[cfg(target_os = "espidf")]
 pub(crate) struct SegmentDeps<'a> {
-    /// Connected, non-blocking socket with `SegmentStart` already sent.
-    pub(crate) socket: &'a mut std::net::TcpStream,
+    /// Connected, non-blocking stream with `SegmentStart` already sent.
+    pub(crate) socket: &'a mut dyn LinkStream,
     /// Telemetry/VAD → streamer channel.
     pub(crate) rx: &'a std::sync::mpsc::Receiver<StreamerMsg>,
     /// Capture ring; production passes `&CAPTURE_RING`.
@@ -982,9 +1002,6 @@ pub(crate) fn run_segment(
     use audio_pipeline::wire::{
         AudioFrame, EndReason, SegmentEnd, StreamFrame, AUDIO_SAMPLES_PER_FRAME, MAX_AUDIO_PAYLOAD,
     };
-    use esp_idf_svc::sys::{POLLIN, POLLOUT};
-    use std::os::fd::AsRawFd as _;
-
     let mut read_cursor = read_cursor;
     let mut frames_sent: u32 = 0;
     let mut samples_sent: u64 = 0;
@@ -1072,14 +1089,11 @@ pub(crate) fn run_segment(
                 state.reset_spin_guard();
             }
         }
-        let mut events: u32 = 0;
-        if inbound_armed {
-            events |= POLLIN;
-        }
-        if write_blocked && spin_backoff_deadline.is_none() {
-            events |= POLLOUT;
-        }
-        let fd = deps.socket.as_raw_fd();
+        let events = deps.socket.poll_events(
+            inbound_armed,
+            write_blocked && spin_backoff_deadline.is_none(),
+        );
+        let fd = deps.socket.link_fd();
         // The write deadline bounds the wait only while blocked on POLLOUT; the pace
         // deadline (set when a ready audio frame was deferred for rate-limiting) bounds
         // it while the catch-up drain is throttled. The earlier of the two wins.
@@ -1117,7 +1131,8 @@ pub(crate) fn run_segment(
                         pending_telemetry.pop_front();
                         log::warn!(
                             "streamer: pending_telemetry at cap {} (outbound stalled, seg {}) — dropping oldest",
-                            PENDING_TELEMETRY_CAP, segment_id
+                            PENDING_TELEMETRY_CAP,
+                            segment_id
                         );
                     }
                     pending_telemetry.push_back(tel);
@@ -1155,9 +1170,12 @@ pub(crate) fn run_segment(
         // Drain inbound until WouldBlock or the per-wake cap; the gate on the first
         // call keeps the load-bearing re-offer-under-backpressure guard (`!inbound_armed`).
         let mut inbound_work = false;
-        if ready.readable() || !inbound_armed {
+        // Poll discipline rule 1: on a transport that buffers decrypted
+        // plaintext, readiness under-reports what is available, so read every
+        // wake instead of only when POLLIN fired.
+        if ready.readable() || !inbound_armed || deps.socket.buffers_plaintext() {
             match pump_inbound(
-                deps.socket,
+                deps.socket.as_read(),
                 deps.inbound_accum,
                 deps.inbound_sink,
                 deps.inbound_state,
@@ -1394,7 +1412,11 @@ pub(crate) fn run_segment(
                                     ));
                                 }
                                 Err(e) => {
-                                    log::warn!("streamer: partial AudioFrame encode failed (seg {}): {:?} — dropping segment, keeping socket", segment_id, e);
+                                    log::warn!(
+                                        "streamer: partial AudioFrame encode failed (seg {}): {:?} — dropping segment, keeping socket",
+                                        segment_id,
+                                        e
+                                    );
                                     // Local fault; socket untouched and frame-aligned.
                                     return SegmentExit::SegmentDroppedSocketKept;
                                 }
@@ -1425,7 +1447,7 @@ pub(crate) fn run_segment(
                 unreachable!("outbound is Some after the selector built a frame");
             };
             match state.step_writable(
-                deps.socket,
+                deps.socket.as_write(),
                 deps.outbound_buf.as_slice(),
                 std::time::Instant::now,
             ) {
@@ -1477,7 +1499,11 @@ pub(crate) fn run_segment(
                 }
                 Err(e) => {
                     // Partial write leaves receiver mid-frame; can't resume.
-                    log::warn!("streamer: outbound send failed mid-segment (seg {}): {:?} — dropping segment, clearing socket", segment_id, e);
+                    log::warn!(
+                        "streamer: outbound send failed mid-segment (seg {}): {:?} — dropping segment, clearing socket",
+                        segment_id,
+                        e
+                    );
                     return SegmentExit::SocketLost;
                 }
             }
@@ -1488,7 +1514,10 @@ pub(crate) fn run_segment(
             match state.check_deadlines(std::time::Instant::now) {
                 None => {}
                 Some(Ok(SendOutcome::BackpressureAligned)) => {
-                    log::warn!("streamer: outbound backpressure mid-segment (seg {}) — dropping segment, keeping socket", segment_id);
+                    log::warn!(
+                        "streamer: outbound backpressure mid-segment (seg {}) — dropping segment, keeping socket",
+                        segment_id
+                    );
                     return SegmentExit::SegmentDroppedSocketKept;
                 }
                 Some(Ok(SendOutcome::Sent)) => {
@@ -1497,7 +1526,11 @@ pub(crate) fn run_segment(
                     );
                 }
                 Some(Err(e)) => {
-                    log::warn!("streamer: outbound write ceiling/budget elapsed mid-tail (seg {}): {:?} — dropping segment, clearing socket", segment_id, e);
+                    log::warn!(
+                        "streamer: outbound write ceiling/budget elapsed mid-tail (seg {}): {:?} — dropping segment, clearing socket",
+                        segment_id,
+                        e
+                    );
                     return SegmentExit::SocketLost;
                 }
             }

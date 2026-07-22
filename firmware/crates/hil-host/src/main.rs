@@ -52,6 +52,8 @@ fn main() {
 /// backpressure_port=17383/tcp
 /// poll_readiness_port=17384/tcp
 /// rtd_port=17385/tcp
+/// tls_psk_port=17386/tcp
+/// tls_psk_bad_port=17387/tcp
 /// ```
 ///
 /// Values reflect overrides from `RESPEAKER_HIL_UDP_PORT` / `RESPEAKER_HIL_TCP_PORT` /
@@ -62,6 +64,7 @@ fn main() {
 ///
 /// Extracted from `print_ports()` so tests can call the same formatter and
 /// detect any drift between the Rust output and what the firewall helper parses.
+#[allow(clippy::too_many_arguments)]
 fn format_port_lines(
     udp: u16,
     tcp: u16,
@@ -69,9 +72,11 @@ fn format_port_lines(
     backpressure: u16,
     poll_readiness: u16,
     rtd: u16,
+    tls_psk: u16,
+    tls_psk_bad: u16,
 ) -> String {
     format!(
-        "udp_port={udp}/udp\ntcp_port={tcp}/tcp\ninbound_frames_port={inbound}/tcp\nbackpressure_port={backpressure}/tcp\npoll_readiness_port={poll_readiness}/tcp\nrtd_port={rtd}/tcp\n"
+        "udp_port={udp}/udp\ntcp_port={tcp}/tcp\ninbound_frames_port={inbound}/tcp\nbackpressure_port={backpressure}/tcp\npoll_readiness_port={poll_readiness}/tcp\nrtd_port={rtd}/tcp\ntls_psk_port={tls_psk}/tcp\ntls_psk_bad_port={tls_psk_bad}/tcp\n"
     )
 }
 
@@ -87,6 +92,8 @@ fn print_ports() -> i32 {
                     secrets.backpressure_port,
                     secrets.poll_readiness_port,
                     secrets.rtd_port,
+                    secrets.tls_psk_port,
+                    secrets.tls_psk_bad_port,
                 )
             );
             0
@@ -116,7 +123,7 @@ fn parse_hil_only(var: Result<String, std::env::VarError>) -> Result<Option<Test
                 "RESPEAKER_HIL_ONLY is set to a non-UTF-8 value and cannot name a test; \
                  unset it to run the full suite"
                     .to_string(),
-            )
+            );
         }
     };
     let name = raw.trim();
@@ -511,15 +518,15 @@ fn run() -> i32 {
                     Ok(r) => r,
                     Err(HarnessError::Timeout) => {
                         eprintln!(
-                        "ERROR [AC9]: device not responding to RunTest(FullDuplexRxIntegrity) — \
+                            "ERROR [AC9]: device not responding to RunTest(FullDuplexRxIntegrity) — \
                          capture thread may be wedged or the feed window exceeded the budget"
-                    );
+                        );
                         return 1;
                     }
                     Err(e) => {
                         eprintln!(
-                        "ERROR [check 4 — behavioral]: RunTest(FullDuplexRxIntegrity) failed: {e}"
-                    );
+                            "ERROR [check 4 — behavioral]: RunTest(FullDuplexRxIntegrity) failed: {e}"
+                        );
                         return 1;
                     }
                 };
@@ -683,17 +690,51 @@ fn run() -> i32 {
         println!("  self-test WifiAssociate: PASS");
     }
 
+    // 3b'. Provision a fresh audio-link PSK through the real production command, and
+    // learn the pod identity from the device's own answer — that identity is what the
+    // TLS-PSK listeners will authenticate, and it is authoritative only on the device.
+    let pod_psk = {
+        let key = match generate_audio_psk() {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("ERROR [check 4 — network]: {e}");
+                return 1;
+            }
+        };
+        let psk_resp = match harness.send_command(Command::ProvisionAudioPsk { key }) {
+            Ok(r) => r,
+            Err(HarnessError::Timeout) => {
+                eprintln!(
+                    "ERROR [AC9]: device not responding to ProvisionAudioPsk — wrong/old firmware?"
+                );
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("ERROR [check 4 — network]: ProvisionAudioPsk failed: {e}");
+                return 1;
+            }
+        };
+        if check_status(&psk_resp, "ProvisionAudioPsk").is_err() {
+            return 1;
+        }
+        let Payload::PodId(pod_id) = &psk_resp.payload else {
+            eprintln!(
+                "FAIL [check 4 — behavioral]: ProvisionAudioPsk did not answer with a PodId \
+                 payload: {:?}",
+                psk_resp.payload
+            );
+            return 1;
+        };
+        println!("  ProvisionAudioPsk: OK pod_id={}", pod_id.as_str());
+        PodPsk {
+            identity: pod_id.as_str().to_string(),
+            key,
+        }
+    };
+
     // 3c–3d. Derive host self-IP, bind echo servers, provision peer.
     // PeerServers RAII guard lives to end of network block; Drop joins threads.
-    let peer_servers = match PeerServers::start(
-        pod_ip,
-        secrets.udp_echo_port,
-        secrets.tcp_echo_port,
-        secrets.inbound_frames_port,
-        secrets.backpressure_port,
-        secrets.poll_readiness_port,
-        secrets.rtd_port,
-    ) {
+    let peer_servers = match PeerServers::start(pod_ip, &secrets, &pod_psk) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ERROR [check 4 — network]: failed to start peer servers: {e}");
@@ -719,6 +760,8 @@ fn run() -> i32 {
             backpressure_port: peer_servers.backpressure_port,
             poll_readiness_port: peer_servers.poll_readiness_port,
             rtd_port: peer_servers.rtd_port,
+            tls_psk_port: peer_servers.tls_psk_port,
+            tls_psk_bad_port: peer_servers.tls_psk_bad_port,
         }) {
             Ok(r) => r,
             Err(HarnessError::Timeout) => {
@@ -755,6 +798,8 @@ fn run() -> i32 {
         TestName::TcpSendBackpressure,
         TestName::TcpInboundBackpressure,
         TestName::PollReadinessBidir,
+        TestName::TlsPskHandshake,
+        TestName::TlsPskWrongKeyRejected,
     ];
     for test_name in &reachability_tests {
         // Single-test selector: skip non-selected reachability tests.
@@ -806,6 +851,8 @@ fn run() -> i32 {
             TestName::TcpSendBackpressure => eval_tcp_send_backpressure(data),
             TestName::TcpInboundBackpressure => eval_tcp_inbound_backpressure(data),
             TestName::PollReadinessBidir => eval_poll_readiness_bidir(data),
+            TestName::TlsPskHandshake => eval_tls_psk_handshake(data),
+            TestName::TlsPskWrongKeyRejected => eval_tls_psk_wrong_key_rejected(data),
             _ => unreachable!("unhandled reachability test variant: {test_name:?}"),
         };
         if let Err(e) = outcome {
@@ -1321,8 +1368,12 @@ fn run() -> i32 {
     // copy) and on a full-suite run (a selector run must not deprovision as a side effect).
     match (&secrets.wifi, &only) {
         (None, _) => {
-            println!("  *** NOTICE: NoCredentialsPark SKIPPED — RESPEAKER_WIFI_SSID / RESPEAKER_WIFI_PASS are not set. ***");
-            println!("  *** Clearing credentials without a harness copy would leave the device unprovisionable. ***");
+            println!(
+                "  *** NOTICE: NoCredentialsPark SKIPPED — RESPEAKER_WIFI_SSID / RESPEAKER_WIFI_PASS are not set. ***"
+            );
+            println!(
+                "  *** Clearing credentials without a harness copy would leave the device unprovisionable. ***"
+            );
         }
         (_, Some(sel)) => {
             println!(
@@ -1421,7 +1472,9 @@ fn run() -> i32 {
             }) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("ERROR [check 4 — behavioral]: NoCredentialsPark re-ProvisionWifi failed: {e}");
+                    eprintln!(
+                        "ERROR [check 4 — behavioral]: NoCredentialsPark re-ProvisionWifi failed: {e}"
+                    );
                     return 1;
                 }
             };
@@ -1439,7 +1492,9 @@ fn run() -> i32 {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("ERROR [check 4 — behavioral]: NoCredentialsPark post-provision WifiAssociate failed: {e}");
+                    eprintln!(
+                        "ERROR [check 4 — behavioral]: NoCredentialsPark post-provision WifiAssociate failed: {e}"
+                    );
                     return 1;
                 }
             };
@@ -2290,6 +2345,13 @@ const fn test_meta(t: &TestName) -> TestMeta {
             // 2 × ping-budget (~8 s) + 90 s device-side poll + ~15 s association + 15 s margin.
             timeout: Duration::from_secs(130),
         },
+        TestName::TlsPskHandshake | TestName::TlsPskWrongKeyRejected => TestMeta {
+            phase: TestPhase::Network,
+            // Device-side handshake deadline (3 s) + TCP connect + echo round-trip +
+            // serial round-trip, with margin so the host always sees the typed
+            // TestReport rather than a hang.
+            timeout: Duration::from_secs(15),
+        },
         TestName::PollReadinessBidir => TestMeta {
             phase: TestPhase::Network,
             // POLLOUT poll + up to a 5 s POLLIN_WAIT_BUDGET (device-side) + connect + serial
@@ -2413,6 +2475,13 @@ const DEFAULT_HIL_POLL_READINESS_PORT: u16 = 17384;
 /// `SegmentEnd` frames, and times the pre-roll burst drain + catch-up wall clock so the host
 /// can assert the streamer keeps up with real time.
 const DEFAULT_HIL_RTD_PORT: u16 = 17385;
+/// Default fixed port for the TLS-PSK listener holding the pod's real audio-link key,
+/// used by `TlsPskHandshake`.
+const DEFAULT_HIL_TLS_PSK_PORT: u16 = 17386;
+/// Default fixed port for the TLS-PSK listener holding a *different* key for the pod's
+/// identity, used by `TlsPskWrongKeyRejected`. Separate port rather than a mode byte: the
+/// handshake fails before any application byte can select anything.
+const DEFAULT_HIL_TLS_PSK_BAD_PORT: u16 = 17387;
 /// Number of 20 ms audio frames the device's synthetic producer commits after the pre-roll
 /// (250 × 20 ms = 5 s). Manual-sync copy of the device-side `RTD_PRODUCER_FRAMES` (the two
 /// crates share no const module); a drift surfaces as an integrity-count mismatch in
@@ -2510,6 +2579,12 @@ struct HilSecrets {
     /// Resolved TCP `StreamRealtimeDuplex` listener port
     /// (override from RESPEAKER_HIL_RTD_PORT or DEFAULT_HIL_RTD_PORT).
     rtd_port: u16,
+    /// Resolved TCP TLS-PSK listener port for `TlsPskHandshake`
+    /// (override from RESPEAKER_HIL_TLS_PSK_PORT or DEFAULT_HIL_TLS_PSK_PORT).
+    tls_psk_port: u16,
+    /// Resolved TCP wrong-key TLS-PSK listener port for `TlsPskWrongKeyRejected`
+    /// (override from RESPEAKER_HIL_TLS_PSK_BAD_PORT or DEFAULT_HIL_TLS_PSK_BAD_PORT).
+    tls_psk_bad_port: u16,
 }
 
 /// Parse a 4-byte IPv4 address from a dotted-decimal string (e.g. "1.2.3.4").
@@ -2685,6 +2760,18 @@ fn resolve_secrets(get: impl Fn(&str) -> Option<String>, secrets_path: &str) -> 
         DEFAULT_HIL_RTD_PORT,
         secrets_path,
     );
+    let tls_psk_port = resolve_hil_port(
+        &get,
+        "RESPEAKER_HIL_TLS_PSK_PORT",
+        DEFAULT_HIL_TLS_PSK_PORT,
+        secrets_path,
+    );
+    let tls_psk_bad_port = resolve_hil_port(
+        &get,
+        "RESPEAKER_HIL_TLS_PSK_BAD_PORT",
+        DEFAULT_HIL_TLS_PSK_BAD_PORT,
+        secrets_path,
+    );
 
     HilSecrets {
         wifi,
@@ -2695,6 +2782,8 @@ fn resolve_secrets(get: impl Fn(&str) -> Option<String>, secrets_path: &str) -> 
         backpressure_port,
         poll_readiness_port,
         rtd_port,
+        tls_psk_port,
+        tls_psk_bad_port,
     }
 }
 
@@ -2730,10 +2819,231 @@ fn resolve_hil_port(
     }
 }
 
-// ── PeerServers RAII guard (design §3.4) ──────────────────────────────────────
+// ── TLS-PSK listener fixture (TlsPskHandshake / TlsPskWrongKeyRejected) ───────
+
+/// The one identity/key pair a TLS-PSK listener will accept.
+///
+/// The identity is the pod id the device itself reported from `ProvisionAudioPsk`,
+/// so the fixture authenticates the exact string the device puts in the handshake
+/// rather than one the host guessed.
+#[derive(Clone)]
+struct PodPsk {
+    identity: String,
+    key: [u8; AUDIO_PSK_LEN],
+}
+
+impl PodPsk {
+    /// The same identity with a key the device has never seen, for the wrong-key
+    /// listener. Derived by inverting every byte so the two keys can never collide,
+    /// whatever the random one turned out to be.
+    fn with_wrong_key(&self) -> Self {
+        let mut key = self.key;
+        for b in &mut key {
+            *b = !*b;
+        }
+        PodPsk {
+            identity: self.identity.clone(),
+            key,
+        }
+    }
+}
+
+/// Redacting `Debug`: the key never reaches a log line or a panic message.
+impl std::fmt::Debug for PodPsk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PodPsk")
+            .field("identity", &self.identity)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Length of the audio-link pre-shared key, in bytes. Manual-sync copy of the
+/// device-side `tls_link::PSK_LEN` (the two crates share no const module); a drift
+/// surfaces immediately, since `Command::ProvisionAudioPsk`'s field is `[u8; 32]`.
+const AUDIO_PSK_LEN: usize = 32;
+
+/// The one ciphersuite this link negotiates, in OpenSSL's spelling. mbedTLS spells
+/// the same suite [`EXPECTED_MBEDTLS_SUITE`], which is what the device reports.
+const PSK_CIPHERSUITE: &str = "ECDHE-PSK-CHACHA20-POLY1305";
+
+/// The negotiated ciphersuite the device must report, in mbedTLS's spelling.
+const EXPECTED_MBEDTLS_SUITE: &str = "TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256";
+
+/// The negotiated protocol version the device must report. Both ends are pinned to
+/// TLS 1.2 because esp-tls's PSK support is the 1.2 `psk_hint_key` path.
+const EXPECTED_TLS_VERSION: &str = "TLSv1.2";
+
+/// Read `AUDIO_PSK_LEN` bytes from the OS CSPRNG.
+///
+/// A failure is an error, never a silently weak key.
+fn generate_audio_psk() -> Result<[u8; AUDIO_PSK_LEN], String> {
+    let mut key = [0u8; AUDIO_PSK_LEN];
+    getrandom::fill(&mut key)
+        .map_err(|e| format!("OS CSPRNG failed generating the audio PSK: {e}"))?;
+    Ok(key)
+}
+
+/// Build the server-side TLS context a PSK listener accepts with: TLS 1.2 pinned at
+/// both ends, the single ECDHE-PSK suite, no certificate, and a callback that hands
+/// back `psk.key` only for `psk.identity`.
+///
+/// A non-matching identity gets a zero-length key, which fails the handshake — so the
+/// fixture is an identity test as well as a key test.
+fn psk_server_context(psk: &PodPsk) -> Result<openssl::ssl::SslContext, String> {
+    use openssl::ssl::{SslContext, SslMethod, SslVersion};
+
+    let psk = psk.clone();
+    let mut builder = SslContext::builder(SslMethod::tls_server())
+        .map_err(|e| format!("SslContext::builder failed: {e}"))?;
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .and_then(|()| builder.set_max_proto_version(Some(SslVersion::TLS1_2)))
+        .map_err(|e| format!("pinning TLS 1.2 failed: {e}"))?;
+    builder
+        .set_cipher_list(PSK_CIPHERSUITE)
+        .map_err(|e| format!("set_cipher_list({PSK_CIPHERSUITE}) failed: {e}"))?;
+    builder.set_psk_server_callback(move |_ssl, identity, secret| {
+        let matches = identity
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .is_some_and(|id| id == psk.identity);
+        if matches && secret.len() >= psk.key.len() {
+            secret[..psk.key.len()].copy_from_slice(&psk.key);
+            Ok(psk.key.len())
+        } else {
+            Ok(0)
+        }
+    });
+    Ok(builder.build())
+}
+
+/// Spawn a TLS-PSK echo listener on `port`, accepting only `psk`'s identity+key.
+///
+/// After a completed handshake the listener echoes whatever it reads back through the
+/// tunnel, which is what `TlsPskHandshake` round-trips. A refused handshake is logged
+/// and the connection dropped — that is the expected outcome on the wrong-key
+/// listener, so it is a normal event there, not a warning.
+fn spawn_tls_psk_listener(
+    name: &'static str,
+    port: u16,
+    port_env_key: &str,
+    psk: &PodPsk,
+    stop: &Arc<Mutex<bool>>,
+) -> Result<thread::JoinHandle<()>, String> {
+    let ctx = psk_server_context(psk)?;
+    let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| {
+        format!(
+            "failed to bind {name} listener on 0.0.0.0:{port}: {e}\n  \
+             (port already in use? set {port_env_key} to a free port)"
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to set {name} listener non-blocking: {e}"))?;
+    let stop = Arc::clone(stop);
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let mut conn: u32 = 0;
+            loop {
+                if *stop.lock().unwrap() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, peer)) => {
+                        println!("[{name}] accepted {peer} conn={conn}");
+                        conn += 1;
+                        tls_psk_serve(&ctx, stream, &peer, name);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => {
+                        if *stop.lock().unwrap() {
+                            break;
+                        }
+                        eprintln!("WARN [{name}]: accept error: {e}");
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        })
+        .map_err(|e| format!("failed to spawn {name} thread: {e}"))
+}
+
+/// Complete the TLS-PSK handshake on one accepted connection and echo until EOF.
+///
+/// The socket goes blocking with read/write timeouts for both the handshake and the
+/// echo: a device that connects and then stalls must not wedge the listener thread
+/// against the next connection.
+fn tls_psk_serve(
+    ctx: &openssl::ssl::SslContext,
+    stream: std::net::TcpStream,
+    peer: &std::net::SocketAddr,
+    name: &str,
+) {
+    use std::io::{Read as _, Write as _};
+
+    let io_timeout = Duration::from_secs(5);
+    if let Err(e) = stream
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(Some(io_timeout)))
+        .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
+    {
+        eprintln!("WARN [{name}]: {peer} socket setup failed: {e}");
+        return;
+    }
+    let ssl = match openssl::ssl::Ssl::new(ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("WARN [{name}]: Ssl::new failed: {e}");
+            return;
+        }
+    };
+    let mut tls = match openssl::ssl::SslStream::new(ssl, stream) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("WARN [{name}]: SslStream::new failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = tls.accept() {
+        println!("[{name}] {peer} handshake refused: {e}");
+        return;
+    }
+    println!(
+        "[{name}] {peer} handshake OK version={} cipher={}",
+        tls.ssl().version_str(),
+        tls.ssl()
+            .current_cipher()
+            .map(|c| c.name())
+            .unwrap_or("<none>")
+    );
+
+    let mut buf = [0u8; 512];
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Err(e) = tls.write_all(&buf[..n]) {
+                    eprintln!("WARN [{name}]: {peer} echo write failed: {e}");
+                    break;
+                }
+            }
+            Err(e) => {
+                // A read timeout is the normal end of this exchange.
+                println!("[{name}] {peer} echo read ended: {e}");
+                break;
+            }
+        }
+    }
+    let _ = tls.shutdown();
+}
+
+// ── PeerServers RAII guard ─────────────────────────────────────────────────────
 
 /// RAII guard that owns the UDP and TCP echo server threads for the duration of the
-/// network reachability tests (design §3.4 pre-network setup block).
+/// network reachability tests.
 ///
 /// - **UDP echo**: a thread that loops `recv_from` → `send_to` the same bytes back.
 /// - **TCP echo**: a `TcpListener` that accepts one connection, reads N bytes, writes
@@ -2759,6 +3069,11 @@ struct PeerServers {
     poll_readiness_port: u16,
     /// Fixed TCP `StreamRealtimeDuplex` listener port (configured or default).
     rtd_port: u16,
+    /// Fixed TCP TLS-PSK listener port holding the pod's real key (`TlsPskHandshake`).
+    tls_psk_port: u16,
+    /// Fixed TCP TLS-PSK listener port holding a different key for the same identity
+    /// (`TlsPskWrongKeyRejected`).
+    tls_psk_bad_port: u16,
     /// Observation recorded by the `StreamRealtimeDuplex` listener for the device's first
     /// (Scenario A, outbound-only) connection: pre-roll burst-drain timing, received sample
     /// count, and end reason. The runner reads this after the device returns its typed result.
@@ -2780,6 +3095,10 @@ struct PeerServers {
     poll_readiness_thread: Option<thread::JoinHandle<()>>,
     /// TCP `StreamRealtimeDuplex` listener thread handle.
     rtd_thread: Option<thread::JoinHandle<()>>,
+    /// TLS-PSK echo listener thread handle (correct key).
+    tls_psk_thread: Option<thread::JoinHandle<()>>,
+    /// TLS-PSK echo listener thread handle (wrong key for the same identity).
+    tls_psk_bad_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl PeerServers {
@@ -2788,15 +3107,18 @@ impl PeerServers {
     ///
     /// Ports come from `HilSecrets` (resolved override or compiled-in default).
     /// A failed bind hard-errors — there is no `:0` fallback, by design (AC7).
-    fn start(
-        pod_ip: [u8; 4],
-        udp_port: u16,
-        tcp_port: u16,
-        inbound_frames_port: u16,
-        backpressure_port: u16,
-        poll_readiness_port: u16,
-        rtd_port: u16,
-    ) -> Result<Self, String> {
+    fn start(pod_ip: [u8; 4], secrets: &HilSecrets, psk: &PodPsk) -> Result<Self, String> {
+        let HilSecrets {
+            udp_echo_port: udp_port,
+            tcp_echo_port: tcp_port,
+            inbound_frames_port,
+            backpressure_port,
+            poll_readiness_port,
+            rtd_port,
+            tls_psk_port,
+            tls_psk_bad_port,
+            ..
+        } = *secrets;
         // Derive host self-IP: connect a UDP socket to pod_ip on an arbitrary port
         // (no packet sent; this selects the egress route/interface), read local_addr().
         let route_sock = UdpSocket::bind("0.0.0.0:0")
@@ -2813,7 +3135,7 @@ impl PeerServers {
             other => {
                 return Err(format!(
                     "route to pod is via a non-IPv4 address: {other}; check network config"
-                ))
+                ));
             }
         };
 
@@ -3299,8 +3621,28 @@ impl PeerServers {
             })
             .map_err(|e| format!("failed to spawn rtd-listener thread: {e}"))?;
 
+        // ── TLS-PSK echo listeners (TlsPskHandshake / TlsPskWrongKeyRejected) ──
+        // Two listeners, same identity, different keys: one holds the key the device
+        // was provisioned with, the other a key it has never seen. Separate ports
+        // rather than one listener with a mode byte, because the wrong-key handshake
+        // fails before any application byte could select a mode.
+        let tls_psk_thread = spawn_tls_psk_listener(
+            "tls-psk-source",
+            tls_psk_port,
+            "RESPEAKER_HIL_TLS_PSK_PORT",
+            psk,
+            &stop,
+        )?;
+        let tls_psk_bad_thread = spawn_tls_psk_listener(
+            "tls-psk-bad-source",
+            tls_psk_bad_port,
+            "RESPEAKER_HIL_TLS_PSK_BAD_PORT",
+            &psk.with_wrong_key(),
+            &stop,
+        )?;
+
         println!(
-            "  PeerServers: host_ip={} udp_port={udp_port} tcp_port={tcp_port} inbound_frames_port={inbound_frames_port} backpressure_port={backpressure_port} poll_readiness_port={poll_readiness_port} rtd_port={rtd_port}",
+            "  PeerServers: host_ip={} udp_port={udp_port} tcp_port={tcp_port} inbound_frames_port={inbound_frames_port} backpressure_port={backpressure_port} poll_readiness_port={poll_readiness_port} rtd_port={rtd_port} tls_psk_port={tls_psk_port} tls_psk_bad_port={tls_psk_bad_port}",
             Ipv4Addr::from(host_ip)
         );
 
@@ -3312,6 +3654,8 @@ impl PeerServers {
             backpressure_port,
             poll_readiness_port,
             rtd_port,
+            tls_psk_port,
+            tls_psk_bad_port,
             rtd_observation,
             rtd_observation_b,
             stop,
@@ -3321,6 +3665,8 @@ impl PeerServers {
             backpressure_thread: Some(backpressure_thread),
             poll_readiness_thread: Some(poll_readiness_thread),
             rtd_thread: Some(rtd_thread),
+            tls_psk_thread: Some(tls_psk_thread),
+            tls_psk_bad_thread: Some(tls_psk_bad_thread),
         })
     }
 }
@@ -3877,6 +4223,16 @@ impl Drop for PeerServers {
                 eprintln!("WARN [peer-servers]: rtd-listener thread panicked: {e:?}");
             }
         }
+        if let Some(t) = self.tls_psk_thread.take() {
+            if let Err(e) = t.join() {
+                eprintln!("WARN [peer-servers]: tls-psk-source thread panicked: {e:?}");
+            }
+        }
+        if let Some(t) = self.tls_psk_bad_thread.take() {
+            if let Err(e) = t.join() {
+                eprintln!("WARN [peer-servers]: tls-psk-bad-source thread panicked: {e:?}");
+            }
+        }
     }
 }
 
@@ -4129,7 +4485,7 @@ fn eval_no_credentials_park(resp: &Response, logs: &[String]) -> Result<(), Stri
         other => {
             return Err(format!(
                 "post-clear WifiAssociate carried {other:?}, expected a TestReport detail"
-            ))
+            ));
         }
     };
     if !detail.contains(NO_NVS_CREDENTIALS) {
@@ -4144,7 +4500,7 @@ fn eval_no_credentials_park(resp: &Response, logs: &[String]) -> Result<(), Stri
                 "no {:?} line in the {} collected log lines — supervisor did not announce the park",
                 WIFI_PARKED_NO_CREDS,
                 logs.len()
-            ))
+            ));
         }
     };
     // Only lines at/after the park announcement prove anything about the parked state.
@@ -4467,6 +4823,98 @@ fn eval_poll_readiness_bidir(data: &TestData) -> Result<(), String> {
     Ok(())
 }
 
+/// Assert a `TlsPskHandshake` result: the production TLS-PSK client completed a
+/// handshake against a listener holding this pod's key, negotiated the pinned
+/// version and suite, and round-tripped a payload through the tunnel.
+///
+/// The version and suite are asserted, not merely reported: a downgrade to a
+/// non-forward-secret suite, or to a protocol version neither end was pinned to,
+/// would still handshake and still echo. Per CLAUDE.md bring-up doctrine an
+/// unexpected negotiated value is a discovery for human review, not something to
+/// make green by relaxing this assertion.
+fn eval_tls_psk_handshake(data: &TestData) -> Result<(), String> {
+    let TestData::TlsPskHandshake {
+        peer_ip,
+        peer_port,
+        handshake_ms,
+        version,
+        ciphersuite,
+        echo_bytes,
+    } = data
+    else {
+        return Err(format!(
+            "TlsPskHandshake did not report a TlsPskHandshake verdict: {data:?}"
+        ));
+    };
+    if version.as_str() != EXPECTED_TLS_VERSION {
+        return Err(format!(
+            "TlsPskHandshake: negotiated version {:?}, expected {EXPECTED_TLS_VERSION:?} — \
+             both ends are pinned to TLS 1.2 because esp-tls's PSK support is the 1.2 \
+             psk_hint_key path",
+            escape_device_str(version)
+        ));
+    }
+    if ciphersuite.as_str() != EXPECTED_MBEDTLS_SUITE {
+        return Err(format!(
+            "TlsPskHandshake: negotiated suite {:?}, expected {EXPECTED_MBEDTLS_SUITE:?} — \
+             a different suite means the ECDHE-PSK forward-secrecy requirement was not met",
+            escape_device_str(ciphersuite)
+        ));
+    }
+    if *echo_bytes == 0 {
+        return Err(
+            "TlsPskHandshake: echo_bytes=0 — the handshake completed but nothing was proven \
+             to flow through the tunnel"
+                .to_string(),
+        );
+    }
+    println!(
+        "  TlsPskHandshake: {} via {}:{peer_port} in {handshake_ms} ms, {echo_bytes} bytes \
+         echoed through the tunnel",
+        escape_device_str(ciphersuite),
+        Ipv4Addr::from(*peer_ip)
+    );
+    Ok(())
+}
+
+/// Assert a `TlsPskWrongKeyRejected` result: a listener holding a different key for
+/// this pod's identity refused the handshake, promptly and by an alert.
+///
+/// The device reports `Fail` if the handshake completed, if the port was
+/// unreachable, or if the attempt ended on its own deadline, so reaching this eval
+/// already means a real refusal. What is checked here is the measured latency of
+/// that refusal: an ECDHE-PSK exchange on this silicon costs 100–300 ms, so a
+/// refusal an order of magnitude slower is an unexpected reading for human review
+/// (a stalling fixture, a retransmit storm) rather than a pass.
+fn eval_tls_psk_wrong_key_rejected(data: &TestData) -> Result<(), String> {
+    /// Upper bound on a LAN TLS-PSK refusal, generous against the 100–300 ms the
+    /// exchange itself costs and well under the device's 3 s handshake deadline.
+    const REJECT_MAX_MS: u32 = 1500;
+
+    let TestData::TlsPskRejected {
+        peer_ip,
+        peer_port,
+        reject_ms,
+    } = data
+    else {
+        return Err(format!(
+            "TlsPskWrongKeyRejected did not report a TlsPskRejected verdict: {data:?}"
+        ));
+    };
+    if *reject_ms > REJECT_MAX_MS {
+        return Err(format!(
+            "TlsPskWrongKeyRejected: refusal took {reject_ms} ms (> {REJECT_MAX_MS} ms) — \
+             the peer did not promptly reject the key; review before accepting"
+        ));
+    }
+    println!(
+        "  TlsPskWrongKeyRejected: handshake refused by {}:{peer_port} in {reject_ms} ms; \
+         no stream, so no application byte could cross",
+        Ipv4Addr::from(*peer_ip)
+    );
+    Ok(())
+}
+
 /// Expected total received sample count for `StreamRealtimeDuplex` Scenario A: the
 /// pre-roll plus the synthetic producer's 5 s of real-time capture. The synthetic producer
 /// commits an exact frame count so this is deterministic (design Scenario A integrity).
@@ -4538,13 +4986,13 @@ fn eval_rtd_outbound(data: &TestData, obs: &RtdObservation) -> Result<(u64, u64)
             return Err(format!(
                 "StreamRealtimeDuplex: SegmentEnd reason={other}, expected VadRelease — \
                  the loop could not keep up with real time (Overrun laps the ring)"
-            ))
+            ));
         }
         None => {
             return Err(
                 "StreamRealtimeDuplex: no SegmentEnd received — segment never closed cleanly"
                     .to_string(),
-            )
+            );
         }
     }
 
@@ -4952,7 +5400,7 @@ fn eval_playback_drain_rate(data: &TestData, logs: &[String]) -> Result<(), Stri
                         "PlaybackDrainRate: orphaned '{CAPTURE_OBS_LINE}' line with no \
                          un-paired '{CAPTURE_TX_LINE}' window to attach it to — the device \
                          emit order/contract has drifted: {line}"
-                    ))
+                    ));
                 }
             }
             continue;
@@ -4973,9 +5421,11 @@ fn eval_playback_drain_rate(data: &TestData, logs: &[String]) -> Result<(), Stri
         // non-containment test in `device_protocol::log_tokens`), so a bare substring search
         // reads the right field regardless of emit order.
         let empty_polls = parse_token_u64(line, POLL_EMPTY).ok_or_else(|| {
-            format!("PlaybackDrainRate: '{CAPTURE_TX_LINE}' line missing/invalid '{POLL_EMPTY}': {line}")
+            format!(
+                "PlaybackDrainRate: '{CAPTURE_TX_LINE}' line missing/invalid '{POLL_EMPTY}': {line}"
+            )
         })?;
-        // The exact window duration (design §5): the emit window is gated at ≥1 s but stretches
+        // The exact window duration: the emit window is gated at ≥1 s but stretches
         // under load, so the raw-drain rate must divide by this real elapsed time, not a nominal
         // 1 s. Same fail-closed discipline as the other tokens — `parse_token_u64` because the
         // firmware emits `as_micros() as u64`.
@@ -8354,7 +8804,237 @@ mod tests {
         );
     }
 
-    // ── eval_poll_readiness_bidir tests (event-loop design §4 test #1) ─────────
+    // ── eval_poll_readiness_bidir tests ─────────────────────────────────────────
+
+    // ── TLS-PSK self-test evals and listener fixture ──────────────────────────
+
+    /// Build a `TlsPskHandshake` verdict from its parts.
+    fn psk_verdict(version: &str, suite: &str, echo_bytes: u32) -> TestData {
+        let mut v = device_protocol::TlsVersionStr::new();
+        v.push_str(version).unwrap();
+        let mut c = device_protocol::TlsSuiteStr::new();
+        c.push_str(suite).unwrap();
+        TestData::TlsPskHandshake {
+            peer_ip: [10, 0, 0, 4],
+            peer_port: 17386,
+            handshake_ms: 210,
+            version: v,
+            ciphersuite: c,
+            echo_bytes,
+        }
+    }
+
+    /// The expected version + suite + a non-empty echo passes.
+    #[test]
+    fn eval_tls_psk_handshake_expected_negotiation_passes() {
+        assert!(
+            eval_tls_psk_handshake(&psk_verdict(
+                EXPECTED_TLS_VERSION,
+                EXPECTED_MBEDTLS_SUITE,
+                16
+            ))
+            .is_ok(),
+            "the pinned version and suite with a real echo must pass"
+        );
+    }
+
+    /// A protocol-version downgrade fails even though the handshake completed.
+    #[test]
+    fn eval_tls_psk_handshake_rejects_other_version() {
+        let err = eval_tls_psk_handshake(&psk_verdict("TLSv1.3", EXPECTED_MBEDTLS_SUITE, 16))
+            .unwrap_err();
+        assert!(
+            err.contains("negotiated version"),
+            "error must name the version mismatch: {err}"
+        );
+    }
+
+    /// A suite without ECDHE would drop forward secrecy; it must fail.
+    #[test]
+    fn eval_tls_psk_handshake_rejects_non_ecdhe_suite() {
+        let err = eval_tls_psk_handshake(&psk_verdict(
+            EXPECTED_TLS_VERSION,
+            "TLS-PSK-WITH-CHACHA20-POLY1305-SHA256",
+            16,
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("negotiated suite"),
+            "error must name the suite mismatch: {err}"
+        );
+    }
+
+    /// A handshake that carried no application bytes proves nothing about the tunnel.
+    #[test]
+    fn eval_tls_psk_handshake_rejects_empty_echo() {
+        let err = eval_tls_psk_handshake(&psk_verdict(
+            EXPECTED_TLS_VERSION,
+            EXPECTED_MBEDTLS_SUITE,
+            0,
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("echo_bytes=0"),
+            "error must name the empty echo: {err}"
+        );
+    }
+
+    /// A wrong-variant verdict is rejected rather than silently accepted.
+    #[test]
+    fn eval_tls_psk_handshake_rejects_wrong_variant() {
+        assert!(
+            eval_tls_psk_handshake(&TestData::None).is_err(),
+            "fail-path data must be rejected"
+        );
+    }
+
+    /// A promptly refused handshake passes.
+    #[test]
+    fn eval_tls_psk_wrong_key_rejected_prompt_refusal_passes() {
+        assert!(
+            eval_tls_psk_wrong_key_rejected(&TestData::TlsPskRejected {
+                peer_ip: [10, 0, 0, 4],
+                peer_port: 17387,
+                reject_ms: 240,
+            })
+            .is_ok(),
+            "an alert-speed refusal must pass"
+        );
+    }
+
+    /// A refusal that took far longer than the exchange costs is an unexpected
+    /// reading, not a pass.
+    #[test]
+    fn eval_tls_psk_wrong_key_rejected_rejects_a_slow_refusal() {
+        let err = eval_tls_psk_wrong_key_rejected(&TestData::TlsPskRejected {
+            peer_ip: [10, 0, 0, 4],
+            peer_port: 17387,
+            reject_ms: 2900,
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("2900 ms"),
+            "error must name the observed latency: {err}"
+        );
+    }
+
+    /// Two generated keys differ and neither is all-zero — the fixture never hands
+    /// the device a degenerate secret.
+    #[test]
+    fn generate_audio_psk_produces_distinct_nonzero_keys() {
+        let a = super::generate_audio_psk().expect("urandom read failed");
+        let b = super::generate_audio_psk().expect("urandom read failed");
+        assert_ne!(a, b, "two generated PSKs must differ");
+        assert_ne!(a, [0u8; AUDIO_PSK_LEN], "a generated PSK must not be zeros");
+    }
+
+    /// The wrong-key derivation keeps the identity and changes every byte of the key.
+    #[test]
+    fn pod_psk_with_wrong_key_shares_identity_and_differs_everywhere() {
+        let good = PodPsk {
+            identity: "pod-aabbcc".to_string(),
+            key: [0x5au8; AUDIO_PSK_LEN],
+        };
+        let bad = good.with_wrong_key();
+        assert_eq!(bad.identity, good.identity, "identity must be preserved");
+        for (i, (g, b)) in good.key.iter().zip(bad.key.iter()).enumerate() {
+            assert_ne!(g, b, "key byte {i} must differ");
+        }
+    }
+
+    /// `PodPsk`'s `Debug` names the identity and never the key bytes.
+    #[test]
+    fn pod_psk_debug_redacts_the_key() {
+        let psk = PodPsk {
+            identity: "pod-aabbcc".to_string(),
+            key: [0xABu8; AUDIO_PSK_LEN],
+        };
+        let rendered = format!("{psk:?}");
+        assert!(
+            rendered.contains("pod-aabbcc"),
+            "Debug must name the identity: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>") && !rendered.contains("171"),
+            "Debug must not render key bytes: {rendered}"
+        );
+    }
+
+    /// End-to-end over loopback: a client presenting the fixture's identity and key
+    /// completes the handshake and gets its payload echoed; a client with the
+    /// wrong-key derivation is refused. This is the fixture's own self-test — it
+    /// proves the listener discriminates before any hardware is involved.
+    #[test]
+    fn tls_psk_listener_accepts_the_key_and_refuses_the_wrong_one() {
+        use openssl::ssl::{SslContext, SslMethod, SslVersion};
+        use std::io::{Read as _, Write as _};
+
+        let psk = PodPsk {
+            identity: "pod-fixture".to_string(),
+            key: [0x11u8; AUDIO_PSK_LEN],
+        };
+        // Port 0: the fixture's spawn helper binds a fixed port, so this test drives
+        // `tls_psk_serve` directly over an ephemeral listener instead.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind failed");
+        let addr = listener.local_addr().expect("local_addr failed");
+        let server_ctx = psk_server_context(&psk).expect("server context failed");
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, peer) = listener.accept().expect("accept failed");
+                tls_psk_serve(&server_ctx, stream, &peer, "tls-psk-test");
+            }
+        });
+
+        let client_ctx = |key: [u8; AUDIO_PSK_LEN], identity: String| -> SslContext {
+            let mut builder = SslContext::builder(SslMethod::tls_client()).unwrap();
+            builder
+                .set_min_proto_version(Some(SslVersion::TLS1_2))
+                .unwrap();
+            builder
+                .set_max_proto_version(Some(SslVersion::TLS1_2))
+                .unwrap();
+            builder.set_cipher_list(PSK_CIPHERSUITE).unwrap();
+            builder.set_psk_client_callback(move |_ssl, _hint, identity_out, secret| {
+                let bytes = identity.as_bytes();
+                identity_out[..bytes.len()].copy_from_slice(bytes);
+                identity_out[bytes.len()] = 0;
+                secret[..key.len()].copy_from_slice(&key);
+                Ok(key.len())
+            });
+            builder.build()
+        };
+
+        // Right key: handshake completes and the payload comes back.
+        let ctx = client_ctx(psk.key, psk.identity.clone());
+        let tcp = std::net::TcpStream::connect(addr).expect("connect failed");
+        let ssl = openssl::ssl::Ssl::new(&ctx).unwrap();
+        let mut tls = openssl::ssl::SslStream::new(ssl, tcp).unwrap();
+        tls.connect()
+            .expect("handshake with the right key must succeed");
+        assert_eq!(
+            tls.ssl().version_str(),
+            EXPECTED_TLS_VERSION,
+            "the fixture must negotiate the pinned protocol version"
+        );
+        tls.write_all(b"ping").unwrap();
+        let mut echo = [0u8; 4];
+        tls.read_exact(&mut echo).expect("echo read failed");
+        assert_eq!(&echo, b"ping", "the tunnel must echo what was written");
+        drop(tls);
+
+        // Wrong key, same identity: refused.
+        let bad = psk.with_wrong_key();
+        let ctx = client_ctx(bad.key, bad.identity);
+        let tcp = std::net::TcpStream::connect(addr).expect("connect failed");
+        let ssl = openssl::ssl::Ssl::new(&ctx).unwrap();
+        let mut tls = openssl::ssl::SslStream::new(ssl, tcp).unwrap();
+        assert!(
+            tls.connect().is_err(),
+            "a handshake with the wrong key must be refused"
+        );
+
+        server.join().expect("listener thread panicked");
+    }
 
     /// Build a poll-readiness verdict from its parts.
     fn poll_verdict(pollin: bool, pollout: bool, both: bool, read_bytes: u32) -> TestData {
@@ -9006,6 +9686,8 @@ mod tests {
             TestName::WifiReassociation,
             TestName::GatewayProbeGate,
             TestName::StreamRealtimeDuplex,
+            TestName::TlsPskHandshake,
+            TestName::TlsPskWrongKeyRejected,
         ];
         // CapturePeriodicLine drives the local production capture thread, not a network
         // peer; it and the two ~5 s-feed drain tests run in dedicated collect-logs blocks.
@@ -9737,7 +10419,9 @@ mod tests {
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 // Port legitimately in use; skip.
-                eprintln!("SKIP udp_echo_default_port_binds_on_loopback: port {DEFAULT_HIL_UDP_PORT} already in use");
+                eprintln!(
+                    "SKIP udp_echo_default_port_binds_on_loopback: port {DEFAULT_HIL_UDP_PORT} already in use"
+                );
             }
             Err(e) => panic!("unexpected bind error: {e}"),
         }
@@ -9759,7 +10443,9 @@ mod tests {
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                eprintln!("SKIP tcp_echo_default_port_binds_on_loopback: port {DEFAULT_HIL_TCP_PORT} already in use");
+                eprintln!(
+                    "SKIP tcp_echo_default_port_binds_on_loopback: port {DEFAULT_HIL_TCP_PORT} already in use"
+                );
             }
             Err(e) => panic!("unexpected bind error: {e}"),
         }
@@ -9814,15 +10500,17 @@ mod tests {
             DEFAULT_HIL_BACKPRESSURE_PORT,
             DEFAULT_HIL_POLL_READINESS_PORT,
             DEFAULT_HIL_RTD_PORT,
+            DEFAULT_HIL_TLS_PSK_PORT,
+            DEFAULT_HIL_TLS_PSK_BAD_PORT,
         );
         assert_eq!(
             output,
             format!(
-                "udp_port={DEFAULT_HIL_UDP_PORT}/udp\ntcp_port={DEFAULT_HIL_TCP_PORT}/tcp\ninbound_frames_port={DEFAULT_HIL_INBOUND_FRAMES_PORT}/tcp\nbackpressure_port={DEFAULT_HIL_BACKPRESSURE_PORT}/tcp\npoll_readiness_port={DEFAULT_HIL_POLL_READINESS_PORT}/tcp\nrtd_port={DEFAULT_HIL_RTD_PORT}/tcp\n"
+                "udp_port={DEFAULT_HIL_UDP_PORT}/udp\ntcp_port={DEFAULT_HIL_TCP_PORT}/tcp\ninbound_frames_port={DEFAULT_HIL_INBOUND_FRAMES_PORT}/tcp\nbackpressure_port={DEFAULT_HIL_BACKPRESSURE_PORT}/tcp\npoll_readiness_port={DEFAULT_HIL_POLL_READINESS_PORT}/tcp\nrtd_port={DEFAULT_HIL_RTD_PORT}/tcp\ntls_psk_port={DEFAULT_HIL_TLS_PSK_PORT}/tcp\ntls_psk_bad_port={DEFAULT_HIL_TLS_PSK_BAD_PORT}/tcp\n"
             ),
-            "--print-ports default output must be `udp_port=17380/udp\\ntcp_port=17381/tcp\\ninbound_frames_port=17382/tcp\\nbackpressure_port=17383/tcp\\npoll_readiness_port=17384/tcp\\nrtd_port=17385/tcp\\n`"
+            "--print-ports default output must be `udp_port=17380/udp\\ntcp_port=17381/tcp\\ninbound_frames_port=17382/tcp\\nbackpressure_port=17383/tcp\\npoll_readiness_port=17384/tcp\\nrtd_port=17385/tcp\\ntls_psk_port=17386/tcp\\ntls_psk_bad_port=17387/tcp\\n`"
         );
-        // Verify the exact documented defaults (design §2.1).
+        // Verify the exact documented defaults.
         assert!(
             output.contains("udp_port=17380"),
             "default UDP port line must be `udp_port=17380`"
@@ -9847,6 +10535,14 @@ mod tests {
             output.contains("rtd_port=17385"),
             "default rtd port line must be `rtd_port=17385`"
         );
+        assert!(
+            output.contains("tls_psk_port=17386"),
+            "default TLS-PSK port line must be `tls_psk_port=17386`"
+        );
+        assert!(
+            output.contains("tls_psk_bad_port=17387"),
+            "default wrong-key TLS-PSK port line must be `tls_psk_bad_port=17387`"
+        );
         // Each line carries its firewall protocol so the helper never encodes a
         // port-name-to-proto table: udp_port is the sole `/udp`, all others `/tcp`.
         assert!(
@@ -9864,8 +10560,8 @@ mod tests {
         );
         assert_eq!(
             output.matches("/tcp").count(),
-            5,
-            "all five non-echo-UDP ports must be emitted as `/tcp`"
+            7,
+            "all seven non-echo-UDP ports must be emitted as `/tcp`"
         );
     }
 
@@ -9876,7 +10572,8 @@ mod tests {
     /// helper opens the overridden port (not the default).
     #[test]
     fn print_ports_overrides_produce_correct_output() {
-        let output = super::format_port_lines(18000, 18001, 18002, 18003, 18004, 18005);
+        let output =
+            super::format_port_lines(18000, 18001, 18002, 18003, 18004, 18005, 18006, 18007);
         assert!(
             output.contains("udp_port=18000"),
             "overridden UDP port must appear verbatim in --print-ports output"
@@ -9901,6 +10598,14 @@ mod tests {
             output.contains("rtd_port=18005"),
             "overridden rtd port must appear verbatim in --print-ports output"
         );
+        assert!(
+            output.contains("tls_psk_port=18006"),
+            "overridden TLS-PSK port must appear verbatim in --print-ports output"
+        );
+        assert!(
+            output.contains("tls_psk_bad_port=18007"),
+            "overridden wrong-key TLS-PSK port must appear verbatim in --print-ports output"
+        );
     }
 
     /// `--print-ports` output via `resolve_secrets` uses the same resolved values
@@ -9922,6 +10627,8 @@ mod tests {
             secrets.backpressure_port,
             secrets.poll_readiness_port,
             secrets.rtd_port,
+            secrets.tls_psk_port,
+            secrets.tls_psk_bad_port,
         );
         assert!(
             output.contains("udp_port=19000"),

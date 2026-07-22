@@ -10,6 +10,8 @@
 //!                              [--tls-host <IP>] [--tls-port <N>]
 //!                              [--inbound-frames-port <N>] [--port <PATH>] [--serial <SN>]
 //!   podctl provision-audio     [--host <IP>] [--port <N>] [--serial-port <PATH>] [--serial <SN>]
+//!   podctl provision-audio-psk [--generate | --psk-file <PATH>] [--host-psk-file <PATH>]
+//!                              [--serial-port <PATH>] [--serial <SN>]
 //!   podctl set-vad-threshold   --threshold <F32> [--serial-port <PATH>] [--serial <SN>]
 //!   podctl set-vad-hangover    --hangover-ms <U32> [--serial-port <PATH>] [--serial <SN>]
 //!   podctl set-temp-wifi       --ssid <S> --passphrase <P> [--port <PATH>] [--serial <SN>]
@@ -21,6 +23,7 @@
 //!           PODCTL_UDP_PORT, PODCTL_TCP_PORT, PODCTL_TLS_HOST, PODCTL_TLS_PORT,
 //!           PODCTL_INBOUND_FRAMES_PORT,
 //!           PODCTL_AUDIO_HOST, PODCTL_AUDIO_PORT,
+//!           PODCTL_AUDIO_PSK_FILE, PODCTL_HOST_PSK_FILE,
 //!           PODCTL_VAD_THRESHOLD, PODCTL_VAD_HANGOVER_MS,
 //!           PODCTL_LOG_JSONL, PODCTL_PORT, PODCTL_SERIAL.
 //!
@@ -55,6 +58,12 @@ struct Cli {
     command: Cmd,
 }
 
+// The lint's remedy — boxing a variant's fields — is unavailable: clap's derive
+// builds these variants field-by-field, and there is exactly one of them alive for
+// the process's lifetime (parsed from argv, matched once, dropped). The size spread
+// is the cost of one subcommand carrying many optional string arguments, paid once
+// on the stack at startup.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Provisioning subcommands, flattened so they stay top-level (`podctl provision-wifi`).
@@ -121,6 +130,12 @@ enum Cmd {
     },
 }
 
+// The lint's remedy — boxing a variant's fields — is unavailable: clap's derive
+// builds these variants field-by-field, and there is exactly one of them alive for
+// the process's lifetime (parsed from argv, matched once, dropped). The size spread
+// is the cost of one subcommand carrying many optional string arguments, paid once
+// on the stack at startup.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum ProvisionCmd {
     /// Provision WiFi credentials (SSID + passphrase) into device NVS.
@@ -195,6 +210,18 @@ enum ProvisionCmd {
         #[arg(long, env = "PODCTL_RTD_PORT")]
         rtd_port: Option<String>,
 
+        /// TLS-PSK listener TCP port (0–65535) for the TlsPskHandshake self-test — the
+        /// listener holding this pod's real audio-link key. The host IP is the same as
+        /// --host. Also $PODCTL_TLS_PSK_PORT.
+        #[arg(long, env = "PODCTL_TLS_PSK_PORT")]
+        tls_psk_port: Option<String>,
+
+        /// TLS-PSK listener TCP port (0–65535) for the TlsPskWrongKeyRejected self-test —
+        /// the listener holding a different key for this pod's identity. The host IP is
+        /// the same as --host. Also $PODCTL_TLS_PSK_BAD_PORT.
+        #[arg(long, env = "PODCTL_TLS_PSK_BAD_PORT")]
+        tls_psk_bad_port: Option<String>,
+
         /// Target device by serial port path (e.g. /dev/ttyACM0). Also $PODCTL_PORT.
         #[arg(long, env = "PODCTL_PORT")]
         port: Option<String>,
@@ -216,6 +243,42 @@ enum ProvisionCmd {
         /// Audio receiver port (0–65535). Also $PODCTL_AUDIO_PORT.
         #[arg(long = "audio-port", env = "PODCTL_AUDIO_PORT")]
         audio_port: Option<String>,
+
+        /// Target device by serial port path (e.g. /dev/ttyACM0). Also $PODCTL_PORT.
+        #[arg(long = "serial-port", env = "PODCTL_PORT")]
+        port: Option<String>,
+
+        /// Target device by USB serial number (best-effort). Also $PODCTL_SERIAL.
+        #[arg(long, env = "PODCTL_SERIAL")]
+        serial: Option<String>,
+    },
+
+    /// Provision the audio-link pre-shared key into device NVS.
+    ///
+    /// Takes effect on the streamer's next connect — no reboot needed.
+    ///
+    /// The device answers with its MAC-derived pod id — the identity it presents in the
+    /// TLS handshake. With --host-psk-file that id and the key are upserted into the
+    /// host's secrets table; without it, only the id is printed, never the key.
+    ///
+    /// There is deliberately no --psk <HEX> flag: keys do not belong in shell history.
+    ProvisionAudioPsk {
+        /// Generate a fresh 32-byte key from the OS CSPRNG (the default when neither
+        /// this nor --psk-file is given).
+        #[arg(long, conflicts_with = "psk_file")]
+        generate: bool,
+
+        /// Install a specific key read from this file (64 hex characters, surrounding
+        /// whitespace ignored). Use for rotation or re-installing a known key.
+        /// Also $PODCTL_AUDIO_PSK_FILE.
+        #[arg(long, env = "PODCTL_AUDIO_PSK_FILE")]
+        psk_file: Option<String>,
+
+        /// Upsert "<pod_id>" = "<hex>" into this TOML secrets file, creating it mode
+        /// 0600 if absent. This is the file the host's pod_psk_file config points at.
+        /// Also $PODCTL_HOST_PSK_FILE.
+        #[arg(long, env = "PODCTL_HOST_PSK_FILE")]
+        host_psk_file: Option<PathBuf>,
 
         /// Target device by serial port path (e.g. /dev/ttyACM0). Also $PODCTL_PORT.
         #[arg(long = "serial-port", env = "PODCTL_PORT")]
@@ -289,6 +352,15 @@ enum ValidationError {
         field: &'static str,
         expected: &'static str,
     },
+    /// A file named by a flag could not be read. `detail` is the OS error; the file's
+    /// contents are never quoted back, because the files this reaches for hold keys.
+    FileRead {
+        what: &'static str,
+        path: String,
+        detail: String,
+    },
+    /// The OS CSPRNG refused to produce key material.
+    RandomFailed { detail: String },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -307,8 +379,160 @@ impl std::fmt::Display for ValidationError {
             ValidationError::InvalidField { field, expected } => {
                 write!(f, "{field} is not a valid {expected}")
             }
+            ValidationError::FileRead { what, path, detail } => {
+                write!(f, "cannot read {what} {path}: {detail}")
+            }
+            ValidationError::RandomFailed { detail } => {
+                write!(f, "could not generate a key from the OS RNG: {detail}")
+            }
         }
     }
+}
+
+// ── Audio-link PSK helpers ────────────────────────────────────────────────────
+
+/// Lowercase hex encoding of a 32-byte key.
+fn hex_encode32(key: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in key {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Parse exactly 64 hex characters into a 32-byte key. Case-insensitive; surrounding
+/// whitespace must already be trimmed by the caller.
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *o = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+/// Arguments for provision-audio-psk after clap parsing.
+struct AudioPskArgs {
+    generate: bool,
+    psk_file: Option<String>,
+}
+
+/// Resolve the key to install and build the command.
+///
+/// `--generate` and `--psk-file` are mutually exclusive at the clap layer; with neither,
+/// generation is the default, so an operator who types the bare subcommand gets a fresh
+/// random key rather than an error.
+fn validate_audio_psk(args: AudioPskArgs) -> Result<Command, ValidationError> {
+    let key = match args.psk_file {
+        Some(path) => {
+            let raw = std::fs::read_to_string(&path).map_err(|e| ValidationError::FileRead {
+                what: "PSK file",
+                path: path.clone(),
+                detail: e.to_string(),
+            })?;
+            parse_hex32(raw.trim()).ok_or(ValidationError::InvalidField {
+                field: "psk-file contents",
+                expected: "64-character hex key (32 bytes)",
+            })?
+        }
+        None => {
+            // `generate` is the default; the flag exists so the intent can be stated.
+            let _ = args.generate;
+            let mut key = [0u8; 32];
+            getrandom::fill(&mut key).map_err(|e| ValidationError::RandomFailed {
+                detail: e.to_string(),
+            })?;
+            key
+        }
+    };
+    Ok(Command::ProvisionAudioPsk { key })
+}
+
+/// Upsert `pod_id = "<key_hex>"` into a TOML document's top level, preserving every
+/// other entry, comment, and formatting detail of `existing`.
+///
+/// Returns the new document text. An existing entry for the same pod is overwritten —
+/// that is key rotation, the operation this exists for.
+fn upsert_psk_entry(existing: &str, pod_id: &str, key_hex: &str) -> Result<String, String> {
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("not valid TOML: {e}"))?;
+    if let Some(item) = doc.get(pod_id) {
+        if !item.is_str() {
+            return Err(format!(
+                "existing entry for {pod_id} is not a string; refusing to overwrite"
+            ));
+        }
+    }
+    doc[pod_id] = toml_edit::value(key_hex);
+    Ok(doc.to_string())
+}
+
+/// Read-modify-write the host-side `pod_id → key` table at `path`.
+///
+/// A missing file is created; an unreadable or non-TOML file is an error rather than a
+/// silent overwrite, because the file is the operator's whole fleet of keys. The file
+/// must be mode 0600 on Unix (group/other bits cause the host to reject it at load).
+///
+/// The new table is written to a sibling temp file and renamed over the original, so an
+/// interruption mid-write leaves the existing table intact: the keys it holds exist
+/// nowhere else, and a torn file would take the whole fleet offline at the next daemon
+/// restart.
+fn write_host_psk_file(path: &std::path::Path, pod_id: &str, key_hex: &str) -> Result<(), String> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let updated = upsert_psk_entry(&existing, pod_id, key_hex)
+        .map_err(|e| format!("cannot update {}: {e}", path.display()))?;
+
+    // Same directory, so the rename is atomic (a cross-filesystem rename is not).
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+
+    let write_tmp = || -> Result<(), String> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        // `mode` above only applies at creation, so a leftover looser temp file keeps its
+        // permissions; tighten it explicitly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("cannot set mode 0600 on {}: {e}", tmp.display()))?;
+        }
+        f.write_all(updated.as_bytes())
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        f.flush()
+            .map_err(|e| format!("cannot flush {}: {e}", tmp.display()))?;
+        // Durable before the rename: a crash after the rename must not expose a file whose
+        // contents never reached the disk.
+        f.sync_all()
+            .map_err(|e| format!("cannot sync {}: {e}", tmp.display()))
+    };
+
+    if let Err(e) = write_tmp().and_then(|()| {
+        std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
+    }) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Arguments for provision-wifi after clap parsing (all Option<String> at this layer).
@@ -328,6 +552,8 @@ struct PeerArgs {
     backpressure_port: Option<String>,
     poll_readiness_port: Option<String>,
     rtd_port: Option<String>,
+    tls_psk_port: Option<String>,
+    tls_psk_bad_port: Option<String>,
 }
 
 /// Arguments for provision-audio after clap parsing.
@@ -467,6 +693,16 @@ fn validate_peer(args: PeerArgs) -> Result<Command, ValidationError> {
         flag: "rtd-port",
         env: "PODCTL_RTD_PORT",
     })?;
+    let tls_psk_str = args.tls_psk_port.ok_or(ValidationError::Missing {
+        input: "tls-psk-port",
+        flag: "tls-psk-port",
+        env: "PODCTL_TLS_PSK_PORT",
+    })?;
+    let tls_psk_bad_str = args.tls_psk_bad_port.ok_or(ValidationError::Missing {
+        input: "tls-psk-bad-port",
+        flag: "tls-psk-bad-port",
+        env: "PODCTL_TLS_PSK_BAD_PORT",
+    })?;
 
     let host = parse_ipv4(&host_str, "host")?;
     let udp_port = parse_port(&udp_str, "udp-port")?;
@@ -477,6 +713,8 @@ fn validate_peer(args: PeerArgs) -> Result<Command, ValidationError> {
     let backpressure_port = parse_port(&backpressure_str, "backpressure-port")?;
     let poll_readiness_port = parse_port(&poll_readiness_str, "poll-readiness-port")?;
     let rtd_port = parse_port(&rtd_str, "rtd-port")?;
+    let tls_psk_port = parse_port(&tls_psk_str, "tls-psk-port")?;
+    let tls_psk_bad_port = parse_port(&tls_psk_bad_str, "tls-psk-bad-port")?;
 
     Ok(Command::ProvisionPeer {
         host,
@@ -488,6 +726,8 @@ fn validate_peer(args: PeerArgs) -> Result<Command, ValidationError> {
         backpressure_port,
         poll_readiness_port,
         rtd_port,
+        tls_psk_port,
+        tls_psk_bad_port,
     })
 }
 
@@ -848,6 +1088,10 @@ fn success_line(identity: &str, cmd: &Command) -> String {
                 host[0], host[1], host[2], host[3], port
             )
         }
+        // The key is never rendered — not in full, not as a prefix.
+        Command::ProvisionAudioPsk { .. } => {
+            format!("provisioned audio-link PSK on {identity} (applies on next connect)")
+        }
         Command::SetVadThreshold { threshold } => {
             format!("provisioned VAD threshold {threshold} on {identity} (reboot to apply)")
         }
@@ -856,10 +1100,14 @@ fn success_line(identity: &str, cmd: &Command) -> String {
         }
         Command::ClearWifiCredentials => format!("cleared wifi credentials on {identity}"),
         Command::SetTemporaryWifiConfig { ssid, .. } => {
-            format!("applied temporary wifi config on {identity}: SSID \"{ssid}\" (RAM-only; reboot reverts)")
+            format!(
+                "applied temporary wifi config on {identity}: SSID \"{ssid}\" (RAM-only; reboot reverts)"
+            )
         }
         Command::ClearTemporaryWifiConfig => {
-            format!("cleared temporary wifi config on {identity} (reverted to persisted credentials, if any)")
+            format!(
+                "cleared temporary wifi config on {identity} (reverted to persisted credentials, if any)"
+            )
         }
         // RunTest is dispatched by hil-host, not by podctl; podctl should not reach this arm.
         Command::RunTest(_) => format!("sent command on {identity}"),
@@ -914,6 +1162,8 @@ fn run() -> i32 {
             backpressure_port,
             poll_readiness_port,
             rtd_port,
+            tls_psk_port,
+            tls_psk_bad_port,
             port,
             serial,
         } => {
@@ -927,6 +1177,8 @@ fn run() -> i32 {
                 backpressure_port,
                 poll_readiness_port,
                 rtd_port,
+                tls_psk_port,
+                tls_psk_bad_port,
             });
             (result, port, serial)
         }
@@ -938,6 +1190,17 @@ fn run() -> i32 {
         } => {
             let result = validate_audio(AudioArgs { host, audio_port });
             (result, port, serial)
+        }
+        ProvisionCmd::ProvisionAudioPsk {
+            generate,
+            psk_file,
+            host_psk_file,
+            port,
+            serial,
+        } => {
+            let key_was_generated = psk_file.is_none();
+            let result = validate_audio_psk(AudioPskArgs { generate, psk_file });
+            return run_provision_audio_psk(result, key_was_generated, host_psk_file, port, serial);
         }
         ProvisionCmd::SetVadThreshold {
             threshold,
@@ -968,6 +1231,23 @@ fn run_command(
     port_target: Option<String>,
     serial_target: Option<String>,
 ) -> i32 {
+    run_command_with(cmd_result, port_target, serial_target, |_| Ok(None))
+}
+
+/// `run_command` plus a hook that runs on a `Status::Ok` response, before the success
+/// line is printed.
+///
+/// The hook exists for commands whose response carries data the operator must act on —
+/// `ProvisionAudioPsk` returns the pod id that keys the host-side table. A hook error
+/// makes the whole invocation fail (exit 1) even though the device applied the command:
+/// silently succeeding with the host half unwritten would leave a pod that can no longer
+/// connect. The hook's `Ok` string, if any, is printed after the success line.
+fn run_command_with(
+    cmd_result: Result<Command, ValidationError>,
+    port_target: Option<String>,
+    serial_target: Option<String>,
+    on_success: impl FnOnce(&Response) -> Result<Option<String>, String>,
+) -> i32 {
     // Step 1: validate args (no USB until this passes).
     let cmd = match cmd_result {
         Ok(c) => c,
@@ -992,13 +1272,82 @@ fn run_command(
     // Step 5: send command and handle response.
     let mut harness = pod_transport::Harness::new(transport);
     let result = harness.send_command(cmd);
+
+    let extra = match &result {
+        Ok(resp) if matches!(resp.status, Status::Ok) => match on_success(resp) {
+            Ok(extra) => extra,
+            Err(e) => {
+                eprintln!("error: device applied the command but the host-side step failed: {e}");
+                return 1;
+            }
+        },
+        _ => None,
+    };
+
     let (msg, to_stdout, exit) = map_response(result, &success, &identity);
     if to_stdout {
         println!("{msg}");
     } else {
         eprintln!("{msg}");
     }
+    if let Some(line) = extra {
+        println!("{line}");
+    }
     exit
+}
+
+/// Send `ProvisionAudioPsk` and, on success, record the key against the pod id the
+/// device reported.
+///
+/// The key is written only into the host secrets file — never to stdout, stderr, or
+/// a log line.
+///
+/// `key_was_generated` distinguishes the two no-`--host-psk-file` outcomes: a key read
+/// from a file is still in that file, but a freshly generated one exists nowhere but the
+/// pod's NVS and is unrecoverable, which the operator is told plainly.
+fn run_provision_audio_psk(
+    cmd_result: Result<Command, ValidationError>,
+    key_was_generated: bool,
+    host_psk_file: Option<PathBuf>,
+    port_target: Option<String>,
+    serial_target: Option<String>,
+) -> i32 {
+    let key_hex = match &cmd_result {
+        Ok(Command::ProvisionAudioPsk { key }) => hex_encode32(key),
+        // Validation failed, or a caller passed the wrong command; `run_command_with`
+        // reports the former and the hook below never fires for the latter.
+        _ => String::new(),
+    };
+
+    run_command_with(cmd_result, port_target, serial_target, |resp| {
+        let pod_id = match &resp.payload {
+            Payload::PodId(id) => escape_device_str(id),
+            _ => {
+                return Err(
+                    "device did not report its pod id; cannot record the host-side entry"
+                        .to_string(),
+                );
+            }
+        };
+        match host_psk_file {
+            Some(path) => {
+                write_host_psk_file(&path, &pod_id, &key_hex)?;
+                Ok(Some(format!(
+                    "recorded key for pod id \"{pod_id}\" in {}",
+                    path.display()
+                )))
+            }
+            None if key_was_generated => Ok(Some(format!(
+                "pod id is \"{pod_id}\"; no --host-psk-file given, so the generated key \
+                 now exists only in this pod's NVS — re-run with --host-psk-file to \
+                 install a key the host can also hold"
+            ))),
+            None => Ok(Some(format!(
+                "pod id is \"{pod_id}\"; no --host-psk-file given, so the key was recorded \
+                 only in the pod — add it to the host's secrets file under that id"
+            ))),
+        }
+    })
 }
 
 /// Map a harness send result to an output message, stream (true=stdout, false=stderr), and
@@ -1065,12 +1414,48 @@ mod tests {
     /// acquire this lock — not a separate per-var mutex.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Clears every `PODCTL_*` var for the lifetime of the guard and restores the prior
+    /// values on drop, including on panic. Hold `ENV_MUTEX` across it.
+    struct ClearedEnv {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl ClearedEnv {
+        fn new() -> Self {
+            let saved: Vec<(&'static str, Option<String>)> = PODCTL_ENV_VARS
+                .iter()
+                .map(|v| (*v, std::env::var(v).ok()))
+                .collect();
+            unsafe {
+                for (v, _) in &saved {
+                    std::env::remove_var(v);
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ClearedEnv {
+        fn drop(&mut self) {
+            unsafe {
+                for (v, old) in &self.saved {
+                    match old {
+                        Some(val) => std::env::set_var(v, val),
+                        None => std::env::remove_var(v),
+                    }
+                }
+            }
+        }
+    }
+
     /// Every `env = "…"` var the CLI grammar declares. Tests that assert on a parse
     /// must clear these so an ambient shell value cannot feed the parse.
     const PODCTL_ENV_VARS: &[&str] = &[
         "PODCTL_AUDIO_HOST",
         "PODCTL_AUDIO_PORT",
+        "PODCTL_AUDIO_PSK_FILE",
         "PODCTL_BACKPRESSURE_PORT",
+        "PODCTL_HOST_PSK_FILE",
         "PODCTL_INBOUND_FRAMES_PORT",
         "PODCTL_LOG_JSONL",
         "PODCTL_PEER_HOST",
@@ -1395,6 +1780,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap();
         match cmd {
@@ -1408,6 +1795,8 @@ mod tests {
                 backpressure_port,
                 poll_readiness_port,
                 rtd_port,
+                tls_psk_port,
+                tls_psk_bad_port,
             } => {
                 assert_eq!(host, [192, 168, 1, 10]);
                 assert_eq!(udp_port, 5000);
@@ -1418,6 +1807,8 @@ mod tests {
                 assert_eq!(backpressure_port, 17383);
                 assert_eq!(poll_readiness_port, 17384);
                 assert_eq!(rtd_port, 17385);
+                assert_eq!(tls_psk_port, 17386);
+                assert_eq!(tls_psk_bad_port, 17387);
             }
             _ => panic!("wrong command type"),
         }
@@ -1435,6 +1826,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(matches!(
@@ -1455,6 +1848,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1481,6 +1876,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1507,6 +1904,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1533,6 +1932,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1559,6 +1960,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1585,6 +1988,8 @@ mod tests {
             backpressure_port: None,
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1611,6 +2016,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: None,
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1618,6 +2025,62 @@ mod tests {
                 err,
                 ValidationError::Missing {
                     input: "poll-readiness-port",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_peer_missing_tls_psk_port() {
+        let err = validate_peer(PeerArgs {
+            host: Some("192.168.1.1".into()),
+            udp_port: Some("5000".into()),
+            tcp_port: Some("5001".into()),
+            tls_host: Some("10.0.0.1".into()),
+            tls_port: Some("8883".into()),
+            inbound_frames_port: Some("17382".into()),
+            backpressure_port: Some("17383".into()),
+            poll_readiness_port: Some("17384".into()),
+            rtd_port: Some("17385".into()),
+            tls_psk_port: None,
+            tls_psk_bad_port: Some("17387".into()),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ValidationError::Missing {
+                    input: "tls-psk-port",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_peer_missing_tls_psk_bad_port() {
+        let err = validate_peer(PeerArgs {
+            host: Some("192.168.1.1".into()),
+            udp_port: Some("5000".into()),
+            tcp_port: Some("5001".into()),
+            tls_host: Some("10.0.0.1".into()),
+            tls_port: Some("8883".into()),
+            inbound_frames_port: Some("17382".into()),
+            backpressure_port: Some("17383".into()),
+            poll_readiness_port: Some("17384".into()),
+            rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: None,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ValidationError::Missing {
+                    input: "tls-psk-bad-port",
                     ..
                 }
             ),
@@ -1637,6 +2100,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: None,
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1663,6 +2128,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -1689,6 +2156,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -2503,6 +2972,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -2530,6 +3001,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -2557,6 +3030,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -2584,6 +3059,8 @@ mod tests {
             backpressure_port: Some("17383".into()),
             poll_readiness_port: Some("17384".into()),
             rtd_port: Some("17385".into()),
+            tls_psk_port: Some("17386".into()),
+            tls_psk_bad_port: Some("17387".into()),
         })
         .unwrap_err();
         assert!(
@@ -3089,5 +3566,286 @@ mod tests {
             out.attempts_after_fail, 1,
             "both frames arrived in one batch, but only the first may touch stdout"
         );
+    }
+
+    // ── Audio-link PSK: hex, key sourcing, host table, redaction ──────────────
+
+    /// A generated key must survive the hex round-trip the host table stores it in.
+    #[test]
+    fn hex_encode32_round_trips_through_parse_hex32() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let hex = hex_encode32(&key);
+        assert_eq!(
+            hex.len(),
+            64,
+            "32 bytes must render as 64 hex chars; got {hex:?}"
+        );
+        assert_eq!(parse_hex32(&hex), Some(key));
+    }
+
+    #[test]
+    fn parse_hex32_accepts_uppercase_and_rejects_malformed() {
+        let upper = "AB".repeat(32);
+        assert_eq!(parse_hex32(&upper), Some([0xabu8; 32]));
+        assert_eq!(
+            parse_hex32(&"ab".repeat(31)),
+            None,
+            "63 chars must be rejected"
+        );
+        assert_eq!(
+            parse_hex32(&"ab".repeat(33)),
+            None,
+            "66 chars must be rejected"
+        );
+        let non_hex = format!("{}zz", "ab".repeat(31));
+        assert_eq!(
+            parse_hex32(&non_hex),
+            None,
+            "non-hex digits must be rejected"
+        );
+    }
+
+    /// `--generate` (the default) must produce a full-length key, and a different one
+    /// each time — a constant key would silently give every pod the same secret.
+    #[test]
+    fn validate_audio_psk_generates_distinct_keys() {
+        let a = validate_audio_psk(AudioPskArgs {
+            generate: true,
+            psk_file: None,
+        });
+        let b = validate_audio_psk(AudioPskArgs {
+            generate: false,
+            psk_file: None,
+        });
+        match (a, b) {
+            (
+                Ok(Command::ProvisionAudioPsk { key: ka }),
+                Ok(Command::ProvisionAudioPsk { key: kb }),
+            ) => {
+                assert_ne!(ka, kb, "two generated keys must differ");
+                assert_ne!(ka, [0u8; 32], "a generated key must not be all zeros");
+            }
+            other => panic!("expected two generated ProvisionAudioPsk commands; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_audio_psk_reads_hex_key_file_ignoring_surrounding_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.hex");
+        std::fs::write(&path, format!("  {}\n", "cd".repeat(32))).unwrap();
+        let cmd = validate_audio_psk(AudioPskArgs {
+            generate: false,
+            psk_file: Some(path.to_str().unwrap().to_string()),
+        });
+        match cmd {
+            Ok(Command::ProvisionAudioPsk { key }) => assert_eq!(key, [0xcdu8; 32]),
+            other => panic!("expected ProvisionAudioPsk; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_audio_psk_rejects_a_malformed_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.hex");
+        std::fs::write(&path, "not-a-key").unwrap();
+        let err = validate_audio_psk(AudioPskArgs {
+            generate: false,
+            psk_file: Some(path.to_str().unwrap().to_string()),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ValidationError::InvalidField {
+                    field: "psk-file contents",
+                    ..
+                }
+            ),
+            "expected an InvalidField for the key contents; got {err:?}"
+        );
+    }
+
+    /// A missing key file must fail before any USB is touched, and the error must name
+    /// the path without quoting file contents.
+    #[test]
+    fn validate_audio_psk_reports_a_missing_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.hex");
+        let err = validate_audio_psk(AudioPskArgs {
+            generate: false,
+            psk_file: Some(path.to_str().unwrap().to_string()),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ValidationError::FileRead {
+                    what: "PSK file",
+                    ..
+                }
+            ),
+            "expected a FileRead error; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("absent.hex"),
+            "the error must name the path; got {err}"
+        );
+    }
+
+    #[test]
+    fn upsert_psk_entry_adds_rotates_and_preserves_other_entries() {
+        let existing = "# fleet keys\npod-000000 = \"11\"\npod-aabbcc = \"22\"\n";
+        let updated = upsert_psk_entry(existing, "pod-aabbcc", &"ee".repeat(32)).unwrap();
+        assert!(
+            updated.contains("# fleet keys"),
+            "comments must survive: {updated}"
+        );
+        assert!(
+            updated.contains("pod-000000 = \"11\""),
+            "other pods' entries must survive: {updated}"
+        );
+        assert!(
+            updated.contains(&format!("pod-aabbcc = \"{}\"", "ee".repeat(32))),
+            "the rotated entry must hold the new key: {updated}"
+        );
+        assert!(
+            !updated.contains("\"22\""),
+            "the old key must be gone: {updated}"
+        );
+
+        let fresh = upsert_psk_entry("", "pod-ffeedd", &"01".repeat(32)).unwrap();
+        assert!(
+            fresh.contains("pod-ffeedd"),
+            "a new file must gain the entry: {fresh}"
+        );
+    }
+
+    /// Refusing to parse (rather than overwriting) protects the operator's whole fleet
+    /// of keys from a stray edit.
+    #[test]
+    fn upsert_psk_entry_refuses_malformed_or_wrongly_typed_input() {
+        assert!(upsert_psk_entry("this is not = = toml", "pod-a", "ff").is_err());
+        let err = upsert_psk_entry("pod-a = 5\n", "pod-a", "ff").unwrap_err();
+        assert!(
+            err.contains("not a string"),
+            "a non-string entry must be refused by name; got {err}"
+        );
+    }
+
+    #[test]
+    fn write_host_psk_file_creates_the_table_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pods.toml");
+        let hex = "7f".repeat(32);
+        write_host_psk_file(&path, "pod-aabbcc", &hex).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("pod-aabbcc"),
+            "table must key on the pod id: {text}"
+        );
+        assert!(text.contains(&hex), "table must carry the key: {text}");
+
+        // A second pod is added, not substituted.
+        write_host_psk_file(&path, "pod-ddeeff", &"12".repeat(32)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("pod-aabbcc") && text.contains("pod-ddeeff"),
+            "got {text}"
+        );
+    }
+
+    /// The host rejects a secrets file with any group/other permission bits, so podctl
+    /// must leave 0600 behind — including on a file that already existed wide open.
+    #[cfg(unix)]
+    #[test]
+    fn write_host_psk_file_leaves_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+
+        let created = dir.path().join("new.toml");
+        write_host_psk_file(&created, "pod-aabbcc", &"7f".repeat(32)).unwrap();
+        let mode = std::fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a newly created secrets file must be 0600; got {mode:o}"
+        );
+
+        let loose = dir.path().join("loose.toml");
+        std::fs::write(&loose, "").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_host_psk_file(&loose, "pod-aabbcc", &"7f".repeat(32)).unwrap();
+        let mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an existing loose secrets file must be tightened; got {mode:o}"
+        );
+    }
+
+    /// Mirrors the passphrase hygiene test: the key must never reach the terminal.
+    #[test]
+    fn success_line_never_contains_the_psk() {
+        let key = [0xabu8; 32];
+        let line = success_line("/dev/ttyACM0", &Command::ProvisionAudioPsk { key });
+        assert!(
+            !line.contains(&hex_encode32(&key)),
+            "success_line must not contain the key; got: {line:?}"
+        );
+        assert!(
+            !line.contains("abab"),
+            "success_line must not contain even a fragment of the key; got: {line:?}"
+        );
+        assert!(
+            line.contains("/dev/ttyACM0"),
+            "success_line should name the device; got: {line:?}"
+        );
+    }
+
+    /// `--generate` and `--psk-file` name two different keys; the grammar must reject
+    /// both at once rather than silently preferring one.
+    #[test]
+    fn provision_audio_psk_generate_and_psk_file_conflict() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ClearedEnv::new();
+        let parsed = Cli::try_parse_from([
+            "podctl",
+            "provision-audio-psk",
+            "--generate",
+            "--psk-file",
+            "/tmp/k.hex",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "--generate with --psk-file must be rejected"
+        );
+    }
+
+    #[test]
+    fn provision_audio_psk_parses_with_host_psk_file() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ClearedEnv::new();
+        let cli = Cli::try_parse_from([
+            "podctl",
+            "provision-audio-psk",
+            "--host-psk-file",
+            "/etc/pods.toml",
+        ])
+        .expect("bare provision-audio-psk with --host-psk-file must parse");
+        match cli.command {
+            Cmd::Provision(ProvisionCmd::ProvisionAudioPsk {
+                generate,
+                psk_file,
+                host_psk_file,
+                ..
+            }) => {
+                assert!(!generate, "the flag is off unless given");
+                assert_eq!(psk_file, None);
+                assert_eq!(host_psk_file, Some(PathBuf::from("/etc/pods.toml")));
+            }
+            _ => panic!("expected ProvisionAudioPsk"),
+        }
     }
 }

@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use audio_pipeline::wire::{decode_frame, MAX_FRAME_BYTES};
+use openssl::ssl::{Ssl, SslContext, SslMethod};
 use serde::Serialize;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
@@ -49,7 +50,7 @@ use speech_pipeline::{
 
 use crate::barge::TurnLedger;
 use crate::clip::{load_clip, ClipError};
-use crate::config::{BrainMode, Config, SttBackend, SttConfig, TtsBackend};
+use crate::config::{BrainMode, Config, PskTable, SttBackend, SttConfig, TtsBackend};
 use crate::iso8601_ms;
 use crate::jsonl::JsonlHandle;
 use crate::pipeline::{BargeWiring, BrainWiring, PipelineFatal};
@@ -79,6 +80,46 @@ const PAYLOAD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// delay busy-spins a core and floods the observability sink; a short pause
 /// paces it into a legible error stream without meaningfully delaying recovery.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Deadline for the TLS-PSK handshake on an accepted connection. The handshake
+/// runs while the connection already holds an accept-gate permit, so a peer that
+/// completes the TCP connect and then dribbles (or sends nothing) would pin a
+/// permit for as long as the OS lets the socket live. A real pod's handshake is
+/// one round trip plus an ECDHE it computes in a few hundred milliseconds.
+const TLS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The TLS-PSK accept parameters every connection task needs: the shared context
+/// — whose PSK callback owns the key table, so no connection task ever holds key
+/// material — and the deadline its handshake runs under.
+#[derive(Clone)]
+struct TlsAccept {
+    ssl: Arc<SslContext>,
+    deadline: Duration,
+}
+
+/// Build the ingest listener's TLS context: the link's pinned protocol and suite
+/// ([`crate::psk::pin_link_params`]), no certificate, and a PSK callback that
+/// authenticates the client by looking its identity up in `table`. An unknown
+/// identity returns a zero-length key, which fails the handshake before any
+/// application byte is exchanged.
+fn build_psk_context(table: PskTable) -> Result<SslContext, openssl::error::ErrorStack> {
+    let mut builder = SslContext::builder(SslMethod::tls_server())?;
+    crate::psk::pin_link_params(&mut builder)?;
+    builder.set_psk_server_callback(move |_ssl, identity, secret| {
+        // A non-UTF-8 identity cannot name a pod: pod ids are ASCII.
+        let key = identity
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|identity| table.key_for(identity));
+        match key {
+            Some(key) if secret.len() >= key.len() => {
+                secret[..key.len()].copy_from_slice(key);
+                Ok(key.len())
+            }
+            _ => Ok(0),
+        }
+    });
+    Ok(builder.build())
+}
 
 /// One live pod connection in the supersede registry. `cancel` terminates the
 /// task (it may be parked in `read_exact`); `finished` fires once that task has
@@ -290,6 +331,7 @@ pub struct Server {
     listener: TcpListener,
     config: Arc<Config>,
     jsonl: JsonlHandle,
+    tls: TlsAccept,
     // A test-supplied router join handle that stands in for the real router task,
     // so a mid-run router exit can be driven without a live brain and channel.
     #[cfg(test)]
@@ -302,18 +344,41 @@ pub struct Server {
 }
 
 impl Server {
-    /// Bind the listener at `config.listen_addr`. A bind failure is fatal.
+    /// Bind the listener at `config.listen_addr` and build the TLS-PSK context
+    /// from `config.pod_psk_file`. A bind failure, an unreadable or malformed
+    /// key file, and an OpenSSL context failure are all fatal: a daemon that came
+    /// up without keys would refuse its whole fleet while looking healthy.
     pub async fn bind(config: Arc<Config>, jsonl: JsonlHandle) -> std::io::Result<Server> {
+        let table = PskTable::load(&config.pod_psk_file).map_err(std::io::Error::other)?;
+        let pods = table.len();
+        let ssl = build_psk_context(table).map_err(std::io::Error::other)?;
         let listener = TcpListener::bind(config.listen_addr).await?;
+        jsonl.emit(
+            "psk_table_loaded",
+            &json!({
+                "path": config.pod_psk_file.display().to_string(),
+                "pods": pods,
+            }),
+        );
         Ok(Server {
             listener,
             config,
             jsonl,
+            tls: TlsAccept {
+                ssl: Arc::new(ssl),
+                deadline: TLS_HANDSHAKE_DEADLINE,
+            },
             #[cfg(test)]
             router_override: None,
             #[cfg(test)]
             playback_registry_override: None,
         })
+    }
+
+    #[cfg(test)]
+    fn with_handshake_deadline(mut self, deadline: Duration) -> Self {
+        self.tls.deadline = deadline;
+        self
     }
 
     /// Replace the spawned router task with a test-supplied join handle, so a
@@ -353,6 +418,7 @@ impl Server {
             listener,
             config,
             jsonl,
+            tls,
             ..
         } = self;
 
@@ -640,6 +706,26 @@ impl Server {
         // shutdown-path join below neither re-polls the completed handle nor
         // re-emits. Single source of truth for which side observed the exit.
         let mut router_joined = false;
+        // Cloned per accepted socket; every field is a handle, so a clone is
+        // refcount traffic, not a copy of state.
+        let conn_deps = ConnDeps {
+            tls,
+            config: config.clone(),
+            jsonl: jsonl.clone(),
+            ledger: ledger.clone(),
+            registry: registry.clone(),
+            open_logs: open_logs.clone(),
+            prune_coord: prune_coord.clone(),
+            recording_failed: recording_failed.clone(),
+            item_tx: item_tx.clone(),
+            shutdown: shutdown_token.clone(),
+            telemetry_outside_segment: telemetry_outside_segment.clone(),
+            clock_step_clamps: clock_step_clamps.clone(),
+            playback_stats: playback_stats.clone(),
+            playback_events: playback_events.clone(),
+            playback_registry: playback_registry.clone(),
+            listener: listener_handle.clone(),
+        };
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
@@ -704,30 +790,17 @@ impl Server {
                             continue;
                         }
                     };
-                    conns.spawn(connection(
-                        stream,
-                        peer,
-                        seq,
-                        config.clone(),
-                        jsonl.clone(),
-                        ledger.clone(),
-                        registry.clone(),
-                        open_logs.clone(),
-                        prune_coord.clone(),
-                        recording_failed.clone(),
-                        item_tx.clone(),
-                        shutdown_token.clone(),
-                        telemetry_outside_segment.clone(),
-                        clock_step_clamps.clone(),
-                        playback_stats.clone(),
-                        playback_events.clone(),
-                        playback_registry.clone(),
-                        listener_handle.clone(),
-                        permit,
-                    ));
+                    conns.spawn(connection(stream, peer, seq, conn_deps.clone(), permit));
                 }
             }
         }
+
+        // Accepting has stopped, so the per-connection template is dead weight —
+        // and it is not inert: it holds a pipeline-queue sender clone and a
+        // `ListenerHandle` reference. The shutdown sequence below needs both to be
+        // gone (the listener join takes the last `Arc`, and the pipeline drains
+        // only once every sender has dropped), so release it first.
+        drop(conn_deps);
 
         // Graceful shutdown: accepting has stopped (the loop broke). Cancel every
         // in-flight connection so it leaves its read park and runs its close path
@@ -1183,13 +1256,107 @@ fn handle_pipeline_result(
     }
 }
 
-/// One pod connection: read frames, tap them to the frame log, decode, feed the
-/// FSM, assemble segments, and hand them to the pipeline queue.
-#[allow(clippy::too_many_arguments)]
-async fn connection(
+/// Complete the TLS-PSK handshake on an accepted socket and return the session
+/// plus the authenticated pod identity — the PSK identity the client proved it
+/// holds the key for. `None` means the peer never authenticated: the caller
+/// returns immediately, dropping the socket and releasing its accept-gate permit.
+///
+/// The handshake runs here, in the per-connection task, rather than in the accept
+/// loop: a stalled peer must not delay the next `accept`, and the permit is
+/// already held, so the deadline below is what bounds an unauthenticated peer's
+/// hold on it.
+async fn tls_handshake(
     stream: TcpStream,
+    tls: &TlsAccept,
     peer: std::net::SocketAddr,
     conn_seq: u64,
+    jsonl: &JsonlHandle,
+    shutdown: &CancellationToken,
+) -> Option<(tokio_openssl::SslStream<TcpStream>, Arc<str>)> {
+    let refused = |detail: String| {
+        jsonl.emit(
+            "conn_handshake_failed",
+            &json!({
+                "peer": peer.to_string(),
+                "conn_seq": conn_seq,
+                "detail": detail,
+            }),
+        );
+    };
+    let session = match Ssl::new(&tls.ssl) {
+        Ok(session) => session,
+        Err(e) => {
+            refused(format!("ssl session: {e}"));
+            return None;
+        }
+    };
+    let mut stream = match tokio_openssl::SslStream::new(session, stream) {
+        Ok(stream) => stream,
+        Err(e) => {
+            refused(format!("ssl stream: {e}"));
+            return None;
+        }
+    };
+    let accepted = tokio::select! {
+        _ = shutdown.cancelled() => {
+            refused("shutdown during handshake".to_string());
+            return None;
+        }
+        r = tokio::time::timeout(
+            tls.deadline,
+            std::pin::Pin::new(&mut stream).accept(),
+        ) => r,
+    };
+    match accepted {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // Unknown identity and wrong key both land here: the PSK callback
+            // returned no key, or the client's Finished failed to verify.
+            refused(e.to_string());
+            return None;
+        }
+        Err(_elapsed) => {
+            refused("handshake deadline".to_string());
+            return None;
+        }
+    }
+    // The identity is whatever the client sent *and* proved a key for — the
+    // callback only supplies a key for identities in the table, and the handshake
+    // only completes if both sides derived the same secret from it.
+    let identity = match stream.ssl().psk_identity() {
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(identity) => Arc::<str>::from(identity),
+            Err(_) => {
+                refused("psk identity is not utf-8".to_string());
+                return None;
+            }
+        },
+        None => {
+            refused("handshake completed without a psk identity".to_string());
+            return None;
+        }
+    };
+    jsonl.emit(
+        "conn_authenticated",
+        &json!({
+            "peer": peer.to_string(),
+            "conn_seq": conn_seq,
+            "pod_id": identity.as_ref(),
+            "cipher": stream.ssl().current_cipher().map(|c| c.name()),
+            "tls_version": stream.ssl().version_str(),
+        }),
+    );
+    Some((stream, identity))
+}
+
+/// Everything a connection task needs that does not vary between connections:
+/// the server's configuration, sinks, shared registries, counters, and the TLS
+/// accept parameters. Built once at `run` and cloned per accepted socket, so a
+/// new per-connection dependency is one field here instead of another positional
+/// argument on [`connection`].
+#[derive(Clone)]
+struct ConnDeps {
+    tls: TlsAccept,
     config: Arc<Config>,
     jsonl: JsonlHandle,
     ledger: Arc<Mutex<ResumeLedger>>,
@@ -1205,8 +1372,46 @@ async fn connection(
     playback_events: PlaybackEventFn,
     playback_registry: PlaybackRegistry,
     listener: Option<Arc<ListenerHandle>>,
+}
+
+/// One pod connection: complete the TLS-PSK handshake, then read frames, tap
+/// them to the frame log, decode, feed the FSM, assemble segments, and hand them
+/// to the pipeline queue.
+async fn connection(
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    conn_seq: u64,
+    deps: ConnDeps,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let ConnDeps {
+        tls,
+        config,
+        jsonl,
+        ledger,
+        registry,
+        open_logs,
+        prune_coord,
+        recording_failed,
+        item_tx,
+        shutdown,
+        telemetry_outside_segment,
+        clock_step_clamps,
+        playback_stats,
+        playback_events,
+        playback_registry,
+        listener,
+    } = deps;
+
+    // Authenticate before anything else happens on this socket: no frame log
+    // opens, no FSM exists, and nothing reaches the pipeline until the peer has
+    // proved it holds a provisioned pod key.
+    let (stream, authenticated_pod_id) =
+        match tls_handshake(stream, &tls, peer, conn_seq, &jsonl, &shutdown).await {
+            Some(pair) => pair,
+            None => return,
+        };
+
     let recording_on = config.record.enabled && !recording_failed.load(Ordering::Relaxed);
 
     // Supersede plumbing: `cancel` lets a later same-pod connection terminate
@@ -1224,9 +1429,11 @@ async fn connection(
     let _finished_guard = finished.clone().drop_guard();
     let mut registered_pod: Option<String> = None;
 
-    // Split the socket: the ingest loop reads from `rd`; the write half is handed
-    // to a per-pod paced playback writer once `Hello` identifies the pod.
-    let (mut rd, wr) = stream.into_split();
+    // Split the TLS session: the ingest loop reads from `rd`; the write half is
+    // handed to a per-pod paced playback writer once `Hello` identifies the pod.
+    // `tokio::io::split` works over any `AsyncRead + AsyncWrite`, so both halves
+    // ride the one encrypted session.
+    let (mut rd, wr) = tokio::io::split(stream);
     let mut write_half = Some(wr);
     // Cancels this connection's playback writer on close, aborting any in-flight
     // job. The writer is spawned post-`Hello`; a pre-`Hello` death never spawns.
@@ -1388,6 +1595,25 @@ async fn connection(
             tap_listener(listener.as_ref(), &mut listener_pod, ev, conn_seq).await;
             match ev {
                 SessionEvent::HelloAccepted { pod_id, .. } => {
+                    // Identity binding: the pod id the FSM accepted off the wire
+                    // must be the identity the handshake authenticated. Checked
+                    // here, before the room lookup, the recorder rename, registry
+                    // registration, and any ledger or record-store touch — a
+                    // mismatched `Hello` must leave no trace attributed to either
+                    // id. The ingest FSM stays transport-agnostic; this layer owns
+                    // both facts, so the enforcement lives here.
+                    if pod_id.as_str() != authenticated_pod_id.as_ref() {
+                        jsonl.emit(
+                            "hello_identity_mismatch",
+                            &json!({
+                                "authenticated_pod_id": authenticated_pod_id.as_ref(),
+                                "hello_pod_id": pod_id,
+                                "conn_seq": conn_seq,
+                            }),
+                        );
+                        fatal_close = true;
+                        break 'read;
+                    }
                     let room = config.room_for(pod_id);
                     current_room = room.room().to_string();
                     recorder.on_hello(pod_id, &accept_iso, conn_seq, host_rx, &framed);
@@ -1987,9 +2213,15 @@ mod tests {
     }
 
     fn hello(source: ChannelSource) -> StreamFrame {
+        hello_from(TEST_POD_ID, source)
+    }
+
+    /// A `Hello` claiming `pod_id` — the identity-binding tests need one that
+    /// disagrees with the authenticated PSK identity.
+    fn hello_from(pod_id: &str, source: ChannelSource) -> StreamFrame {
         StreamFrame::Hello(Hello {
             version: AUDIO_PROTOCOL_VERSION,
-            pod_id: heapless::String::try_from("pod-srv").unwrap(),
+            pod_id: heapless::String::try_from(pod_id).unwrap(),
             sample_rate_hz: 16_000,
             bits_per_sample: 16,
             channels: 1,
@@ -2015,7 +2247,7 @@ mod tests {
 
     /// Read one length-prefixed wire frame off `client` and decode it — the
     /// server's half of the socket (playback writes, in particular).
-    async fn read_frame(client: &mut TcpStream) -> StreamFrame {
+    async fn read_frame<S: tokio::io::AsyncRead + Unpin>(client: &mut S) -> StreamFrame {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut len = [0u8; 2];
             client.read_exact(&mut len).await.unwrap();
@@ -2029,6 +2261,57 @@ mod tests {
         .expect("server frame within timeout")
     }
 
+    /// The pod identity every in-crate server test authenticates as, and its key.
+    const TEST_POD_ID: &str = "pod-srv";
+    const TEST_PSK: [u8; 32] = [0x5a; 32];
+
+    /// Path to the process-wide 0600 PSK file naming [`TEST_POD_ID`]. The tempdir
+    /// is leaked deliberately: it must outlive every test in the binary, and the
+    /// process exit reclaims it.
+    fn test_psk_file() -> &'static Path {
+        static PSK_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        PSK_FILE.get_or_init(|| {
+            let dir = Box::leak(Box::new(tempfile::tempdir().expect("psk tempdir")));
+            let path = dir.path().join("psk.toml");
+            let hex = crate::psk::psk_hex(&TEST_PSK);
+            crate::psk::write_secret_file(&path, &format!("{TEST_POD_ID} = \"{hex}\"\n"))
+                .expect("write psk file");
+            path
+        })
+    }
+
+    /// Parse a test config, prefixing the shared `pod_psk_file` so every server a
+    /// test binds accepts exactly [`TEST_POD_ID`]. Test configs are written
+    /// without that field and gain it here rather than repeating the path.
+    fn test_config(text: &str) -> Result<Config, toml::de::Error> {
+        Config::parse(&format!("pod_psk_file = {:?}\n{text}", test_psk_file()))
+    }
+
+    /// Connect and complete the handshake as [`TEST_POD_ID`] — the stand-in for a
+    /// provisioned pod in every test below.
+    async fn connect_pod(addr: std::net::SocketAddr) -> tokio_openssl::SslStream<TcpStream> {
+        try_connect_pod_as(addr, TEST_POD_ID, TEST_PSK)
+            .await
+            .expect("tls handshake")
+    }
+
+    /// Attempt a handshake presenting `pod_id` and `key`. The error case is the
+    /// point for the unknown-identity and wrong-key tests.
+    async fn try_connect_pod_as(
+        addr: std::net::SocketAddr,
+        pod_id: &str,
+        key: [u8; 32],
+    ) -> Result<tokio_openssl::SslStream<TcpStream>, String> {
+        let ctx = crate::psk::client_context(pod_id, key).expect("client context");
+        let tcp = TcpStream::connect(addr).await.expect("tcp connect");
+        let mut stream =
+            tokio_openssl::SslStream::new(Ssl::new(&ctx).expect("client ssl"), tcp).expect("wrap");
+        match std::pin::Pin::new(&mut stream).connect().await {
+            Ok(()) => Ok(stream),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Build a config bound to an ephemeral loopback port, recording into `dir`.
     fn config(dir: &Path, record: bool) -> Arc<Config> {
         let text = format!(
@@ -2037,7 +2320,7 @@ mod tests {
              [pods.pod-srv]\nroom = \"kitchen\"\n",
             dir.to_str().unwrap()
         );
-        Arc::new(Config::parse(&text).expect("config parses"))
+        Arc::new(test_config(&text).expect("config parses"))
     }
 
     /// Spawn a server on an ephemeral port, returning its address, the JSONL
@@ -2072,6 +2355,7 @@ mod tests {
         config: Arc<Config>,
         jsonl: JsonlHandle,
         reg: Option<PlaybackRegistry>,
+        handshake_deadline: Option<Duration>,
     ) -> (
         std::net::SocketAddr,
         tokio::sync::oneshot::Sender<()>,
@@ -2080,6 +2364,9 @@ mod tests {
         let (mut server, addr, stop_tx, stop_rx) = bind_with_stop(config, jsonl, None).await;
         if let Some(reg) = reg {
             server = server.with_playback_registry_override(reg);
+        }
+        if let Some(deadline) = handshake_deadline {
+            server = server.with_handshake_deadline(deadline);
         }
         let join = tokio::spawn(async move {
             server
@@ -2100,7 +2387,19 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
-        spawn_server_inner(config, jsonl, None).await
+        spawn_server_inner(config, jsonl, None, None).await
+    }
+
+    async fn spawn_server_with_handshake_deadline(
+        config: Arc<Config>,
+        jsonl: JsonlHandle,
+        deadline: Duration,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_server_inner(config, jsonl, None, Some(deadline)).await
     }
 
     /// Like `spawn_server`, but injects a playback registry the caller retains,
@@ -2114,7 +2413,7 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
-        spawn_server_inner(config, jsonl, Some(reg)).await
+        spawn_server_inner(config, jsonl, Some(reg), None).await
     }
 
     /// Spawn a file-backed JSONL sink, returning the emit handle, the writer's
@@ -2143,7 +2442,7 @@ mod tests {
              [brain]\nmode = \"wav\"\n{clip_line}",
             store.to_str().unwrap(),
         );
-        Arc::new(Config::parse(&text).expect("config parses"))
+        Arc::new(test_config(&text).expect("config parses"))
     }
 
     #[tokio::test]
@@ -2408,7 +2707,7 @@ mod tests {
              [brain]\nmode = \"echo\"\n",
             dir.path().join("store").to_str().unwrap(),
         );
-        let cfg = Arc::new(Config::parse(&text).expect("config parses"));
+        let cfg = Arc::new(test_config(&text).expect("config parses"));
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
         let (brain, _, _stats) = build_brain(&cfg, &handle).unwrap();
@@ -2450,7 +2749,7 @@ mod tests {
              model = \"whisper-small\"\nlanguage = \"en\"\n",
             dir.path().join("store").to_str().unwrap(),
         );
-        let cfg = Arc::new(Config::parse(&text).expect("config parses"));
+        let cfg = Arc::new(test_config(&text).expect("config parses"));
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
         let transcriber = build_transcriber(&cfg, &handle).unwrap();
@@ -2493,7 +2792,7 @@ mod tests {
              model = \"kokoro\"\nvoice = \"af_heart\"\n",
             dir.path().join("store").to_str().unwrap(),
         );
-        let cfg = Arc::new(Config::parse(&text).expect("config parses"));
+        let cfg = Arc::new(test_config(&text).expect("config parses"));
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
         let synthesizer = build_synthesizer(&cfg, &handle).unwrap();
@@ -2775,7 +3074,7 @@ mod tests {
         // A pod connects and identifies itself; the server registers it and spawns
         // a paced playback writer on the write half, which writes one leading
         // `Hello` back before any playback.
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_pod(addr).await;
         client
             .write_all(&framed(&hello(ChannelSource::AsrBeam)))
             .await
@@ -2821,7 +3120,7 @@ mod tests {
         // A pod connects and identifies itself; the writer spawned on its write
         // half emits a `HelloWritten` event, which the wired adapter turns into a
         // `playback_hello` JSONL line naming the pod.
-        let client = TcpStream::connect(addr).await.unwrap();
+        let client = connect_pod(addr).await;
         {
             let mut c = client;
             c.write_all(&framed(&hello(ChannelSource::AsrBeam)))
@@ -2907,7 +3206,7 @@ mod tests {
 
         let (addr, stop, run_join) = spawn_server(config(&store, true), handle.clone()).await;
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_pod(addr).await;
         for f in [
             hello(ChannelSource::AsrBeam),
             StreamFrame::SegmentStart(SegmentStart {
@@ -3011,7 +3310,7 @@ mod tests {
 
         // One complete segment, so the queue's `pushed` counter is non-zero and
         // a telemetry-outside-segment frame (before any SegmentStart) is tallied.
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_pod(addr).await;
         for f in [
             hello(ChannelSource::AsrBeam),
             // Telemetry with no segment open → discarded-but-counted by the FSM.
@@ -3100,14 +3399,14 @@ mod tests {
              [pods.pod-srv]\nroom = \"kitchen\"\n",
             store.to_str().unwrap()
         );
-        let config = Arc::new(Config::parse(&text).unwrap());
+        let config = Arc::new(test_config(&text).unwrap());
         let (handle, join) =
             jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
                 .await
                 .unwrap();
         let (addr, stop, run_join) = spawn_server(config, handle.clone()).await;
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_pod(addr).await;
         client
             .write_all(&framed(&hello(ChannelSource::AsrBeam)))
             .await
@@ -3224,7 +3523,7 @@ mod tests {
         // Open a segment and stream audio, but never send `SegmentEnd`: the
         // segment is still open on the server, and the client stays connected
         // (the server task is parked in its read) when shutdown arrives.
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_pod(addr).await;
         for f in [
             hello(ChannelSource::AsrBeam),
             StreamFrame::SegmentStart(SegmentStart {
@@ -3277,7 +3576,7 @@ mod tests {
         let (addr, stop, run_join) =
             spawn_server(config(&dir.path().join("store"), false), handle.clone()).await;
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_pod(addr).await;
         client
             .write_all(&framed(&hello(ChannelSource::Stereo)))
             .await
@@ -3322,7 +3621,7 @@ mod tests {
                 .unwrap();
         let (addr, stop, run_join) = spawn_server(config(&store, true), handle.clone()).await;
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_pod(addr).await;
         for f in [
             hello(ChannelSource::AsrBeam),
             StreamFrame::SegmentStart(SegmentStart {
@@ -3364,6 +3663,345 @@ mod tests {
         assert_eq!(events_named(&lines, "tracking").len(), 1);
     }
 
+    /// An identity absent from the key table cannot complete the handshake, so
+    /// no session, no `Hello`, and no connection state ever exist for it: an
+    /// unknown peer is refused before the ingest FSM sees a byte.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_psk_identity_fails_the_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let (addr, stop, run_join) =
+            spawn_server(config(&dir.path().join("store"), false), handle.clone()).await;
+
+        let err = try_connect_pod_as(addr, "pod-stranger", TEST_PSK)
+            .await
+            .expect_err("unknown identity must not handshake");
+        assert!(!err.is_empty(), "handshake error is reported: {err}");
+
+        wait_for_event(&jsonl_path, "conn_handshake_failed", |v| {
+            v["event"] == "conn_handshake_failed"
+        })
+        .await;
+
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        assert!(
+            events_named(&lines, "conn_authenticated").is_empty(),
+            "no peer authenticated: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "conn_hello").is_empty(),
+            "no Hello was ever processed: {lines:?}"
+        );
+    }
+
+    /// The accepted link speaks exactly the pinned parameters. Forward secrecy
+    /// is what ECDHE was chosen for, so a widened cipher list (a plain `PSK-*`
+    /// suite has none) or a version drift must fail here — both peers share
+    /// `pin_link_params`, so nothing else in the suite would notice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticated_link_negotiates_the_pinned_suite_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let (addr, stop, run_join) =
+            spawn_server(config(&dir.path().join("store"), false), handle.clone()).await;
+
+        let client = connect_pod(addr).await;
+        let authed = wait_for_event(&jsonl_path, "conn_authenticated", |v| {
+            v["event"] == "conn_authenticated"
+        })
+        .await;
+        assert_eq!(authed["cipher"], crate::psk::PSK_CIPHERSUITE);
+        assert_eq!(authed["tls_version"], "TLSv1.2");
+
+        drop(client);
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+    }
+
+    /// A client holding the right key but offering anything other than the
+    /// pinned parameters gets no session: the forward-secrecy-free `PSK-*` suite
+    /// and TLS 1.3 are both refused by the server's own pinning.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpinned_clients_are_refused_even_with_the_right_key() {
+        use openssl::ssl::{SslContextBuilder, SslVersion};
+
+        /// A client context with the correct identity and key, but the caller's
+        /// choice of TLS parameters instead of `pin_link_params`.
+        fn loose_client_context(tweak: impl FnOnce(&mut SslContextBuilder)) -> SslContext {
+            let mut builder = SslContext::builder(SslMethod::tls_client()).expect("builder");
+            tweak(&mut builder);
+            builder.set_psk_client_callback(|_ssl, _hint, identity_out, secret| {
+                let bytes = TEST_POD_ID.as_bytes();
+                identity_out[..bytes.len()].copy_from_slice(bytes);
+                identity_out[bytes.len()] = 0;
+                secret[..TEST_PSK.len()].copy_from_slice(&TEST_PSK);
+                Ok(TEST_PSK.len())
+            });
+            builder.build()
+        }
+
+        async fn expect_no_handshake(addr: std::net::SocketAddr, ctx: SslContext, what: &str) {
+            let tcp = TcpStream::connect(addr).await.expect("tcp connect");
+            let mut stream =
+                tokio_openssl::SslStream::new(Ssl::new(&ctx).expect("ssl"), tcp).expect("wrap");
+            let outcome = std::pin::Pin::new(&mut stream).connect().await;
+            assert!(outcome.is_err(), "{what} must not complete a handshake");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let (addr, stop, run_join) =
+            spawn_server(config(&dir.path().join("store"), false), handle.clone()).await;
+
+        let no_forward_secrecy = loose_client_context(|b| {
+            b.set_min_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+            b.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+            b.set_cipher_list("PSK-CHACHA20-POLY1305").unwrap();
+        });
+        expect_no_handshake(addr, no_forward_secrecy, "a plain-PSK suite").await;
+
+        let tls13_only = loose_client_context(|b| {
+            b.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+            b.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+        });
+        expect_no_handshake(addr, tls13_only, "a TLS 1.3 client").await;
+
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        assert!(
+            events_named(&lines, "conn_authenticated").is_empty(),
+            "no unpinned peer authenticated: {lines:?}"
+        );
+    }
+
+    /// A peer that skips TLS entirely and writes framed protocol bytes at the
+    /// listener is refused at the handshake: no `Hello` is processed and no audio
+    /// is ever attributed to whatever pod id it claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plaintext_peer_is_refused_before_any_frame_is_processed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let (addr, stop, run_join) = spawn_server(config(&store, true), handle.clone()).await;
+
+        let mut plain = TcpStream::connect(addr).await.unwrap();
+        plain
+            .write_all(&framed(&hello_from(TEST_POD_ID, ChannelSource::AsrBeam)))
+            .await
+            .unwrap();
+        for f in [
+            StreamFrame::SegmentStart(SegmentStart {
+                segment_id: 1,
+                base_sample_index: 0,
+                base_device_ts_us: 0,
+                preroll_samples: 0,
+            }),
+            audio(1, 0, 160),
+        ] {
+            // A refused peer's writes may fail once the server drops the socket;
+            // the point is only that nothing it sent was ever processed.
+            let _ = plain.write_all(&framed(&f)).await;
+        }
+
+        wait_for_event(&jsonl_path, "conn_handshake_failed", |v| {
+            v["event"] == "conn_handshake_failed"
+        })
+        .await;
+
+        drop(plain);
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        assert!(
+            events_named(&lines, "conn_authenticated").is_empty(),
+            "no plaintext peer authenticated: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "conn_hello").is_empty(),
+            "no Hello was processed: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "segment_closed").is_empty(),
+            "no segment was attributed: {lines:?}"
+        );
+        assert!(
+            !store.exists() || std::fs::read_dir(&store).unwrap().next().is_none(),
+            "the record store stayed empty"
+        );
+    }
+
+    /// A known identity with the wrong key fails the same way: the PSK secret,
+    /// not the identity string, is what authenticates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wrong_key_for_known_identity_fails_the_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let (addr, stop, run_join) =
+            spawn_server(config(&dir.path().join("store"), false), handle.clone()).await;
+
+        try_connect_pod_as(addr, TEST_POD_ID, [0xa5; 32])
+            .await
+            .expect_err("wrong key must not handshake");
+
+        wait_for_event(&jsonl_path, "conn_handshake_failed", |v| {
+            v["event"] == "conn_handshake_failed"
+        })
+        .await;
+
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        assert!(
+            events_named(&lines, "conn_authenticated").is_empty(),
+            "no peer authenticated: {lines:?}"
+        );
+    }
+
+    /// A peer that completes the TCP connect and then sends nothing is dropped at
+    /// the handshake deadline, and the accept-gate permit it held comes back. The
+    /// cap is one connection, so the second, real pod can only authenticate if the
+    /// stalled peer's slot was actually released — that is what makes this a test
+    /// of the permit and not just of the timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stalled_handshake_is_dropped_at_the_deadline_and_frees_its_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let text = format!(
+            "listen_addr = \"127.0.0.1:0\"\nmax_connections = 1\n\
+             [record]\nenabled = false\ndir = {:?}\n",
+            dir.path().join("store").to_str().unwrap()
+        );
+        let config = Arc::new(test_config(&text).unwrap());
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let (addr, stop, run_join) = spawn_server_with_handshake_deadline(
+            config,
+            handle.clone(),
+            Duration::from_millis(300),
+        )
+        .await;
+
+        // Connect and send nothing at all. The socket is held open for the whole
+        // wait, so what ends the connection is the deadline and not an EOF.
+        let stalled = TcpStream::connect(addr).await.unwrap();
+        let refused = wait_for_event(&jsonl_path, "conn_handshake_failed", |v| {
+            v["event"] == "conn_handshake_failed"
+        })
+        .await;
+        assert_eq!(refused["detail"], "handshake deadline");
+        drop(stalled);
+
+        let pod = try_connect_pod_as(addr, TEST_POD_ID, TEST_PSK)
+            .await
+            .expect("the released permit admits a real pod");
+        wait_for_event(&jsonl_path, "conn_authenticated", |v| {
+            v["event"] == "conn_authenticated"
+        })
+        .await;
+
+        drop(pod);
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        assert!(
+            events_named(&lines, "conn_rejected").is_empty(),
+            "the pod took the freed slot rather than being turned away: {lines:?}"
+        );
+        // The stalled peer never authenticated; the pod did, exactly once.
+        assert_eq!(events_named(&lines, "conn_authenticated").len(), 1);
+    }
+
+    /// A `Hello` claiming a pod other than the authenticated identity is fatal
+    /// before any registration or attribution: an authenticated pod cannot
+    /// impersonate its neighbour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hello_claiming_another_pod_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let reg: PlaybackRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (addr, stop, run_join) = spawn_server_with_playback_registry(
+            config(&dir.path().join("store"), false),
+            handle.clone(),
+            reg.clone(),
+        )
+        .await;
+
+        let mut client = connect_pod(addr).await;
+        client
+            .write_all(&framed(&hello_from("pod-victim", ChannelSource::AsrBeam)))
+            .await
+            .unwrap();
+
+        let mismatch = wait_for_event(&jsonl_path, "hello_identity_mismatch", |v| {
+            v["event"] == "hello_identity_mismatch"
+        })
+        .await;
+        assert_eq!(mismatch["authenticated_pod_id"], TEST_POD_ID);
+        assert_eq!(mismatch["hello_pod_id"], "pod-victim");
+
+        drop(client);
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        assert!(
+            events_named(&lines, "conn_hello").is_empty(),
+            "the claimed pod was never registered: {lines:?}"
+        );
+        assert!(
+            reg.lock().unwrap().is_empty(),
+            "no playback writer was installed for either identity"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn connection_cap_rejects_beyond_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -3373,22 +4011,23 @@ mod tests {
              [record]\nenabled = false\ndir = {:?}\n",
             dir.path().join("store").to_str().unwrap()
         );
-        let config = Arc::new(Config::parse(&text).unwrap());
+        let config = Arc::new(test_config(&text).unwrap());
         let (handle, join) =
             jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
                 .await
                 .unwrap();
         let (addr, stop, run_join) = spawn_server(config, handle.clone()).await;
 
-        // First connection holds its permit (opened, kept idle).
-        let hold = TcpStream::connect(addr).await.unwrap();
-        hold.set_nodelay(true).unwrap();
+        // First connection holds its permit (handshaked, then kept idle).
+        let hold = connect_pod(addr).await;
+        hold.get_ref().set_nodelay(true).unwrap();
         // Give the accept loop time to take the only permit.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Second connection is accepted then rejected for lack of a permit.
-        let rejected = TcpStream::connect(addr).await.unwrap();
-        let mut rejected = rejected;
+        // Second connection is accepted then rejected for lack of a permit — the
+        // rejection precedes any handshake, so this peer stays a bare TCP client
+        // and only observes the close.
+        let mut rejected = TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 1];
         let _ = rejected.read(&mut buf).await; // server closes it
         drop(rejected);
@@ -3423,7 +4062,7 @@ mod tests {
         .await;
 
         // First connection says hello and stays parked (socket held open).
-        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut first = connect_pod(addr).await;
         first
             .write_all(&framed(&hello(ChannelSource::AsrBeam)))
             .await
@@ -3445,7 +4084,7 @@ mod tests {
         .await;
 
         // Second connection, same pod id, supersedes the first.
-        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut second = connect_pod(addr).await;
         second
             .write_all(&framed(&hello(ChannelSource::AsrBeam)))
             .await
@@ -3518,7 +4157,7 @@ mod tests {
             spawn_server(config(&dir.path().join("store"), false), handle.clone()).await;
 
         // First connection opens segment 7 and leaves it open (no SegmentEnd).
-        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut first = connect_pod(addr).await;
         for f in [
             hello(ChannelSource::AsrBeam),
             StreamFrame::SegmentStart(SegmentStart {
@@ -3542,7 +4181,7 @@ mod tests {
         // Second connection, same pod, resumes segment 7. The server awaits the
         // first task's truncating close (ledger note) before reading this
         // SegmentStart, so the resume is recognized deterministically.
-        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut second = connect_pod(addr).await;
         for f in [
             hello(ChannelSource::AsrBeam),
             StreamFrame::SegmentStart(SegmentStart {
@@ -3633,7 +4272,7 @@ mod tests {
              [pods.pod-srv]\nroom = \"kitchen\"\n",
             store.to_str().unwrap()
         );
-        let config = Arc::new(Config::parse(&text).unwrap());
+        let config = Arc::new(test_config(&text).unwrap());
         let (handle, join) =
             jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
                 .await
@@ -3686,14 +4325,14 @@ mod tests {
              [pods.pod-srv]\nroom = \"kitchen\"\n",
             store.to_str().unwrap()
         );
-        let config = Arc::new(Config::parse(&text).unwrap());
+        let config = Arc::new(test_config(&text).unwrap());
         let (handle, join) =
             jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
                 .await
                 .unwrap();
         let (addr, stop, run_join) = spawn_server(config, handle.clone()).await;
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut client = connect_pod(addr).await;
         client
             .write_all(&framed(&hello(ChannelSource::AsrBeam)))
             .await
@@ -3777,7 +4416,7 @@ mod tests {
         // only the 2-byte length prefix of a second frame and close the socket —
         // a mid-frame tear. The payload read hits EOF → `ReadError`, and the open
         // segment finalizes truncated (a ledger note for the resume).
-        let mut first = TcpStream::connect(addr).await.unwrap();
+        let mut first = connect_pod(addr).await;
         for f in [
             hello(ChannelSource::AsrBeam),
             StreamFrame::SegmentStart(SegmentStart {
@@ -3803,7 +4442,7 @@ mod tests {
         .await;
 
         // Second, independent connection resumes segment 5.
-        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut second = connect_pod(addr).await;
         for f in [
             hello(ChannelSource::AsrBeam),
             StreamFrame::SegmentStart(SegmentStart {
@@ -3945,7 +4584,7 @@ mod tests {
     #[test]
     fn build_listener_requires_oww_and_endpointer() {
         // No `[wake]` table: no streaming wake, so no listener (models never load).
-        let c = Config::parse("listen_addr = \"10.0.0.5:7380\"").unwrap();
+        let c = test_config("listen_addr = \"10.0.0.5:7380\"\n").unwrap();
         assert!(
             build_listener(&c).unwrap().is_none(),
             "no wake ⇒ no listener"
@@ -3953,7 +4592,7 @@ mod tests {
 
         // Bypass wake + an endpointer: the batch bypass path has no OWW to stream,
         // so the listener stays unwired even with Silero configured.
-        let c = Config::parse(
+        let c = test_config(
             "listen_addr = \"10.0.0.5:7380\"\n[wake]\nmode = \"bypass\"\n[endpointer]\nmodel = \"/m/s.onnx\"",
         )
         .unwrap();
@@ -3964,7 +4603,7 @@ mod tests {
 
         // OWW wake but no `[endpointer]`: no Silero endpointer to carve utterances,
         // so no listener — and it returns before attempting any model load.
-        let c = Config::parse(
+        let c = test_config(
             "listen_addr = \"10.0.0.5:7380\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/w.onnx\"",
         )
         .unwrap();

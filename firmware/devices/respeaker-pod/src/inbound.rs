@@ -576,13 +576,11 @@ pub(crate) fn consume_frames(
 /// the held head frame must be re-offered to the sink each tick so a freed slot can
 /// drain it — otherwise the TCP window never reopens (circular dependency → livelock).
 pub(crate) fn drain_inbound(
-    stream: &mut std::net::TcpStream,
+    stream: &mut dyn std::io::Read,
     accum: &mut FrameAccumulator,
     sink: &mut dyn PlaybackSink,
     state: &mut InboundConnectionState,
 ) -> std::io::Result<DrainOutcome> {
-    use std::io::Read;
-
     let buf_len = accum.buf.len();
     // Skip the read when full (backpressure). A read(&mut []) would return Ok(0),
     // which the EOF arm misreads as disconnect. The consume_frames retry below still
@@ -649,7 +647,7 @@ pub(crate) struct PumpOutcome {
 /// once pumping, subsequent reads are driven by progress, so an armed-but-quiet wake
 /// costs at most one trailing `WouldBlock` read.
 pub(crate) fn pump_inbound(
-    stream: &mut std::net::TcpStream,
+    stream: &mut dyn std::io::Read,
     accum: &mut FrameAccumulator,
     sink: &mut dyn PlaybackSink,
     state: &mut InboundConnectionState,

@@ -272,3 +272,59 @@ fn realtime_pacing_wall_time_meets_capture_span_lower_bound() {
         facts.capture_span_us
     );
 }
+
+/// An unusable key file stops the tool before it costs a connection attempt,
+/// with a machine-readable reason and a hard-failure exit — the only key-loading
+/// failure path an operator can hit, and the one every other test's valid
+/// `--psk-file` hides. The key never reaches the message; a missing file has
+/// none, and the 63-character case must be named without echoing its contents.
+#[test]
+fn unusable_psk_file_exits_hard_with_a_named_reason() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("absent.hex");
+    let short_path = dir.path().join("short.hex");
+    let short_hex = "a".repeat(63);
+    std::fs::write(&short_path, &short_hex).expect("write short key file");
+
+    for (path, expect_in_detail) in [(&missing, "absent.hex"), (&short_path, "63 characters")] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_replay-pod"))
+            .arg("--connect")
+            .arg("127.0.0.1:9")
+            .arg("--pod-id")
+            .arg("pod-replay")
+            .arg("--psk-file")
+            .arg(path)
+            .arg(FIXTURE_PATH)
+            .output()
+            .expect("run replay-pod");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "hard failure for {}\n{stdout}",
+            path.display()
+        );
+        let lines: Vec<Value> = stdout
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+        let unusable: Vec<&Value> = lines
+            .iter()
+            .filter(|v| v["event"] == "psk_unusable")
+            .collect();
+        assert_eq!(unusable.len(), 1, "exactly one psk_unusable line: {stdout}");
+        let detail = unusable[0]["detail"].as_str().expect("detail is a string");
+        assert!(
+            detail.contains(path.to_str().unwrap()) && detail.contains(expect_in_detail),
+            "detail names the file and the reason: {detail}"
+        );
+        assert!(
+            lines.iter().all(|v| v["event"] != "replay_connected"),
+            "no connection was attempted: {stdout}"
+        );
+        assert!(
+            !stdout.contains(&short_hex),
+            "no key material in the output: {stdout}"
+        );
+    }
+}

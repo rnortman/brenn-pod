@@ -131,3 +131,36 @@ CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 # malloc-probe assertion is the detector for this and MUST NOT be weakened; if it still reports
 # external after this, that is a fresh discovery for human review.
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=n
+
+# TLS-PSK support for the pod↔host audio link. The link authenticates with one
+# per-pod pre-shared key (NVS `audio_psk`) under TLS 1.2
+# ECDHE-PSK-CHACHA20-POLY1305; the PSK identity string is the pod id, so the
+# handshake itself binds identity, and ECDHE keeps forward secrecy (plain-PSK
+# suites are deliberately not enabled).
+#
+# ESP_TLS_PSK_VERIFICATION is load-bearing beyond mbedTLS: it gates the
+# `psk_hint_key` field of the C `esp_tls_cfg` struct — and therefore the
+# bindgen'd `sys::esp_tls_cfg` field src/tls_link.rs populates directly. Without
+# it the field does not exist (build error), and even reaching a build no PSK
+# would be offered, leaving no ciphersuite overlap and a refused handshake: the
+# failure mode is closed, not silently plaintext.
+#
+# ChaCha20/Poly1305/ChaChaPoly are the AEAD half of the chosen suite (no AES-GCM
+# hardware dependency, and cheap on this core).
+#
+# The cert-based TLS path (used by TlsReachability against a public endpoint)
+# coexists with PSK. CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN must NOT be shrunk
+# globally — public endpoints send 16 KB records. The audio link's record-buffer
+# cost is managed by heap measurement, not by trimming a global that another test
+# depends on. The session's buffers are at their IDF defaults (16 KB in + 4 KB
+# out, internal RAM).
+# TODO(tls-link-bench-measure): measure that cost against HEAP_MIN_EVER_FLOOR; the
+# levers if it does not fit are MBEDTLS_DYNAMIC_BUFFER then
+# MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH, both global and both re-validated against
+# the cert-based path.
+CONFIG_ESP_TLS_PSK_VERIFICATION=y
+CONFIG_MBEDTLS_PSK_MODES=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_PSK=y
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y

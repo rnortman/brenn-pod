@@ -686,7 +686,9 @@ pub(crate) fn run_playback_sequence(
     // error is a real driver/bidir-init fault, surfaced as the distinct TxEnable phase.
     if let Err(e) = driver.tx_enable() {
         if e.code() == esp_idf_svc::sys::ESP_ERR_INVALID_STATE {
-            log::debug!("playback: tx_enable reports already-enabled (ESP_ERR_INVALID_STATE) — TX already RUNNING, proceeding");
+            log::debug!(
+                "playback: tx_enable reports already-enabled (ESP_ERR_INVALID_STATE) — TX already RUNNING, proceeding"
+            );
         } else {
             log::warn!("playback: tx_enable failed: {:?}", e);
             return PlaybackOutcome::I2sWriteFailed {
@@ -982,18 +984,9 @@ pub(crate) fn speaker_stream_init(
 // `PlaybackSink` trait, `is_valid_s16le_pcm`, `LogCountdown`, and `I2sStreamSink` live
 // in `audio_pipeline::playback`. The HIL-only `CountingSink` lives in `inbound.rs`.
 //
-// TODO(playback-auth): ACCEPTED RISK. The server→device audio channel is plaintext TCP
-// with no peer authentication, and the socket is always open (persistent connection).
-// Any on-LAN host answering on the audio address can play arbitrary audio. Since protocol
-// v3 the same unauthenticated channel also carries control frames: an on-path injector can
-// surgically silence the pod — `FlushPlayback` discards banked audio and mutes,
-// `EndOfAudio` forces the mute path — cutting an in-progress announcement/alert with one
-// 3-byte frame, seamlessly (no drop, no decode error). Each boundary that takes effect is
-// reflected in the periodic `eoa_mutes=` telemetry counter, and mark-FIFO overflow is
-// throttle-warned (an injected/runaway stream is at least observable), but neither is
-// authenticated. Accepted for now (LAN = security perimeter); fix is mutual TLS/PSK tracked
-// as `audio-auth`, whose threat model must now weigh remote mute/flush, not just audio
-// injection.
+// The inbound audio and control frames this sink consumes must arrive over an
+// authenticated transport; without that, playback injection and the
+// `FlushPlayback`/`EndOfAudio` mute paths are open to any reachable host.
 
 /// Build an `I2sStreamSink` wired to the `INBOUND_PCM_PRODUCER` ring half.
 ///

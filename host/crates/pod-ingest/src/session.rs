@@ -507,11 +507,9 @@ impl SessionFsm {
             self.fatal(ProtocolErrorKind::FormatMismatch, host_rx, out);
             return;
         }
-        // TODO(pod-auth-threat-model): `pod_id` is an unauthenticated wire value
-        // that keys the shared cross-connection `ResumeLedger` and drives
-        // record-store attribution. Any LAN peer can impersonate a pod. The
-        // trust model (LAN-trusted, device auth deferred) and any defense
-        // (peer-IP binding, pre-shared key) need an explicit decision.
+        // This FSM is transport-agnostic: it accepts whatever `pod_id` the wire
+        // carries. Binding that id to the authenticated peer identity is the
+        // server layer's responsibility — it owns both facts.
         let pod_id = hello.pod_id.as_str().to_owned();
         self.pod_id = Some(pod_id.clone());
         self.state = State::Idle;

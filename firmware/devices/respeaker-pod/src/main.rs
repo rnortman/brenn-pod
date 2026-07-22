@@ -47,6 +47,7 @@ mod netpoll;
 mod nvs;
 mod speaker;
 mod streamer;
+mod tls_link;
 mod xvf3800;
 
 #[cfg(target_os = "espidf")]
@@ -103,9 +104,9 @@ use net_tests::{
 };
 #[cfg(target_os = "espidf")]
 use nvs::{
-    handle_clear_wifi_credentials, handle_provision_audio, handle_provision_peer,
-    handle_provision_wifi, handle_set_vad_hangover, handle_set_vad_threshold, nvs_get_str,
-    open_wifi_nvs,
+    handle_clear_wifi_credentials, handle_provision_audio, handle_provision_audio_psk,
+    handle_provision_peer, handle_provision_wifi, handle_set_vad_hangover,
+    handle_set_vad_threshold, nvs_get_str, open_wifi_nvs,
 };
 #[cfg(target_os = "espidf")]
 use speaker::{
@@ -760,18 +761,25 @@ fn dispatch_request(req: Request) {
             backpressure_port,
             poll_readiness_port,
             rtd_port,
+            tls_psk_port,
+            tls_psk_bad_port,
         } => handle_provision_peer(
             host,
-            udp_port,
-            tcp_port,
-            tls_host,
-            tls_port,
-            inbound_frames_port,
-            backpressure_port,
-            poll_readiness_port,
-            rtd_port,
+            &crate::nvs::PeerEndpoints {
+                udp_port,
+                tcp_port,
+                tls_host,
+                tls_port,
+                inbound_frames_port,
+                backpressure_port,
+                poll_readiness_port,
+                rtd_port,
+                tls_psk_port,
+                tls_psk_bad_port,
+            },
         ),
         Command::ProvisionAudio { host, port } => handle_provision_audio(host, port),
+        Command::ProvisionAudioPsk { key } => handle_provision_audio_psk(key),
         Command::SetVadThreshold { threshold } => handle_set_vad_threshold(threshold),
         Command::SetVadHangover { hangover_ms } => handle_set_vad_hangover(hangover_ms),
         Command::ClearWifiCredentials => handle_clear_wifi_credentials(),

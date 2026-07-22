@@ -12,6 +12,7 @@ pub mod jsonl;
 pub mod pipeline;
 pub mod playback_router;
 pub mod prune;
+pub mod psk;
 pub mod recorder;
 pub mod replay;
 pub mod server;

@@ -40,17 +40,6 @@ DFU pod is acceptable. The `--port`→DFU→AC4 path is guaranteed (port_name al
 unaffected. Place the `TODO(podctl-dfu-serial)` comment at the `--serial` branch of `select()`
 when implemented.
 
-## `audio-auth`
-
-Production TLS/auth selection for the audio TCP stream: mbedTLS-PSK exposure via
-`EspTls` vs mutual TLS. Explicitly deferred from the MVP audio-transport milestone.
-The feasibility question (whether `esp-idf-svc`'s `EspTls` exposes PSK configuration
-at the Rust API level) should be verified before this milestone opens. Revisit-ifs
-that could force an earlier decision: off-LAN streaming, browser-based live
-monitoring. See `docs/adr/2026/06/09-audio-transport/decision.md` §Production auth.
-Reference: `TODO(audio-auth)` comment at the streamer TCP connect site in
-`firmware/devices/respeaker-pod/src/streamer.rs`.
-
 ## `espidf-lts-pin` — BLOCKED as of 2026-07-17 (external: awaiting an ESP-IDF LTS line that esp-idf-svc/hal support)
 
 ESP-IDF is pinned to v5.5.4, which is what esp-idf-svc 0.52 / esp-idf-hal 0.46 are tested
@@ -59,76 +48,6 @@ incompatible with it. Revisit: once an ESP-IDF LTS release and the esp-idf-svc/h
 tested/compatible version actually align, pin to that LTS line for OTA-longevity and long-term
 support. Referenced by `TODO(espidf-lts-pin)` at `ESP_IDF_VERSION` in
 `firmware/devices/respeaker-pod/.cargo/config.toml`.
-
-## `playback-auth`
-
-ACCEPTED RISK (deliberate decision, recorded for the speaker-RX-audio increment —
-`docs/adr/2026/06/21-speaker-rx-audio`).  `PlaybackSink` now drives the speaker amplifier
-via `I2sStreamSink`, and the server→device audio channel is plaintext TCP with no peer
-authentication.  Since the persistent-connection change the socket is *always open and
-always reading*, independent of VAD, so any on-LAN host that can reach the audio port can
-inject arbitrary audio (spoofed voice commands, covert audio) out of the speaker at any
-moment, with no segment gating to bound the window.  This is accepted for now: the audio
-server is treated as trusted and the LAN as the security perimeter.  The fix — mutual
-TLS/PSK on the audio connection — is tracked as the separate follow-on `audio-auth` and is
-NOT a blocker for the speaker-RX-audio work.  Re-evaluate this acceptance when `audio-auth`
-lands.  See `TODO(playback-auth)` comment at the playback sink abstraction in
-`firmware/devices/respeaker-pod/src/speaker.rs`.
-
-## `pod-auth-threat-model`
-
-Disposition (recorded 2026-07-18): LAN-trust accepted for now; revisit with `audio-auth` / device auth on `Hello`. Slug stays open pending that work.
-
-The audio protocol carries no device authentication: `Hello.pod_id` is a
-free-form string any LAN TCP peer supplies, and it keys the process-wide,
-cross-connection `ResumeLedger` and drives record-store attribution
-(`Segment.pod`/`room` → the training corpus and future Brenn utterance surface).
-So any host that can reach the listener can impersonate a pod — seeding or
-consuming a victim's resume entries (laundering or breaking the sample-count
-cross-check) or streaming audio attributed to a room it is not in. This trust
-model (LAN-trusted, real device auth deferred) predates this diff — it is
-inherited from `audio-receiver` — but the host architecture *widens* what
-`pod_id` controls, so the assumption needs an explicit decision recorded in the
-design/ADR. Options: document LAN-trust as accepted; bind ledger entries to the
-originating peer IP as cheap defense-in-depth (a mismatch downgrades to "fresh
-segment", the safe direction); or device auth (pre-shared key / TLS on `Hello`)
-before the corpus feeds model training. Deferred from the deep-review respond
-round (security-1). See `TODO(pod-auth-threat-model)` at the `pod_id` acceptance
-site in `feed_await_hello`, `host/crates/pod-ingest/src/session.rs`.
-
-Residuals from `ingest-flood-hardening` (per-pod store quotas landed 2026-07-18):
-per-pod byte quotas now bound a single spoofed identity's store footprint, but
-because `pod_id` is unauthenticated, three flood residuals belong to this threat
-model. (a) A flooder spoofing many *distinct* pod ids gets a full quota per
-identity (bounded only by the global cap) and can also consume up to
-`max_connections` connection slots (`host/crates/speech-surface/src/server.rs`,
-the `Semaphore::new(config.max_connections)` site). (b) Ingest has no real-time
-pacing — frames are consumed as fast as they arrive. (c) The shared drop-oldest
-segment queue still admits cross-pod eviction *pressure* in principle, though
-audio feeds now drop lossily per-connection rather than backing up globally. All
-three are consequences of unauthenticated pod identity and close only with real
-device auth on `Hello`.
-
-## `pod-identity-trust`
-
-Playback routing (`PlaybackRegistry` + router) is keyed on a self-asserted,
-unauthenticated pod identity: any LAN peer can send a `Hello` with an arbitrary
-`pod_id`, and the supersede registry hands routing to the latest claimant, so
-`SpeakCmd` audio for a pod id is written to whichever socket last claimed it. As of
-the HTTP STT/TTS + EchoBrain increment the router carries synthesized,
-household-derived audio through exactly this path — the trigger this TODO named.
-
-Disposition (recorded, not resolved): accepted for now. The deployment is a single
-household on a trusted LAN behind the operator's own firewall — the same trust
-envelope under which raw microphone audio already flows *inbound* unauthenticated,
-which is the strictly more sensitive direction. No per-pod token is added now; a
-takeover is loud because the supersede event is already JSONL-visible in the log.
-
-The mitigation path when the trust envelope changes (off-LAN streaming, untrusted
-peers) is the deferred `audio-auth` (TLS/PSK) candidate plus `pod-auth-threat-model`
-(device auth on `Hello`), which together would authenticate the peer and eliminate
-the impersonation surface. The slug stays open pending that work. Marked at
-`SpeakCmd.target` in `host/crates/speech-pipeline/src/types.rs`.
 
 ## `config-backend-parse-dont-validate` — BLOCKED as of 2026-07-18 (needs the `embedded` backend to land)
 
@@ -302,3 +221,96 @@ extra registered-test slot and per-run time cost, not just an obvious fix.
 See `TODO(post-feed-heap-durable-guard)` at `REGISTERED_TESTS` in
 `firmware/crates/device-protocol/src/lib.rs`.
 
+## `tls-link-bench-measure`
+
+The TLS-PSK audio link (`docs/adr/2026/07/22-pod--tls-and-auth/`) landed with the
+mbedTLS record buffers at their IDF defaults — 16 KB in + 4 KB out, roughly 20.5 KB
+of internal RAM for the one long-lived session, since plain `malloc` stays internal
+under `CONFIG_SPIRAM_USE_CAPS_ALLOC` — and the streamer thread's stack raised
+20480 → 28672 for the ECDHE handshake. Both numbers are engineering estimates that
+no bench run has confirmed: against the observed `mh_post` population (~76–78 KB
+POWERON, 67.9 KB post-flash outlier) and `HEAP_MIN_EVER_FLOOR = 53_248`, 20.5 KB
+plausibly fits but consumes most of the remaining margin.
+
+The measurement is the design's §7 plan and needs hardware: a full `make hil-test`
+suite run with the TLS link live, plus the two-invocation post-feed procedure from
+`docs/adr/2026/07/19-heap-gate-measure/` (a second, separate
+`RESPEAKER_HIL_ONLY=DeviceHealthCheck make hil-test` on the same boot), reading both
+the post-feed `min_heap` trough and the streamer stack HWM the health report carries.
+Expect a `HEAP_MIN_EVER_FLOOR` re-bake either way, combined with the sampling
+`heap-floor-post-flash-boot-path-offset` already wants and following that entry's
+"re-bake against `min()` of both populations" rule.
+
+If the trough does not clear the floor with ~25% headroom, the recorded fallback
+levers in preference order are `CONFIG_MBEDTLS_DYNAMIC_BUFFER=y` (allocate/free the
+SSL buffers by connection state) then `CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH=y`.
+Both are global and must be re-validated against `run_tls_reachability`, which
+speaks cert-based TLS to a public endpoint. Shrinking
+`CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN` is off the table for the same reason — public
+endpoints send 16 KB records.
+
+Deferred because it is a data-gathering session on the bench pod, not a code change:
+the numbers cannot be produced from the host side, and an unexpected reading gets
+human review before anything is re-baked to match it.
+
+Done = post-feed `min_heap` and streamer stack HWM recorded with the TLS link live,
+`HEAP_MIN_EVER_FLOOR` re-baked or explicitly confirmed against them, and the stack
+size either confirmed or tuned to the observed watermark.
+
+See `TODO(tls-link-bench-measure)` at the streamer thread's `.stack_size` in
+`firmware/devices/respeaker-pod/src/streamer.rs` and in the TLS-PSK block of
+`firmware/devices/respeaker-pod/sdkconfig.defaults`.
+
+## `esp-idf-svc-psk-wrapper-upstream`
+
+`firmware/devices/respeaker-pod/src/tls_link.rs` drops below the safe
+`esp_idf_svc::tls::EspTls` wrapper to raw `esp-tls` `sys` calls because of two
+defects in `esp-idf-svc-0.52.1/src/tls.rs`, both characterized in that module's doc
+comment: `Config::try_into_raw` (tls.rs:245-263) leaves `rcfg.psk_hint_key` pointing
+into a dead stack frame, and `EspTls::negotiate` (tls.rs:620) passes `cfg.non_block`
+as both the `asynch` selector and `rcfg.non_block`, which an adopted socket cannot
+survive. Neither is reported upstream, so every downstream user of PSK or of an
+adopted non-blocking socket hits them fresh, and this tree carries a local
+workaround with no path to deleting it.
+
+Deferred: filing on the `esp-rs/esp-idf-svc` tracker is an action against a
+third-party project taken in the maintainer's name, not a change to this repo.
+
+Done = both defects reported upstream with their reproductions, the issue numbers
+recorded in `tls_link.rs`'s doc comment. If upstream fixes them, `tls_link.rs` can
+be re-hosted on `EspTls` without touching callers.
+
+See `TODO(esp-idf-svc-psk-wrapper-upstream)` in the module doc comment of
+`firmware/devices/respeaker-pod/src/tls_link.rs`.
+
+
+## `tls-link-run-segment-hil-coverage`
+
+The streamer's `poll` loop over a `TlsStream` — production's only transport since the
+TLS-PSK audio link landed (`docs/adr/2026/07/22-pod--tls-and-auth/`) — is the one
+combination nothing tests. `LinkStream` exists to carry two TLS-specific rules into
+that loop: read on every wake because decrypted plaintext can sit in the session
+buffer with no `POLLIN` (`buffers_plaintext`), and poll the direction esp-tls asked
+for rather than the one the caller armed (`poll_events`). Both branches take their
+trivial arm in every existing test: `run_stream_realtime_duplex` (the only test that
+drives `run_segment`) connects with a plain `TcpStream`, the two TLS self-tests
+(`TlsPskHandshake`, `TlsPskWrongKeyRejected`) use hand-written read/write helpers and
+never reach `run_segment`, and `tls_link.rs` is entirely `cfg(target_os = "espidf")`
+so no host unit test can reach it. A mishandled poll direction or a missed buffered
+read stalls the real audio link and surfaces only as a hang on the bench.
+
+Deferred because closing it needs a decision this ADR deliberately did not make. The
+obvious route — running the RTD fixture over TLS — converts an HIL fixture link the
+design named an explicit non-goal (§10: bench traffic under physical trust, not
+production surface), so whether the RTD listener gains a PSK context or a separate
+TLS-speaking fixture is added is a design question, not an implementation detail. The
+result is also a hardware assertion either way: a new HIL self-test whose first
+readings get human review before they are baked in, per the bring-up doctrine.
+
+Done = at least one registered HIL self-test pushes a segment through `run_segment`
+over a `TlsStream`, with the buffered-plaintext read and the direction-substitution
+paths actually taken, and the fixture question above settled in the ADR that decides
+it.
+
+See `TODO(tls-link-run-segment-hil-coverage)` at the idle readiness wait in
+`firmware/devices/respeaker-pod/src/streamer.rs`.

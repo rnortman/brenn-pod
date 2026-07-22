@@ -205,9 +205,9 @@ struct LogEntry {
 /// other pod's recordings. **Phase 2 — global cap.** The classic pass, over the
 /// post-phase-1 totals.
 ///
-/// Residual: a flooder spoofing many *distinct* pod ids gets `pod_cap_bytes` per
-/// identity, bounded only by the global cap. Closing that needs authenticated
-/// pod identity, deferred to `TODO(pod-auth-threat-model)`.
+/// Pod identities are authenticated at the TLS-PSK handshake, so the buckets
+/// this quota bounds belong to provisioned pods — a flooder cannot mint fresh
+/// identities to win a quota each.
 pub fn prune(req: &PruneRequest) -> io::Result<PruneOutcome> {
     let mut logs = inventory(req)?;
     let mut outcome = PruneOutcome::default();

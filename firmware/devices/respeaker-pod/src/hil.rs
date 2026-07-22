@@ -100,6 +100,8 @@ pub(crate) fn run_handler(name: TestName) -> (Status, Payload) {
         TestName::PsramIdentity => run_psram_identity(),
         TestName::WifiPowerSaveCheck => run_wifi_power_save_check(),
         TestName::TcpInboundBackpressure => run_tcp_inbound_backpressure(),
+        TestName::TlsPskHandshake => crate::net_tests::run_tls_psk_handshake(),
+        TestName::TlsPskWrongKeyRejected => crate::net_tests::run_tls_psk_wrong_key_rejected(),
     }
 }
 

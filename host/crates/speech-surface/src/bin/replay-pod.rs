@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 
 use audio_pipeline::wire::{decode_frame, StreamFrame};
 use clap::{Parser, ValueEnum};
+use openssl::ssl::{Ssl, SslContext, SslStream};
 use pod_ingest::{FrameLogError, FrameLogReader, HostMicros, LogItem};
 use serde_json::json;
 use speech_surface::emit_line as emit;
 use speech_surface::exit;
+use speech_surface::psk::{client_context, parse_psk_hex};
 
 /// Send pacing between records.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -37,6 +39,14 @@ struct Cli {
     /// The daemon's ingest address, `host:port`.
     #[arg(long)]
     connect: String,
+    /// PSK identity to authenticate as. Must match the `Hello.pod_id` the
+    /// replayed log carries; a mismatch is a fatal connection error.
+    #[arg(long)]
+    pod_id: String,
+    /// File holding this pod's 64-hex-character audio-link key. A file, never an
+    /// argument: keys do not belong in shell history or `ps` output.
+    #[arg(long)]
+    psk_file: PathBuf,
     /// Pacing between records.
     #[arg(long, value_enum, default_value_t = Pace::Realtime)]
     pace: Pace,
@@ -382,13 +392,93 @@ fn pace_str(pace: Pace) -> String {
         .to_owned()
 }
 
-/// Replay one frame log as a fake pod over its own TCP connection: each record's
-/// payload is written to the socket verbatim (no decode, no re-encode), paced by
-/// `Pacer` in `realtime` mode. The connection is closed with a `Write` shutdown
-/// so the daemon reads EOF and finalizes as it would for a real pod.
+/// How long the socket waits for bytes before the drain releases the session
+/// lock. Short enough that a paced write is never held up materially, long
+/// enough that idle polling stays cheap.
+const READ_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// The shared TLS session. One session serves both directions — TLS record
+/// framing and sequence numbers are session state, so there is no `try_clone`
+/// equivalent — and the drain thread holds the lock only for one read at a time,
+/// bounded by [`READ_TIMEOUT`].
+type SharedSession = Arc<Mutex<SslStream<TcpStream>>>;
+
+/// A `Read` view onto the shared session, so the drain keeps its `R: Read` shape.
+/// A receive timeout with no plaintext ready yields the lock and retries rather
+/// than reporting an error.
+struct SessionReader {
+    session: SharedSession,
+}
+
+impl Read for SessionReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let result = {
+                let mut session = self.session.lock().expect("tls session poisoned");
+                session.read(buf)
+            };
+            match result {
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+/// Read a key file holding the 64 hex characters of one pod key. The key never
+/// reaches an error message.
+fn read_psk_file(path: &Path) -> Result<[u8; 32], String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading psk file {}: {e}", path.display()))?;
+    parse_psk_hex(&path.display().to_string(), &text)
+}
+
+/// Connect and complete the TLS-PSK handshake. The socket carries a receive
+/// timeout from the start (the drain depends on it), so a timed-out read during
+/// the handshake is a retry, not a failure.
+fn connect_session(connect: &str, ctx: &SslContext) -> Result<SharedSession, String> {
+    let tcp = TcpStream::connect(connect).map_err(|e| e.to_string())?;
+    // Paced per-frame writes must not be quantized by Nagle — the pacing is the
+    // measurement. A failure here degrades that measurement silently, so warn.
+    if let Err(e) = tcp.set_nodelay(true) {
+        eprintln!(
+            "replay-pod: warning: TCP_NODELAY not set on {connect}: {e}; \
+             paced timings may be Nagle-quantized"
+        );
+    }
+    tcp.set_read_timeout(Some(READ_TIMEOUT))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    let session = Ssl::new(ctx).map_err(|e| format!("ssl session: {e}"))?;
+    let mut stream = SslStream::new(session, tcp).map_err(|e| format!("ssl stream: {e}"))?;
+    loop {
+        match stream.connect() {
+            Ok(()) => break,
+            Err(e)
+                if matches!(
+                    e.io_error().map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::WouldBlock) | Some(std::io::ErrorKind::TimedOut)
+                ) => {}
+            Err(e) => return Err(format!("tls handshake: {e}")),
+        }
+    }
+    Ok(Arc::new(Mutex::new(stream)))
+}
+
+/// Replay one frame log as a fake pod over its own TLS-PSK connection: each
+/// record's payload is written to the session verbatim (no decode, no re-encode),
+/// paced by `Pacer` in `realtime` mode. The connection is closed with a
+/// close_notify and a `Write` shutdown.
 fn replay_log(
     path: &Path,
     connect: &str,
+    ctx: &SslContext,
     pace: Pace,
     max_gap: Option<Duration>,
     linger: Option<Duration>,
@@ -423,16 +513,18 @@ fn replay_log(
         }
     };
 
-    let mut stream = match TcpStream::connect(connect) {
+    let stream = match connect_session(connect, ctx) {
         Ok(s) => s,
-        Err(e) => {
+        Err(detail) => {
             // Report on the structured channel like every other terminal
             // outcome, not stderr alone, so a JSONL-only consumer sees the abort.
+            // A refused TCP connect and a refused handshake (unknown identity,
+            // wrong key) are the same terminal outcome: no session, no replay.
             emit(
                 "connect_refused",
-                json!({ "log": log_name, "connect": connect, "detail": e.to_string() }),
+                json!({ "log": log_name, "connect": connect, "detail": detail }),
             );
-            eprintln!("replay-pod: cannot connect to {connect}: {e}");
+            eprintln!("replay-pod: cannot connect to {connect}: {detail}");
             return LogReplay {
                 outcome: LogOutcome::ConnectRefused,
                 frames: 0,
@@ -441,15 +533,10 @@ fn replay_log(
             };
         }
     };
-    // Paced per-frame writes must not be quantized by Nagle — the pacing is the
-    // measurement. A failure here degrades that measurement silently, so warn.
-    if let Err(e) = stream.set_nodelay(true) {
-        eprintln!(
-            "replay-pod: warning: TCP_NODELAY not set on {connect}: {e}; \
-             paced timings may be Nagle-quantized"
-        );
-    }
     let addr = stream
+        .lock()
+        .expect("tls session poisoned")
+        .get_ref()
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| connect.to_string());
@@ -458,25 +545,18 @@ fn replay_log(
         json!({ "log": log_name, "addr": addr, "pace": pace_str(pace) }),
     );
 
-    // Drain the daemon's server→device stream to EOF on a cloned handle, decoding
-    // and tallying frames by variant. A peer that never reads would deadlock the
-    // daemon once it writes; a failed clone re-creates that future deadlock
-    // silently, so warn and count nothing. The drain signals `linger_signal` on a
-    // decoded `EndOfAudio` and on its own exit — the two release conditions of the
-    // linger wait below.
+    // Drain the daemon's server→device stream to EOF through a shared view of the
+    // session, decoding and tallying frames by variant. A peer that never reads
+    // would deadlock the daemon once it writes. The drain signals `linger_signal`
+    // on a decoded `EndOfAudio` and on its own exit — the two release conditions
+    // of the linger wait below.
     let linger_signal = Arc::new(LingerSignal::new());
-    let drain = match stream.try_clone() {
-        Ok(r) => {
-            let signal = Arc::clone(&linger_signal);
-            Some(thread::spawn(move || drain_and_count(r, signal)))
-        }
-        Err(e) => {
-            eprintln!(
-                "replay-pod: warning: could not start drain thread on {connect}: {e}; \
-                 replay may stall if the daemon writes back"
-            );
-            None
-        }
+    let drain = {
+        let signal = Arc::clone(&linger_signal);
+        let reader = SessionReader {
+            session: Arc::clone(&stream),
+        };
+        Some(thread::spawn(move || drain_and_count(reader, signal)))
     };
 
     let mut pacer = Pacer::new(reader.meta().rolled_from.is_some(), max_gap);
@@ -496,7 +576,11 @@ fn replay_log(
                 if pace == Pace::Realtime {
                     thread::sleep(pacer.delay_before(host_rx));
                 }
-                if let Err(e) = stream.write_all(&payload) {
+                let sent = {
+                    let mut session = stream.lock().expect("tls session poisoned");
+                    session.write_all(&payload).and_then(|()| session.flush())
+                };
+                if let Err(e) = sent {
                     emit(
                         "replay_peer_closed",
                         json!({ "log": log_name, "frames_sent": frames, "detail": e.to_string() }),
@@ -554,30 +638,33 @@ fn replay_log(
         _ => None,
     };
 
-    // FIN so the daemon reads EOF and finalizes; then the drain thread sees EOF
-    // and exits. Ignored on an already-broken socket (peer-closed path).
-    let _ = stream.shutdown(Shutdown::Write);
+    // close_notify then FIN; the drain thread sees EOF and exits. Both are
+    // ignored on an already-broken session (peer-closed path).
+    {
+        let mut session = stream.lock().expect("tls session poisoned");
+        let _ = session.shutdown();
+        let _ = session.get_ref().shutdown(Shutdown::Write);
+    }
     // Join the drain and carry its per-connection frame tally out as the device-side
     // record of what actually crossed the wire back; `run_all` folds it into the
     // run's `replay_complete` report. A panicked drain must not read as a clean
     // all-zero tally (indistinguishable from "the daemon sent nothing", which is
     // exactly what the tally exists to disprove) — surface it loudly and keep the
-    // default so the zeroed tally is at least explained. An absent drain (clone
-    // failure, already warned at connect) also leaves the default.
+    // default so the zeroed tally is at least explained.
     let rx = match drain {
-        Some(h) => {
-            match h.join() {
-                Ok(rx) => rx,
-                Err(_) => {
-                    emit(
-                        "drain_panicked",
-                        json!({ "log": log_name, "detail": "playback drain thread panicked; tally is unreliable" }),
-                    );
-                    eprintln!("replay-pod: drain thread panicked on {log_name}; playback tally unreliable");
-                    PlaybackRx::default()
-                }
+        Some(h) => match h.join() {
+            Ok(rx) => rx,
+            Err(_) => {
+                emit(
+                    "drain_panicked",
+                    json!({ "log": log_name, "detail": "playback drain thread panicked; tally is unreliable" }),
+                );
+                eprintln!(
+                    "replay-pod: drain thread panicked on {log_name}; playback tally unreliable"
+                );
+                PlaybackRx::default()
             }
-        }
+        },
         None => PlaybackRx::default(),
     };
 
@@ -663,6 +750,7 @@ fn aggregate_exit_code(codes: impl IntoIterator<Item = u8>) -> u8 {
 fn run_all(
     framelogs: &[PathBuf],
     connect: &str,
+    ctx: &SslContext,
     pace: Pace,
     max_gap: Option<Duration>,
     linger: Option<Duration>,
@@ -676,7 +764,7 @@ fn run_all(
     let mut linger_max_ms = 0u64;
 
     for path in framelogs {
-        let replay = replay_log(path, connect, pace, max_gap, linger);
+        let replay = replay_log(path, connect, ctx, pace, max_gap, linger);
         logs += 1;
         total_frames += replay.frames;
         rx.add(replay.rx);
@@ -724,7 +812,25 @@ fn main() {
         .linger_until_eoa
         .then(|| Duration::from_millis(cli.linger_timeout_ms));
 
-    let summary = run_all(&cli.framelogs, &cli.connect, cli.pace, max_gap, linger);
+    // Key and context first: a bad key file or identity is a usage error, and
+    // must not cost a connection attempt to discover.
+    let ctx = match read_psk_file(&cli.psk_file).and_then(|key| client_context(&cli.pod_id, key)) {
+        Ok(ctx) => ctx,
+        Err(detail) => {
+            emit("psk_unusable", json!({ "detail": detail }));
+            eprintln!("replay-pod: {detail}");
+            std::process::exit(exit::HARD_FAILURE as i32);
+        }
+    };
+
+    let summary = run_all(
+        &cli.framelogs,
+        &cli.connect,
+        &ctx,
+        cli.pace,
+        max_gap,
+        linger,
+    );
 
     let rx = summary.rx;
     let mut complete = json!({
@@ -755,6 +861,7 @@ mod tests {
         encode_frame, AudioFrame, ChannelSource, Codec, EndOfAudio, FlushPlayback, Hello,
         AUDIO_PROTOCOL_VERSION, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES,
     };
+    use openssl::ssl::SslMethod;
     use pod_ingest::{FrameLogWriter, LogMeta};
     use std::net::TcpListener;
 
@@ -807,6 +914,45 @@ mod tests {
         // Drop flushes the writer's buffer.
     }
 
+    /// The key and identity every test in this module authenticates with. The
+    /// stand-in daemons below hold the same key, so the handshake is real even
+    /// though the fixture fleet is one pod.
+    const TEST_PSK: [u8; 32] = [0x5a; 32];
+    const TEST_POD_ID: &str = "pod-replay";
+
+    /// The client context `replay_log` takes — what `main` builds from
+    /// `--pod-id`/`--psk-file`.
+    fn test_ctx() -> SslContext {
+        client_context(TEST_POD_ID, TEST_PSK).expect("client context")
+    }
+
+    /// A stand-in daemon's TLS-PSK server context: same suite, same key.
+    fn psk_server_context() -> SslContext {
+        let mut builder = SslContext::builder(SslMethod::tls_server()).expect("server context");
+        speech_surface::psk::pin_link_params(&mut builder).expect("tls parameters");
+        builder.set_psk_server_callback(|_ssl, identity, secret| {
+            assert_eq!(
+                identity,
+                Some(TEST_POD_ID.as_bytes()),
+                "client presents its configured identity"
+            );
+            secret[..TEST_PSK.len()].copy_from_slice(&TEST_PSK);
+            Ok(TEST_PSK.len())
+        });
+        builder.build()
+    }
+
+    /// Accept one connection and complete the server-side handshake — every
+    /// stand-in daemon below starts here, because the tool has no plaintext mode.
+    fn accept_tls(listener: &TcpListener) -> SslStream<TcpStream> {
+        let (sock, _) = listener.accept().expect("accept");
+        let ctx = psk_server_context();
+        let mut stream =
+            SslStream::new(Ssl::new(&ctx).expect("server ssl"), sock).expect("wrap socket");
+        stream.accept().expect("server handshake");
+        stream
+    }
+
     #[test]
     fn replays_records_verbatim_to_a_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -821,13 +967,20 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = accept_tls(&listener);
             let mut got = Vec::new();
             sock.read_to_end(&mut got).unwrap();
             got
         });
 
-        let replay = replay_log(&path, &addr.to_string(), Pace::Fast, None, None);
+        let replay = replay_log(
+            &path,
+            &addr.to_string(),
+            &test_ctx(),
+            Pace::Fast,
+            None,
+            None,
+        );
         assert!(matches!(replay.outcome, LogOutcome::Done));
         assert_eq!(replay.frames, 3, "all three records replay");
 
@@ -845,6 +998,7 @@ mod tests {
         let replay = replay_log(
             Path::new("/nonexistent/does-not-exist.framelog"),
             "127.0.0.1:9",
+            &test_ctx(),
             Pace::Fast,
             None,
             None,
@@ -864,7 +1018,14 @@ mod tests {
         let path = dir.path().join("cap.framelog");
         write_framelog(&path, false, &[(1, &[1, 2, 3])]);
 
-        let replay = replay_log(&path, &addr.to_string(), Pace::Fast, None, None);
+        let replay = replay_log(
+            &path,
+            &addr.to_string(),
+            &test_ctx(),
+            Pace::Fast,
+            None,
+            None,
+        );
         assert!(matches!(replay.outcome, LogOutcome::ConnectRefused));
         assert_eq!(replay.frames, 0, "no frames sent when connect is refused");
     }
@@ -872,7 +1033,7 @@ mod tests {
     /// Accept one connection, drain it to EOF, and return the bytes received.
     fn accept_and_collect(listener: TcpListener) -> thread::JoinHandle<Vec<u8>> {
         thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = accept_tls(&listener);
             let mut got = Vec::new();
             sock.read_to_end(&mut got).unwrap();
             got
@@ -897,7 +1058,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = accept_and_collect(listener);
 
-        let replay = replay_log(&path, &addr.to_string(), Pace::Fast, None, None);
+        let replay = replay_log(
+            &path,
+            &addr.to_string(),
+            &test_ctx(),
+            Pace::Fast,
+            None,
+            None,
+        );
         assert!(
             matches!(replay.outcome, LogOutcome::Done),
             "a torn tail is normal completion, not a failure"
@@ -930,7 +1098,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = accept_and_collect(listener);
 
-        let replay = replay_log(&path, &addr.to_string(), Pace::Fast, None, None);
+        let replay = replay_log(
+            &path,
+            &addr.to_string(),
+            &test_ctx(),
+            Pace::Fast,
+            None,
+            None,
+        );
         assert!(
             matches!(replay.outcome, LogOutcome::Failed),
             "a corrupt record length is a hard failure"
@@ -1047,6 +1222,7 @@ mod tests {
                 PathBuf::from("/nonexistent/b.framelog"),
             ],
             "127.0.0.1:9",
+            &test_ctx(),
             Pace::Fast,
             None,
             None,
@@ -1078,7 +1254,14 @@ mod tests {
         write_framelog(&a, false, &[(1, &[1, 2, 3])]);
         write_framelog(&b, false, &[(1, &[4, 5, 6])]);
 
-        let summary = run_all(&[a, b], &addr.to_string(), Pace::Fast, None, None);
+        let summary = run_all(
+            &[a, b],
+            &addr.to_string(),
+            &test_ctx(),
+            Pace::Fast,
+            None,
+            None,
+        );
         assert_eq!(
             summary.logs, 1,
             "the run aborts after the first refused connect"
@@ -1103,14 +1286,21 @@ mod tests {
             // One connection per log, in order; write one Hello back on each, then
             // drain to EOF — so the run-level `playback_rx` tally sums to two Hellos.
             for _ in 0..2 {
-                let (mut sock, _) = listener.accept().unwrap();
+                let mut sock = accept_tls(&listener);
                 sock.write_all(&frame_bytes(&hello_frame())).unwrap();
                 let mut got = Vec::new();
                 sock.read_to_end(&mut got).unwrap();
             }
         });
 
-        let summary = run_all(&[a, b], &addr.to_string(), Pace::Fast, None, None);
+        let summary = run_all(
+            &[a, b],
+            &addr.to_string(),
+            &test_ctx(),
+            Pace::Fast,
+            None,
+            None,
+        );
         server.join().unwrap();
         assert_eq!(summary.logs, 2);
         assert_eq!(summary.frames, 5, "2 frames from log A + 3 from log B");
@@ -1123,8 +1313,17 @@ mod tests {
 
     #[test]
     fn cli_defaults_realtime_unclamped() {
-        let cli = Cli::try_parse_from(["replay-pod", "--connect", "127.0.0.1:9", "a.framelog"])
-            .expect("parse");
+        let cli = Cli::try_parse_from([
+            "replay-pod",
+            "--pod-id",
+            "pod-replay",
+            "--psk-file",
+            "/dev/null",
+            "--connect",
+            "127.0.0.1:9",
+            "a.framelog",
+        ])
+        .expect("parse");
         assert_eq!(cli.connect, "127.0.0.1:9");
         assert_eq!(cli.pace, Pace::Realtime);
         assert_eq!(cli.max_gap_ms, None);
@@ -1137,6 +1336,10 @@ mod tests {
     fn cli_linger_flag_parses() {
         let cli = Cli::try_parse_from([
             "replay-pod",
+            "--pod-id",
+            "pod-replay",
+            "--psk-file",
+            "/dev/null",
             "--connect",
             "h:1",
             "--linger-until-eoa",
@@ -1153,6 +1356,10 @@ mod tests {
     fn cli_linger_timeout_zero_rejected() {
         let bad = Cli::try_parse_from([
             "replay-pod",
+            "--pod-id",
+            "pod-replay",
+            "--psk-file",
+            "/dev/null",
             "--connect",
             "h:1",
             "--linger-until-eoa",
@@ -1167,6 +1374,10 @@ mod tests {
     fn cli_linger_timeout_requires_linger_flag() {
         let bad = Cli::try_parse_from([
             "replay-pod",
+            "--pod-id",
+            "pod-replay",
+            "--psk-file",
+            "/dev/null",
             "--connect",
             "h:1",
             "--linger-timeout-ms",
@@ -1183,6 +1394,10 @@ mod tests {
     fn cli_pace_values_parse() {
         let realtime = Cli::try_parse_from([
             "replay-pod",
+            "--pod-id",
+            "pod-replay",
+            "--psk-file",
+            "/dev/null",
             "--connect",
             "h:1",
             "--pace",
@@ -1194,6 +1409,10 @@ mod tests {
 
         let fast = Cli::try_parse_from([
             "replay-pod",
+            "--pod-id",
+            "pod-replay",
+            "--psk-file",
+            "/dev/null",
             "--connect",
             "h:1",
             "--pace",
@@ -1205,6 +1424,10 @@ mod tests {
 
         let bad = Cli::try_parse_from([
             "replay-pod",
+            "--pod-id",
+            "pod-replay",
+            "--psk-file",
+            "/dev/null",
             "--connect",
             "h:1",
             "--pace",
@@ -1309,7 +1532,7 @@ mod tests {
         // EndOfAudio) back down the connection, then drains the client's replay to
         // EOF and closes so the client's drain sees EOF.
         let server = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = accept_tls(&listener);
             sock.write_all(&frame_bytes(&hello_frame())).unwrap();
             sock.write_all(&frame_bytes(&audio_frame())).unwrap();
             sock.write_all(&frame_bytes(&audio_frame())).unwrap();
@@ -1319,7 +1542,14 @@ mod tests {
             sock.read_to_end(&mut got).unwrap();
         });
 
-        let replay = replay_log(&path, &addr.to_string(), Pace::Fast, None, None);
+        let replay = replay_log(
+            &path,
+            &addr.to_string(),
+            &test_ctx(),
+            Pace::Fast,
+            None,
+            None,
+        );
         server.join().unwrap();
         assert!(matches!(replay.outcome, LogOutcome::Done));
         assert_eq!(
@@ -1339,6 +1569,10 @@ mod tests {
     fn cli_framelogs_collected_in_order() {
         let cli = Cli::try_parse_from([
             "replay-pod",
+            "--pod-id",
+            "pod-replay",
+            "--psk-file",
+            "/dev/null",
             "--connect",
             "h:1",
             "--max-gap-ms",
@@ -1371,7 +1605,7 @@ mod tests {
         // then wait for the client's FIN — which the linger releases only on the
         // observed EndOfAudio.
         let server = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = accept_tls(&listener);
             sock.write_all(&frame_bytes(&hello_frame())).unwrap();
             sock.write_all(&frame_bytes(&audio_frame())).unwrap();
             sock.write_all(&frame_bytes(&StreamFrame::EndOfAudio(EndOfAudio {})))
@@ -1385,6 +1619,7 @@ mod tests {
         let replay = replay_log(
             &path,
             &addr.to_string(),
+            &test_ctx(),
             Pace::Fast,
             None,
             Some(Duration::from_secs(10)),
@@ -1412,7 +1647,7 @@ mod tests {
         // so neither an EndOfAudio nor a drain close ever releases the wait — only
         // the timeout can. `read_to_end` returns once the client FINs at the timeout.
         let server = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = accept_tls(&listener);
             let mut got = Vec::new();
             sock.read_to_end(&mut got).unwrap();
         });
@@ -1420,6 +1655,7 @@ mod tests {
         let replay = replay_log(
             &path,
             &addr.to_string(),
+            &test_ctx(),
             Pace::Fast,
             None,
             Some(Duration::from_millis(150)),
@@ -1446,7 +1682,7 @@ mod tests {
         // ever writing EndOfAudio. The client's drain sees EOF and exits, releasing
         // the wait promptly with `DrainClosed` — well under the generous timeout.
         let server = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let mut sock = accept_tls(&listener);
             let mut got = [0u8; 64];
             let _ = sock.read(&mut got);
             // Dropping `sock` closes the connection.
@@ -1456,6 +1692,7 @@ mod tests {
         let replay = replay_log(
             &path,
             &addr.to_string(),
+            &test_ctx(),
             Pace::Fast,
             None,
             Some(Duration::from_secs(10)),
@@ -1495,7 +1732,7 @@ mod tests {
             // the client's drain thread sees EOF and `replay_log` can join it and
             // move on to connection B.
             {
-                let (mut ca, _) = listener.accept().unwrap();
+                let mut ca = accept_tls(&listener);
                 ca.write_all(&frame_bytes(&hello_frame())).unwrap();
                 ca.write_all(&frame_bytes(&audio_frame())).unwrap();
                 ca.write_all(&frame_bytes(&StreamFrame::EndOfAudio(EndOfAudio {})))
@@ -1507,7 +1744,7 @@ mod tests {
             // (the scope drop closes the socket → the client's drain sees EOF and
             // releases the linger as `DrainClosed`).
             {
-                let (mut cb, _) = listener.accept().unwrap();
+                let mut cb = accept_tls(&listener);
                 let mut buf = [0u8; 64];
                 let _ = cb.read(&mut buf);
             }
@@ -1518,6 +1755,7 @@ mod tests {
         let summary = run_all(
             &[a, b],
             &addr.to_string(),
+            &test_ctx(),
             Pace::Fast,
             None,
             Some(Duration::from_secs(10)),
@@ -1554,6 +1792,7 @@ mod tests {
         let summary = run_all(
             &[a],
             &addr.to_string(),
+            &test_ctx(),
             Pace::Fast,
             None,
             Some(Duration::from_millis(500)),

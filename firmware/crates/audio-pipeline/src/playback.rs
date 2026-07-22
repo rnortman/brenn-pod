@@ -1025,23 +1025,22 @@ pub enum Accepted {
 ///
 /// EXPOSURE NOTE (persistent-audio-connection): the device drains this inbound channel
 /// on every idle tick, independent of VAD — the socket is *always open and always
-/// reading*. With a real speaker sink (`I2sStreamSink`) in place, any on-LAN host that
-/// can answer on the audio address could play arbitrary audio out of the device at any
-/// moment, with no segment gating to bound it. The accepted-risk auth posture and the
-/// `TODO(playback-auth)` record live with the call site in `main.rs` (design §3).
+/// reading*, with no segment gating to bound what a peer can play out of the
+/// speaker. The transport must authenticate the peer; without that, any
+/// reachable host could inject arbitrary audio.
 pub trait PlaybackSink {
     /// Accept one decoded inbound `Audio` frame's PCM. Returns [`Accepted::Full`] when the
     /// downstream channel is full and the frame could not be enqueued (the caller must
     /// apply backpressure and retry), or [`Accepted::Enqueued`] otherwise.
     fn accept(&mut self, pcm: &[u8]) -> Accepted;
 
-    /// Handle an explicit end-of-audio marker (`InboundFrame::EndOfAudio`, design §3.4): the
+    /// Handle an explicit end-of-audio marker (`InboundFrame::EndOfAudio`): the
     /// host has finished a stream. The banked tail plays out, then the DAC mutes. Default
     /// no-op so non-playback sinks (counting/test) need not react; `I2sStreamSink` overrides
     /// it to push an end-of-audio mark onto the ring.
     fn end_of_audio(&mut self) {}
 
-    /// Handle a flush/stop control frame (`InboundFrame::Flush`, design §3.5): discard
+    /// Handle a flush/stop control frame (`InboundFrame::Flush`): discard
     /// everything banked and go silent immediately (barge-in mechanism). Default no-op;
     /// `I2sStreamSink` overrides it to reset the ring and mark end-of-audio.
     fn flush_playback(&mut self) {}

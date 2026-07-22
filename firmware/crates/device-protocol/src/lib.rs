@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// Wire-contract capacity: `Payload::Identify::tests` is typed as
 /// `HVec<TestName, MAX_TESTS>`.  This constant must never be decreased.
 /// It may be larger than `REGISTERED_TESTS.len()` (slack capacity is fine).
-pub const MAX_TESTS: usize = 28;
+pub const MAX_TESTS: usize = 30;
 
 /// The canonical, ordered registry of self-tests a conforming device advertises
 /// in `Payload::Identify` and the host harness expects (HIL check 3).
@@ -80,6 +80,8 @@ pub const REGISTERED_TESTS: &[TestName] = &[
     TestName::PsramIdentity,
     TestName::WifiPowerSaveCheck,
     TestName::TcpInboundBackpressure,
+    TestName::TlsPskHandshake,
+    TestName::TlsPskWrongKeyRejected,
 ];
 
 // ── `TcpInboundFrames` drain-budget tuning constants ──────────────────────────
@@ -193,6 +195,12 @@ pub enum Command {
     ///   `StreamRealtimeDuplex` self-test (the device connects and streams a synthetic
     ///   segment so the host can time the drain). The host IP is the same as `host`.
     ///   Stored in NVS as `peer_rtd_tcp` (u16).
+    /// - `tls_psk_port`: TCP port of the TLS-PSK listener holding this pod's real
+    ///   audio-link key, for the `TlsPskHandshake` self-test. The host IP is the same as
+    ///   `host`. Stored in NVS as `peer_psk_tcp` (u16).
+    /// - `tls_psk_bad_port`: TCP port of the TLS-PSK listener holding a *different* key
+    ///   for the same identity, for the `TlsPskWrongKeyRejected` self-test. Stored in NVS
+    ///   as `peer_pskbad_tcp` (u16).
     ProvisionPeer {
         host: [u8; 4],
         udp_port: u16,
@@ -203,6 +211,8 @@ pub enum Command {
         backpressure_port: u16,
         poll_readiness_port: u16,
         rtd_port: u16,
+        tls_psk_port: u16,
+        tls_psk_bad_port: u16,
     },
     /// Provision the audio receiver address and port into device NVS (discriminant 3).
     ///
@@ -282,6 +292,16 @@ pub enum Command {
     /// probe or retry will re-evaluate against NVS credentials), but the caller must
     /// not assume the trial link has actually been torn down yet.
     ClearTemporaryWifiConfig,
+    /// Provision the audio-link pre-shared key into device NVS (discriminant 9).
+    ///
+    /// Takes effect on the streamer's next connect — no reboot needed. Idempotent:
+    /// re-provisioning overwrites the prior key.
+    ///
+    /// The success response carries [`Payload::PodId`] — the device's MAC-derived pod
+    /// identity — and deliberately never echoes the key. The identity is what the
+    /// device presents as the TLS PSK identity, so the provisioning host needs it to
+    /// write its own `pod_id → key` table entry, and it is authoritative only here.
+    ProvisionAudioPsk { key: [u8; 32] },
 }
 
 /// Registered self-test names. Using an enum (not a free string) makes registry
@@ -670,6 +690,31 @@ pub enum TestName {
     /// Returns `TestData::TcpInboundBackpressure`; the host-side eval enforces the same.
     /// Requires prior `WifiAssociate` and `ProvisionPeer`.
     TcpInboundBackpressure,
+    /// TLS-PSK handshake proof over the production audio-link client (discriminant 28).
+    ///
+    /// Reads the audio-link key (`audio_psk`, written by [`Command::ProvisionAudioPsk`])
+    /// and the host's TLS-PSK listener port (`peer_psk_tcp`) from NVS, then connects with
+    /// the same `tls_connect_psk` path the streamer uses. Asserts the handshake completes,
+    /// reports the negotiated protocol version and ciphersuite for host-side assertion,
+    /// and round-trips one echo payload through the tunnel.
+    ///
+    /// Returns `TestData::TlsPskHandshake`. An unexpected negotiated version or suite is a
+    /// discovery requiring human review before the host-side expectation is adjusted
+    /// (bring-up guardrail). Requires prior `WifiAssociate`, `ProvisionPeer` and
+    /// `ProvisionAudioPsk`.
+    TlsPskHandshake,
+    /// TLS-PSK identity-negative self-test (discriminant 29).
+    ///
+    /// Connects to the listener that holds a *different* key for this pod's identity
+    /// (`peer_pskbad_tcp`) and asserts the handshake fails — promptly, by a TLS alert
+    /// rather than by the deadline expiring. No application byte can cross, because a
+    /// failed handshake yields no stream to write to. Kept separate from
+    /// [`TestName::TlsPskHandshake`] per the presence-vs-identity doctrine: one
+    /// proves the link works, this one proves the key is what makes it work.
+    ///
+    /// Returns `TestData::TlsPskRejected`. Requires the same provisioning as
+    /// [`TestName::TlsPskHandshake`].
+    TlsPskWrongKeyRejected,
 }
 
 // ── Response ──────────────────────────────────────────────────────────────────
@@ -722,6 +767,12 @@ pub enum Payload {
     Empty,
     /// Typed self-test outcome (discriminant 3).
     TestReport(TestReport),
+    /// The device's MAC-derived pod identity, e.g. `"pod-aabbcc"` (discriminant 4).
+    ///
+    /// Returned by [`Command::ProvisionAudioPsk`] so the provisioning host can key its
+    /// own PSK table by the identity the device will present in the TLS handshake. The
+    /// key itself is never echoed. Capacity must match the streamer's `Hello::pod_id`.
+    PodId(heapless::String<32>),
 }
 
 /// Typed self-test outcome: machine-checkable data plus human-readable detail.
@@ -918,7 +969,39 @@ pub enum TestData {
         peer_ip: [u8; 4],
         peer_port: u16,
     },
+    TlsPskHandshake {
+        peer_ip: [u8; 4],
+        peer_port: u16,
+        /// Wall-clock milliseconds from TCP connect to completed handshake (the
+        /// cold-connect latency the streamer pays once per connect).
+        handshake_ms: u32,
+        /// Negotiated protocol version as mbedTLS spells it, e.g. `"TLSv1.2"`.
+        version: TlsVersionStr,
+        /// Negotiated ciphersuite as mbedTLS spells it, e.g.
+        /// `"TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256"`.
+        ciphersuite: TlsSuiteStr,
+        /// Bytes echoed back through the tunnel and byte-matched by the device.
+        echo_bytes: u32,
+    },
+    TlsPskRejected {
+        peer_ip: [u8; 4],
+        peer_port: u16,
+        /// Milliseconds from the start of the handshake to the peer's refusal,
+        /// measured. A refusal that arrives promptly is a real TLS alert; one
+        /// that consumes the handshake deadline means nothing was refused —
+        /// the device fails the test in that case rather than reporting it.
+        reject_ms: u32,
+    },
 }
+
+/// Negotiated TLS protocol version string, as reported by `mbedtls_ssl_get_version`.
+/// Sized for `"TLSv1.2"` and any sibling spelling with room to spare.
+pub type TlsVersionStr = heapless::String<16>;
+
+/// Negotiated TLS ciphersuite name, as reported by `mbedtls_ssl_get_ciphersuite`.
+/// Sized for the longest name this link can negotiate,
+/// `"TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256"` (43 bytes).
+pub type TlsSuiteStr = heapless::String<48>;
 
 /// Raw `wifi_ps_type_t` value for `WIFI_PS_NONE` (power save off) — the expected
 /// [`TestData::WifiPowerSaveCheck::ps_mode`]. Owned here because the wire meaning is
@@ -1829,13 +1912,7 @@ mod tests {
         );
     }
 
-    /// An unknown `Command` discriminant must hard-error.
-    ///
-    /// `Command` has nine variants: `RunTest`=0, `ProvisionWifi`=1, `ProvisionPeer`=2,
-    /// `ProvisionAudio`=3, `SetVadThreshold`=4, `SetVadHangover`=5,
-    /// `ClearWifiCredentials`=6, `SetTemporaryWifiConfig`=7, `ClearTemporaryWifiConfig`=8.
-    /// Discriminant 9 is the first out-of-range value and must not silently decode.
-    /// Verifies that the "no unknown discriminants" guarantee holds.
+    /// An unknown `Command` discriminant must hard-error — no silent decode.
     #[test]
     fn unknown_command_discriminant_errors() {
         // Discriminant 5 (SetVadHangover) must decode successfully.
@@ -1864,12 +1941,85 @@ mod tests {
             "discriminant 8 (ClearTemporaryWifiConfig) must decode successfully; got: {result:?}"
         );
 
-        // Discriminant 9 is the first out-of-range value for the 9-variant Command enum.
-        let raw: &[u8] = &[9u8];
+        // Discriminant 9 (ProvisionAudioPsk) must decode successfully: the varint
+        // discriminant is followed by the 32 raw key bytes (postcard encodes a fixed-size
+        // array with no length prefix).
+        let mut raw_psk = [0u8; 33];
+        raw_psk[0] = 9;
+        for (i, b) in raw_psk[1..].iter_mut().enumerate() {
+            *b = (i + 1) as u8;
+        }
+        let result = postcard::from_bytes::<Command>(&raw_psk);
+        assert!(
+            matches!(result, Ok(Command::ProvisionAudioPsk { key }) if key[0] == 1 && key[31] == 32),
+            "discriminant 9 (ProvisionAudioPsk) must decode successfully; got: {result:?}"
+        );
+
+        let raw: &[u8] = &[10u8];
         let result = postcard::from_bytes::<Command>(raw);
         assert!(
             result.is_err(),
-            "unknown Command discriminant 9 must produce Err, not silent decode; got: {result:?}"
+            "unknown Command discriminant 10 must produce Err, not silent decode; got: {result:?}"
+        );
+    }
+
+    /// `Command::ProvisionAudioPsk` golden bytes and roundtrip.
+    ///
+    /// Postcard encodes `[u8; 32]` as 32 raw bytes with no length prefix, so the raw
+    /// payload for `Request { id: 0, .. }` is `[id=0x00, disc=0x09, key[0..32]]`. The key
+    /// used here is `1..=32` (no zero bytes), so COBS emits one escape byte for the zero
+    /// id and then a single 33-byte run.
+    #[test]
+    fn provision_audio_psk_golden_roundtrip() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i + 1) as u8;
+        }
+        let req = Request {
+            id: 0,
+            command: Command::ProvisionAudioPsk { key },
+        };
+        let mut buf = [0u8; 64];
+        let len = framing::encode_request(&req, &mut buf).expect("encode failed");
+        assert_eq!(decode_one_cobs::<Request>(&buf[..len]), req);
+
+        let mut expected = alloc::vec![0x01u8, 0x22, 0x09];
+        expected.extend_from_slice(&key);
+        expected.push(0x00);
+        assert_eq!(
+            &buf[..len],
+            expected.as_slice(),
+            "ProvisionAudioPsk golden bytes mismatch — discriminant or array layout regression"
+        );
+    }
+
+    /// A `Payload::PodId` response round-trips, and its golden bytes pin discriminant 4.
+    ///
+    /// The provisioning host reads the pod identity out of this payload to key its PSK
+    /// table, so a silent discriminant shift would misattribute keys.
+    #[test]
+    fn payload_pod_id_golden_roundtrip() {
+        let mut pod_id = heapless::String::<32>::new();
+        pod_id.push_str("pod-aabbcc").unwrap();
+        let frame = DeviceFrame::Response(Response {
+            id: 1,
+            status: Status::Ok,
+            payload: Payload::PodId(pod_id),
+        });
+        let mut buf = [0u8; 64];
+        let len = framing::encode_device_frame(&frame, &mut buf).expect("encode failed");
+        assert_eq!(decode_one_cobs::<DeviceFrame>(&buf[..len]), frame);
+
+        // Raw postcard: [DeviceFrame::Response=0x00, id=0x01, Status::Ok=0x00,
+        // Payload::PodId=0x04, str len=0x0a, 10 ASCII bytes]. COBS escapes both zero
+        // bytes, so the frame is 0x01, 0x02, 0x01, then a 12-byte run (code 0x0d).
+        let mut expected = alloc::vec![0x01u8, 0x02, 0x01, 0x0d, 0x04, 0x0a];
+        expected.extend_from_slice(b"pod-aabbcc");
+        expected.push(0x00);
+        assert_eq!(
+            &buf[..len],
+            expected.as_slice(),
+            "Payload::PodId golden bytes mismatch — discriminant or layout regression"
         );
     }
 
@@ -2132,6 +2282,8 @@ mod tests {
             PsramIdentity,
             WifiPowerSaveCheck,
             TcpInboundBackpressure,
+            TlsPskHandshake,
+            TlsPskWrongKeyRejected,
         );
 
         // Step 2: every variant must be in REGISTERED_TESTS.
@@ -2340,7 +2492,8 @@ mod tests {
     ///
     /// Verifies discriminant 2 and that all fields (host, udp_port, tcp_port,
     /// tls_host, tls_port, inbound_frames_port, backpressure_port, poll_readiness_port,
-    /// rtd_port) survive a COBS/postcard round-trip unchanged.
+    /// rtd_port, tls_psk_port, tls_psk_bad_port) survive a COBS/postcard round-trip
+    /// unchanged.
     #[test]
     fn provision_peer_golden_roundtrip() {
         let req = Request {
@@ -2355,6 +2508,8 @@ mod tests {
                 backpressure_port: 17383,
                 poll_readiness_port: 17384,
                 rtd_port: 17385,
+                tls_psk_port: 17386,
+                tls_psk_bad_port: 17387,
             },
         };
         let mut buf = [0u8; 128];
@@ -2370,20 +2525,24 @@ mod tests {
         // Layout: COBS overhead byte (points past the next embedded 0x00), id=0x00
         // (embedded zero → COBS-encoded), discriminant=0x02, host bytes, udp_port varint,
         // tcp_port varint, tls_host bytes, tls_port varint, inbound_frames_port varint,
-        // backpressure_port varint, poll_readiness_port varint.
+        // backpressure_port varint, poll_readiness_port varint, rtd_port varint,
+        // tls_psk_port varint, tls_psk_bad_port varint.
         // postcard encodes u16 as a variable-length integer (not raw LE bytes).
         // Generated from a test run: id=0, ProvisionPeer discriminant=2 in postcard,
         // host=[192,168,1,50], udp=9, tcp=7, tls_host=[1,1,1,1], tls_port=443,
-        // inbound_frames_port=17382, backpressure_port=17383, poll_readiness_port=17384.
+        // inbound_frames_port=17382, backpressure_port=17383, poll_readiness_port=17384,
+        // rtd_port=17385, tls_psk_port=17386, tls_psk_bad_port=17387.
         // Postcard encodes u16 as a varint; 17382=0x43E6 → 0xE6,0x87,0x01,
         // 17383=0x43E7 → 0xE7,0x87,0x01, 17384=0x43E8 → 0xE8,0x87,0x01,
-        // 17385=0x43E9 → 0xE9,0x87,0x01 (COBS leaves non-zero bytes in place).
+        // 17385=0x43E9 → 0xE9,0x87,0x01, 17386=0x43EA → 0xEA,0x87,0x01,
+        // 17387=0x43EB → 0xEB,0x87,0x01 (COBS leaves non-zero bytes in place).
         // COBS: overhead byte 0x01 points to the embedded zero (id=0x00) at index 1;
-        // 0x1a (26) then points 26 bytes ahead to the trailing 0x00 frame delimiter
+        // 0x20 (32) then points 32 bytes ahead to the trailing 0x00 frame delimiter
         // (the rest of the payload has no embedded zeros).
         let expected: &[u8] = &[
-            0x01, 0x1a, 0x02, 0xc0, 0xa8, 0x01, 0x32, 0x09, 0x07, 0x01, 0x01, 0x01, 0x01, 0xbb,
-            0x03, 0xe6, 0x87, 0x01, 0xe7, 0x87, 0x01, 0xe8, 0x87, 0x01, 0xe9, 0x87, 0x01, 0x00,
+            0x01, 0x20, 0x02, 0xc0, 0xa8, 0x01, 0x32, 0x09, 0x07, 0x01, 0x01, 0x01, 0x01, 0xbb,
+            0x03, 0xe6, 0x87, 0x01, 0xe7, 0x87, 0x01, 0xe8, 0x87, 0x01, 0xe9, 0x87, 0x01, 0xea,
+            0x87, 0x01, 0xeb, 0x87, 0x01, 0x00,
         ];
         assert_eq!(
             &buf[..len],
@@ -2523,6 +2682,8 @@ mod typed_report_tests {
             TestData::PsramIdentity { .. } => 23,
             TestData::WifiPowerSaveCheck { .. } => 24,
             TestData::TcpInboundBackpressure { .. } => 25,
+            TestData::TlsPskHandshake { .. } => 26,
+            TestData::TlsPskRejected { .. } => 27,
         }
     }
 
@@ -2530,7 +2691,7 @@ mod typed_report_tests {
     /// intact. Adding a variant requires a case here; the pairing with
     /// [`canonical_discriminant`] is enforced by
     /// `test_data_cases_cover_every_discriminant`.
-    fn all_test_data_cases() -> [TestData; 26] {
+    fn all_test_data_cases() -> [TestData; 28] {
         let mut found = HVec::<u8, I2C_SCAN_MAX_ADDRS>::new();
         for a in 0x08u8..=0x77 {
             found.push(a).unwrap();
@@ -2669,6 +2830,28 @@ mod typed_report_tests {
                 sink_full_events: 12,
                 peer_ip: [10, 0, 0, 3],
                 peer_port: 9003,
+            },
+            TestData::TlsPskHandshake {
+                peer_ip: [10, 0, 0, 4],
+                peer_port: 17386,
+                handshake_ms: 217,
+                version: {
+                    let mut v = TlsVersionStr::new();
+                    v.push_str("TLSv1.2").unwrap();
+                    v
+                },
+                ciphersuite: {
+                    let mut c = TlsSuiteStr::new();
+                    c.push_str("TLS-ECDHE-PSK-WITH-CHACHA20-POLY1305-SHA256")
+                        .unwrap();
+                    c
+                },
+                echo_bytes: 16,
+            },
+            TestData::TlsPskRejected {
+                peer_ip: [10, 0, 0, 4],
+                peer_port: 17387,
+                reject_ms: 43,
             },
         ]
     }

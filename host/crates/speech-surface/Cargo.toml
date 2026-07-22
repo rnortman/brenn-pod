@@ -34,6 +34,8 @@ anyhow = "1"
 # re-check-before-delete, so an explicitly-pinned recording is never lost to a
 # concurrent rewrite race.
 rustix = { version = "1", features = ["fs"] }
+openssl = "0.10"
+tokio-openssl = "0.6"
 
 [dev-dependencies]
 # `#[tokio::test]` runtime for the file-sink writer test; `tempfile` for its dir.

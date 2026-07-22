@@ -20,6 +20,8 @@ use speech_pipeline::{
     ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, PacerConfig, Url, FRAME_MS,
 };
 
+use crate::psk::parse_psk_hex;
+
 /// Silero VAD chunk duration: 512 samples at the 16 kHz spine rate. The listener's
 /// endpointer knobs are chunk-counts; the `[endpointer]` table is ms-denominated,
 /// so both sides single-source from [`ListenerEndpointerConfig::default`] through
@@ -39,6 +41,9 @@ pub struct Config {
     /// LAN address to bind the accept loop to. Required: no default bind, so an
     /// operator states the interface rather than falling back to `0.0.0.0`.
     pub listen_addr: SocketAddr,
+    /// Path to the per-pod PSK secrets file ([`PskTable`]). Required: the ingest
+    /// listener speaks only TLS-PSK, so a daemon without keys can serve no pod.
+    pub pod_psk_file: PathBuf,
     /// Accept-gate semaphore size.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -749,9 +754,9 @@ pub enum TtsBackend {
 }
 
 /// Parse-check a base URL and enforce the plain-`http` scheme. The HTTP speech
-/// stages carry no TLS stack (deferred `audio-auth`), so an `https` endpoint is a
-/// loud startup error naming that deferral rather than a confusing runtime "no
-/// TLS backend" failure.
+/// stages carry no TLS stack — they talk to a container on the operator's own
+/// host — so an `https` endpoint is a loud startup error rather than a confusing
+/// runtime "no TLS backend" failure.
 fn validate_http_url(field: &str, url: &str) -> Result<(), String> {
     let parsed = Url::parse(url).map_err(|e| format!("{field} {url:?} is not a valid URL: {e}"))?;
     match parsed.scheme() {
@@ -759,24 +764,22 @@ fn validate_http_url(field: &str, url: &str) -> Result<(), String> {
         "https" => {
             return Err(format!(
                 "{field} uses https, but the HTTP speech stages carry no TLS stack; \
-                 TLS/PSK is the deferred audio-auth work — use an http:// endpoint"
-            ))
+                 use an http:// endpoint"
+            ));
         }
         other => {
             return Err(format!(
                 "{field} scheme {other:?} is unsupported; use an http:// endpoint"
-            ))
+            ));
         }
     }
     // Embedded credentials (`user:pass@host`) would ride verbatim onto the
     // `*_configured` startup line where any log reader could harvest them; reject
-    // them rather than leak. Authenticated backends are the deferred audio-auth
-    // work. The message never echoes the offending userinfo.
+    // them rather than leak. The message never echoes the offending userinfo.
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
             "{field} carries embedded credentials (user:pass@host); credentials in \
-             stage URLs are unsupported — authenticated backends are the deferred \
-             audio-auth work"
+             stage URLs are unsupported"
         ));
     }
     Ok(())
@@ -794,10 +797,110 @@ fn validate_timeouts(table: &str, timeout_ms: u64, connect_timeout_ms: u64) -> R
     Ok(())
 }
 
-/// A failure loading configuration, carrying the offending path.
+/// Per-pod pre-shared keys for the TLS-PSK ingest link: PSK identity (the pod id
+/// the pod puts in the handshake, and must repeat in `Hello`) → 32-byte key.
+///
+/// The file is TOML, a flat table of `pod_id = "<64 hex chars>"`, written by
+/// `podctl provision-audio-psk --host-psk-file`. Every parse problem is a hard
+/// startup failure: a daemon that silently drops half its fleet's keys looks
+/// exactly like a network fault. `Debug` prints identities and key *lengths*
+/// only, so a key never reaches a log through an error or a `{:?}` on `Config`.
+#[derive(Clone, Default)]
+pub struct PskTable {
+    keys: HashMap<String, [u8; 32]>,
+}
+
+impl PskTable {
+    /// Read and validate the secrets file at `path`.
+    pub fn load(path: &Path) -> Result<PskTable, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mode_check = psk_file_mode_error(path);
+        let table = PskTable::parse(&text)
+            .and_then(|table| match mode_check {
+                Some(message) => Err(message),
+                None => Ok(table),
+            })
+            .map_err(|message| ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message,
+            })?;
+        Ok(table)
+    }
+
+    /// Parse the secrets file's contents. Path-free; [`PskTable::load`] wraps it
+    /// and adds the file-mode check (which needs the path).
+    pub fn parse(text: &str) -> Result<PskTable, String> {
+        let raw: toml::Value =
+            toml::from_str(text).map_err(|e| format!("psk file is not valid TOML: {e}"))?;
+        let table = raw
+            .as_table()
+            .ok_or_else(|| "psk file must be a table of pod_id = \"<hex>\"".to_string())?;
+        let mut keys = HashMap::with_capacity(table.len());
+        for (pod_id, value) in table {
+            let hex = value.as_str().ok_or_else(|| {
+                format!("psk entry for {pod_id:?} must be a 64-hex-character string")
+            })?;
+            // Duplicate ids are a TOML parse error, so reaching a second insert
+            // for one id would mean the parser changed under us.
+            keys.insert(pod_id.clone(), parse_psk_hex(pod_id, hex)?);
+        }
+        if keys.is_empty() {
+            return Err("psk file defines no pods; no pod could connect".to_string());
+        }
+        Ok(PskTable { keys })
+    }
+
+    /// The key for `identity`, or `None` when the identity is unknown.
+    pub fn key_for(&self, identity: &str) -> Option<&[u8; 32]> {
+        self.keys.get(identity)
+    }
+
+    /// How many pods the table provisions (startup line; never the keys).
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+impl std::fmt::Debug for PskTable {
+    /// Identities and key lengths only — the keys themselves never render.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ids: Vec<&str> = self.keys.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        write!(f, "PskTable {{ pods: {ids:?}, key_bytes: 32 }}")
+    }
+}
+
+/// Reject a secrets file any other local account can read, matching ssh's posture
+/// on private keys. Unix only — elsewhere there is no mode to check.
+#[cfg(unix)]
+fn psk_file_mode_error(path: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Some(format!(
+            "psk file mode {mode:04o} is group/world-accessible; chmod 600 it"
+        ));
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn psk_file_mode_error(_path: &Path) -> Option<String> {
+    None
+}
+
+/// A failure loading configuration or the PSK secrets file it names, carrying
+/// the offending path.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("failed to read config file {path}: {source}")]
+    #[error("failed to read {path}: {source}")]
     Read {
         path: PathBuf,
         source: std::io::Error,
@@ -807,7 +910,7 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
-    #[error("invalid config file {path}: {message}")]
+    #[error("invalid {path}: {message}")]
     Invalid { path: PathBuf, message: String },
 }
 
@@ -902,6 +1005,7 @@ mod tests {
     fn parses_full_config() {
         let text = r#"
 listen_addr = "192.168.1.10:7380"
+pod_psk_file = "/psk.toml"
 max_connections = 16
 
 [jsonl]
@@ -946,7 +1050,9 @@ room = "kitchen"
 
     #[test]
     fn applies_defaults_for_optional_fields() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         assert_eq!(config.max_connections, 8);
         assert_eq!(config.jsonl.sink, JsonlSink::None);
         assert_eq!(config.jsonl.stage_health_period_s, 30);
@@ -965,14 +1071,14 @@ room = "kitchen"
     fn pod_cap_bytes_parses_and_resolves() {
         // Explicit value parses and is returned as-is.
         let cfg = Config::parse(
-            "listen_addr = \"10.0.0.5:7380\"\n[record]\ncap_bytes = 1000\npod_cap_bytes = 250\n",
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[record]\ncap_bytes = 1000\npod_cap_bytes = 250\n",
         )
         .expect("parse");
         assert_eq!(cfg.record.pod_cap_bytes, Some(250));
         assert_eq!(cfg.record.resolved_pod_cap_bytes(), 250);
 
         // Absent → half the global cap.
-        let cfg = Config::parse("listen_addr = \"10.0.0.5:7380\"\n[record]\ncap_bytes = 1000\n")
+        let cfg = Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[record]\ncap_bytes = 1000\n")
             .expect("parse");
         assert_eq!(cfg.record.pod_cap_bytes, None);
         assert_eq!(cfg.record.resolved_pod_cap_bytes(), 500);
@@ -980,7 +1086,9 @@ room = "kitchen"
 
     #[test]
     fn wake_absent_table_is_none() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         assert!(config.wake.is_none());
         assert!(config.validate().is_ok());
     }
@@ -988,7 +1096,7 @@ room = "kitchen"
     #[test]
     fn wake_bypass_ignores_model_paths() {
         let config = Config::parse(
-            "listen_addr = \"10.0.0.5:7380\"\n[wake]\nmode = \"bypass\"\nmodel = \"/m/wake.onnx\"",
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"bypass\"\nmodel = \"/m/wake.onnx\"",
         )
         .expect("parse");
         let wake = config.wake.as_ref().expect("wake table");
@@ -1003,6 +1111,7 @@ room = "kitchen"
     fn wake_oww_full() {
         let text = r#"
 listen_addr = "10.0.0.5:7380"
+pod_psk_file = "/psk.toml"
 [wake]
 mode = "oww"
 melspectrogram = "/m/mel.onnx"
@@ -1036,8 +1145,10 @@ threshold = 0.7
                 "[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"",
             ),
         ] {
-            let config =
-                Config::parse(&format!("listen_addr = \"10.0.0.5:7380\"\n{table}")).expect("parse");
+            let config = Config::parse(&format!(
+                "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n{table}"
+            ))
+            .expect("parse");
             let err = config.validate().unwrap_err();
             assert!(err.contains(name), "expected {name} in message: {err}");
         }
@@ -1047,7 +1158,7 @@ threshold = 0.7
     fn wake_threshold_bounds_rejected() {
         for bad in ["0.0", "1.0", "-0.1", "1.5"] {
             let config = Config::parse(&format!(
-                "listen_addr = \"10.0.0.5:7380\"\n[wake]\nmode = \"bypass\"\nthreshold = {bad}"
+                "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"bypass\"\nthreshold = {bad}"
             ))
             .expect("parse");
             let err = config.validate().unwrap_err();
@@ -1058,7 +1169,7 @@ threshold = 0.7
     #[test]
     fn wake_default_threshold_in_bounds() {
         let config =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"")
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"")
                 .expect("parse");
         assert_eq!(config.wake.as_ref().unwrap().threshold, 0.5);
         assert!(config.validate().is_ok());
@@ -1067,7 +1178,7 @@ threshold = 0.7
     #[test]
     fn wake_rejects_unknown_key() {
         let err =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[wake]\nmode = \"bypass\"\nbogus = 1")
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"bypass\"\nbogus = 1")
                 .unwrap_err();
         assert!(err.to_string().contains("bogus"), "message: {err}");
     }
@@ -1075,20 +1186,22 @@ threshold = 0.7
     #[test]
     fn wake_rejects_missing_mode() {
         let err =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[wake]\nthreshold = 0.6").unwrap_err();
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nthreshold = 0.6").unwrap_err();
         assert!(err.to_string().contains("mode"), "message: {err}");
     }
 
     #[test]
     fn wake_rejects_unknown_mode() {
         assert!(
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[wake]\nmode = \"magic\"").is_err()
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"magic\"").is_err()
         );
     }
 
     #[test]
     fn endpointer_absent_table_is_none() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         assert!(config.endpointer.is_none());
         assert!(config.validate().is_ok());
     }
@@ -1096,7 +1209,7 @@ threshold = 0.7
     #[test]
     fn endpointer_defaults_when_only_model_given() {
         let config = Config::parse(
-            "listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nmodel = \"/m/silero.onnx\"",
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[endpointer]\nmodel = \"/m/silero.onnx\"",
         )
         .expect("parse");
         let ep = config.endpointer.as_ref().expect("endpointer table");
@@ -1119,7 +1232,7 @@ threshold = 0.7
         // `max_utterance_samples` is supplied by the caller (the pipeline cap), not
         // the table. Round-trips the defaults back to the canonical listener config.
         let config = Config::parse(
-            "listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nmodel = \"/m/silero.onnx\"",
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[endpointer]\nmodel = \"/m/silero.onnx\"",
         )
         .expect("parse");
         let ep = config.endpointer.as_ref().expect("endpointer table");
@@ -1141,7 +1254,7 @@ threshold = 0.7
     #[test]
     fn endpointer_requires_model() {
         let err =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nonset_thresh = 0.6")
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[endpointer]\nonset_thresh = 0.6")
                 .unwrap_err();
         assert!(err.to_string().contains("model"), "message: {err}");
     }
@@ -1150,7 +1263,7 @@ threshold = 0.7
     fn endpointer_rejects_out_of_range_threshold() {
         for bad in ["0.0", "1.0", "-0.1"] {
             let config = Config::parse(&format!(
-                "listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nmodel = \"/m/s.onnx\"\nonset_thresh = {bad}"
+                "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[endpointer]\nmodel = \"/m/s.onnx\"\nonset_thresh = {bad}"
             ))
             .expect("parse");
             let err = config.validate().unwrap_err();
@@ -1161,7 +1274,7 @@ threshold = 0.7
     #[test]
     fn endpointer_rejects_release_above_onset() {
         let config = Config::parse(
-            "listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nmodel = \"/m/s.onnx\"\nonset_thresh = 0.4\nrelease_thresh = 0.6",
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[endpointer]\nmodel = \"/m/s.onnx\"\nonset_thresh = 0.4\nrelease_thresh = 0.6",
         )
         .expect("parse");
         let err = config.validate().unwrap_err();
@@ -1171,7 +1284,7 @@ threshold = 0.7
     #[test]
     fn endpointer_rejects_zero_onset_chunks() {
         let config = Config::parse(
-            "listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nmodel = \"/m/s.onnx\"\nonset_chunks = 0",
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[endpointer]\nmodel = \"/m/s.onnx\"\nonset_chunks = 0",
         )
         .expect("parse");
         let err = config.validate().unwrap_err();
@@ -1183,7 +1296,7 @@ threshold = 0.7
         for field in ["soft_hangover_ms", "continuation_window_ms"] {
             for bad in ["0", "31"] {
                 let config = Config::parse(&format!(
-                    "listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nmodel = \"/m/s.onnx\"\n{field} = {bad}"
+                    "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[endpointer]\nmodel = \"/m/s.onnx\"\n{field} = {bad}"
                 ))
                 .expect("parse");
                 let err = config.validate().unwrap_err();
@@ -1195,7 +1308,7 @@ threshold = 0.7
     #[test]
     fn endpointer_rejects_unknown_key() {
         let err = Config::parse(
-            "listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nmodel = \"/m/s.onnx\"\nbogus = 1",
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[endpointer]\nmodel = \"/m/s.onnx\"\nbogus = 1",
         )
         .unwrap_err();
         assert!(err.to_string().contains("bogus"), "message: {err}");
@@ -1203,7 +1316,9 @@ threshold = 0.7
 
     #[test]
     fn brain_absent_table_is_none() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         assert!(config.brain.is_none());
         assert!(config.validate().is_ok());
     }
@@ -1211,7 +1326,7 @@ threshold = 0.7
     #[test]
     fn brain_wav_full() {
         let config = Config::parse(
-            "listen_addr = \"10.0.0.5:7380\"\n[brain]\nmode = \"wav\"\nclip = \"/clips/ack.wav\"",
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[brain]\nmode = \"wav\"\nclip = \"/clips/ack.wav\"",
         )
         .expect("parse");
         let brain = config.brain.as_ref().expect("brain table");
@@ -1222,7 +1337,7 @@ threshold = 0.7
 
     #[test]
     fn brain_wav_missing_clip_rejected() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"\n[brain]\nmode = \"wav\"")
+        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[brain]\nmode = \"wav\"")
             .expect("parse");
         let err = config.validate().unwrap_err();
         assert!(err.contains("clip"), "expected clip in message: {err}");
@@ -1230,27 +1345,29 @@ threshold = 0.7
 
     #[test]
     fn brain_rejects_missing_mode() {
-        let err = Config::parse("listen_addr = \"10.0.0.5:7380\"\n[brain]\nclip = \"/c/a.wav\"")
+        let err = Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[brain]\nclip = \"/c/a.wav\"")
             .unwrap_err();
         assert!(err.to_string().contains("mode"), "message: {err}");
     }
 
     #[test]
     fn brain_rejects_unknown_mode() {
-        assert!(Config::parse("listen_addr = \"10.0.0.5:7380\"\n[brain]\nmode = \"llm\"").is_err());
+        assert!(Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[brain]\nmode = \"llm\"").is_err());
     }
 
     #[test]
     fn brain_rejects_unknown_key() {
         let err =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[brain]\nmode = \"wav\"\nbogus = 1")
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[brain]\nmode = \"wav\"\nbogus = 1")
                 .unwrap_err();
         assert!(err.to_string().contains("bogus"), "message: {err}");
     }
 
     #[test]
     fn playback_defaults_when_absent() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         assert_eq!(
             config.playback.lead_ms,
             audio_pipeline::playback::PLAYBACK_BURST_LEAD_MS
@@ -1265,6 +1382,7 @@ threshold = 0.7
     fn playback_full_table_parses() {
         let text = r#"
 listen_addr = "10.0.0.5:7380"
+pod_psk_file = "/psk.toml"
 [playback]
 lead_ms = 300
 write_timeout_ms = 500
@@ -1283,14 +1401,14 @@ job_queue_depth = 4
     fn playback_rejects_lead_below_one_frame() {
         for bad in ["0", "19"] {
             let config = Config::parse(&format!(
-                "listen_addr = \"10.0.0.5:7380\"\n[playback]\nlead_ms = {bad}"
+                "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[playback]\nlead_ms = {bad}"
             ))
             .expect("parse");
             let err = config.validate().unwrap_err();
             assert!(err.contains("lead_ms"), "lead_ms {bad}: {err}");
         }
         // Exactly one frame is accepted.
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"\n[playback]\nlead_ms = 20")
+        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[playback]\nlead_ms = 20")
             .expect("parse");
         assert!(config.validate().is_ok());
     }
@@ -1315,7 +1433,7 @@ job_queue_depth = 4
 
         // The exact combined-budget cap is accepted.
         let config = Config::parse(&format!(
-            "listen_addr = \"10.0.0.5:7380\"\n[playback]\nlead_ms = {max_lead_ms}"
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[playback]\nlead_ms = {max_lead_ms}"
         ))
         .expect("parse");
         assert!(
@@ -1326,7 +1444,7 @@ job_queue_depth = 4
         // One ms past the combined budget over-banks the device and is rejected.
         let over = max_lead_ms + 1;
         let config = Config::parse(&format!(
-            "listen_addr = \"10.0.0.5:7380\"\n[playback]\nlead_ms = {over}"
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[playback]\nlead_ms = {over}"
         ))
         .expect("parse");
         let err = config.validate().unwrap_err();
@@ -1344,7 +1462,7 @@ job_queue_depth = 4
         let old_cap = (INBOUND_PCM_RING_BYTES as u64) / bytes_per_ms;
         assert!(old_cap > max_lead_ms, "old cap must exceed the new one");
         let config = Config::parse(&format!(
-            "listen_addr = \"10.0.0.5:7380\"\n[playback]\nlead_ms = {old_cap}"
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[playback]\nlead_ms = {old_cap}"
         ))
         .expect("parse");
         assert!(
@@ -1357,7 +1475,7 @@ job_queue_depth = 4
         // i64::MAX, whose ×32 byte-equivalent overflows u64.
         let huge = i64::MAX as u64;
         let config = Config::parse(&format!(
-            "listen_addr = \"10.0.0.5:7380\"\n[playback]\nlead_ms = {huge}"
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[playback]\nlead_ms = {huge}"
         ))
         .expect("parse");
         let err = config.validate().unwrap_err();
@@ -1367,7 +1485,7 @@ job_queue_depth = 4
     #[test]
     fn playback_rejects_zero_write_timeout() {
         let config =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[playback]\nwrite_timeout_ms = 0")
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[playback]\nwrite_timeout_ms = 0")
                 .expect("parse");
         let err = config.validate().unwrap_err();
         assert!(err.contains("write_timeout_ms"), "message: {err}");
@@ -1379,8 +1497,10 @@ job_queue_depth = 4
             ("speak_queue_depth", "[playback]\nspeak_queue_depth = 0"),
             ("job_queue_depth", "[playback]\njob_queue_depth = 0"),
         ] {
-            let config =
-                Config::parse(&format!("listen_addr = \"10.0.0.5:7380\"\n{table}")).expect("parse");
+            let config = Config::parse(&format!(
+                "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n{table}"
+            ))
+            .expect("parse");
             let err = config.validate().unwrap_err();
             assert!(err.contains(field), "expected {field} in message: {err}");
         }
@@ -1388,21 +1508,26 @@ job_queue_depth = 4
 
     #[test]
     fn playback_rejects_unknown_key() {
-        let err =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[playback]\nbogus = 1").unwrap_err();
+        let err = Config::parse(
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[playback]\nbogus = 1",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("bogus"), "message: {err}");
     }
 
     #[test]
     fn sink_stdout_keyword() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"\n[jsonl]\nsink = \"stdout\"")
+        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[jsonl]\nsink = \"stdout\"")
             .expect("parse");
         assert_eq!(config.jsonl.sink, JsonlSink::Stdout);
     }
 
     #[test]
     fn rejects_unknown_key() {
-        let err = Config::parse("listen_addr = \"10.0.0.5:7380\"\nbogus = 1").unwrap_err();
+        let err = Config::parse(
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\nbogus = 1",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("bogus"), "message: {err}");
     }
 
@@ -1410,28 +1535,32 @@ job_queue_depth = 4
     fn rejects_unknown_key_in_nested_table() {
         // `deny_unknown_fields` applies at every nesting level, not just the top.
         let err =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[record]\nenabled = true\ntypo = 1")
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[record]\nenabled = true\ntypo = 1")
                 .unwrap_err();
         assert!(err.to_string().contains("typo"), "message: {err}");
     }
 
     #[test]
     fn sink_dash_alias_is_stdout() {
-        let config =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[jsonl]\nsink = \"-\"").expect("parse");
+        let config = Config::parse(
+            "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[jsonl]\nsink = \"-\"",
+        )
+        .expect("parse");
         assert_eq!(config.jsonl.sink, JsonlSink::Stdout);
     }
 
     #[test]
     fn sink_none_keyword() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"\n[jsonl]\nsink = \"none\"")
+        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[jsonl]\nsink = \"none\"")
             .expect("parse");
         assert_eq!(config.jsonl.sink, JsonlSink::None);
     }
 
     #[test]
     fn validate_rejects_unspecified_listen_addr() {
-        let config = Config::parse("listen_addr = \"0.0.0.0:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"0.0.0.0:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         let err = config.validate().unwrap_err();
         assert!(err.contains("listen_addr"), "message: {err}");
     }
@@ -1439,7 +1568,7 @@ job_queue_depth = 4
     #[test]
     fn validate_rejects_zero_segment_queue_depth() {
         let config =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\n[pipeline]\nsegment_queue_depth = 0")
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[pipeline]\nsegment_queue_depth = 0")
                 .expect("parse");
         let err = config.validate().unwrap_err();
         assert!(err.contains("segment_queue_depth"), "message: {err}");
@@ -1447,7 +1576,9 @@ job_queue_depth = 4
 
     #[test]
     fn validate_accepts_concrete_addr_and_defaults() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         assert!(config.validate().is_ok());
     }
 
@@ -1459,12 +1590,17 @@ job_queue_depth = 4
 
     #[test]
     fn rejects_unparseable_listen_addr() {
-        assert!(Config::parse("listen_addr = \"not-an-address\"").is_err());
+        assert!(
+            Config::parse("listen_addr = \"not-an-address\"\npod_psk_file = \"/psk.toml\"\n")
+                .is_err()
+        );
     }
 
     #[test]
     fn room_lookup_unmapped() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         let lookup = config.room_for("pod-unknown");
         assert_eq!(lookup, RoomLookup::Unmapped);
         assert!(lookup.is_unmapped());
@@ -1495,12 +1631,14 @@ voice = "af_heart"
 "#;
 
     fn with_addr(body: &str) -> String {
-        format!("listen_addr = \"10.0.0.5:7380\"\n{body}")
+        format!("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n{body}")
     }
 
     #[test]
     fn stt_tts_absent_tables_are_none() {
-        let config = Config::parse("listen_addr = \"10.0.0.5:7380\"").expect("parse");
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n")
+                .expect("parse");
         assert!(config.stt.is_none());
         assert!(config.tts.is_none());
         assert!(config.validate().is_ok());
@@ -1773,5 +1911,103 @@ model = "m"
         let config = Config::parse(&with_addr(stt_only)).expect("parse");
         let err = config.validate().unwrap_err();
         assert!(err.contains("[tts]"), "message: {err}");
+    }
+
+    #[test]
+    fn config_without_pod_psk_file_is_rejected() {
+        let err = Config::parse("listen_addr = \"10.0.0.5:7380\"").unwrap_err();
+        assert!(err.to_string().contains("pod_psk_file"), "message: {err}",);
+    }
+
+    const KEY_A: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn psk_table_parses_pod_keys() {
+        let table = PskTable::parse(&format!(
+            "pod-aabbcc = \"{KEY_A}\"\npod-ddeeff = \"{}\"\n",
+            "ff".repeat(32)
+        ))
+        .expect("parses");
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.key_for("pod-aabbcc").expect("key")[0], 0x00);
+        assert_eq!(table.key_for("pod-aabbcc").expect("key")[31], 0xff);
+        assert_eq!(table.key_for("pod-ddeeff").expect("key"), &[0xff; 32]);
+        assert!(table.key_for("pod-unknown").is_none());
+    }
+
+    #[test]
+    fn psk_table_rejects_non_hex() {
+        let err = PskTable::parse(&format!("pod-a = \"{}zz\"\n", &KEY_A[..62])).unwrap_err();
+        assert!(err.contains("hexadecimal"), "message: {err}");
+    }
+
+    #[test]
+    fn psk_table_rejects_wrong_length() {
+        let err = PskTable::parse(&format!("pod-a = \"{}\"\n", &KEY_A[..62])).unwrap_err();
+        assert!(err.contains("62 characters"), "message: {err}");
+    }
+
+    #[test]
+    fn psk_table_rejects_non_string_entry() {
+        let err = PskTable::parse("pod-a = 12345\n").unwrap_err();
+        assert!(err.contains("64-hex"), "message: {err}");
+    }
+
+    #[test]
+    fn psk_table_rejects_duplicate_pod_id() {
+        let err =
+            PskTable::parse(&format!("pod-a = \"{KEY_A}\"\npod-a = \"{KEY_A}\"\n")).unwrap_err();
+        assert!(err.contains("valid TOML"), "message: {err}");
+    }
+
+    #[test]
+    fn psk_table_rejects_empty_file() {
+        let err = PskTable::parse("# no pods\n").unwrap_err();
+        assert!(err.contains("no pods"), "message: {err}");
+    }
+
+    #[test]
+    fn psk_table_debug_redacts_keys() {
+        let table = PskTable::parse(&format!("pod-a = \"{KEY_A}\"\n")).expect("parses");
+        let rendered = format!("{table:?}");
+        assert_eq!(rendered, "PskTable { pods: [\"pod-a\"], key_bytes: 32 }");
+        // Every 4-hex-character window of the key, in both cases: a leak of any
+        // slice of it — head, tail, or middle — fails, not just the first bytes.
+        let upper = KEY_A.to_ascii_uppercase();
+        for hex in [KEY_A, upper.as_str()] {
+            for window in hex.as_bytes().windows(4) {
+                let window = std::str::from_utf8(window).expect("ascii hex");
+                assert!(
+                    !rendered.contains(window),
+                    "rendered {rendered:?} leaks key material at {window:?}",
+                );
+            }
+        }
+    }
+
+    /// A secrets file any other local account can read is a startup failure, not
+    /// a warning — the whole fleet's keys sit in it.
+    #[cfg(unix)]
+    #[test]
+    fn psk_table_rejects_group_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("psk.toml");
+        std::fs::write(&path, format!("pod-a = \"{KEY_A}\"\n")).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let err = PskTable::load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("group/world-accessible"),
+            "message: {err}",
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let table = PskTable::load(&path).expect("loads at 0600");
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn psk_table_load_reports_a_missing_file() {
+        let err = PskTable::load(Path::new("/nonexistent/psk.toml")).unwrap_err();
+        assert!(err.to_string().contains("/nonexistent/psk.toml"), "{err}");
     }
 }

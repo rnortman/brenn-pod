@@ -194,15 +194,9 @@ impl DoaTrack {
 /// later increment); defined here so the type graph is complete.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeakCmd {
-    // TODO(pod-identity-trust): `target` is a self-asserted, unauthenticated pod
-    // identity — any LAN peer can claim it via `Hello`, and the supersede registry
-    // hands routing to the latest claimant, so synthesized, household-derived audio
-    // for a pod id goes to whichever socket last claimed it. Disposition: accepted on
-    // a trusted single-household LAN — the same envelope under which raw mic audio
-    // already flows inbound unauthenticated (the more sensitive direction) — with no
-    // per-pod token for now; a takeover is loud because the supersede is already
-    // JSONL-visible. Mitigation path is the deferred `audio-auth` (TLS/PSK) work plus
-    // `pod-auth-threat-model`. Slug stays open pending that.
+    // `target` is an authenticated pod identity: the ingest server has
+    // verified the peer holds a per-pod key before any `Hello` reaches the
+    // supersede registry, so routing by this id reaches only a key holder.
     pub target: PodId,
     pub in_reply_to: Option<UtteranceId>,
     pub body: SpeakBody,

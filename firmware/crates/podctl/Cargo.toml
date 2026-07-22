@@ -18,6 +18,10 @@ heapless        = { version = "0.9", features = ["serde"] }
 clap            = { version = "4", features = ["derive", "env"] }
 serde           = { version = "1", features = ["derive"] }
 serde_json      = "1"
+# Host-only. getrandom: OS CSPRNG for `provision-audio-psk --generate`. toml_edit:
+# format-preserving upsert of the operator's host-side pod_id → key table.
+getrandom       = "0.4"
+toml_edit       = "0.25"
 
 [dev-dependencies]
 tempfile = "3"

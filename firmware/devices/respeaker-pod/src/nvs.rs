@@ -91,6 +91,39 @@ pub(crate) fn nvs_get_blob4(
     }
 }
 
+/// Read the 32-byte audio-link PSK blob from the `"wifi"` NVS namespace.
+///
+/// A short or absent blob is reported as unprovisioned rather than padded — a
+/// truncated key would fail the TLS handshake with a far less obvious message.
+#[allow(clippy::result_large_err)] // device_protocol::TestResultMsg is the no-alloc error type on no_std
+#[cfg(target_os = "espidf")]
+pub(crate) fn nvs_get_blob32(
+    nvs: &EspNvs<NvsDefault>,
+    key: &str,
+) -> Result<[u8; 32], device_protocol::TestResultMsg> {
+    let mut buf = [0u8; 32];
+    match nvs.get_blob(key, &mut buf) {
+        Ok(Some(b)) if b.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(b);
+            Ok(out)
+        }
+        Ok(_) => {
+            let mut s = device_protocol::TestResultMsg::new();
+            let _ = core::fmt::write(
+                &mut s,
+                format_args!("no {} in NVS — run ProvisionAudioPsk first", key),
+            );
+            Err(s)
+        }
+        Err(e) => {
+            let mut s = device_protocol::TestResultMsg::new();
+            let _ = core::fmt::write(&mut s, format_args!("nvs get_blob {} failed: {:?}", key, e));
+            Err(s)
+        }
+    }
+}
+
 /// Read a string NVS key from the `"wifi"` namespace into a fixed buffer.
 /// Returns `None` if the key is absent, `Some(str)` if present.
 /// Returns `Err` with message on NVS error.
@@ -181,20 +214,50 @@ pub(crate) fn handle_clear_wifi_credentials() -> (Status, Payload) {
     (Status::Ok, Payload::Empty)
 }
 
-/// Write peer host/port configuration to NVS.
-#[allow(clippy::too_many_arguments)]
+/// The HIL peer endpoints one `ProvisionPeer` writes, bundled.
+///
+/// A bundle rather than a parameter list: the handler would otherwise take eleven
+/// argument words, past the six the Xtensa realign-miscompile guard tolerates
+/// (`TODO(xtensa-realign-stack-args)`, `firmware/tools/check-realign-args.sh`).
 #[cfg(target_os = "espidf")]
-pub(crate) fn handle_provision_peer(
-    host: [u8; 4],
-    udp_port: u16,
-    tcp_port: u16,
-    tls_host: [u8; 4],
-    tls_port: u16,
-    inbound_frames_port: u16,
-    backpressure_port: u16,
-    poll_readiness_port: u16,
-    rtd_port: u16,
-) -> (Status, Payload) {
+pub(crate) struct PeerEndpoints {
+    /// UDP echo port.
+    pub(crate) udp_port: u16,
+    /// TCP echo port.
+    pub(crate) tcp_port: u16,
+    /// Public TLS endpoint address, reached by literal IP.
+    pub(crate) tls_host: [u8; 4],
+    /// Public TLS endpoint port.
+    pub(crate) tls_port: u16,
+    /// Inbound audio-frame source port.
+    pub(crate) inbound_frames_port: u16,
+    /// Backpressure source port.
+    pub(crate) backpressure_port: u16,
+    /// Poll-readiness adversary port.
+    pub(crate) poll_readiness_port: u16,
+    /// `StreamRealtimeDuplex` listener port.
+    pub(crate) rtd_port: u16,
+    /// TLS-PSK listener holding this pod's real audio-link key.
+    pub(crate) tls_psk_port: u16,
+    /// TLS-PSK listener holding a different key for this pod's identity.
+    pub(crate) tls_psk_bad_port: u16,
+}
+
+/// Write peer host/port configuration to NVS.
+#[cfg(target_os = "espidf")]
+pub(crate) fn handle_provision_peer(host: [u8; 4], ports: &PeerEndpoints) -> (Status, Payload) {
+    let PeerEndpoints {
+        udp_port,
+        tcp_port,
+        tls_host,
+        tls_port,
+        inbound_frames_port,
+        backpressure_port,
+        poll_readiness_port,
+        rtd_port,
+        tls_psk_port,
+        tls_psk_bad_port,
+    } = *ports;
     let nvs = match open_wifi_nvs(true) {
         Ok(n) => n,
         Err(msg) => return test_report_fail_msg(msg),
@@ -226,9 +289,15 @@ pub(crate) fn handle_provision_peer(
     if let Err(e) = nvs.set_u16("peer_rtd_tcp", rtd_port) {
         return test_report_fail_detail("nvs set_u16 peer_rtd_tcp failed", &e);
     }
+    if let Err(e) = nvs.set_u16("peer_psk_tcp", tls_psk_port) {
+        return test_report_fail_detail("nvs set_u16 peer_psk_tcp failed", &e);
+    }
+    if let Err(e) = nvs.set_u16("peer_psk_bad", tls_psk_bad_port) {
+        return test_report_fail_detail("nvs set_u16 peer_psk_bad failed", &e);
+    }
     log::info!(
         "provisioned peer host={} udp={} tcp={} tls_host={} tls={} inbound_tcp={} bp_tcp={} \
-         poll_tcp={} rtd_tcp={}",
+         poll_tcp={} rtd_tcp={} psk_tcp={} pskbad_tcp={}",
         fmt_ipv4(host),
         udp_port,
         tcp_port,
@@ -238,6 +307,8 @@ pub(crate) fn handle_provision_peer(
         backpressure_port,
         poll_readiness_port,
         rtd_port,
+        tls_psk_port,
+        tls_psk_bad_port,
     );
     (Status::Ok, Payload::Empty)
 }
@@ -257,6 +328,38 @@ pub(crate) fn handle_provision_audio(host: [u8; 4], port: u16) -> (Status, Paylo
     }
     log::info!("provisioned audio host={} port={}", fmt_ipv4(host), port);
     (Status::Ok, Payload::Empty)
+}
+
+/// Write the 32-byte audio-link PSK to NVS and answer with this pod's identity.
+///
+/// The response carries the MAC-derived pod id, never the key: the provisioning host
+/// needs the identity to key its own `pod_id → key` table, and that identity is
+/// authoritative only on the device. Neither the key bytes nor any digest of them are
+/// logged.
+///
+/// `POD_ID` is filled during WiFi stack initialization. If it is still empty the
+/// command fails *before* touching NVS: a caller that recorded an empty identity would
+/// build a host table entry no handshake can ever match, and a half-applied provision
+/// (key stored, identity unknown) is worse than none.
+#[cfg(target_os = "espidf")]
+pub(crate) fn handle_provision_audio_psk(key: [u8; 32]) -> (Status, Payload) {
+    let Some(pod_id) = crate::streamer::pod_id_snapshot() else {
+        return test_report_fail_fmt(format_args!(
+            "pod identity not yet initialized; retry after the wifi stack starts"
+        ));
+    };
+    let nvs = match open_wifi_nvs(true) {
+        Ok(n) => n,
+        Err(msg) => return test_report_fail_msg(msg),
+    };
+    if let Err(e) = nvs.set_blob("audio_psk", &key) {
+        return test_report_fail_detail("nvs set_blob audio_psk failed", &e);
+    }
+    log::info!(
+        "provisioned audio_psk (32 bytes) pod_id={} (applies on next streamer connect)",
+        pod_id.as_str()
+    );
+    (Status::Ok, Payload::PodId(pod_id))
 }
 
 /// Validate and write a VAD threshold to NVS. Applied on next boot.

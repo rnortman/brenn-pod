@@ -269,8 +269,22 @@ mod tests {
     use super::*;
     use speech_surface::Sidecar;
 
+    /// Write a 0600 PSK file into `dir` and return the `pod_psk_file` config line
+    /// naming it. Every test that actually binds a listener needs a loadable key
+    /// table; the parse-only tests keep a placeholder path.
+    fn psk_file_line(dir: &Path) -> String {
+        let path = dir.join("psk.toml");
+        speech_surface::psk::write_secret_file(
+            &path,
+            &format!("pod-srv = \"{}\"\n", "5a".repeat(32)),
+        )
+        .expect("write psk");
+        format!("pod_psk_file = {path:?}\n")
+    }
+
     fn base_config() -> Config {
-        Config::parse("listen_addr = \"127.0.0.1:7380\"").expect("parse")
+        Config::parse("listen_addr = \"127.0.0.1:7380\"\npod_psk_file = \"/psk.toml\"\n")
+            .expect("parse")
     }
 
     #[test]
@@ -332,7 +346,11 @@ mod tests {
     fn load_config_rejects_override_binding_all_interfaces() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("speech.toml");
-        std::fs::write(&path, "listen_addr = \"127.0.0.1:7380\"").unwrap();
+        std::fs::write(
+            &path,
+            "listen_addr = \"127.0.0.1:7380\"\npod_psk_file = \"/psk.toml\"\n",
+        )
+        .unwrap();
         let args = RunArgs {
             config: Some(path),
             listen: Some("0.0.0.0:7380".parse().unwrap()),
@@ -366,9 +384,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jsonl_path = dir.path().join("events.jsonl");
         let text = format!(
-            "listen_addr = \"127.0.0.1:0\"\n\
+            "listen_addr = \"127.0.0.1:0\"\n{}\
              [jsonl]\nsink = {:?}\n\
              [record]\nenabled = false\n",
+            psk_file_line(dir.path()),
             jsonl_path.to_str().unwrap()
         );
         let config = Config::parse(&text).expect("parse");
@@ -395,9 +414,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let jsonl_path = dir.path().join("events.jsonl");
         let text = format!(
-            "listen_addr = \"127.0.0.1:0\"\n\
+            "listen_addr = \"127.0.0.1:0\"\n{}\
              [jsonl]\nsink = {:?}\n\
              [record]\nenabled = false\n",
+            psk_file_line(dir.path()),
             jsonl_path.to_str().unwrap()
         );
         let config = Config::parse(&text).expect("parse");
@@ -420,9 +440,12 @@ mod tests {
     /// cleanly with no file writer task and no hang.
     #[tokio::test(flavor = "multi_thread")]
     async fn serve_with_no_sink_starts_and_drains() {
-        let text = "listen_addr = \"127.0.0.1:0\"\n\
-                    [record]\nenabled = false\n";
-        let config = Config::parse(text).expect("parse");
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "listen_addr = \"127.0.0.1:0\"\n{}[record]\nenabled = false\n",
+            psk_file_line(dir.path())
+        );
+        let config = Config::parse(&text).expect("parse");
         assert_eq!(config.jsonl.sink, JsonlSink::None);
         serve(config, |_| async {}).await.expect("serve");
     }
