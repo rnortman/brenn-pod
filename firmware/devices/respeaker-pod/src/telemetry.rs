@@ -4,8 +4,8 @@
 //! the streamer. Also holds the VAD-threshold NVS loader.
 
 use audio_pipeline::vad::{
-    decode_vad_hangover_ms, decode_vad_threshold, vad_hangover_ticks_ms, VadStateMachine,
-    VadTransition, VAD_HANGOVER_MS,
+    VAD_HANGOVER_MS, VadStateMachine, VadTransition, decode_vad_hangover_ms, decode_vad_threshold,
+    vad_hangover_ticks_ms,
 };
 use audio_pipeline::wire::{Telemetry as WireTelemetry, TelemetryKind};
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -13,11 +13,11 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use crate::i2c::I2C_BUS;
 use crate::nvs::open_audio_nvs;
 use crate::xvf3800::{
-    decode_f32x4, xvf3800_control_read, XVF3800_AEC_AZIMUTH_READ_LEN,
-    XVF3800_AEC_AZIMUTH_VALUES_CMD, XVF3800_AEC_RESID, XVF3800_AEC_SPENERGY_READ_LEN,
-    XVF3800_AEC_SPENERGY_VALUES_CMD,
+    XVF3800_AEC_AZIMUTH_READ_LEN, XVF3800_AEC_AZIMUTH_VALUES_CMD, XVF3800_AEC_RESID,
+    XVF3800_AEC_SPENERGY_READ_LEN, XVF3800_AEC_SPENERGY_VALUES_CMD, decode_f32x4,
+    xvf3800_control_read,
 };
-use crate::{StreamerMsg, CAPTURE_RING, VAD_CLOSED_FLAG};
+use crate::{CAPTURE_RING, StreamerMsg, VAD_CLOSED_FLAG};
 
 /// SPENERGY polling rate (Hz). 20 Hz → 50 ms poll interval for the VAD FSM.
 pub(crate) const VAD_POLL_HZ: u32 = 20;
@@ -215,22 +215,19 @@ pub(crate) fn spawn_telemetry_vad_thread(tx: std::sync::mpsc::SyncSender<Streame
                     };
 
                     // Forward DoA telemetry while a segment is open.
-                    if segment_open {
-                        if let Some(az) = az_values_opt {
-                            let doa_now_us =
-                                unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-                            let tel = WireTelemetry {
-                                device_ts_us: doa_now_us,
-                                kind: TelemetryKind::Azimuths { values: az },
-                            };
-                            match tx.try_send(StreamerMsg::Telemetry(tel)) {
-                                Ok(()) => {}
-                                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                                    telemetry_drops = telemetry_drops.saturating_add(1);
-                                }
-                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                    log::warn!("telemetry: streamer channel disconnected (DoA)");
-                                }
+                    if segment_open && let Some(az) = az_values_opt {
+                        let doa_now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+                        let tel = WireTelemetry {
+                            device_ts_us: doa_now_us,
+                            kind: TelemetryKind::Azimuths { values: az },
+                        };
+                        match tx.try_send(StreamerMsg::Telemetry(tel)) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                telemetry_drops = telemetry_drops.saturating_add(1);
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                log::warn!("telemetry: streamer channel disconnected (DoA)");
                             }
                         }
                     }

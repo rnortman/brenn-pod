@@ -81,7 +81,7 @@ impl OwwGate {
 mod tests {
     use super::*;
     use crate::test_support::{oww_config, oww_model_dir, seeded_noise, wake_phrase_pcm};
-    use crate::types::{test_segment, Segment};
+    use crate::types::{Segment, test_segment};
 
     fn test_gate_with_threshold(threshold: f32) -> OwwGate {
         OwwGate::load(&oww_config(threshold)).expect("load committed models")

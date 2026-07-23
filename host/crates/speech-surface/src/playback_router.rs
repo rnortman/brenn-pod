@@ -18,22 +18,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use audio_pipeline::vad::VAD_HANGOVER_MS;
+use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future::BoxFuture;
-use futures::StreamExt;
 use pod_ingest::HostMicros;
 use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
-    signed_offset_us, stage_delta_us, Feed, FeedPermit, PlayRejected, PlaybackEvent,
-    PlaybackEventFn, PlaybackJob, PodId, SpeakBody, SpeakCmd, StageTimings, SynthesisError,
-    Synthesizer, UtteranceId, FRAME_MS,
+    FRAME_MS, Feed, FeedPermit, PlayRejected, PlaybackEvent, PlaybackEventFn, PlaybackJob, PodId,
+    SpeakBody, SpeakCmd, StageTimings, SynthesisError, Synthesizer, UtteranceId, signed_offset_us,
+    stage_delta_us,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::barge::TurnLedger;
 use crate::jsonl::JsonlHandle;
-use crate::server::{playback_try_play, PlaybackRegistry};
+use crate::server::{PlaybackRegistry, playback_try_play};
 
 /// Router-side counters, atomics-only with a `Copy` snapshot for `stage_health`
 /// (the `WakeStats` idiom). The writer-side rejections (`QueueFull`/`WriterDead`)
@@ -312,7 +312,7 @@ async fn synthesize_text(
         None => {
             return Err(SynthesisError::Decode(
                 "stream ended without a chunk".into(),
-            ))
+            ));
         }
     };
     // Peek for a second chunk: a stream that ends here (today's sole shape) reuses
@@ -1623,8 +1623,8 @@ mod tests {
         })
         .await
         .expect("the writer starts the job");
-        let t = seen.lock().unwrap().pop().unwrap();
-        t
+
+        seen.lock().unwrap().pop().unwrap()
     }
 
     #[tokio::test]
@@ -1701,9 +1701,11 @@ mod tests {
         assert_eq!(dropped["during"], "queue");
         // The newer turn reached the (absent) pod, so it was routed, not evicted.
         assert_eq!(stats.no_pod, 1);
-        assert!(lines
-            .iter()
-            .any(|v| v["event"] == "playback_no_pod" && v["utterance"] == 2));
+        assert!(
+            lines
+                .iter()
+                .any(|v| v["event"] == "playback_no_pod" && v["utterance"] == 2)
+        );
     }
 
     #[tokio::test]

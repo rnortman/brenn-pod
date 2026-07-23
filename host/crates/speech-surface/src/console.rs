@@ -337,12 +337,12 @@ fn collect_counter_deltas(
         };
         if child.is_object() {
             collect_counter_deltas(child, &child_path, snapshot, movers);
-        } else if HEALTH_COUNTER_LEAVES.contains(&key.as_str()) {
-            if let Some(current) = child.as_u64() {
-                let previous = snapshot.insert(child_path.clone(), current).unwrap_or(0);
-                if current > previous {
-                    movers.push(format!("{child_path} +{}", current - previous));
-                }
+        } else if HEALTH_COUNTER_LEAVES.contains(&key.as_str())
+            && let Some(current) = child.as_u64()
+        {
+            let previous = snapshot.insert(child_path.clone(), current).unwrap_or(0);
+            if current > previous {
+                movers.push(format!("{child_path} +{}", current - previous));
             }
         }
     }
@@ -1579,15 +1579,19 @@ mod tests {
     #[test]
     fn wake_bypassed_renders_loud() {
         let mut plain = Renderer::new(false);
-        assert!(plain
-            .render(0, "wake_bypassed", &json!({}))
-            .unwrap()
-            .contains("!!!"));
+        assert!(
+            plain
+                .render(0, "wake_bypassed", &json!({}))
+                .unwrap()
+                .contains("!!!")
+        );
         let mut colored = Renderer::new(true);
-        assert!(colored
-            .render(0, "wake_bypassed", &json!({}))
-            .unwrap()
-            .contains('\x1b'));
+        assert!(
+            colored
+                .render(0, "wake_bypassed", &json!({}))
+                .unwrap()
+                .contains('\x1b')
+        );
     }
 
     #[test]
@@ -1801,31 +1805,36 @@ mod tests {
     #[test]
     fn color_wraps_loud_lines_only() {
         let mut r = Renderer::new(true);
-        assert!(r
-            .render(0, "stt_failed", &json!({}))
-            .unwrap()
-            .contains('\x1b'));
-        assert!(!r
-            .render(0, "segment_opened", &json!({}))
-            .unwrap()
-            .contains('\x1b'));
+        assert!(
+            r.render(0, "stt_failed", &json!({}))
+                .unwrap()
+                .contains('\x1b')
+        );
+        assert!(
+            !r.render(0, "segment_opened", &json!({}))
+                .unwrap()
+                .contains('\x1b')
+        );
     }
 
     #[test]
     fn wake_decision_is_loud_only_on_error_outcome() {
         let mut r = Renderer::new(false);
-        assert!(r
-            .render(0, "wake_decision", &json!({ "outcome": "positive" }))
-            .unwrap()
-            .contains("wake positive"));
-        assert!(!r
-            .render(0, "wake_decision", &json!({ "outcome": "positive" }))
-            .unwrap()
-            .contains("!!!"));
-        assert!(r
-            .render(0, "wake_decision", &json!({ "outcome": "error" }))
-            .unwrap()
-            .contains("!!!"));
+        assert!(
+            r.render(0, "wake_decision", &json!({ "outcome": "positive" }))
+                .unwrap()
+                .contains("wake positive")
+        );
+        assert!(
+            !r.render(0, "wake_decision", &json!({ "outcome": "positive" }))
+                .unwrap()
+                .contains("!!!")
+        );
+        assert!(
+            r.render(0, "wake_decision", &json!({ "outcome": "error" }))
+                .unwrap()
+                .contains("!!!")
+        );
     }
 
     #[test]
@@ -2242,13 +2251,14 @@ mod tests {
             "{line}"
         );
         // Nothing further moves: silent again despite the counters being nonzero.
-        assert!(r
-            .render(
+        assert!(
+            r.render(
                 0,
                 "stage_health",
                 &json!({ "stt": { "failed": 3 }, "jsonl_dropped": 7 }),
             )
-            .is_none());
+            .is_none()
+        );
     }
 
     #[test]
@@ -2397,13 +2407,14 @@ mod tests {
         // A non-object value, a curated leaf with a non-numeric value, and a
         // non-curated leaf: none panics, none is a mover.
         assert!(r.render(0, "stage_health", &Value::Null).is_none());
-        assert!(r
-            .render(
+        assert!(
+            r.render(
                 0,
                 "stage_health",
                 &json!({ "stt": { "failed": "lots" }, "unrelated": 9 }),
             )
-            .is_none());
+            .is_none()
+        );
     }
 
     #[test]

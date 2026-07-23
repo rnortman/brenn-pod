@@ -296,7 +296,7 @@ pub(crate) fn aic3104_dac_mute_best_effort(driver: &mut I2cDriver<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{masked_eq, AIC3104_DAC_VOLUME_MUTED, AIC3104_INIT_SEQUENCE};
+    use super::{AIC3104_DAC_VOLUME_MUTED, AIC3104_INIT_SEQUENCE, masked_eq};
 
     // ── AIC3104 masked read-back compare ──────────────────────────────────
 

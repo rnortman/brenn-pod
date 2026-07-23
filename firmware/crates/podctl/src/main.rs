@@ -28,8 +28,8 @@
 use clap::{Parser, Subcommand};
 use device_protocol::{Command, DeviceFrame, LogFrame, LogLevel, Payload, Response, Status};
 use pod_transport::{
-    enumerate_pods, escape_device_str, format_log, open_port, FrameReader, HarnessError, PodMode,
-    PodPort, Transport, RESPONSE_TIMEOUT,
+    FrameReader, HarnessError, PodMode, PodPort, RESPONSE_TIMEOUT, Transport, enumerate_pods,
+    escape_device_str, format_log, open_port,
 };
 use serde::Serialize;
 use std::fs::File;
@@ -390,12 +390,12 @@ fn upsert_psk_entry(existing: &str, pod_id: &str, key_hex: &str) -> Result<Strin
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| format!("not valid TOML: {e}"))?;
-    if let Some(item) = doc.get(pod_id) {
-        if !item.is_str() {
-            return Err(format!(
-                "existing entry for {pod_id} is not a string; refusing to overwrite"
-            ));
-        }
+    if let Some(item) = doc.get(pod_id)
+        && !item.is_str()
+    {
+        return Err(format!(
+            "existing entry for {pod_id} is not a string; refusing to overwrite"
+        ));
     }
     doc[pod_id] = toml_edit::value(key_hex);
     Ok(doc.to_string())
@@ -1464,11 +1464,13 @@ mod tests {
     #[test]
     fn validate_wifi_ssid_32_bytes_accepted() {
         let ssid = "a".repeat(32);
-        assert!(validate_wifi(WifiArgs {
-            ssid: Some(ssid),
-            passphrase: Some("pass".into()),
-        })
-        .is_ok());
+        assert!(
+            validate_wifi(WifiArgs {
+                ssid: Some(ssid),
+                passphrase: Some("pass".into()),
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1485,11 +1487,13 @@ mod tests {
     #[test]
     fn validate_wifi_passphrase_64_bytes_accepted() {
         let pass = "p".repeat(64);
-        assert!(validate_wifi(WifiArgs {
-            ssid: Some("net".into()),
-            passphrase: Some(pass),
-        })
-        .is_ok());
+        assert!(
+            validate_wifi(WifiArgs {
+                ssid: Some("net".into()),
+                passphrase: Some(pass),
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1508,11 +1512,13 @@ mod tests {
         // 10 * 3 = 30 bytes — should pass.
         let ssid_ok = "中".repeat(10);
         assert_eq!(ssid_ok.len(), 30);
-        assert!(validate_wifi(WifiArgs {
-            ssid: Some(ssid_ok),
-            passphrase: Some("pass".into()),
-        })
-        .is_ok());
+        assert!(
+            validate_wifi(WifiArgs {
+                ssid: Some(ssid_ok),
+                passphrase: Some("pass".into()),
+            })
+            .is_ok()
+        );
     }
 
     // ── Validation: set-temp-wifi ─────────────────────────────────────────────

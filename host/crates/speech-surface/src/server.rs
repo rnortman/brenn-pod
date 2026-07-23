@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use audio_pipeline::wire::{decode_frame, MAX_FRAME_BYTES};
+use audio_pipeline::wire::{MAX_FRAME_BYTES, decode_frame};
 use openssl::ssl::{Ssl, SslContext, SslMethod};
 use serde::Serialize;
 use serde_json::json;
@@ -37,27 +37,27 @@ use pod_ingest::{
     CloseCause, CrossCheck, HostMicros, ResumeLedger, SegmentRef, SessionEvent, SessionFsm,
 };
 use speech_pipeline::{
-    stage_delta_us, AssemblerLimits, Brain, BrainEvent, BrainEventFn, BrainStats,
-    BrainStatsSnapshot, BuildError, ConfidenceGate, DropOldestQueue, EchoBrain, FeedSender,
-    FlushRejected, HttpSynthesizer, HttpTranscriber, InterruptProgress, Listener, ListenerConfig,
-    ListenerEvent, ListenerHandle, ListenerStats, ListenerStatsSnapshot, OwwModels, PacerConfig,
-    PlayRejected, PlaybackEventFn, PlaybackHandle, PlaybackJob, PlaybackStats,
-    PlaybackStatsSnapshot, PlaybackWriter, PodId, QueueStats, RoomId, Segment, SegmentAssembler,
-    SegmentEndCause, Sender, SileroModel, SpeakCmd, StageTimings, StatsHandle, SttParams, SttStats,
-    SttStatsSnapshot, Synthesizer, Transcriber, TtsParams, TtsStats, TtsStatsSnapshot, UtteranceId,
-    WakeCommandReason, WakeError, WavBrain, SPINE_FORMAT,
+    AssemblerLimits, Brain, BrainEvent, BrainEventFn, BrainStats, BrainStatsSnapshot, BuildError,
+    ConfidenceGate, DropOldestQueue, EchoBrain, FeedSender, FlushRejected, HttpSynthesizer,
+    HttpTranscriber, InterruptProgress, Listener, ListenerConfig, ListenerEvent, ListenerHandle,
+    ListenerStats, ListenerStatsSnapshot, OwwModels, PacerConfig, PlayRejected, PlaybackEventFn,
+    PlaybackHandle, PlaybackJob, PlaybackStats, PlaybackStatsSnapshot, PlaybackWriter, PodId,
+    QueueStats, RoomId, SPINE_FORMAT, Segment, SegmentAssembler, SegmentEndCause, Sender,
+    SileroModel, SpeakCmd, StageTimings, StatsHandle, SttParams, SttStats, SttStatsSnapshot,
+    Synthesizer, Transcriber, TtsParams, TtsStats, TtsStatsSnapshot, UtteranceId,
+    WakeCommandReason, WakeError, WavBrain, stage_delta_us,
 };
 
 use crate::barge::TurnLedger;
-use crate::clip::{load_clip, ClipError};
+use crate::clip::{ClipError, load_clip};
 use crate::config::{BrainMode, Config, PskTable, SttBackend, SttConfig, TtsBackend};
 use crate::iso8601_ms;
 use crate::jsonl::JsonlHandle;
 use crate::pipeline::{BargeWiring, BrainWiring, PipelineFatal};
 use crate::playback_router::{
-    self, playback_event_adapter, PlaybackFanout, RouterStats, RouterStatsSnapshot,
+    self, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
 };
-use crate::prune::{prune, PruneOutcome, PruneRequest};
+use crate::prune::{PruneOutcome, PruneRequest, prune};
 use crate::recorder::{OpenLogs, Recorder, RecorderShared};
 
 /// Deadline for an accepted connection to send its first decodable frame. Until
@@ -832,15 +832,14 @@ impl Server {
         // sender) before the pipeline can drain, so it is joined here rather than
         // after — otherwise the pipeline would wait on a sender that waits on this
         // join.
-        if let Some(listener_handle) = listener_handle {
-            if let Some(handle) = Arc::into_inner(listener_handle) {
-                if handle.join().is_err() {
-                    jsonl.emit("listener_thread_panicked", &json!({}));
-                    pipeline_fatal.get_or_insert(PipelineFatal {
-                        detail: "listener thread panicked".to_string(),
-                    });
-                }
-            }
+        if let Some(listener_handle) = listener_handle
+            && let Some(handle) = Arc::into_inner(listener_handle)
+            && handle.join().is_err()
+        {
+            jsonl.emit("listener_thread_panicked", &json!({}));
+            pipeline_fatal.get_or_insert(PipelineFatal {
+                detail: "listener thread panicked".to_string(),
+            });
         }
         if let Some(forwarder) = listener_forwarder {
             let _ = forwarder.await;
@@ -862,10 +861,8 @@ impl Server {
         // The router task exits once its `SpeakCmd` channel closes (the pipeline
         // has ended, dropping `BrainWiring`'s sender) or `shutdown_token` fired,
         // whichever comes first. A non-`Ok` join means it panicked mid-run.
-        if !router_joined {
-            if let Some(join) = router_join {
-                handle_router_exit(join.await, &jsonl);
-            }
+        if !router_joined && let Some(join) = router_join {
+            handle_router_exit(join.await, &jsonl);
         }
 
         // Final `stage_health` after the pipeline drained, before the caller
@@ -904,7 +901,7 @@ fn build_listener(
 ///
 /// The upgrade is dropped before returning, so only a `FeedSender` clone can live
 /// across a marker await; that delays the thread join by at most the marker timeout.
-fn weak_feed_sender(listener: &Arc<ListenerHandle>) -> impl Fn() -> Option<FeedSender> {
+fn weak_feed_sender(listener: &Arc<ListenerHandle>) -> impl Fn() -> Option<FeedSender> + use<> {
     let listener = Arc::downgrade(listener);
     move || listener.upgrade().map(|l| l.feed_sender())
 }
@@ -929,10 +926,10 @@ async fn tap_listener(
     let Some(listener) = listener else {
         return;
     };
-    if let Some(feed) = crate::replay::session_event_to_feed(ev, pod, epoch) {
-        if let Some(id) = pod.as_ref() {
-            listener.feed(id.clone(), feed).await;
-        }
+    if let Some(feed) = crate::replay::session_event_to_feed(ev, pod, epoch)
+        && let Some(id) = pod.as_ref()
+    {
+        listener.feed(id.clone(), feed).await;
     }
 }
 
@@ -1736,18 +1733,18 @@ async fn connection(
                 }
             }
 
-            if let Some(a) = assembler.as_mut() {
-                if let Some(seg) = a.on_event(ev, recorder.log_name()) {
-                    finalize_segment(
-                        seg,
-                        conn_seq,
-                        &mut recorder,
-                        &jsonl,
-                        &item_tx,
-                        &clock_step_clamps,
-                    );
-                    segment_finalized = true;
-                }
+            if let Some(a) = assembler.as_mut()
+                && let Some(seg) = a.on_event(ev, recorder.log_name())
+            {
+                finalize_segment(
+                    seg,
+                    conn_seq,
+                    &mut recorder,
+                    &jsonl,
+                    &item_tx,
+                    &clock_step_clamps,
+                );
+                segment_finalized = true;
             }
         }
 
@@ -1756,20 +1753,21 @@ async fn connection(
         // Rolls happen only here, so a `SegmentRef` never spans logs. A roll
         // reclaims the just-closed log as a deletion candidate, so it fires a
         // background prune pass — off the connection task, never inline.
-        if (segment_finalized || saw_segment_closed) && !fsm.segment_open() {
-            if let Some(pod) = fsm.pod_id().map(str::to_owned) {
-                let rolled = recorder.maybe_roll(
-                    &pod,
-                    conn_seq,
-                    config.record.roll_max_bytes,
-                    config.record.roll_max_age_s,
-                );
-                if rolled {
-                    // Coalesced + serialized: at most one prune pass runs at a
-                    // time, and a burst of rolls collapses into one follow-up
-                    // pass rather than one redundant full-store scan per roll.
-                    prune_coord.schedule();
-                }
+        if (segment_finalized || saw_segment_closed)
+            && !fsm.segment_open()
+            && let Some(pod) = fsm.pod_id().map(str::to_owned)
+        {
+            let rolled = recorder.maybe_roll(
+                &pod,
+                conn_seq,
+                config.record.roll_max_bytes,
+                config.record.roll_max_age_s,
+            );
+            if rolled {
+                // Coalesced + serialized: at most one prune pass runs at a
+                // time, and a burst of rolls collapses into one follow-up
+                // pass rather than one redundant full-store scan per roll.
+                prune_coord.schedule();
             }
         }
 
@@ -1786,17 +1784,17 @@ async fn connection(
         // The device close reaches the listener as its outer-boundary fallback
         // (missed-onset carve / arm clear), so tap the close-path events too.
         tap_listener(listener.as_ref(), &mut listener_pod, ev, conn_seq).await;
-        if let Some(a) = assembler.as_mut() {
-            if let Some(seg) = a.on_event(ev, recorder.log_name()) {
-                finalize_segment(
-                    seg,
-                    conn_seq,
-                    &mut recorder,
-                    &jsonl,
-                    &item_tx,
-                    &clock_step_clamps,
-                );
-            }
+        if let Some(a) = assembler.as_mut()
+            && let Some(seg) = a.on_event(ev, recorder.log_name())
+        {
+            finalize_segment(
+                seg,
+                conn_seq,
+                &mut recorder,
+                &jsonl,
+                &item_tx,
+                &clock_step_clamps,
+            );
         }
     }
 
@@ -2158,8 +2156,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use audio_pipeline::wire::{
-        encode_frame, AudioFrame, ChannelSource, Codec, EndReason, Hello, SegmentEnd, SegmentStart,
-        StreamFrame, Telemetry, TelemetryKind, AUDIO_PROTOCOL_VERSION, MAX_AUDIO_PAYLOAD,
+        AUDIO_PROTOCOL_VERSION, AudioFrame, ChannelSource, Codec, EndReason, Hello,
+        MAX_AUDIO_PAYLOAD, SegmentEnd, SegmentStart, StreamFrame, Telemetry, TelemetryKind,
+        encode_frame,
     };
     use serde_json::Value;
     use tokio::io::AsyncWriteExt;
@@ -2167,7 +2166,7 @@ mod tests {
 
     use crate::config::Config;
     use crate::jsonl::{self, JsonlHandle};
-    use crate::recorder::{sidecar_path, Sidecar, SidecarSegment};
+    use crate::recorder::{Sidecar, SidecarSegment, sidecar_path};
 
     /// The listener's marker-timeout counter reaches the `stage_health` line
     /// operators read, under that exact name — the counter exists to make a wedged
@@ -3277,11 +3276,13 @@ mod tests {
             .filter(|p| p.extension().is_some_and(|x| x == "framelog"))
             .collect();
         assert_eq!(framelogs.len(), 1);
-        assert!(framelogs[0]
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("pod-srv_"));
+        assert!(
+            framelogs[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pod-srv_")
+        );
         let sidecar = framelogs[0].with_extension("sidecar.json");
         assert!(sidecar.exists());
         let sc: Value = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();

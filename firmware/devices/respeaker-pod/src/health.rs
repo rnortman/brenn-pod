@@ -6,7 +6,7 @@
 //! split out so it is host-testable without ESP-IDF FFI.
 
 use device_protocol::{
-    evaluate_health, test_report_fail_fmt, test_report_ok, MallocProbe, Payload, Status, TestData,
+    MallocProbe, Payload, Status, TestData, evaluate_health, test_report_fail_fmt, test_report_ok,
 };
 
 use crate::console::{ENCODE_FAILURES, TX_WRITE_FAILURES, WRITER_STATE_ANOMALIES};

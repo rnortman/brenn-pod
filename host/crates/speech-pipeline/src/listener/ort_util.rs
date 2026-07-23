@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 
 use crate::wake::WakeError;
 

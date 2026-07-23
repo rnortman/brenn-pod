@@ -16,7 +16,7 @@
 //! Requires `std` (the body builds a `heapless::Vec` via `std`-test machinery and
 //! is only ever compiled for host/test targets).
 
-use crate::wire::{AudioFrame, StreamFrame, MAX_AUDIO_PAYLOAD};
+use crate::wire::{AudioFrame, MAX_AUDIO_PAYLOAD, StreamFrame};
 
 /// Build a minimal `StreamFrame::Audio` with `n_samples` silence samples
 /// (mono S16_LE — 2 bytes per sample).

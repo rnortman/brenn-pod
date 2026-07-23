@@ -742,7 +742,7 @@ mod tests {
     // prefix accepted then no progress for a full budget) and a genuine fault.
 
     use super::{
-        write_frame_classified, write_frame_classified_at, SendOutcome, Writable, WRITE_TIMEOUT_MS,
+        SendOutcome, WRITE_TIMEOUT_MS, Writable, write_frame_classified, write_frame_classified_at,
     };
     use crate::test_support::audio_frame;
     use crate::wire::{AUDIO_SAMPLES_PER_FRAME, MAX_FRAME_BYTES};
@@ -1467,9 +1467,9 @@ mod host_socket_tests {
     // item 2: "the real-socket non-blocking-write + poll + resume loop completes the
     // frame and never desyncs."
 
-    use super::{write_frame_classified_at, SendOutcome, Writable};
+    use super::{SendOutcome, Writable, write_frame_classified_at};
     use crate::test_support::audio_frame;
-    use crate::wire::{encode_frame, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES};
+    use crate::wire::{MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES, encode_frame};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::os::fd::AsRawFd;
@@ -1788,10 +1788,10 @@ mod cross_iteration_tests {
     //      `written > 0` → fatal Err (clear socket).
 
     use super::{
-        FrameWriteState, SendOutcome, StepOutcome, FRAME_WALL_CLOCK_MAX_MS, WRITE_TIMEOUT_MS,
+        FRAME_WALL_CLOCK_MAX_MS, FrameWriteState, SendOutcome, StepOutcome, WRITE_TIMEOUT_MS,
     };
     use crate::test_support::audio_frame;
-    use crate::wire::{encode_frame, AUDIO_SAMPLES_PER_FRAME, MAX_FRAME_BYTES};
+    use crate::wire::{AUDIO_SAMPLES_PER_FRAME, MAX_FRAME_BYTES, encode_frame};
     use std::cell::Cell;
     use std::io::Write;
     use std::time::{Duration, Instant};
@@ -2030,8 +2030,8 @@ mod cross_iteration_tests {
         // Carve into small accepts so many sub-budget windows elapse.
         const K: usize = 8;
         let edges = (n - K) / K; // leave the last chunk for the no-script finishing write
-                                 // `edges` capped accepts, then an empty script: the finishing `step_writable` hits
-                                 // the no-script "accept everything" path and drains the remainder to `WroteWhole`.
+        // `edges` capped accepts, then an empty script: the finishing `step_writable` hits
+        // the no-script "accept everything" path and drains the remainder to `WroteWhole`.
         let script: Vec<usize> = (0..edges).map(|_| K).collect();
         let mut w = StepWriter::new(script);
         for step_i in 0..edges {

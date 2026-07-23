@@ -11,12 +11,12 @@ pub mod synth;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_fixtures;
 
-pub use clock::{samples_to_micros, ClockOffsetEstimate, DeviceMicros, HostMicros};
+pub use clock::{ClockOffsetEstimate, DeviceMicros, HostMicros, samples_to_micros};
 pub use framelog::{FrameLogError, FrameLogReader, FrameLogWriter, LogItem, LogMeta};
-pub use readback::{splice_log_into, SpliceOutcome, SpliceStop};
-pub use segref::{resolve_open, ResolveError, Resolved, SegmentRef};
+pub use readback::{SpliceOutcome, SpliceStop, splice_log_into};
+pub use segref::{ResolveError, Resolved, SegmentRef, resolve_open};
 pub use session::{
     ChannelSource, CloseCause, Codec, CrossCheck, EndReason, FormatConstraint, FsmStats, Gap,
     ProtocolErrorKind, ResumeLedger, SegmentClose, SessionEvent, SessionFsm, TelemetryKind,
 };
-pub use synth::{synth_session, SynthError, SynthFrame, SynthParams};
+pub use synth::{SynthError, SynthFrame, SynthParams, synth_session};

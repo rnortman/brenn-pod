@@ -10,8 +10,8 @@
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
 
 use audio_pipeline::playback::{
-    is_valid_s16le_pcm, Accepted, LogCountdown, PlaybackSink, INBOUND_PCM_RING_BYTES,
-    INBOUND_PCM_WRITE_UNIT_BYTES, PLAYBACK_LOG_CADENCE_FRAMES, PLAYBACK_PREROLL_TARGET_BYTES,
+    Accepted, INBOUND_PCM_RING_BYTES, INBOUND_PCM_WRITE_UNIT_BYTES, LogCountdown,
+    PLAYBACK_LOG_CADENCE_FRAMES, PLAYBACK_PREROLL_TARGET_BYTES, PlaybackSink, is_valid_s16le_pcm,
 };
 
 use crate::DEVICE_PLAYBACK_FORMAT;
@@ -183,10 +183,10 @@ impl FakeDacSink {
             return Accepted::Enqueued;
         }
         // Backpressure: refuse (hold) a frame that would overfill the buffer.
-        if let Some(pe) = self.play_end {
-            if pe.saturating_duration_since(now) >= FAKE_DAC_QUEUE_FRAMES * FAKE_DAC_FRAME_DUR {
-                return Accepted::Full;
-            }
+        if let Some(pe) = self.play_end
+            && pe.saturating_duration_since(now) >= FAKE_DAC_QUEUE_FRAMES * FAKE_DAC_FRAME_DUR
+        {
+            return Accepted::Full;
         }
         self.consumed = self.consumed.wrapping_add(1);
         if !self.playout_started {
@@ -397,8 +397,8 @@ pub(crate) fn consume_frames(
     state: &mut InboundConnectionState,
 ) -> std::io::Result<u32> {
     use audio_pipeline::wire::{
-        check_inbound_format, DecodeError, FormatCheck, InboundFrame, PlaybackFormat,
-        AUDIO_PROTOCOL_VERSION, MAX_FRAME_BYTES,
+        AUDIO_PROTOCOL_VERSION, DecodeError, FormatCheck, InboundFrame, MAX_FRAME_BYTES,
+        PlaybackFormat, check_inbound_format,
     };
 
     let mut frames_decoded: u32 = 0;
@@ -673,13 +673,13 @@ mod tests {
     // ── drain_inbound / consume_frames ────────────────────────────────────
 
     use super::{
-        consume_frames, drain_inbound, inbound_has_room, pump_inbound, Accepted, FrameAccumulator,
-        InboundConnectionState, PlaybackSink, StallCountingSink,
+        Accepted, FrameAccumulator, InboundConnectionState, PlaybackSink, StallCountingSink,
+        consume_frames, drain_inbound, inbound_has_room, pump_inbound,
     };
     use audio_pipeline::test_support::audio_frame;
     use audio_pipeline::wire::{
-        AudioFrame, EndOfAudio, FlushPlayback, SegmentStart, StreamFrame, AUDIO_SAMPLES_PER_FRAME,
-        MAX_FRAME_BYTES,
+        AUDIO_SAMPLES_PER_FRAME, AudioFrame, EndOfAudio, FlushPlayback, MAX_FRAME_BYTES,
+        SegmentStart, StreamFrame,
     };
 
     /// Sink that captures the full PCM bytes of each accepted frame (never refuses).
@@ -1803,7 +1803,7 @@ mod tests {
     /// drains, so the playhead never catches an empty buffer.
     #[test]
     fn fake_dac_realtime_arrival_never_underruns() {
-        use super::{FakeDacSink, FAKE_DAC_FRAME_DUR};
+        use super::{FAKE_DAC_FRAME_DUR, FakeDacSink};
         let frame = [0u8; 640];
         let mut sink = FakeDacSink::new();
         let base = std::time::Instant::now();
@@ -1822,7 +1822,7 @@ mod tests {
     /// for any product-constant value.
     #[test]
     fn fake_dac_slow_arrival_underruns() {
-        use super::{FakeDacSink, FAKE_DAC_FRAME_DUR, FAKE_DAC_PREROLL_FRAMES};
+        use super::{FAKE_DAC_FRAME_DUR, FAKE_DAC_PREROLL_FRAMES, FakeDacSink};
         let frame = [0u8; 640];
         let mut sink = FakeDacSink::new();
         let base = std::time::Instant::now();
@@ -1857,7 +1857,7 @@ mod tests {
     /// constant so it exceeds the cap regardless of its value.
     #[test]
     fn fake_dac_backpressures_when_full() {
-        use super::{FakeDacSink, FAKE_DAC_QUEUE_FRAMES};
+        use super::{FAKE_DAC_QUEUE_FRAMES, FakeDacSink};
         let frame = [0u8; 640];
         let mut sink = FakeDacSink::new();
         let base = std::time::Instant::now();

@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use audio_pipeline::wire::{StreamFrame, AUDIO_PROTOCOL_VERSION};
+use audio_pipeline::wire::{AUDIO_PROTOCOL_VERSION, StreamFrame};
 
 use serde::Serialize;
 
@@ -83,11 +83,11 @@ impl ResumeLedger {
         let mut id_evicted = false;
         if entry.members.insert(segment_id) {
             entry.order.push_back(segment_id);
-            if entry.order.len() > PER_POD_CAP {
-                if let Some(oldest) = entry.order.pop_front() {
-                    entry.members.remove(&oldest);
-                    id_evicted = true;
-                }
+            if entry.order.len() > PER_POD_CAP
+                && let Some(oldest) = entry.order.pop_front()
+            {
+                entry.members.remove(&oldest);
+                id_evicted = true;
             }
         }
         if id_evicted {
@@ -1070,12 +1070,14 @@ mod tests {
         for i in 0u64..5 {
             let ev = fsm.feed(audio(1, i * 320, 320, i * 20_000), hx(20 + i));
             match ev.as_slice() {
-                [SessionEvent::Audio {
-                    first_sample_index,
-                    pcm,
-                    gap,
-                    ..
-                }] => {
+                [
+                    SessionEvent::Audio {
+                        first_sample_index,
+                        pcm,
+                        gap,
+                        ..
+                    },
+                ] => {
                     assert_eq!(*first_sample_index, i * 320);
                     assert_eq!(pcm.len(), 320);
                     assert_eq!(*gap, None);
@@ -1241,11 +1243,13 @@ mod tests {
         });
         let ev = fsm.feed(t, hx(11));
         match ev.as_slice() {
-            [SessionEvent::Telemetry {
-                segment_id: 1,
-                sample_offset,
-                ..
-            }] => assert_eq!(*sample_offset, 320),
+            [
+                SessionEvent::Telemetry {
+                    segment_id: 1,
+                    sample_offset,
+                    ..
+                },
+            ] => assert_eq!(*sample_offset, 320),
             other => panic!("expected one Telemetry event, got {other:?}"),
         }
     }

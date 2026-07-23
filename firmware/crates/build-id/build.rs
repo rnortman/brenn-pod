@@ -101,12 +101,12 @@ fn emit_git_ref_rerun_triggers() {
     // Current branch's loose ref. Read HEAD to find the symbolic-ref target rather than
     // hardcoding `main`; if HEAD is detached (no `ref:` prefix) or unreadable, there is
     // no branch ref to track and HEAD itself already covers detached commits.
-    if let Ok(head_contents) = fs::read_to_string(format!("{git_dir}/HEAD")) {
-        if let Some(ref_path) = head_contents.trim().strip_prefix("ref:") {
-            let ref_path = ref_path.trim();
-            if !ref_path.is_empty() {
-                println!("cargo:rerun-if-changed={git_dir}/{ref_path}");
-            }
+    if let Ok(head_contents) = fs::read_to_string(format!("{git_dir}/HEAD"))
+        && let Some(ref_path) = head_contents.trim().strip_prefix("ref:")
+    {
+        let ref_path = ref_path.trim();
+        if !ref_path.is_empty() {
+            println!("cargo:rerun-if-changed={git_dir}/{ref_path}");
         }
     }
 }

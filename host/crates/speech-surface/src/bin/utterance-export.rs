@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::json;
 
-use speech_pipeline::{write_spine_wav, AudioSpan, ResolvedSpanAudio};
+use speech_pipeline::{AudioSpan, ResolvedSpanAudio, write_spine_wav};
 use speech_surface::{emit_line as emit, exit};
 
 #[derive(Parser)]
@@ -131,8 +131,8 @@ fn resolve_and_write(store_root: &Path, out: &Path, span: &AudioSpan) -> Result<
 mod tests {
     use super::*;
     use audio_pipeline::wire::StreamFrame;
-    use pod_ingest::test_fixtures::{audio, seg_end, seg_start, write_log};
     use pod_ingest::SegmentRef;
+    use pod_ingest::test_fixtures::{audio, seg_end, seg_start, write_log};
 
     fn hello() -> StreamFrame {
         pod_ingest::test_fixtures::hello("pod-utterance")

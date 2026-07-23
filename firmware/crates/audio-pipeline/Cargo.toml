@@ -1,7 +1,7 @@
 [package]
 name = "audio-pipeline"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 license.workspace = true
 
 # no_std by default; enable `std` feature for host-side use (tests, host tools).

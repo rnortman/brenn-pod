@@ -9,7 +9,7 @@ use device_protocol::{Payload, Status};
 use esp_idf_svc::hal::gpio::{InputOutput, PinDriver};
 use std::sync::Mutex;
 
-use device_protocol::{test_report_fail, test_report_fail_detail, test_report_ok_detail, TestData};
+use device_protocol::{TestData, test_report_fail, test_report_fail_detail, test_report_ok_detail};
 
 /// Mutex-guarded LED driver (GPIO21, active-LOW).
 ///

@@ -11,8 +11,8 @@
 //! rather than aborting the process.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pod_ingest::HostMicros;
@@ -89,10 +89,10 @@ impl SinkTasks {
                 eprintln!("console sink drain timed out; aborting to protect the file flush");
             }
         }
-        if let Some(file) = self.file {
-            if let Err(e) = file.await {
-                eprintln!("JSONL sink writer task exited abnormally: {e}");
-            }
+        if let Some(file) = self.file
+            && let Err(e) = file.await
+        {
+            eprintln!("JSONL sink writer task exited abnormally: {e}");
         }
     }
 }
@@ -161,10 +161,10 @@ impl JsonlHandle {
     pub fn emit<T: Serialize>(&self, event: &str, fields: &T) {
         let ts_ms = HostMicros::now().0 / 1000;
 
-        if let Some(tx) = &self.file_tx {
-            if tx.try_send(format_line_at(ts_ms, event, fields)).is_err() {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(tx) = &self.file_tx
+            && tx.try_send(format_line_at(ts_ms, event, fields)).is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
 
         if console::wants(event) {
@@ -305,16 +305,15 @@ async fn run_console<W: AsyncWrite + Unpin>(
         let result = write_batch(&mut writer, &batch).await;
         batch.clear();
         if let Err(err) = result {
-            if let Some(tx) = &file_tx {
-                if tx
+            if let Some(tx) = &file_tx
+                && tx
                     .try_send(format_line(
                         "console_sink_failed",
                         &serde_json::json!({ "detail": err.to_string() }),
                     ))
                     .is_err()
-                {
-                    file_dropped.fetch_add(1, Ordering::Relaxed);
-                }
+            {
+                file_dropped.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }

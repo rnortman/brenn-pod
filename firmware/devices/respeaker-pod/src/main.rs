@@ -52,11 +52,11 @@ mod tls_link;
 mod xvf3800;
 
 #[cfg(target_os = "espidf")]
-use audio_pipeline::playback::{InboundPcmRing, INBOUND_PCM_RING_BYTES};
+use audio_pipeline::playback::{INBOUND_PCM_RING_BYTES, InboundPcmRing};
 #[cfg(target_os = "espidf")]
 use audio_pipeline::ring::RING_CAPACITY_SAMPLES;
 #[cfg(target_os = "espidf")]
-use device_protocol::{log_tokens, Command, DeviceFrame, Payload, Request, Response, Status};
+use device_protocol::{Command, DeviceFrame, Payload, Request, Response, Status, log_tokens};
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 #[cfg(target_os = "espidf")]
@@ -86,17 +86,17 @@ use wifi_diag::fmt_ipv4;
 use aic3104::AIC3104_ADDR;
 use capture::DEVICE_PLAYBACK_FORMAT;
 #[cfg(target_os = "espidf")]
-use capture::{run_i2s_waveform_sanity, spawn_capture_thread, CaptureRing, CAPTURE_RING};
+use capture::{CAPTURE_RING, CaptureRing, run_i2s_waveform_sanity, spawn_capture_thread};
 #[cfg(target_os = "espidf")]
-use console::{write_frame, UsbSerialTxSink, LOGGER, WRITER};
+use console::{LOGGER, UsbSerialTxSink, WRITER, write_frame};
 #[cfg(target_os = "espidf")]
-use gpio::{run_gpio_self_test, LED};
+use gpio::{LED, run_gpio_self_test};
 #[cfg(target_os = "espidf")]
 use health::{run_device_health_check, run_psram_identity};
 #[cfg(target_os = "espidf")]
 use hil::run_handler;
 #[cfg(target_os = "espidf")]
-use i2c::{make_i2c_driver, run_i2c_bus_scan, I2C_BUS};
+use i2c::{I2C_BUS, make_i2c_driver, run_i2c_bus_scan};
 #[cfg(target_os = "espidf")]
 use net_tests::{
     run_poll_readiness_bidir, run_stream_realtime_duplex, run_tls_inbound_backpressure,
@@ -110,31 +110,31 @@ use nvs::{
 };
 #[cfg(target_os = "espidf")]
 use speaker::{
-    build_inbound_stream_sink, is_tx_wedged, run_capture_periodic_line,
-    run_full_duplex_rx_integrity, run_playback_drain_rate, run_playback_sequence,
-    run_speaker_output, rx_deficit_frames, should_rearm_preroll, speaker_stream_init,
-    write_silence_frames, PlaybackPhase, PlaybackRequest, CAPTURE_I2S_BUF_BYTES, I2S_DMA_DESC_NUM,
-    I2S_DMA_FRAME_NUM, INBOUND_PCM_CONSUMER, INBOUND_PCM_PRODUCER, PLAYBACK_CHAN_CAPACITY,
-    PLAYBACK_DAC_UNMUTE_SETTLE_FRAMES, PLAYBACK_PREROLL_MAX_WAIT_MS, PLAYBACK_REQUEST_TX,
-    STREAM_EOA_MUTE_DELAY_MS, TX_WEDGE_WARN_US,
+    CAPTURE_I2S_BUF_BYTES, I2S_DMA_DESC_NUM, I2S_DMA_FRAME_NUM, INBOUND_PCM_CONSUMER,
+    INBOUND_PCM_PRODUCER, PLAYBACK_CHAN_CAPACITY, PLAYBACK_DAC_UNMUTE_SETTLE_FRAMES,
+    PLAYBACK_PREROLL_MAX_WAIT_MS, PLAYBACK_REQUEST_TX, PlaybackPhase, PlaybackRequest,
+    STREAM_EOA_MUTE_DELAY_MS, TX_WEDGE_WARN_US, build_inbound_stream_sink, is_tx_wedged,
+    run_capture_periodic_line, run_full_duplex_rx_integrity, run_playback_drain_rate,
+    run_playback_sequence, run_speaker_output, rx_deficit_frames, should_rearm_preroll,
+    speaker_stream_init, write_silence_frames,
 };
 #[cfg(target_os = "espidf")]
 use streamer::{
-    send_frame_bp, send_frame_bp_counted, spawn_streamer_thread, StreamerMsg, POD_ID,
-    STREAMER_CHAN_CAPACITY, STREAMER_RX, VAD_CLOSED_FLAG,
+    POD_ID, STREAMER_CHAN_CAPACITY, STREAMER_RX, StreamerMsg, VAD_CLOSED_FLAG, send_frame_bp,
+    send_frame_bp_counted, spawn_streamer_thread,
 };
 #[cfg(target_os = "espidf")]
-use telemetry::{spawn_telemetry_vad_thread, DOA_POLL_HZ, VAD_POLL_HZ};
+use telemetry::{DOA_POLL_HZ, VAD_POLL_HZ, spawn_telemetry_vad_thread};
 #[cfg(target_os = "espidf")]
 use wifi::{
-    ring_wifi_wake, ring_wifi_wake_on_disconnect, run_gateway_probe_gate, run_wifi_associate,
+    WIFI_EVENT_SUBS, WIFI_STACK, WifiEventSubs, WifiStack, ring_wifi_wake,
+    ring_wifi_wake_on_disconnect, run_gateway_probe_gate, run_wifi_associate,
     run_wifi_power_save_check, run_wifi_reassociation, run_wifi_scan, spawn_wifi_supervisor_thread,
-    WifiEventSubs, WifiStack, WIFI_EVENT_SUBS, WIFI_STACK,
 };
 #[cfg(target_os = "espidf")]
 use xvf3800::{
-    run_amp_always_on_gpo_inert, run_xvf3800_doa_plausibility, run_xvf3800_reg_read,
-    run_xvf3800_sp_energy, XVF3800_ADDR,
+    XVF3800_ADDR, run_amp_always_on_gpo_inert, run_xvf3800_doa_plausibility, run_xvf3800_reg_read,
+    run_xvf3800_sp_energy,
 };
 
 // The host build exists only to run `cargo test`; the firmware binary is never meant to run
@@ -187,13 +187,15 @@ struct WatchpointArm {
 /// core only, which is why this is dispatched per core.
 #[cfg(target_os = "espidf")]
 unsafe extern "C" fn arm_watchpoint_cb(arg: *mut core::ffi::c_void) {
-    let arm = &mut *(arg as *mut WatchpointArm);
-    arm.result = esp_idf_svc::sys::esp_cpu_set_watchpoint(
-        arm.slot,
-        arm.word,
-        arm.size,
-        esp_idf_svc::sys::esp_cpu_watchpoint_trigger_t_ESP_CPU_WATCHPOINT_STORE,
-    );
+    let arm = unsafe { &mut *(arg as *mut WatchpointArm) };
+    arm.result = unsafe {
+        esp_idf_svc::sys::esp_cpu_set_watchpoint(
+            arm.slot,
+            arm.word,
+            arm.size,
+            esp_idf_svc::sys::esp_cpu_watchpoint_trigger_t_ESP_CPU_WATCHPOINT_STORE,
+        )
+    };
 }
 
 /// Arm a `size`-byte write watchpoint on `addr` in `slot`, on every core (watchpoints are

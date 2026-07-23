@@ -17,12 +17,12 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde::Serialize;
 
 use super::{
-    build_stage, classify_send, read_body_capped, truncate_body, BuildError, StageCounters,
-    StageError,
+    BuildError, StageCounters, StageError, build_stage, classify_send, read_body_capped,
+    truncate_body,
 };
+use crate::SPINE_FORMAT;
 use crate::traits::{PcmChunk, SynthesisError, Synthesizer};
 use crate::wav::check_spine_format;
-use crate::SPINE_FORMAT;
 
 /// Largest response body this stage will buffer. A readback clip at the spine
 /// rate is ~32 KB/s, so this covers minutes of audio; any `Content-Length` past
@@ -206,12 +206,12 @@ async fn request(
     // Reject an honestly-advertised oversized body before reading a byte; the
     // capped read below holds the bound even when `Content-Length` is absent or
     // understated (chunked encoding, or a hostile peer).
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BODY_BYTES {
-            return Err(SynthesisError::Decode(format!(
-                "response body {len} bytes exceeds {MAX_BODY_BYTES}-byte cap"
-            )));
-        }
+    if let Some(len) = resp.content_length()
+        && len > MAX_BODY_BYTES
+    {
+        return Err(SynthesisError::Decode(format!(
+            "response body {len} bytes exceeds {MAX_BODY_BYTES}-byte cap"
+        )));
     }
 
     let bytes = read_body_capped::<SynthesisError>(resp, MAX_BODY_BYTES).await?;
@@ -241,7 +241,7 @@ fn decode_clip(bytes: &[u8]) -> Result<PcmChunk, SynthesisError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::test_support::{spawn_server, Behavior};
+    use crate::http::test_support::{Behavior, spawn_server};
     use tokio::net::TcpListener;
 
     fn params(url: String) -> TtsParams {

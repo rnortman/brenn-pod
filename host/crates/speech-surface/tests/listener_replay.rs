@@ -14,13 +14,13 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use audio_pipeline::wire::{encode_frame, ChannelSource, StreamFrame, MAX_FRAME_BYTES};
-use pod_ingest::{synth_session, FrameLogWriter, HostMicros, LogMeta, SynthParams};
+use audio_pipeline::wire::{ChannelSource, MAX_FRAME_BYTES, StreamFrame, encode_frame};
+use pod_ingest::{FrameLogWriter, HostMicros, LogMeta, SynthParams, synth_session};
 use speech_pipeline::{
-    EndpointCause, ListenerConfig, ListenerEvent, OwwConfig, OwwModels, SileroConfig, SileroModel,
-    SPINE_FORMAT,
+    EndpointCause, ListenerConfig, ListenerEvent, OwwConfig, OwwModels, SPINE_FORMAT, SileroConfig,
+    SileroModel,
 };
-use speech_surface::replay::{replay_framelog, ReplayListener, StopReason};
+use speech_surface::replay::{ReplayListener, StopReason, replay_framelog};
 
 /// Load a `ReplayListener` over the committed models at the default threshold.
 fn committed_listener() -> ReplayListener {

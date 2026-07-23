@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use crate::{AIC3104_ADDR, XVF3800_ADDR};
 use device_protocol::{
-    test_report_fail, test_report_fail_fmt, test_report_ok, TestData, I2C_SCAN_MAX_ADDRS,
+    I2C_SCAN_MAX_ADDRS, TestData, test_report_fail, test_report_fail_fmt, test_report_ok,
 };
 
 // ── I2C shared bus (process-lifetime, boot-initialized) ───────────────────────

@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 
-use crate::brain::{send_or_report, BrainEventFn, BrainStats};
+use crate::brain::{BrainEventFn, BrainStats, send_or_report};
 use crate::traits::{Brain, ResponseSink};
 use crate::types::{InterruptProgress, SpeakBody, SpeakCmd, Utterance, UtteranceId};
 

@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use audio_pipeline::wire::{decode_frame, StreamFrame};
+use audio_pipeline::wire::{StreamFrame, decode_frame};
 use clap::{Parser, ValueEnum};
 use openssl::ssl::{Ssl, SslContext, SslStream};
 use pod_ingest::{FrameLogError, FrameLogReader, HostMicros, LogItem};
@@ -858,8 +858,8 @@ fn main() {
 mod tests {
     use super::*;
     use audio_pipeline::wire::{
-        encode_frame, AudioFrame, ChannelSource, Codec, EndOfAudio, FlushPlayback, Hello,
-        AUDIO_PROTOCOL_VERSION, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES,
+        AUDIO_PROTOCOL_VERSION, AudioFrame, ChannelSource, Codec, EndOfAudio, FlushPlayback, Hello,
+        MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES, encode_frame,
     };
     use openssl::ssl::SslMethod;
     use pod_ingest::{FrameLogWriter, LogMeta};

@@ -14,12 +14,12 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{anyhow, bail, Context, Result};
-use audio_pipeline::wire::{encode_frame, ChannelSource, MAX_FRAME_BYTES};
+use anyhow::{Context, Result, anyhow, bail};
+use audio_pipeline::wire::{ChannelSource, MAX_FRAME_BYTES, encode_frame};
 use clap::Parser;
 use serde_json::json;
 
-use pod_ingest::{synth_session, FrameLogWriter, HostMicros, LogMeta, SynthParams};
+use pod_ingest::{FrameLogWriter, HostMicros, LogMeta, SynthParams, synth_session};
 use speech_pipeline::SPINE_FORMAT;
 use speech_surface::{check_spine_format, emit_line as emit};
 
@@ -246,10 +246,10 @@ mod tests {
                         AssemblerLimits::default(),
                     ));
                 }
-                if let Some(a) = assembler.as_mut() {
-                    if let Some(seg) = a.on_event(&ev, "cap.framelog") {
-                        assembled = Some(seg.pcm);
-                    }
+                if let Some(a) = assembler.as_mut()
+                    && let Some(seg) = a.on_event(&ev, "cap.framelog")
+                {
+                    assembled = Some(seg.pcm);
                 }
             }
         }

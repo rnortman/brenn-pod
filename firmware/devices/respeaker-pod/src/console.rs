@@ -5,10 +5,10 @@
 //! log-frames and response-frames never interleave mid-bytes. [`FramedLogger`]
 //! (installed as [`LOGGER`]) turns every `log::*` record into a `DeviceFrame::Log`.
 
-use device_protocol::console::{classify_write, WriteOutcome};
+use device_protocol::console::{WriteOutcome, classify_write};
 use device_protocol::{DeviceFrame, LogFrame, LogLevel};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 

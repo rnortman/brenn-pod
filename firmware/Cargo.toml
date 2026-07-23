@@ -22,6 +22,10 @@ default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/bu
 resolver = "2"
 
 [workspace.package]
+# Source of truth for the edition across every crate in this workspace; each member
+# manifest says `edition.workspace = true`. Must agree with host/Cargo.toml and the
+# rustfmt edition flag in .claude/hooks/format.sh — scripts/check-edition.sh enforces it.
+edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]

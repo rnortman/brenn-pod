@@ -185,7 +185,7 @@ mod tests {
     use crate::session::Codec;
     use crate::test_fixtures::{audio, framed, meta, seg_end, seg_start, write_log};
     use audio_pipeline::wire::{
-        ChannelSource, Hello, StreamFrame, AUDIO_PROTOCOL_VERSION, MAX_FRAME_BYTES,
+        AUDIO_PROTOCOL_VERSION, ChannelSource, Hello, MAX_FRAME_BYTES, StreamFrame,
     };
     use std::fs::OpenOptions;
     use std::io::Write;

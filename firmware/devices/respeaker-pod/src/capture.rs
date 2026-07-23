@@ -10,17 +10,17 @@
 // Host view: these items exist for the tests and for the device-gated call sites.
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
 
-use audio_pipeline::playback::{next_preroll_target, PLAYBACK_PREROLL_TARGET_BYTES};
+use audio_pipeline::playback::{PLAYBACK_PREROLL_TARGET_BYTES, next_preroll_target};
 
 #[cfg(target_os = "espidf")]
 use audio_pipeline::playback::{
-    expand_run_in_place, preroll_gate_ready, InboundRingConsumer, I2S_TX_FRAME_BYTES,
-    INBOUND_PCM_WRITE_UNIT_BYTES, WIRE_BYTES_PER_SAMPLE,
+    I2S_TX_FRAME_BYTES, INBOUND_PCM_WRITE_UNIT_BYTES, InboundRingConsumer, WIRE_BYTES_PER_SAMPLE,
+    expand_run_in_place, preroll_gate_ready,
 };
 #[cfg(target_os = "espidf")]
-use audio_pipeline::ring::{RingIndex, RING_CAPACITY_SAMPLES};
+use audio_pipeline::ring::{RING_CAPACITY_SAMPLES, RingIndex};
 #[cfg(target_os = "espidf")]
-use device_protocol::{log_tokens, Payload, Status};
+use device_protocol::{Payload, Status, log_tokens};
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::hal::delay::FreeRtos;
 #[cfg(target_os = "espidf")]
@@ -32,9 +32,9 @@ use esp_idf_svc::hal::i2s::config::{
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::hal::i2s::{I2sBiDir, I2sDriver};
 #[cfg(target_os = "espidf")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "espidf")]
 use std::sync::Mutex;
+#[cfg(target_os = "espidf")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_os = "espidf")]
 use crate::aic3104::{aic3104_dac_mute_best_effort, aic3104_dac_unmute};
@@ -42,14 +42,14 @@ use crate::aic3104::{aic3104_dac_mute_best_effort, aic3104_dac_unmute};
 use crate::i2c::I2C_BUS;
 #[cfg(target_os = "espidf")]
 use crate::{
-    is_tx_wedged, run_playback_sequence, rx_deficit_frames, should_rearm_preroll,
-    speaker_stream_init, write_silence_frames, PlaybackPhase, PlaybackRequest,
     CAPTURE_I2S_BUF_BYTES, I2S_DMA_DESC_NUM, I2S_DMA_FRAME_NUM, INBOUND_PCM_CONSUMER,
-    PLAYBACK_DAC_UNMUTE_SETTLE_FRAMES, PLAYBACK_PREROLL_MAX_WAIT_MS, STREAM_EOA_MUTE_DELAY_MS,
-    TX_WEDGE_WARN_US,
+    PLAYBACK_DAC_UNMUTE_SETTLE_FRAMES, PLAYBACK_PREROLL_MAX_WAIT_MS, PlaybackPhase,
+    PlaybackRequest, STREAM_EOA_MUTE_DELAY_MS, TX_WEDGE_WARN_US, is_tx_wedged,
+    run_playback_sequence, rx_deficit_frames, should_rearm_preroll, speaker_stream_init,
+    write_silence_frames,
 };
 #[cfg(target_os = "espidf")]
-use device_protocol::{test_report_fail, test_report_fail_fmt, test_report_ok, TestData};
+use device_protocol::{TestData, test_report_fail, test_report_fail_fmt, test_report_ok};
 
 // ── Audio capture ring (process-lifetime, boot-initialized) ──────────────────
 
@@ -1173,30 +1173,30 @@ pub(crate) fn spawn_capture_thread(
                 // it never mutes — the 1 Hz starvation mute limit cycle (and its I2C
                 // churn) is removed structurally, not tuned away. Best-effort: on I2C
                 // failure the DAC stays unmuted into a silent line (quiet, with a log).
-                if dac_active && mute_armed {
-                    if let Some(t) = last_pcm_write {
-                        if t.elapsed().as_millis() as u64 >= STREAM_EOA_MUTE_DELAY_MS {
-                            match I2C_BUS
-                                .lock()
-                                .unwrap_or_else(|_| {
-                                    panic!("I2C_BUS mutex poisoned in stream end-of-audio mute")
-                                })
-                                .as_mut()
-                            {
-                                Some(d) => aic3104_dac_mute_best_effort(d),
-                                None => log::warn!(
-                                    "capture: stream end-of-audio mute skipped — I2C_BUS unavailable"
-                                ),
-                            }
-                            dac_active = false;
-                            last_pcm_write = None;
-                            mute_armed = false;
-                            // The adaptive pre-roll target was already reset to base at the
-                            // boundary that armed this mute (the DrainCtl::Next / empty-tail
-                            // arms above), so no target reset is needed here.
-                            tx_eoa_mutes = tx_eoa_mutes.wrapping_add(1);
-                        }
+                if dac_active
+                    && mute_armed
+                    && let Some(t) = last_pcm_write
+                    && t.elapsed().as_millis() as u64 >= STREAM_EOA_MUTE_DELAY_MS
+                {
+                    match I2C_BUS
+                        .lock()
+                        .unwrap_or_else(|_| {
+                            panic!("I2C_BUS mutex poisoned in stream end-of-audio mute")
+                        })
+                        .as_mut()
+                    {
+                        Some(d) => aic3104_dac_mute_best_effort(d),
+                        None => log::warn!(
+                            "capture: stream end-of-audio mute skipped — I2C_BUS unavailable"
+                        ),
                     }
+                    dac_active = false;
+                    last_pcm_write = None;
+                    mute_armed = false;
+                    // The adaptive pre-roll target was already reset to base at the
+                    // boundary that armed this mute (the DrainCtl::Next / empty-tail
+                    // arms above), so no target reset is needed here.
+                    tx_eoa_mutes = tx_eoa_mutes.wrapping_add(1);
                 }
 
                 // ── Periodic ~1 s summary ───────────────────────────────────
@@ -1423,7 +1423,7 @@ pub(crate) fn run_i2s_waveform_sanity() -> (Status, Payload) {
                 None => {
                     return test_report_fail(
                         "FAIL src=ring capture ring not initialized — firmware bug",
-                    )
+                    );
                 }
                 Some(r) => RingIndex::new(RING_CAPACITY_SAMPLES).held(r.write_head) as usize,
             }
@@ -1461,7 +1461,7 @@ pub(crate) fn run_i2s_waveform_sanity() -> (Status, Payload) {
             None => {
                 return test_report_fail(
                     "FAIL src=ring capture ring not initialized — firmware bug",
-                )
+                );
             }
         };
         let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
@@ -1540,8 +1540,8 @@ pub(crate) fn run_i2s_waveform_sanity() -> (Status, Payload) {
 #[cfg(test)]
 mod tests {
     use super::{
-        autocorr_lag1_from_sums, next_preroll_target, PrerollGate, TxStager,
-        PLAYBACK_PREROLL_TARGET_BYTES,
+        PLAYBACK_PREROLL_TARGET_BYTES, PrerollGate, TxStager, autocorr_lag1_from_sums,
+        next_preroll_target,
     };
 
     // ── PrerollGate ────────────────────────────────────────────────────────────

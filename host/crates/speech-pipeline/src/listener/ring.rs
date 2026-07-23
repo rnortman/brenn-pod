@@ -100,14 +100,14 @@ impl PcmRing {
         let mut start = first_sample_index;
         let mut pcm = pcm;
         let mut trimmed = 0;
-        if let Some(last) = self.runs.last() {
-            if start < last.end() {
-                trimmed = (last.end() - start).min(pcm.len() as u64) as usize;
-                pcm = &pcm[trimmed..];
-                start += trimmed as u64;
-                if pcm.is_empty() {
-                    return trimmed;
-                }
+        if let Some(last) = self.runs.last()
+            && start < last.end()
+        {
+            trimmed = (last.end() - start).min(pcm.len() as u64) as usize;
+            pcm = &pcm[trimmed..];
+            start += trimmed as u64;
+            if pcm.is_empty() {
+                return trimmed;
             }
         }
         match self.runs.last_mut() {
@@ -199,7 +199,7 @@ mod tests {
         let mut ring = PcmRing::new(1000);
         ring.push(0, &[1, 2, 3, 4]);
         ring.push(8, &[5, 6, 7, 8]); // gap at [4, 8)
-                                     // Carve spanning the gap: 4 real, 4 silence, 4 real.
+        // Carve spanning the gap: 4 real, 4 silence, 4 real.
         assert_eq!(&*ring.carve(0, 12), &[1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8]);
         // Carve entirely inside the gap is all silence.
         assert_eq!(&*ring.carve(5, 7), &[0, 0]);
@@ -295,7 +295,7 @@ mod tests {
         let mut ring = PcmRing::new(1000);
         ring.push(0, &[1, 2, 3, 4]);
         ring.push(8, &[5, 6, 7, 8]); // gap at [4, 8)
-                                     // Re-send reaching back to 6: [6,12) overlaps the last run's [8,12)…
+        // Re-send reaching back to 6: [6,12) overlaps the last run's [8,12)…
         assert_eq!(ring.push(6, &[7, 7, 9, 9, 9, 9, 10, 11]), 6);
         // …so only [12,14) is new; the [4,8) gap is untouched silence.
         assert_eq!(

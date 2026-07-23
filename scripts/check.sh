@@ -34,4 +34,10 @@ fi
 echo "scripts/check.sh: running scripts/test-hil-firewall.sh"
 scripts/test-hil-firewall.sh
 
+echo "scripts/check.sh: running scripts/test-check-edition.sh"
+scripts/test-check-edition.sh
+
+echo "scripts/check.sh: running scripts/check-edition.sh"
+scripts/check-edition.sh
+
 run_shellcheck

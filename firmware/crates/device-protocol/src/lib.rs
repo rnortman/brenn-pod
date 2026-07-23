@@ -1120,7 +1120,7 @@ pub struct LogFrame {
 // Graceful char-boundary truncation helpers live in the `truncfmt` crate (a
 // heapless-only crate with no serde dependency). Re-exported here for source
 // compatibility with `device_protocol::` call sites.
-pub use truncfmt::{format_truncating, format_truncating_marked, TRUNCATION_SENTINEL};
+pub use truncfmt::{TRUNCATION_SENTINEL, format_truncating, format_truncating_marked};
 
 /// Log level mirroring `log::Level`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]

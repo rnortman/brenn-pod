@@ -11,8 +11,8 @@
 use crate::hil::test_report_fail_msg;
 #[cfg(target_os = "espidf")]
 use crate::inbound::{
-    consume_frames, drain_inbound, CountingSink, FrameAccumulator, InboundConnectionState,
-    StallCountingSink,
+    CountingSink, FrameAccumulator, InboundConnectionState, StallCountingSink, consume_frames,
+    drain_inbound,
 };
 #[cfg(target_os = "espidf")]
 use crate::netpoll::poll_one;
@@ -26,9 +26,9 @@ use crate::{build_inbound_stream_sink, send_frame_bp, send_frame_bp_counted};
 use audio_pipeline::stream_send::SendOutcome;
 #[cfg(target_os = "espidf")]
 use device_protocol::{
+    Payload, Status, TLS_PSK_CONNECT_TIMEOUT_SECS, TLS_PSK_ECHO_TIMEOUT_SECS, TestData,
     test_report_fail, test_report_fail_detail, test_report_fail_fmt, test_report_ok,
-    test_report_ok_detail, Payload, Status, TestData, TLS_PSK_CONNECT_TIMEOUT_SECS,
-    TLS_PSK_ECHO_TIMEOUT_SECS,
+    test_report_ok_detail,
 };
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::tls::{self, EspTls};
@@ -492,7 +492,7 @@ pub(crate) fn run_tls_inbound_backpressure() -> (Status, Payload) {
 #[cfg(target_os = "espidf")]
 pub(crate) fn run_tls_send_backpressure() -> (Status, Payload) {
     use audio_pipeline::wire::{
-        AudioFrame, StreamFrame, AUDIO_SAMPLES_PER_FRAME, MAX_AUDIO_PAYLOAD,
+        AUDIO_SAMPLES_PER_FRAME, AudioFrame, MAX_AUDIO_PAYLOAD, StreamFrame,
     };
     use std::time::Duration;
 
@@ -963,11 +963,7 @@ struct RtdMeasure {
 /// to 0 for reporting.
 #[cfg(target_os = "espidf")]
 fn sampled_or_zero(v: u32) -> u32 {
-    if v == u32::MAX {
-        0
-    } else {
-        v
-    }
+    if v == u32::MAX { 0 } else { v }
 }
 
 /// Full-heap integrity walk over every region; `true` = clean. On corruption ESP-IDF dumps
@@ -1086,7 +1082,7 @@ pub(crate) fn run_stream_realtime_duplex() -> (Status, Payload) {
 #[cfg(target_os = "espidf")]
 fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
     use crate::inbound::CountingSink;
-    use crate::streamer::{SegmentExit, SEGMENT_ACTIVE};
+    use crate::streamer::{SEGMENT_ACTIVE, SegmentExit};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
@@ -1316,14 +1312,14 @@ fn rtd_run_one_segment(
     io: &mut RtdSegmentIo<'_>,
 ) -> Result<(crate::streamer::SegmentExit, u128, SegMeas), String> {
     use crate::capture::CAPTURE_RING;
-    use crate::streamer::{run_segment, SegmentDeps, StreamerMsg};
-    use audio_pipeline::ring::{RingIndex, PREROLL_SAMPLES, RING_CAPACITY_SAMPLES};
+    use crate::streamer::{SegmentDeps, StreamerMsg, run_segment};
+    use audio_pipeline::ring::{PREROLL_SAMPLES, RING_CAPACITY_SAMPLES, RingIndex};
     use audio_pipeline::wire::{
-        ChannelSource, Hello, SegmentStart, StreamFrame, AUDIO_PROTOCOL_VERSION,
-        AUDIO_SAMPLES_PER_FRAME,
+        AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, ChannelSource, Hello, SegmentStart,
+        StreamFrame,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     let peer_ip = conn.peer_ip;
@@ -1860,7 +1856,7 @@ pub(crate) fn run_tls_psk_wrong_key_rejected() -> (Status, Payload) {
 
 #[cfg(test)]
 mod tests {
-    use super::{post_eof_tick, PostEofTick};
+    use super::{PostEofTick, post_eof_tick};
 
     const LIMIT: u32 = 50;
 

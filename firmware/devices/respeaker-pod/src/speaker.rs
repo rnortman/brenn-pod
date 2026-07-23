@@ -9,11 +9,11 @@
 // Host view: these items exist for the tests and for the device-gated call sites.
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
 
-use audio_pipeline::playback::{
-    expand_sample_to_frame, InboundRingConsumer, InboundRingProducer, I2S_TX_FRAME_BYTES,
-};
 #[cfg(target_os = "espidf")]
 use audio_pipeline::playback::{Accepted, I2sStreamSink, PlaybackSink};
+use audio_pipeline::playback::{
+    I2S_TX_FRAME_BYTES, InboundRingConsumer, InboundRingProducer, expand_sample_to_frame,
+};
 #[cfg(target_os = "espidf")]
 use device_protocol::{Payload, Status};
 #[cfg(target_os = "espidf")]
@@ -25,13 +25,13 @@ use std::sync::Mutex;
 
 #[cfg(target_os = "espidf")]
 use crate::aic3104::{
-    aic3104_dac_mute_best_effort, aic3104_dac_unmute, aic3104_init, Aic3104InitError,
+    Aic3104InitError, aic3104_dac_mute_best_effort, aic3104_dac_unmute, aic3104_init,
 };
 use crate::capture::I2S_SAMPLE_RATE_HZ;
 #[cfg(target_os = "espidf")]
-use crate::i2c::{ms_to_ticks, I2C_BUS};
+use crate::i2c::{I2C_BUS, ms_to_ticks};
 #[cfg(target_os = "espidf")]
-use device_protocol::{test_report_fail, test_report_fail_fmt, test_report_ok, TestData};
+use device_protocol::{TestData, test_report_fail, test_report_fail_fmt, test_report_ok};
 
 // ── Firmware-local sine source (speaker bring-up) ────────────────────────────
 
@@ -1182,13 +1182,13 @@ pub(crate) fn run_full_duplex_rx_integrity() -> (Status, Payload) {
 
 #[cfg(test)]
 mod tests {
-    use super::{duration_ms_to_frames, fill_silence, SineSource, I2S_TX_FRAME_BYTES};
+    use super::{I2S_TX_FRAME_BYTES, SineSource, duration_ms_to_frames, fill_silence};
 
     // ── I2S-wedge threshold ───────────────────────────────────────────────
 
     use super::{
-        is_tx_wedged, rx_deficit_frames, should_rearm_preroll, CAPTURE_PERIODIC_LINE_CHUNK_BYTES,
-        TX_WEDGE_WARN_US,
+        CAPTURE_PERIODIC_LINE_CHUNK_BYTES, TX_WEDGE_WARN_US, is_tx_wedged, rx_deficit_frames,
+        should_rearm_preroll,
     };
 
     /// Below/at threshold is not a wedge (strict `>`), even with data pending and speaker up.

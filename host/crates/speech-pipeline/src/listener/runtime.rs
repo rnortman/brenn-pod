@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pod_ingest::{samples_to_micros, ClockOffsetEstimate, DeviceMicros, HostMicros};
+use pod_ingest::{ClockOffsetEstimate, DeviceMicros, HostMicros, samples_to_micros};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -44,9 +44,9 @@ use super::event::{
 };
 use super::oww_stream::{OwwModels, OwwStream};
 use super::ring::PcmRing;
-use super::silero::{SileroModel, SileroVad, SILERO_CHUNK};
-use super::stats::{ScoreStats, MODEL_STATS_FLUSH_CHUNKS};
-use crate::types::{PodId, WakeConfirmation, SPINE_FORMAT};
+use super::silero::{SILERO_CHUNK, SileroModel, SileroVad};
+use super::stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreStats};
+use crate::types::{PodId, SPINE_FORMAT, WakeConfirmation};
 use crate::wake::WakeError;
 
 /// Depth of the shared `(PodId, Feed)` channel. Audio priority belongs to
@@ -2705,8 +2705,8 @@ mod tests {
         let mut cursor = 0u64;
         let mut events = drive(&mut state, 0.9, 2, &mut cursor); // onset at 1024
         events.extend(drive(&mut state, 0.1, 3, &mut cursor)); // soft endpoint at 2560
-                                                               // The synthetic driver bypasses `handle_audio`, which is what tracks the
-                                                               // stream position a close is stamped at; stand in for it.
+        // The synthetic driver bypasses `handle_audio`, which is what tracks the
+        // stream position a close is stamped at; stand in for it.
         state.expected_next = Some(cursor);
         events.extend(state.handle_close(&pod(), rx_at(cursor)).unwrap()); // close inside the window
 

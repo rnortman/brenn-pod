@@ -525,13 +525,13 @@ impl Sidecar {
         let bytes = match fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(SidecarError::NotFound(path.to_path_buf()))
+                return Err(SidecarError::NotFound(path.to_path_buf()));
             }
             Err(source) => {
                 return Err(SidecarError::Io {
                     path: path.to_path_buf(),
                     source,
-                })
+                });
             }
         };
         serde_json::from_slice(&bytes).map_err(|source| SidecarError::Parse {
@@ -572,10 +572,9 @@ impl Sidecar {
                 .segments
                 .iter_mut()
                 .find(|s| s.segment_id == disk_seg.segment_id && s.part == disk_seg.part)
+                && mem.wake == WakeClass::Ungated
             {
-                if mem.wake == WakeClass::Ungated {
-                    mem.wake = disk_seg.wake;
-                }
+                mem.wake = disk_seg.wake;
             }
         }
         let json = serde_json::to_vec_pretty(self).map_err(|source| SidecarError::Parse {
@@ -714,13 +713,13 @@ fn read_merge_view(path: &Path) -> Result<MergeView, SidecarError> {
             return Ok(MergeView {
                 pinned: false,
                 segments: Vec::new(),
-            })
+            });
         }
         Err(source) => {
             return Err(SidecarError::Io {
                 path: path.to_path_buf(),
                 source,
-            })
+            });
         }
     };
     serde_json::from_slice(&bytes).map_err(|source| SidecarError::Parse {

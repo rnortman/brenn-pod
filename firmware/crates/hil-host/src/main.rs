@@ -8,20 +8,20 @@
 
 use build_id::build_id;
 use device_protocol::log_tokens::{
-    CAPTURE_OBS_LINE, CAPTURE_TX_LINE, CHUNKS, CORE, NONEMPTY_POLLS, NO_NVS_CREDENTIALS,
-    POLL_EMPTY, PREROLL_REARMS, PREROLL_WAITS, PRIO, RX_DEFICIT, RX_WINDOW_US, RX_WIN_OK,
+    CAPTURE_OBS_LINE, CAPTURE_TX_LINE, CHUNKS, CORE, NO_NVS_CREDENTIALS, NONEMPTY_POLLS,
+    POLL_EMPTY, PREROLL_REARMS, PREROLL_WAITS, PRIO, RX_DEFICIT, RX_WIN_OK, RX_WINDOW_US,
     WIFI_CONNECTED, WIFI_CONSECUTIVE_FAILURES, WIFI_DHCP_LEASE, WIFI_DISCONNECTED,
-    WIFI_PARKED_NO_CREDS, WIFI_REASSOCIATED, WIFI_REASSOC_ATTEMPT_FAILED,
-    WIFI_REASSOC_ATTEMPT_START, WIFI_SUPERVISOR_STARTED,
+    WIFI_PARKED_NO_CREDS, WIFI_REASSOC_ATTEMPT_FAILED, WIFI_REASSOC_ATTEMPT_START,
+    WIFI_REASSOCIATED, WIFI_SUPERVISOR_STARTED,
 };
 use device_protocol::{
-    doa_azimuth_ok, sp_energy_ok, test_name_discriminant, truncate_utf8_prefix, Command,
-    MallocProbe, Payload, Response, Status, TestData, TestName, TestReport, REGISTERED_TESTS,
-    SSID_TRUNC_BYTES,
+    Command, MallocProbe, Payload, REGISTERED_TESTS, Response, SSID_TRUNC_BYTES, Status, TestData,
+    TestName, TestReport, doa_azimuth_ok, sp_energy_ok, test_name_discriminant,
+    truncate_utf8_prefix,
 };
 use pod_transport::{
-    enumerate_pods, escape_device_str, open_port, Harness, HarnessError, PodMode, ESP32S3_APP_PID,
-    ESP32S3_DFU_PID, ESP32S3_VID, RESPONSE_TIMEOUT,
+    ESP32S3_APP_PID, ESP32S3_DFU_PID, ESP32S3_VID, Harness, HarnessError, PodMode,
+    RESPONSE_TIMEOUT, enumerate_pods, escape_device_str, open_port,
 };
 use std::{
     collections::BTreeSet,
@@ -598,7 +598,7 @@ fn run_suite(
 
     // ── WifiScan: credential-less radio + AP scan (before provisioning) ──────
     // Runs here (before any ProvisionWifi) to prove the radio inits and can scan
-    // on a factory-fresh device with no credentials. Design §3.4 step 2.
+    // on a factory-fresh device with no credentials.
     // WifiScan stays ungated even under a single-test selector: it starts and proves
     // the credential-less radio the later network-phase blocks build on.
     if run_dedicated_test(
@@ -2233,13 +2233,41 @@ fn eval_i2s_waveform_pass(data: &TestData) -> bool {
     true
 }
 
-/// Validate a `WifiScan` result.
+/// Environment variable naming the WiFi network to provision and to look for in a
+/// scan. Shared by [`eval_wifi_scan`] and [`resolve_secrets`]'s caller so the two
+/// readers cannot drift apart.
+const RESPEAKER_WIFI_SSID_VAR: &str = "RESPEAKER_WIFI_SSID";
+
+/// Validate a `WifiScan` result, reading the configured SSID from the environment.
+///
+/// Supplies `RESPEAKER_WIFI_SSID` (the provisioning variable) to
+/// [`eval_wifi_scan_with`], keeping the evaluation logic itself free of I/O. Must
+/// match the `eval` callback signature `run_dedicated_test` expects.
+fn eval_wifi_scan(data: &TestData) -> Result<(), String> {
+    eval_wifi_scan_with(data, std::env::var(RESPEAKER_WIFI_SSID_VAR).ok().as_deref())
+}
+
+/// Whether the configured SSID appears in a scanned SSID list.
+///
+/// `None` means the check was skipped: `configured` is absent or empty. Otherwise
+/// the SSID is truncated by the device's own rule before comparing, so a non-ASCII
+/// SSID whose UTF-8 form exceeds the device's buffer still matches.
+fn configured_ssid_seen(
+    configured: Option<&str>,
+    ssids: &[heapless::String<SSID_TRUNC_BYTES>],
+) -> Option<bool> {
+    let target = configured.filter(|ssid| !ssid.is_empty())?;
+    let check_prefix = truncate_utf8_prefix(target, SSID_TRUNC_BYTES);
+    Some(ssids.iter().any(|s| s.as_str() == check_prefix))
+}
+
+/// Pure evaluation logic, separated from the environment read for testability.
 ///
 /// Asserts `aps > 0` (at least one AP found, proving the radio inited and the scan
-/// produced output). Optionally, if `RESPEAKER_WIFI_SSID` is set in the environment
-/// (same source as provisioning creds), checks the configured SSID appears in the
-/// reported `ssids` list; that check is a non-fatal diagnostic.
-fn eval_wifi_scan(data: &TestData) -> Result<(), String> {
+/// produced output). `configured_ssid` is the optional `RESPEAKER_WIFI_SSID` value:
+/// `Some(ssid)` checks that SSID appears in the reported `ssids` list as a non-fatal
+/// diagnostic, while `None` or `Some("")` skips the check entirely.
+fn eval_wifi_scan_with(data: &TestData, configured_ssid: Option<&str>) -> Result<(), String> {
     let TestData::WifiScan {
         aps,
         best_rssi: _, // observability only — no threshold is asserted on signal strength
@@ -2253,21 +2281,14 @@ fn eval_wifi_scan(data: &TestData) -> Result<(), String> {
             "scan found 0 APs — radio up but nothing heard (antenna/RF issue?)".to_string(),
         );
     }
-    // Optional SSID check: if RESPEAKER_WIFI_SSID is set, verify it appears in scan result.
-    if let Ok(target_ssid) = std::env::var("RESPEAKER_WIFI_SSID") {
-        if !target_ssid.is_empty() {
-            // The device truncates scanned SSIDs with the same rule; compare against an
-            // identically truncated prefix so a non-ASCII SSID still matches.
-            let check_prefix = truncate_utf8_prefix(&target_ssid, SSID_TRUNC_BYTES);
-            if !ssids.iter().any(|s| s.as_str() == check_prefix) {
-                eprintln!(
-                    "  WifiScan: configured SSID '{check_prefix}' not found in scan list \
-                     (device may be out of range or SSID is hidden): {ssids:?}"
-                );
-                // Non-fatal: log but don't fail. The AP count assertion is the hard gate;
-                // SSID presence is a diagnostic hint when the target is in range.
-            }
-        }
+    // Non-fatal: a missing SSID is logged, not failed. The AP count assertion is the
+    // hard gate; SSID presence is a diagnostic hint when the target is in range.
+    if configured_ssid_seen(configured_ssid, ssids) == Some(false) {
+        let check_prefix = truncate_utf8_prefix(configured_ssid.unwrap_or(""), SSID_TRUNC_BYTES);
+        eprintln!(
+            "  WifiScan: configured SSID '{check_prefix}' not found in scan list \
+                 (device may be out of range or SSID is hidden): {ssids:?}"
+        );
     }
     Ok(())
 }
@@ -2744,7 +2765,7 @@ fn load_hil_secrets() -> Result<HilSecrets, String> {
 /// present and parseable. Absent/unparseable → `None`; parse error → warning.
 fn resolve_secrets(get: impl Fn(&str) -> Option<String>, secrets_path: &str) -> HilSecrets {
     // ── WiFi creds ────────────────────────────────────────────────────────────
-    let wifi_ssid = get("RESPEAKER_WIFI_SSID");
+    let wifi_ssid = get(RESPEAKER_WIFI_SSID_VAR);
     let wifi_pass = get("RESPEAKER_WIFI_PASS");
     let wifi = match (wifi_ssid, wifi_pass) {
         (Some(ssid), Some(pass)) => Some(WifiCreds { ssid, pass }),
@@ -3459,15 +3480,16 @@ impl PeerServers {
         // This is the one fixture whose listener is not a plain `TcpListener::bind`: its
         // receive buffer is clamped so the withhold closes the TCP window deterministically
         // (see `BACKPRESSURE_RCVBUF_BYTES`).
-        let backpressure_listener =
-            bind_clamped_rcvbuf_listener(backpressure_port, BACKPRESSURE_RCVBUF_BYTES).map_err(
-                |e| {
-                    format!(
+        let backpressure_listener = bind_clamped_rcvbuf_listener(
+            backpressure_port,
+            BACKPRESSURE_RCVBUF_BYTES,
+        )
+        .map_err(|e| {
+            format!(
                 "failed to bind backpressure listener on 0.0.0.0:{backpressure_port}: {e}\n  \
                  (port already in use? set RESPEAKER_HIL_BACKPRESSURE_PORT to a free port)"
             )
-                },
-            )?;
+        })?;
         backpressure_listener
             .set_nonblocking(true)
             .map_err(|e| format!("failed to set backpressure listener non-blocking: {e}"))?;
@@ -3500,16 +3522,16 @@ impl PeerServers {
                             // the withhold, so the test would exhaust its warm-up for a
                             // fixture-side reason. Say so here rather than let it read as a
                             // device regression.
-                            if let Some(v) = so_rcvbuf {
-                                if v > BACKPRESSURE_RCVBUF_CEILING_BYTES {
-                                    eprintln!(
-                                        "WARN [backpressure-source]: SO_RCVBUF={v} exceeds the \
+                            if let Some(v) = so_rcvbuf
+                                && v > BACKPRESSURE_RCVBUF_CEILING_BYTES
+                            {
+                                eprintln!(
+                                    "WARN [backpressure-source]: SO_RCVBUF={v} exceeds the \
                                          clamp ceiling {BACKPRESSURE_RCVBUF_CEILING_BYTES} \
                                          (requested {BACKPRESSURE_RCVBUF_BYTES}) — the withhold \
                                          will not close the TCP window, so the device may send \
                                          its whole warm-up without hitting a write boundary"
-                                    );
-                                }
+                                );
                             }
                             bp_conn += 1;
                             let mut stream = match tls_accept(
@@ -4143,7 +4165,7 @@ fn rtd_serve(
     stop: &Arc<Mutex<bool>>,
     conn: u32,
 ) {
-    use audio_pipeline::wire::{decode_frame, StreamFrame, MAX_FRAME_BYTES};
+    use audio_pipeline::wire::{MAX_FRAME_BYTES, StreamFrame, decode_frame};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // Both directions share this one TLS connection in this thread, so the socket goes
@@ -4238,10 +4260,9 @@ fn rtd_serve(
                 if o.burst_drain_ms.is_none()
                     && o.declared_preroll > 0
                     && o.total_samples >= o.declared_preroll as u64
+                    && let Some(start) = t0
                 {
-                    if let Some(start) = t0 {
-                        o.burst_drain_ms = Some(start.elapsed().as_millis() as u64);
-                    }
+                    o.burst_drain_ms = Some(start.elapsed().as_millis() as u64);
                 }
             }
             Ok(StreamFrame::SegmentEnd(e)) => {
@@ -4303,8 +4324,9 @@ struct RtdPacer {
 impl RtdPacer {
     fn new(peer: &std::net::SocketAddr) -> Option<Self> {
         use audio_pipeline::wire::{
-            encode_frame, AudioFrame, ChannelSource, Hello, StreamFrame, AUDIO_PROTOCOL_VERSION,
-            AUDIO_SAMPLES_PER_FRAME, DEVICE_PLAYBACK_FORMAT, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES,
+            AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, AudioFrame, ChannelSource,
+            DEVICE_PLAYBACK_FORMAT, Hello, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES, StreamFrame,
+            encode_frame,
         };
         let mut pcm: heapless::Vec<u8, MAX_AUDIO_PAYLOAD> = heapless::Vec::new();
         for _ in 0..AUDIO_SAMPLES_PER_FRAME * 2 {
@@ -4428,40 +4450,40 @@ impl RtdPacer {
 impl Drop for PeerServers {
     fn drop(&mut self) {
         *self.stop.lock().unwrap() = true;
-        if let Some(t) = self.udp_thread.take() {
-            if let Err(e) = t.join() {
-                eprintln!("WARN [peer-servers]: UDP echo thread panicked: {e:?}");
-            }
+        if let Some(t) = self.udp_thread.take()
+            && let Err(e) = t.join()
+        {
+            eprintln!("WARN [peer-servers]: UDP echo thread panicked: {e:?}");
         }
-        if let Some(t) = self.inbound_frames_thread.take() {
-            if let Err(e) = t.join() {
-                eprintln!("WARN [peer-servers]: inbound-frames-source thread panicked: {e:?}");
-            }
+        if let Some(t) = self.inbound_frames_thread.take()
+            && let Err(e) = t.join()
+        {
+            eprintln!("WARN [peer-servers]: inbound-frames-source thread panicked: {e:?}");
         }
-        if let Some(t) = self.backpressure_thread.take() {
-            if let Err(e) = t.join() {
-                eprintln!("WARN [peer-servers]: backpressure-source thread panicked: {e:?}");
-            }
+        if let Some(t) = self.backpressure_thread.take()
+            && let Err(e) = t.join()
+        {
+            eprintln!("WARN [peer-servers]: backpressure-source thread panicked: {e:?}");
         }
-        if let Some(t) = self.poll_readiness_thread.take() {
-            if let Err(e) = t.join() {
-                eprintln!("WARN [peer-servers]: poll-readiness-source thread panicked: {e:?}");
-            }
+        if let Some(t) = self.poll_readiness_thread.take()
+            && let Err(e) = t.join()
+        {
+            eprintln!("WARN [peer-servers]: poll-readiness-source thread panicked: {e:?}");
         }
-        if let Some(t) = self.rtd_thread.take() {
-            if let Err(e) = t.join() {
-                eprintln!("WARN [peer-servers]: rtd-listener thread panicked: {e:?}");
-            }
+        if let Some(t) = self.rtd_thread.take()
+            && let Err(e) = t.join()
+        {
+            eprintln!("WARN [peer-servers]: rtd-listener thread panicked: {e:?}");
         }
-        if let Some(t) = self.tls_psk_thread.take() {
-            if let Err(e) = t.join() {
-                eprintln!("WARN [peer-servers]: tls-psk-source thread panicked: {e:?}");
-            }
+        if let Some(t) = self.tls_psk_thread.take()
+            && let Err(e) = t.join()
+        {
+            eprintln!("WARN [peer-servers]: tls-psk-source thread panicked: {e:?}");
         }
-        if let Some(t) = self.tls_psk_bad_thread.take() {
-            if let Err(e) = t.join() {
-                eprintln!("WARN [peer-servers]: tls-psk-bad-source thread panicked: {e:?}");
-            }
+        if let Some(t) = self.tls_psk_bad_thread.take()
+            && let Err(e) = t.join()
+        {
+            eprintln!("WARN [peer-servers]: tls-psk-bad-source thread panicked: {e:?}");
         }
     }
 }
@@ -6083,7 +6105,7 @@ fn eval_gateway_probe_gate_unreachable(data: &TestData, logs: &[String]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use device_protocol::{BuildId, DeviceFrame, Payload, Status, MAX_TESTS};
+    use device_protocol::{BuildId, DeviceFrame, MAX_TESTS, Payload, Status};
 
     // ── Corrupt-frame crafting (deser-error recovery check) ──────────────────
 
@@ -6196,7 +6218,7 @@ mod tests {
         assert!(!selector_wants(fdri, TestName::PlaybackDrainRate));
     }
 
-    use pod_transport::test_support::{make_harness, FakePort};
+    use pod_transport::test_support::{FakePort, make_harness};
 
     fn make_build_id(commit: &str, dirty: bool) -> BuildId {
         let mut c = heapless::String::<40>::new();
@@ -8721,7 +8743,7 @@ mod tests {
     /// host test lane instead of on hardware.
     #[test]
     fn paced_catch_up_fits_under_host_ceilings() {
-        use audio_pipeline::pace::{paced_drain_us, AUDIO_FRAME_PERIOD_US};
+        use audio_pipeline::pace::{AUDIO_FRAME_PERIOD_US, paced_drain_us};
         use audio_pipeline::ring::PREROLL_SAMPLES;
         use audio_pipeline::wire::AUDIO_SAMPLES_PER_FRAME;
 
@@ -9213,7 +9235,7 @@ mod tests {
 
     /// Encode one `StreamFrame` to an owned buffer (fixture-side pre-encode shape).
     fn encoded_frame_bytes(frame: &audio_pipeline::wire::StreamFrame) -> Vec<u8> {
-        use audio_pipeline::wire::{encode_frame, MAX_FRAME_BYTES};
+        use audio_pipeline::wire::{MAX_FRAME_BYTES, encode_frame};
         let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
         let n = encode_frame(frame, &mut buf).expect("frame encodes");
         buf[..n].to_vec()
@@ -9419,18 +9441,23 @@ mod tests {
 
     // ── eval_wifi_scan tests ──────────────────────────────────────────────────
 
-    /// Build a `WifiScan` verdict with `aps` APs and the given (already ≤16-byte) SSIDs.
-    fn wifi_scan_verdict(aps: u32, ssids: &[&str]) -> TestData {
-        let mut list: heapless::Vec<heapless::String<16>, 3> = heapless::Vec::new();
+    /// Build a scanned-SSID list from (already ≤16-byte) SSIDs.
+    fn ssid_list(ssids: &[&str]) -> heapless::Vec<heapless::String<SSID_TRUNC_BYTES>, 3> {
+        let mut list = heapless::Vec::new();
         for s in ssids {
-            let mut entry = heapless::String::<16>::new();
+            let mut entry = heapless::String::<SSID_TRUNC_BYTES>::new();
             entry.push_str(s).expect("test SSID exceeds 16 bytes");
             list.push(entry).expect("test supplies at most 3 SSIDs");
         }
+        list
+    }
+
+    /// Build a `WifiScan` verdict with `aps` APs and the given (already ≤16-byte) SSIDs.
+    fn wifi_scan_verdict(aps: u32, ssids: &[&str]) -> TestData {
         TestData::WifiScan {
             aps,
             best_rssi: -48,
-            ssids: list,
+            ssids: ssid_list(ssids),
         }
     }
 
@@ -9438,7 +9465,7 @@ mod tests {
     #[test]
     fn eval_wifi_scan_aps_present_passes() {
         assert!(
-            eval_wifi_scan(&wifi_scan_verdict(7, &["homenet", "neighbor"])).is_ok(),
+            eval_wifi_scan_with(&wifi_scan_verdict(7, &["homenet", "neighbor"]), None).is_ok(),
             "aps=7 must pass"
         );
     }
@@ -9446,7 +9473,7 @@ mod tests {
     /// Message with aps=0 fails.
     #[test]
     fn eval_wifi_scan_zero_aps_fails() {
-        let result = eval_wifi_scan(&wifi_scan_verdict(0, &[]));
+        let result = eval_wifi_scan_with(&wifi_scan_verdict(0, &[]), None);
         assert!(result.is_err(), "aps=0 must fail");
         assert!(
             result.unwrap_err().contains("0 APs"),
@@ -9458,7 +9485,7 @@ mod tests {
     /// "message without aps= token" case: an absent count is now a wrong variant.
     #[test]
     fn eval_wifi_scan_fail_data_rejected() {
-        let result = eval_wifi_scan(&TestData::None);
+        let result = eval_wifi_scan_with(&TestData::None, None);
         assert!(result.is_err(), "fail-path data must be rejected");
         assert!(
             result.unwrap_err().contains("WifiScan"),
@@ -9501,11 +9528,14 @@ mod tests {
     #[test]
     fn eval_wifi_scan_wrong_variant_rejected() {
         assert!(
-            eval_wifi_scan(&TestData::WifiAssociate {
-                ip: [192, 168, 1, 10],
-                gateway: [192, 168, 1, 1],
-                rssi: -55,
-            })
+            eval_wifi_scan_with(
+                &TestData::WifiAssociate {
+                    ip: [192, 168, 1, 10],
+                    gateway: [192, 168, 1, 1],
+                    rssi: -55,
+                },
+                None
+            )
             .is_err(),
             "a WifiAssociate verdict must not satisfy eval_wifi_scan"
         );
@@ -9530,44 +9560,80 @@ mod tests {
     /// list (non-fatal: only a warning is emitted, the hard gate is the AP count).
     #[test]
     fn eval_wifi_scan_ssid_absent_is_non_fatal() {
-        // eval_wifi_scan reads RESPEAKER_WIFI_SSID from std::env; it is not set in this
-        // test, so the optional check is skipped and only the AP-count gate applies.
-        let result = eval_wifi_scan(&wifi_scan_verdict(3, &["neighbor", "other"]));
+        let result = eval_wifi_scan_with(&wifi_scan_verdict(3, &["neighbor", "other"]), None);
         assert!(
             result.is_ok(),
             "scan with aps=3 must pass regardless of SSID names"
         );
+        assert_eq!(
+            configured_ssid_seen(None, &ssid_list(&["neighbor", "other"])),
+            None,
+            "no configured SSID must skip the presence check"
+        );
     }
 
-    /// The `RESPEAKER_WIFI_SSID`-set branch: the eval compares the configured SSID
-    /// (truncated by the shared rule) against the typed `ssids` list. The branch is
-    /// diagnostic-only — it never changes the Ok/Err verdict — so both present and
-    /// absent must return Ok; this test guards the truncate-and-compare path itself.
+    /// An empty configured SSID (an exported-but-blank provisioning variable) skips
+    /// the presence check rather than searching for the empty string.
+    #[test]
+    fn eval_wifi_scan_empty_configured_ssid_skips_check() {
+        assert_eq!(
+            configured_ssid_seen(Some(""), &ssid_list(&["neighbor", "other"])),
+            None,
+            "an empty configured SSID must skip the presence check"
+        );
+        assert!(
+            eval_wifi_scan_with(&wifi_scan_verdict(3, &["neighbor", "other"]), Some("")).is_ok(),
+            "an empty configured SSID must skip the check, not fail"
+        );
+    }
+
+    /// The `RESPEAKER_WIFI_SSID`-set branch: the configured SSID (truncated by the
+    /// shared rule) is looked up in the typed `ssids` list. The outcome is asserted
+    /// directly because the branch is diagnostic-only — it never changes the Ok/Err
+    /// verdict, so `eval_wifi_scan_with` alone cannot distinguish match from miss.
     #[test]
     fn eval_wifi_scan_configured_ssid_branch() {
-        // RESPEAKER_WIFI_SSID is process-global; no other test asserts on this
-        // branch's warning output (they only assert the AP-count verdict), so setting
-        // it here cannot flip another test's result even under parallel execution.
-        std::env::set_var("RESPEAKER_WIFI_SSID", "homenet");
-        assert!(
-            eval_wifi_scan(&wifi_scan_verdict(3, &["homenet", "neighbor"])).is_ok(),
-            "configured SSID present must still pass"
+        assert_eq!(
+            configured_ssid_seen(Some("homenet"), &ssid_list(&["homenet", "neighbor"])),
+            Some(true),
+            "a configured SSID present in the scan list must be reported as seen"
+        );
+        assert_eq!(
+            configured_ssid_seen(Some("homenet"), &ssid_list(&["neighbor", "other"])),
+            Some(false),
+            "a configured SSID absent from the scan list must be reported as unseen"
         );
         assert!(
-            eval_wifi_scan(&wifi_scan_verdict(3, &["neighbor", "other"])).is_ok(),
-            "configured SSID absent is non-fatal, must still pass"
+            eval_wifi_scan_with(
+                &wifi_scan_verdict(3, &["neighbor", "other"]),
+                Some("homenet")
+            )
+            .is_ok(),
+            "an unseen configured SSID is diagnostic-only, so the verdict stays Ok"
         );
-        // Non-ASCII SSID longer than SSID_TRUNC_BYTES: the device ships the
-        // char-boundary-truncated prefix, and the host must compute the identical
-        // prefix so the comparison agrees.
+    }
+
+    /// A non-ASCII SSID longer than `SSID_TRUNC_BYTES`: the device ships the
+    /// char-boundary-truncated prefix, so the host must truncate identically before
+    /// comparing or the SSID would never be found.
+    #[test]
+    fn eval_wifi_scan_non_ascii_ssid_matches_device_prefix() {
         let long_ssid = "0123456789abcde\u{20ac}"; // '€' straddles the 16-byte boundary
         let device_prefix = truncate_utf8_prefix(long_ssid, SSID_TRUNC_BYTES);
-        std::env::set_var("RESPEAKER_WIFI_SSID", long_ssid);
-        assert!(
-            eval_wifi_scan(&wifi_scan_verdict(3, &[device_prefix])).is_ok(),
-            "truncated non-ASCII SSID present must pass"
+        assert_eq!(
+            device_prefix, "0123456789abcde",
+            "truncation must stop at the char boundary before the 16th byte"
         );
-        std::env::remove_var("RESPEAKER_WIFI_SSID");
+        assert_eq!(
+            configured_ssid_seen(Some(long_ssid), &ssid_list(&[device_prefix])),
+            Some(true),
+            "the truncated prefix must match the device's reported SSID"
+        );
+        assert_eq!(
+            configured_ssid_seen(Some(long_ssid), &ssid_list(&["0123456789abcd"])),
+            Some(false),
+            "a one-byte-shorter prefix must not count as the same network"
+        );
     }
 
     /// A non-report payload is rejected. Succeeds the old `Payload::TestResult`- and
@@ -9963,7 +10029,7 @@ mod tests {
     /// with the expected sets below — forcing a conscious update rather than silent drift.
     #[test]
     fn test_meta_phase_matches_expected_partition() {
-        use device_protocol::{TestName, REGISTERED_TESTS};
+        use device_protocol::{REGISTERED_TESTS, TestName};
 
         let network = [
             TestName::WifiAssociate,
@@ -10026,8 +10092,8 @@ mod tests {
     #[test]
     fn tcp_inbound_frames_device_budget_under_host_timeout() {
         use device_protocol::{
-            TestName, INBOUND_CONNECT_TIMEOUT_SECS, INBOUND_READ_TIMEOUT_SECS, MAX_IDLE_RETRIES,
-            TLS_HANDSHAKE_TIMEOUT_SECS,
+            INBOUND_CONNECT_TIMEOUT_SECS, INBOUND_READ_TIMEOUT_SECS, MAX_IDLE_RETRIES,
+            TLS_HANDSHAKE_TIMEOUT_SECS, TestName,
         };
 
         // Serial round-trip + connect/transfer margin: the device must finish, encode,
@@ -10142,8 +10208,8 @@ mod tests {
     #[test]
     fn tcp_inbound_backpressure_device_budget_under_host_timeout() {
         use device_protocol::{
-            TestName, INBOUND_BP_DEADLINE_SECS, INBOUND_CONNECT_TIMEOUT_SECS,
-            INBOUND_READ_TIMEOUT_SECS, TLS_HANDSHAKE_TIMEOUT_SECS,
+            INBOUND_BP_DEADLINE_SECS, INBOUND_CONNECT_TIMEOUT_SECS, INBOUND_READ_TIMEOUT_SECS,
+            TLS_HANDSHAKE_TIMEOUT_SECS, TestName,
         };
 
         // The bound (20s deadline + 5s connect + 3s handshake + 2s read overshoot = 30s)
@@ -10239,8 +10305,8 @@ mod tests {
     #[test]
     fn tls_psk_device_budgets_under_host_timeouts() {
         use device_protocol::{
-            TestName, TLS_HANDSHAKE_TIMEOUT_SECS, TLS_PSK_CONNECT_TIMEOUT_SECS,
-            TLS_PSK_ECHO_TIMEOUT_SECS,
+            TLS_HANDSHAKE_TIMEOUT_SECS, TLS_PSK_CONNECT_TIMEOUT_SECS, TLS_PSK_ECHO_TIMEOUT_SECS,
+            TestName,
         };
 
         // Same conservative stand-in as the inbound guards: serial round-trip for a
@@ -12116,7 +12182,7 @@ mod tests {
         stream: &mut impl std::io::Write,
         frame: &audio_pipeline::wire::StreamFrame,
     ) {
-        use audio_pipeline::wire::{encode_frame, MAX_FRAME_BYTES};
+        use audio_pipeline::wire::{MAX_FRAME_BYTES, encode_frame};
         let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
         let n = encode_frame(frame, &mut buf).expect("test frame encodes");
         stream
@@ -12126,7 +12192,7 @@ mod tests {
 
     fn rtd_test_hello() -> audio_pipeline::wire::StreamFrame {
         use audio_pipeline::wire::{
-            ChannelSource, Hello, StreamFrame, AUDIO_PROTOCOL_VERSION, DEVICE_PLAYBACK_FORMAT,
+            AUDIO_PROTOCOL_VERSION, ChannelSource, DEVICE_PLAYBACK_FORMAT, Hello, StreamFrame,
         };
         StreamFrame::Hello(Hello {
             version: AUDIO_PROTOCOL_VERSION,

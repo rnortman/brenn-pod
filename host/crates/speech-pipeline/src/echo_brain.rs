@@ -12,11 +12,11 @@
 //! readback costs responsiveness, not data). Both cases are made loud via a typed
 //! event plus a counter.
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use std::sync::Arc;
 
-use crate::brain::{send_or_report, BrainEvent, BrainEventFn, BrainStats, WakeCommandReason};
+use crate::brain::{BrainEvent, BrainEventFn, BrainStats, WakeCommandReason, send_or_report};
 use crate::traits::{Brain, ResponseSink};
 use crate::types::{
     ContextSegment, InterruptProgress, SpeakBody, SpeakCmd, Utterance, UtteranceId,

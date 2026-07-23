@@ -23,7 +23,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 use speech_surface::server::Server;
-use speech_surface::{jsonl, set_pinned, sidecar_path, Config, JsonlSink};
+use speech_surface::{Config, JsonlSink, jsonl, set_pinned, sidecar_path};
 
 /// The daemon and its (future) sibling subcommands.
 #[derive(Parser)]
@@ -149,7 +149,7 @@ fn emit_signal_degraded(jsonl: &jsonl::JsonlHandle, missing: &str, fallback: &st
 async fn shutdown_signal(jsonl: jsonl::JsonlHandle) {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match (
             signal(SignalKind::interrupt()),
             signal(SignalKind::terminate()),

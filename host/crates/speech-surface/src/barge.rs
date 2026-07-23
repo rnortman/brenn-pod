@@ -26,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use speech_pipeline::{
-    BargeInContext, ContextSegment, InterruptProgress, PodId, UtteranceId, MAX_CONTEXT_SEGMENTS,
+    BargeInContext, ContextSegment, InterruptProgress, MAX_CONTEXT_SEGMENTS, PodId, UtteranceId,
 };
 
 /// Per-turn settlement accounting: what the tap has sent, what playback has

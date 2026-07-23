@@ -26,10 +26,10 @@ use pod_ingest::{
     SegmentRef, SessionEvent, SessionFsm,
 };
 use speech_pipeline::{
-    tracking_event, write_spine_wav, AssemblerLimits, DoaTrack, PodId, RoomId, Segment,
-    SegmentAssembler, SegmentEndInfo, StageTimings, SPINE_FORMAT,
+    AssemblerLimits, DoaTrack, PodId, RoomId, SPINE_FORMAT, Segment, SegmentAssembler,
+    SegmentEndInfo, StageTimings, tracking_event, write_spine_wav,
 };
-use speech_surface::{emit_line as emit, exit, iso8601_ms, sanitize_filename, UNMAPPED_ROOM};
+use speech_surface::{UNMAPPED_ROOM, emit_line as emit, exit, iso8601_ms, sanitize_filename};
 
 #[derive(Parser)]
 #[command(
@@ -238,11 +238,11 @@ fn drain(
         if let SessionEvent::ProtocolError { fatal: true, .. } = ev {
             fatal = true;
         }
-        if let Some(a) = assembler.as_mut() {
-            if let Some(seg) = a.on_event(ev, log_name) {
-                export_segment(&seg, out_dir)?;
-                count += 1;
-            }
+        if let Some(a) = assembler.as_mut()
+            && let Some(seg) = a.on_event(ev, log_name)
+        {
+            export_segment(&seg, out_dir)?;
+            count += 1;
         }
     }
     Ok((count, fatal))
@@ -302,7 +302,7 @@ fn export_segment(seg: &Segment, out_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use audio_pipeline::wire::{
-        AudioFrame, SegmentEnd, SegmentStart, StreamFrame, Telemetry, MAX_AUDIO_PAYLOAD,
+        AudioFrame, MAX_AUDIO_PAYLOAD, SegmentEnd, SegmentStart, StreamFrame, Telemetry,
     };
     use audio_pipeline::wire::{EndReason, TelemetryKind};
     use heapless::Vec as HVec;

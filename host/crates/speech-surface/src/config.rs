@@ -17,7 +17,7 @@ use audio_pipeline::playback::{
 use audio_pipeline::wire::MAX_AUDIO_PAYLOAD;
 use serde::Deserialize;
 use speech_pipeline::{
-    ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, PacerConfig, Url, FRAME_MS,
+    ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, FRAME_MS, PacerConfig, Url,
 };
 
 use crate::psk::parse_psk_hex;
@@ -146,20 +146,20 @@ impl Config {
         // misconfiguration without both a transcriber (to hear) and a
         // synthesizer (to speak). Fatal at startup with the missing table named,
         // rather than a silently mute daemon.
-        if let Some(brain) = &self.brain {
-            if brain.mode == BrainMode::Echo {
-                if self.stt.is_none() {
-                    return Err(
-                        "brain.mode = \"echo\" requires an [stt] table (nothing to transcribe with)"
-                            .to_string(),
-                    );
-                }
-                if self.tts.is_none() {
-                    return Err(
-                        "brain.mode = \"echo\" requires a [tts] table (nothing to speak with)"
-                            .to_string(),
-                    );
-                }
+        if let Some(brain) = &self.brain
+            && brain.mode == BrainMode::Echo
+        {
+            if self.stt.is_none() {
+                return Err(
+                    "brain.mode = \"echo\" requires an [stt] table (nothing to transcribe with)"
+                        .to_string(),
+                );
+            }
+            if self.tts.is_none() {
+                return Err(
+                    "brain.mode = \"echo\" requires a [tts] table (nothing to speak with)"
+                        .to_string(),
+                );
             }
         }
         self.playback.validate()?;
@@ -665,10 +665,10 @@ impl SttConfig {
                 self.no_speech_max
             ));
         }
-        if let Some(min) = self.avg_logprob_min {
-            if !min.is_finite() {
-                return Err(format!("stt.avg_logprob_min {min} must be a finite value"));
-            }
+        if let Some(min) = self.avg_logprob_min
+            && !min.is_finite()
+        {
+            return Err(format!("stt.avg_logprob_min {min} must be a finite value"));
         }
         match self.backend {
             SttBackend::Http => {

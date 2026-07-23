@@ -138,8 +138,7 @@ pub(crate) fn effective_audio_psk_from<E>(
 
 /// Failure text when neither an override nor a stored key exists; names both
 /// provisioning paths.
-pub(crate) const NO_AUDIO_PSK_MSG: &str =
-    "no audio_psk override or NVS key — run ProvisionAudioPsk (podctl) or \
+pub(crate) const NO_AUDIO_PSK_MSG: &str = "no audio_psk override or NVS key — run ProvisionAudioPsk (podctl) or \
      SetTemporaryAudioPsk (HIL) first";
 
 /// The audio PSK every consumer should use: the RAM override if set, else the
@@ -216,8 +215,8 @@ pub(crate) fn set_temporary_audio_psk_outcome(
 /// Clear the RAM-only audio-PSK override, zeroizing the slot. A clear with no
 /// override active is a pure no-op returning `Ok`.
 #[cfg(target_os = "espidf")]
-pub(crate) fn handle_clear_temporary_audio_psk(
-) -> (device_protocol::Status, device_protocol::Payload) {
+pub(crate) fn handle_clear_temporary_audio_psk()
+-> (device_protocol::Status, device_protocol::Payload) {
     if clear_audio_psk() {
         log::info!("hil session: audio_psk override cleared and zeroized");
     }

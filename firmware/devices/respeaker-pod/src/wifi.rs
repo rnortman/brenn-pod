@@ -8,9 +8,9 @@
 use crate::hil::test_report_fail_msg;
 use crate::nvs::{nvs_get_str, open_wifi_nvs};
 use device_protocol::{
-    log_tokens, test_report_fail, test_report_fail_data, test_report_fail_detail,
-    test_report_fail_fmt, test_report_ok, truncate_utf8_prefix, Payload, Status, TestData,
-    SSID_TRUNC_BYTES, WIFI_PS_NONE_RAW,
+    Payload, SSID_TRUNC_BYTES, Status, TestData, WIFI_PS_NONE_RAW, log_tokens, test_report_fail,
+    test_report_fail_data, test_report_fail_detail, test_report_fail_fmt, test_report_ok,
+    truncate_utf8_prefix,
 };
 use esp_idf_svc::eventloop::{EspSubscription, EspSystemEventLoop, System};
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -18,10 +18,10 @@ use esp_idf_svc::ipv4::{IpInfo, Ipv4Addr};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::ping::{Configuration as PingConfiguration, EspPing};
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use wifi_diag::{fmt_ipv4, WifiSnapshot};
-use wifi_reconnect::{compute_wait_secs, Backoff, GW_UNREACHABLE_THRESHOLD, TICK_INTERVAL_SECS};
+use std::sync::atomic::{AtomicBool, Ordering};
+use wifi_diag::{WifiSnapshot, fmt_ipv4};
+use wifi_reconnect::{Backoff, GW_UNREACHABLE_THRESHOLD, TICK_INTERVAL_SECS, compute_wait_secs};
 
 /// Process-lifetime sender half of the WiFi supervisor doorbell channel.
 ///

@@ -30,4 +30,4 @@ pub use runtime::{
     ListenerStats, ListenerStatsSnapshot,
 };
 pub use silero::{SileroConfig, SileroModel, SileroVad};
-pub use stats::{ScoreStats, ScoreSummary, MODEL_STATS_FLUSH_CHUNKS};
+pub use stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreStats, ScoreSummary};

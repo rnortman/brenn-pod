@@ -1,7 +1,7 @@
 [package]
 name = "wifi-reconnect"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 license.workspace = true
 
 # no_std-compatible pure helper crate for WiFi supervisor backoff logic.

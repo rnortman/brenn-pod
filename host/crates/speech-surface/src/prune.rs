@@ -34,7 +34,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::recorder::{lock_store, sidecar_path, Sidecar, SidecarError, WakeClass, UNKNOWN_POD};
+use crate::recorder::{Sidecar, SidecarError, UNKNOWN_POD, WakeClass, lock_store, sidecar_path};
 
 /// Retention tier of a frame log, ordered so tier 1 (freely prunable) sorts
 /// before tier 2 (holds a wake-positive segment). Serializes to a snake-case
@@ -377,14 +377,14 @@ fn try_delete(
     // revisit. A failed delete is recorded and skipped, not propagated — one
     // wedged file must not abort the whole pass and lose the record of
     // everything already deleted.
-    if let Some(sidecar) = &log.sidecar {
-        if let Err(e) = std::fs::remove_file(sidecar) {
-            outcome.failed.push(PruneFailure {
-                framelog: log.framelog.clone(),
-                error: e.to_string(),
-            });
-            return None;
-        }
+    if let Some(sidecar) = &log.sidecar
+        && let Err(e) = std::fs::remove_file(sidecar)
+    {
+        outcome.failed.push(PruneFailure {
+            framelog: log.framelog.clone(),
+            error: e.to_string(),
+        });
+        return None;
     }
     if let Err(e) = std::fs::remove_file(&log.framelog) {
         outcome.failed.push(PruneFailure {
@@ -828,10 +828,12 @@ mod tests {
         assert!(outcome.halted.is_some());
         // The kept corrupt log is reported so the caller can complain loudly.
         assert_eq!(outcome.kept_corrupt.len(), 1);
-        assert!(outcome.kept_corrupt[0]
-            .framelog
-            .to_string_lossy()
-            .contains("corrupt"));
+        assert!(
+            outcome.kept_corrupt[0]
+                .framelog
+                .to_string_lossy()
+                .contains("corrupt")
+        );
     }
 
     #[test]
@@ -955,14 +957,18 @@ mod tests {
         // Quota ~1.5 logs: two oldest flood logs go; f3 keeps the bucket at quota.
         let outcome = prune(&request_q(dir.path(), 1_000_000, 15_000, &open)).unwrap();
         assert_eq!(pruned_names(&outcome), vec!["f1", "f2"]);
-        assert!(outcome
-            .pruned
-            .iter()
-            .all(|p| p.reason == PruneReason::PodQuota));
-        assert!(outcome
-            .pruned
-            .iter()
-            .all(|p| p.pod_id.as_deref() == Some("flood")));
+        assert!(
+            outcome
+                .pruned
+                .iter()
+                .all(|p| p.reason == PruneReason::PodQuota)
+        );
+        assert!(
+            outcome
+                .pruned
+                .iter()
+                .all(|p| p.pod_id.as_deref() == Some("flood"))
+        );
         assert!(victim.exists());
         assert!(outcome.halted.is_none());
         assert!(outcome.over_quota.is_empty());
@@ -1016,10 +1022,12 @@ mod tests {
         // victim. With a quota it is the flooder's oldest logs.
         let outcome = prune(&request_q(dir.path(), 35_000, 15_000, &open)).unwrap();
         assert!(victim.exists());
-        assert!(outcome
-            .pruned
-            .iter()
-            .all(|p| p.pod_id.as_deref() == Some("flood")));
+        assert!(
+            outcome
+                .pruned
+                .iter()
+                .all(|p| p.pod_id.as_deref() == Some("flood"))
+        );
         assert!(outcome.halted.is_none());
     }
 

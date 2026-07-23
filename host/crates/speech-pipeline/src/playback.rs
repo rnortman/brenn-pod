@@ -19,21 +19,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use audio_pipeline::wire::{
-    encode_frame, AudioFrame, ChannelSource, EndOfAudio, FlushPlayback, Hello, StreamFrame,
-    AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES,
+    AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, AudioFrame, ChannelSource, EndOfAudio,
+    FlushPlayback, Hello, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES, StreamFrame, encode_frame,
 };
 use futures::future::BoxFuture;
 use heapless::{String as HString, Vec as HVec};
 use pod_ingest::HostMicros;
 use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{InterruptProgress, PodId, StageTimings, UtteranceId, SPINE_FORMAT};
+use crate::types::{InterruptProgress, PodId, SPINE_FORMAT, StageTimings, UtteranceId};
 
 /// Wall-clock duration of one `Audio` frame. One `AUDIO_SAMPLES_PER_FRAME` chunk at
 /// 16 kHz is 20 ms; the assert ties the constant to the frame size so a frame-size
@@ -909,8 +909,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use audio_pipeline::wire::{decode_frame, Codec};
-    use tokio::io::{duplex, AsyncReadExt, DuplexStream};
+    use audio_pipeline::wire::{Codec, decode_frame};
+    use tokio::io::{AsyncReadExt, DuplexStream, duplex};
 
     #[test]
     fn build_audio_frame_pads_short_chunk_with_zeros() {

@@ -119,21 +119,21 @@ pub fn enumerate_pods() -> Result<Vec<PodPort>, serialport::Error> {
     let pods = all
         .into_iter()
         .filter_map(|p| {
-            if let serialport::SerialPortType::UsbPort(info) = &p.port_type {
-                if info.vid == ESP32S3_VID {
-                    let mode = if info.pid == ESP32S3_APP_PID {
-                        PodMode::App
-                    } else if info.pid == ESP32S3_DFU_PID {
-                        PodMode::Dfu
-                    } else {
-                        return None;
-                    };
-                    return Some(PodPort {
-                        port_name: p.port_name.clone(),
-                        serial_number: info.serial_number.clone(),
-                        mode,
-                    });
-                }
+            if let serialport::SerialPortType::UsbPort(info) = &p.port_type
+                && info.vid == ESP32S3_VID
+            {
+                let mode = if info.pid == ESP32S3_APP_PID {
+                    PodMode::App
+                } else if info.pid == ESP32S3_DFU_PID {
+                    PodMode::Dfu
+                } else {
+                    return None;
+                };
+                return Some(PodPort {
+                    port_name: p.port_name.clone(),
+                    serial_number: info.serial_number.clone(),
+                    mode,
+                });
             }
             None
         })
@@ -631,10 +631,10 @@ impl Harness {
                     DeviceFrame::Log(log) => {
                         let line = format_log(&log);
                         eprintln!("{line}");
-                        if let Some(token) = stop_token {
-                            if line.contains(token) {
-                                stop = true;
-                            }
+                        if let Some(token) = stop_token
+                            && line.contains(token)
+                        {
+                            stop = true;
                         }
                         logs_out.push((Instant::now(), line));
                     }
@@ -689,9 +689,9 @@ pub mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{make_frame_reader, make_harness, FakePort};
+    use crate::test_support::{FakePort, make_frame_reader, make_harness};
     use device_protocol::{
-        log_tokens, Command, DeviceFrame, LogFrame, LogLevel, Payload, Response, Status, TestName,
+        Command, DeviceFrame, LogFrame, LogLevel, Payload, Response, Status, TestName, log_tokens,
     };
 
     /// A `FakePort` that returns a hard I/O error on any read.
@@ -817,7 +817,7 @@ mod tests {
         // Push junk bytes that will cause a COBS deserialization error.
         // A zero byte is the COBS frame delimiter; push a frame that decodes to garbage.
         port.rx.extend(&[0x01u8, 0x02, 0x03, 0x00]); // corrupt/unrecognized
-                                                     // Then queue the valid response.
+
         port.queue_frame(&DeviceFrame::Response(Response {
             id: 1,
             status: Status::Ok,

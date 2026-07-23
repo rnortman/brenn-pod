@@ -400,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn stats_handle_does_not_keep_the_channel_open() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
         let (tx, mut rx) = DropOldestQueue::<u32>::new(2);
         // A StatsHandle is the load-bearing non-sender view: holding one must NOT
         // count toward the live-sender total, or the receiver would never observe

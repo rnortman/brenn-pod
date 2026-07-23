@@ -62,9 +62,11 @@ mod tests {
         };
         assert!(load.to_string().contains("melspectrogram.onnx"));
         assert!(load.to_string().contains("no such file"));
-        assert!(WakeError::Inference("session run".to_string())
-            .to_string()
-            .contains("session run"));
+        assert!(
+            WakeError::Inference("session run".to_string())
+                .to_string()
+                .contains("session run")
+        );
         assert!(WakeError::NonFiniteScore.to_string().contains("non-finite"));
     }
 }

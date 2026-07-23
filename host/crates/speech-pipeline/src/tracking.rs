@@ -45,7 +45,7 @@ mod tests {
     use super::*;
     use pod_ingest::HostMicros;
 
-    use crate::types::{test_segment, PodId, SegmentTelemetry};
+    use crate::types::{PodId, SegmentTelemetry, test_segment};
 
     #[test]
     fn splits_doa_and_energy_by_kind() {

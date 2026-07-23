@@ -9,28 +9,28 @@
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
 
 #[cfg(target_os = "espidf")]
-use crate::inbound::{inbound_has_room, pump_inbound, FrameAccumulator, InboundConnectionState};
+use crate::inbound::{FrameAccumulator, InboundConnectionState, inbound_has_room, pump_inbound};
 #[cfg(target_os = "espidf")]
 use crate::netpoll::poll_timeout;
 #[cfg(target_os = "espidf")]
 use crate::netpoll::{
-    poll_readiness, poll_writable, Readiness, IDLE_TICK, INBOUND_STEPS_PER_WAKE,
-    OUTBOUND_FRAMES_PER_WAKE,
+    IDLE_TICK, INBOUND_STEPS_PER_WAKE, OUTBOUND_FRAMES_PER_WAKE, Readiness, poll_readiness,
+    poll_writable,
 };
 #[cfg(target_os = "espidf")]
 use crate::nvs::{nvs_get_blob4, open_wifi_nvs};
 #[cfg(target_os = "espidf")]
-use crate::tls_link::{tls_connect_psk, LinkStream, TlsConnectParams, TlsStream, PSK_LEN};
+use crate::tls_link::{LinkStream, PSK_LEN, TlsConnectParams, TlsStream, tls_connect_psk};
 #[cfg(target_os = "espidf")]
 use crate::wifi::{jitter_seed, monotonic_secs, snapshot_wifi_state, wifi_is_up_nonblocking};
 #[cfg(target_os = "espidf")]
-use crate::{build_inbound_stream_sink, CaptureRing, CAPTURE_RING, DEVICE_PLAYBACK_FORMAT};
+use crate::{CAPTURE_RING, CaptureRing, DEVICE_PLAYBACK_FORMAT, build_inbound_stream_sink};
 #[cfg(target_os = "espidf")]
 use audio_pipeline::playback::{I2sStreamSink, PlaybackSink};
 #[cfg(target_os = "espidf")]
 use audio_pipeline::ring::RingIndex;
 #[cfg(target_os = "espidf")]
-use audio_pipeline::stream_send::{write_frame_classified, SendOutcome, WRITE_TIMEOUT_MS};
+use audio_pipeline::stream_send::{SendOutcome, WRITE_TIMEOUT_MS, write_frame_classified};
 use audio_pipeline::wire::Telemetry as WireTelemetry;
 #[cfg(target_os = "espidf")]
 use std::sync::Mutex;
@@ -216,7 +216,7 @@ struct ConnectInputs<'a> {
 /// the fd and the mode must be set before the handoff.
 #[cfg(target_os = "espidf")]
 fn connect_and_hello(inputs: &ConnectInputs, encode_buf: &mut [u8]) -> std::io::Result<TlsStream> {
-    use audio_pipeline::wire::{ChannelSource, Hello, StreamFrame, AUDIO_PROTOCOL_VERSION};
+    use audio_pipeline::wire::{AUDIO_PROTOCOL_VERSION, ChannelSource, Hello, StreamFrame};
     let mut stream = tls_connect_psk(&TlsConnectParams {
         peer: inputs.peer_addr,
         pod_id: inputs.pod_id,
@@ -728,27 +728,25 @@ pub(crate) fn spawn_streamer_thread() {
                     || idle_work_pending
                     || held_socket.as_ref().is_some_and(|s| s.buffers_plaintext());
                 idle_work_pending = false;
-                if must_drain {
-                    if let Some(ref mut s) = held_socket {
-                        match pump_inbound(
-                            s.as_read(),
-                            &mut inbound_accum,
-                            &mut inbound_sink,
-                            &mut inbound_state,
-                            INBOUND_STEPS_PER_WAKE,
-                        ) {
-                            Ok(p) => idle_work_pending = p.hit_cap,
-                            Err(e) => {
-                                log::warn!("streamer: idle inbound drain error — clearing socket, backing off: {:?}", e);
-                                // Blind-window coverage: a post-Hello idle-drain exit
-                                // is inside the post-Hello window too; gated on
-                                // seen_hello inside the helper (silent pre-Hello).
-                                crate::inbound::log_inbound_exit_wp(&inbound_state);
-                                // Stale partial bytes would corrupt the next connection's first frame.
-                                note_socket_lost(&mut held_socket, &mut inbound_accum, &mut inbound_state, &mut inbound_sink);
-                                reconnect_deadline_secs =
-                                    arm_reconnect_deadline(now_secs(), &mut backoff, &mut attempt_counter, jitter_seed_base);
-                            }
+                if must_drain && let Some(ref mut s) = held_socket {
+                    match pump_inbound(
+                        s.as_read(),
+                        &mut inbound_accum,
+                        &mut inbound_sink,
+                        &mut inbound_state,
+                        INBOUND_STEPS_PER_WAKE,
+                    ) {
+                        Ok(p) => idle_work_pending = p.hit_cap,
+                        Err(e) => {
+                            log::warn!("streamer: idle inbound drain error — clearing socket, backing off: {:?}", e);
+                            // Blind-window coverage: a post-Hello idle-drain exit
+                            // is inside the post-Hello window too; gated on
+                            // seen_hello inside the helper (silent pre-Hello).
+                            crate::inbound::log_inbound_exit_wp(&inbound_state);
+                            // Stale partial bytes would corrupt the next connection's first frame.
+                            note_socket_lost(&mut held_socket, &mut inbound_accum, &mut inbound_state, &mut inbound_sink);
+                            reconnect_deadline_secs =
+                                arm_reconnect_deadline(now_secs(), &mut backoff, &mut attempt_counter, jitter_seed_base);
                         }
                     }
                 }
@@ -1006,7 +1004,7 @@ pub(crate) fn run_segment(
     use audio_pipeline::pace::{advance_pace_us, pace_wait_us};
     use audio_pipeline::stream_send::{FrameWriteState, StepOutcome};
     use audio_pipeline::wire::{
-        AudioFrame, EndReason, SegmentEnd, StreamFrame, AUDIO_SAMPLES_PER_FRAME, MAX_AUDIO_PAYLOAD,
+        AUDIO_SAMPLES_PER_FRAME, AudioFrame, EndReason, MAX_AUDIO_PAYLOAD, SegmentEnd, StreamFrame,
     };
     let mut read_cursor = read_cursor;
     let mut frames_sent: u32 = 0;
@@ -1550,9 +1548,9 @@ pub(crate) fn run_segment(
 mod tests {
     // ── Provisioning park ─────────────────────────────────────────────────
 
-    use super::{park_drain, should_log_provisioning_failure, ParkOutcome, StreamerMsg};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::{ParkOutcome, StreamerMsg, park_drain, should_log_provisioning_failure};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// An idle channel parks for the full interval, then reports the timeout.
@@ -1669,8 +1667,8 @@ mod tests {
     // ── Idle reconnect pacing ─────────────────────────────────────────────
 
     use super::{
-        arm_reconnect_deadline, note_connect_success, should_attempt_idle_connect, Backoff,
-        IdleConnectAction,
+        Backoff, IdleConnectAction, arm_reconnect_deadline, note_connect_success,
+        should_attempt_idle_connect,
     };
     use wifi_reconnect::{BACKOFF_CAP_SECS, BACKOFF_FLOOR_SECS};
 

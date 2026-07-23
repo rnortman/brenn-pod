@@ -14,7 +14,7 @@ use device_protocol::{Payload, Status};
 #[cfg(target_os = "espidf")]
 use build_id::build_id;
 #[cfg(target_os = "espidf")]
-use device_protocol::{TestName, MAX_TESTS, REGISTERED_TESTS};
+use device_protocol::{MAX_TESTS, REGISTERED_TESTS, TestName};
 
 #[cfg(target_os = "espidf")]
 use crate::{

@@ -13,14 +13,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use audio_pipeline::wire::{
-    decode_frame, encode_frame, AudioFrame, ChannelSource, Codec, EndReason, Hello, SegmentEnd,
-    SegmentStart, StreamFrame, Telemetry, TelemetryKind, AUDIO_PROTOCOL_VERSION, MAX_AUDIO_PAYLOAD,
-    MAX_FRAME_BYTES,
+    AUDIO_PROTOCOL_VERSION, AudioFrame, ChannelSource, Codec, EndReason, Hello, MAX_AUDIO_PAYLOAD,
+    MAX_FRAME_BYTES, SegmentEnd, SegmentStart, StreamFrame, Telemetry, TelemetryKind, decode_frame,
+    encode_frame,
 };
 use heapless::Vec as HVec;
 use openssl::ssl::{Ssl, SslContext, SslStream};
 use pod_ingest::{
-    synth_session, FrameLogReader, FrameLogWriter, HostMicros, LogItem, LogMeta, SynthParams,
+    FrameLogReader, FrameLogWriter, HostMicros, LogItem, LogMeta, SynthParams, synth_session,
 };
 use serde_json::Value;
 use speech_pipeline::SPINE_FORMAT;
@@ -329,7 +329,7 @@ impl DaemonChild {
     /// self` (not by value) so the tempdir survives for a post-shutdown read of
     /// the final `stage_health` line.
     pub fn sigterm_and_wait(&mut self) {
-        use rustix::process::{kill_process, Pid, Signal};
+        use rustix::process::{Pid, Signal, kill_process};
         let pid = Pid::from_raw(self.child.id() as i32).expect("child pid is valid");
         kill_process(pid, Signal::TERM).expect("send SIGTERM to daemon");
         let status = self.child.wait().expect("wait for daemon exit");

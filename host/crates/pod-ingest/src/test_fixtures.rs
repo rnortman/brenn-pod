@@ -11,8 +11,8 @@
 //! builder set.
 
 use audio_pipeline::wire::{
-    encode_frame, AudioFrame, ChannelSource, Codec, EndReason, Hello, SegmentEnd, SegmentStart,
-    StreamFrame, AUDIO_PROTOCOL_VERSION, MAX_AUDIO_PAYLOAD,
+    AUDIO_PROTOCOL_VERSION, AudioFrame, ChannelSource, Codec, EndReason, Hello, MAX_AUDIO_PAYLOAD,
+    SegmentEnd, SegmentStart, StreamFrame, encode_frame,
 };
 use heapless::Vec as HVec;
 

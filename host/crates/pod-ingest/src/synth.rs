@@ -10,8 +10,8 @@
 //! log. Deterministic for fixed inputs and metadata.
 
 use audio_pipeline::wire::{
-    AudioFrame, ChannelSource, Codec, EndReason, Hello, SegmentEnd, SegmentStart, StreamFrame,
-    AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME,
+    AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, AudioFrame, ChannelSource, Codec, EndReason,
+    Hello, SegmentEnd, SegmentStart, StreamFrame,
 };
 use heapless::String as HString;
 use heapless::Vec as HVec;

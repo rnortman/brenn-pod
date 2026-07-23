@@ -17,8 +17,8 @@ use crate::hil::DebugF32;
 use crate::i2c::{I2C_BUS, I2C_CTRL_TIMEOUT_TICKS};
 #[cfg(target_os = "espidf")]
 use device_protocol::{
-    doa_azimuth_ok, sp_energy_ok, test_report_fail, test_report_fail_fmt, test_report_ok, Payload,
-    Status, TestData,
+    Payload, Status, TestData, doa_azimuth_ok, sp_energy_ok, test_report_fail,
+    test_report_fail_fmt, test_report_ok,
 };
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::hal::{delay::FreeRtos, i2c::I2cDriver};
@@ -391,7 +391,7 @@ pub(crate) fn run_amp_always_on_gpo_inert() -> (Status, Payload) {
     let driver = match bus_guard.as_mut() {
         Some(d) => d,
         None => {
-            return test_report_fail("amp-gpo-inert: I2C_BUS not initialized — firmware init bug")
+            return test_report_fail("amp-gpo-inert: I2C_BUS not initialized — firmware init bug");
         }
     };
 
@@ -406,7 +406,7 @@ pub(crate) fn run_amp_always_on_gpo_inert() -> (Status, Payload) {
     ) {
         Ok(result) => result,
         Err(e) => {
-            return test_report_fail_fmt(format_args!("FAIL src=amp gpo_read0 I2C error {:?}", e))
+            return test_report_fail_fmt(format_args!("FAIL src=amp gpo_read0 I2C error {:?}", e));
         }
     };
     if read0_status != XVF3800_STATUS_DONE {
@@ -431,7 +431,7 @@ pub(crate) fn run_amp_always_on_gpo_inert() -> (Status, Payload) {
                 return test_report_fail_fmt(format_args!(
                     "FAIL src=amp gpo_write I2C error {:?}",
                     e
-                ))
+                ));
             }
         };
 
@@ -447,7 +447,7 @@ pub(crate) fn run_amp_always_on_gpo_inert() -> (Status, Payload) {
     ) {
         Ok(result) => result,
         Err(e) => {
-            return test_report_fail_fmt(format_args!("FAIL src=amp gpo_read1 I2C error {:?}", e))
+            return test_report_fail_fmt(format_args!("FAIL src=amp gpo_read1 I2C error {:?}", e));
         }
     };
     if read1_status != XVF3800_STATUS_DONE {

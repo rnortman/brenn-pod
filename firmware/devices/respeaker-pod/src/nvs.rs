@@ -11,14 +11,14 @@ use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 #[cfg(target_os = "espidf")]
 use audio_pipeline::vad::vad_threshold_ok;
 #[cfg(target_os = "espidf")]
-use device_protocol::{test_report_fail_detail, test_report_fail_fmt, Payload, Status};
+use device_protocol::{Payload, Status, test_report_fail_detail, test_report_fail_fmt};
 #[cfg(target_os = "espidf")]
 use wifi_diag::fmt_ipv4;
 
 #[cfg(target_os = "espidf")]
 use crate::hil::test_report_fail_msg;
 #[cfg(target_os = "espidf")]
-use crate::{ring_wifi_wake, WIFI_STACK};
+use crate::{WIFI_STACK, ring_wifi_wake};
 
 /// Open an NVS namespace. Pass `read_write = true` to enable writes.
 #[allow(clippy::result_large_err)] // device_protocol::TestResultMsg is the no-alloc error type on no_std

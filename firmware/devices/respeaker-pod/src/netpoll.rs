@@ -33,7 +33,7 @@ pub(crate) const OUTBOUND_FRAMES_PER_WAKE: u32 = 16;
 /// error/`POLLERR`/`POLLHUP`/`POLLNVAL` → `Fault`.
 #[cfg(target_os = "espidf")]
 pub(crate) fn poll_writable(fd: std::os::fd::RawFd, deadline: std::time::Instant) -> Writable {
-    use esp_idf_svc::sys::{poll, pollfd, POLLERR, POLLHUP, POLLNVAL, POLLOUT};
+    use esp_idf_svc::sys::{POLLERR, POLLHUP, POLLNVAL, POLLOUT, poll, pollfd};
 
     // Remaining budget toward the WRITE_TIMEOUT_MS deadline.  `poll` takes the
     // timeout in milliseconds as a c_int; a non-positive remaining budget means
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn timeout_caps_at_idle_tick_when_no_deadline_pending() {
-        use super::{timeout_to_next_deadline, IDLE_TICK};
+        use super::{IDLE_TICK, timeout_to_next_deadline};
         use std::time::Instant;
         let now = Instant::now();
         let ms = timeout_to_next_deadline(now, std::iter::empty());
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn timeout_caps_at_idle_tick_even_for_a_far_future_deadline() {
-        use super::{timeout_to_next_deadline, IDLE_TICK};
+        use super::{IDLE_TICK, timeout_to_next_deadline};
         use std::time::{Duration, Instant};
         let now = Instant::now();
         let far = now + Duration::from_millis(1000);
@@ -275,7 +275,7 @@ mod tests {
     /// With no pending work, `poll_timeout` is the existing `[1, IDLE_TICK]` clamp.
     #[test]
     fn poll_timeout_falls_back_to_clamp_when_no_work() {
-        use super::{poll_timeout, IDLE_TICK};
+        use super::{IDLE_TICK, poll_timeout};
         use std::time::{Duration, Instant};
         let now = Instant::now();
         assert_eq!(

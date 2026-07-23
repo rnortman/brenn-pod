@@ -1406,11 +1406,11 @@ impl I2sStreamSink {
 #[cfg(test)]
 mod tests {
     use super::{
+        Accepted, I2S_TX_FRAME_BYTES, I2sStreamSink, InboundPcmRing, InboundRingConsumer,
+        LogCountdown, PLAYBACK_CONSUMER_STALL_WARN_STALLS, PLAYBACK_LOG_CADENCE_FRAMES,
+        PLAYBACK_PREROLL_MAX_TARGET_BYTES, PlaybackSink, WIRE_BYTES_PER_SAMPLE,
         expand_run_in_place, expand_run_into, expand_sample_to_frame, is_drop_burst,
-        next_preroll_target, preroll_gate_ready, Accepted, I2sStreamSink, InboundPcmRing,
-        InboundRingConsumer, LogCountdown, PlaybackSink, I2S_TX_FRAME_BYTES,
-        PLAYBACK_CONSUMER_STALL_WARN_STALLS, PLAYBACK_LOG_CADENCE_FRAMES,
-        PLAYBACK_PREROLL_MAX_TARGET_BYTES, WIRE_BYTES_PER_SAMPLE,
+        next_preroll_target, preroll_gate_ready,
     };
 
     /// Build a sink wired to a fresh ring of `cap` bytes, returning the sink and the ring's
@@ -2468,7 +2468,7 @@ mod tests {
     // NOT exercise `I2sStreamSink`/the capture thread (that wiring is a later increment).
 
     use super::{
-        DrainRun, InboundRingProducer, INBOUND_PCM_RING_BYTES, INBOUND_PCM_WRITE_UNIT_BYTES,
+        DrainRun, INBOUND_PCM_RING_BYTES, INBOUND_PCM_WRITE_UNIT_BYTES, InboundRingProducer,
         PLAYBACK_PREROLL_TARGET_BYTES, RING_EOA_MARK_CAP,
     };
 
@@ -3026,7 +3026,7 @@ mod tests {
         // Dead connection banks audio + an end-of-audio boundary, never drained.
         assert!(ring_write(&producer, &pattern(0, 100)));
         producer.mark_end_of_audio(); // dead mark at head 100, generation 0
-                                      // Reconnect: reset bumps generation and records head_at_reset = head (100).
+        // Reconnect: reset bumps generation and records head_at_reset = head (100).
         producer.reset();
         // Fresh stream banks new audio (head → 150) with no boundary of its own.
         assert!(ring_write(&producer, &pattern(200, 50)));
@@ -3328,8 +3328,8 @@ mod tests {
     /// A dropped/duplicated/torn/reordered byte breaks the +1 chain and fails the assert.
     #[test]
     fn ring_concurrent_stress() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::time::{Duration, Instant};
 
         // A small ring so the ~`ITERS` writes wrap the `cap` boundary many times over.
@@ -3396,11 +3396,11 @@ mod tests {
                 // the entry (insert happens-before `reset()`'s lock release happens-before the
                 // consumer's generation observation).
                 if i % 800 == 799 {
-                    let gen = base_gen.wrapping_add(resets_done + 1);
+                    let generation = base_gen.wrapping_add(resets_done + 1);
                     reset_stamps_w
                         .lock()
                         .expect("reset_stamps mutex poisoned")
-                        .insert(gen, logical as u8);
+                        .insert(generation, logical as u8);
                     producer.reset();
                     resets_done += 1;
                 }
@@ -3431,12 +3431,12 @@ mod tests {
                     // blindly. If a later reset intervened before the next drain, the run's generation
                     // will differ again and we loop back, overwriting this expectation before it is
                     // used, so `next_stamp` never straddles epochs.
-                    let gen = consumer.apply_reset();
-                    last_gen = gen;
+                    let generation = consumer.apply_reset();
+                    last_gen = generation;
                     next_stamp = *reset_stamps_r
                         .lock()
                         .expect("reset_stamps mutex poisoned")
-                        .get(&gen)
+                        .get(&generation)
                         .expect("no recorded reset stamp for observed generation");
                     continue;
                 }

@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 pub use pod_ingest::Codec;
 use pod_ingest::{
-    resolve_open, splice_log_into, CrossCheck, DeviceMicros, FormatConstraint, HostMicros,
-    ResolveError, Resolved, SegmentRef, SpliceStop, TelemetryKind,
+    CrossCheck, DeviceMicros, FormatConstraint, HostMicros, ResolveError, Resolved, SegmentRef,
+    SpliceStop, TelemetryKind, resolve_open, splice_log_into,
 };
 use serde::{Deserialize, Serialize};
 
@@ -849,8 +849,8 @@ mod tests {
 
     // ── AudioSpan::resolve ────────────────────────────────────────────────
 
-    use pod_ingest::test_fixtures::{audio, hello, seg_end, seg_start, write_log};
     use pod_ingest::SpliceStop;
+    use pod_ingest::test_fixtures::{audio, hello, seg_end, seg_start, write_log};
 
     #[test]
     fn multi_part_span_resolves_seamless_across_part_boundary() {

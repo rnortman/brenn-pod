@@ -21,8 +21,8 @@ use pod_ingest::{
     SessionEvent, SessionFsm,
 };
 use speech_pipeline::{
-    Feed, ListenerConfig, ListenerEvent, ListenerState, OwwConfig, OwwModels, PodId,
-    SegmentEndCause, SileroConfig, SileroModel, WakeError, SPINE_FORMAT,
+    Feed, ListenerConfig, ListenerEvent, ListenerState, OwwConfig, OwwModels, PodId, SPINE_FORMAT,
+    SegmentEndCause, SileroConfig, SileroModel, WakeError,
 };
 
 use crate::config::{Config, WakeMode};
@@ -317,13 +317,13 @@ fn drive(
         if let SessionEvent::ProtocolError { fatal: true, .. } = ev {
             fatal = true;
         }
-        if let Some(feed) = session_event_to_feed(ev, pod, epoch) {
-            if let Some(id) = pod.as_ref() {
-                let emitted = state
-                    .handle(id, feed, oww, silero)
-                    .map_err(ReplayError::Listener)?;
-                out.extend(emitted);
-            }
+        if let Some(feed) = session_event_to_feed(ev, pod, epoch)
+            && let Some(id) = pod.as_ref()
+        {
+            let emitted = state
+                .handle(id, feed, oww, silero)
+                .map_err(ReplayError::Listener)?;
+            out.extend(emitted);
         }
     }
     Ok(fatal)

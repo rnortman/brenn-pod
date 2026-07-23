@@ -19,7 +19,7 @@ use serde_json::json;
 use speech_pipeline::{EndpointCause, ListenerEvent};
 use speech_surface::config::Config;
 use speech_surface::pipeline::event_line;
-use speech_surface::replay::{replay_framelog, ReplayError, ReplayListener, StopReason};
+use speech_surface::replay::{ReplayError, ReplayListener, StopReason, replay_framelog};
 use speech_surface::{emit_line as emit, exit};
 
 #[derive(Parser)]

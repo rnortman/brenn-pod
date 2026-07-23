@@ -12,7 +12,7 @@
 //! Only CPU-indexed data belongs here: PSRAM is not DMA-capable in this config.
 
 use core::ops::{Deref, DerefMut};
-use esp_idf_svc::sys::{heap_caps_calloc, heap_caps_free, MALLOC_CAP_SPIRAM};
+use esp_idf_svc::sys::{MALLOC_CAP_SPIRAM, heap_caps_calloc, heap_caps_free};
 
 /// Free bytes currently available in the PSRAM (`MALLOC_CAP_SPIRAM`) pool.
 ///

@@ -15,8 +15,8 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    build_stage, classify_send, read_body_capped, truncate_body, BuildError, StageCounters,
-    StageError,
+    BuildError, StageCounters, StageError, build_stage, classify_send, read_body_capped,
+    truncate_body,
 };
 use crate::traits::{SegmentAudio, TranscribeError, Transcriber, TranscriptEvent};
 use crate::types::TranscriptConfidence;
@@ -312,12 +312,12 @@ async fn request(
     // Reject an honestly-advertised oversized body before reading a byte; the
     // capped read below holds the bound even when `Content-Length` is absent or
     // understated (chunked encoding, or a hostile peer).
-    if let Some(len) = resp.content_length() {
-        if len > MAX_BODY_BYTES {
-            return Err(TranscribeError::Decode(format!(
-                "response body {len} bytes exceeds {MAX_BODY_BYTES}-byte cap"
-            )));
-        }
+    if let Some(len) = resp.content_length()
+        && len > MAX_BODY_BYTES
+    {
+        return Err(TranscribeError::Decode(format!(
+            "response body {len} bytes exceeds {MAX_BODY_BYTES}-byte cap"
+        )));
     }
 
     let body = read_body_capped::<TranscribeError>(resp, MAX_BODY_BYTES).await?;
@@ -363,7 +363,7 @@ fn encode_wav(audio: &SegmentAudio) -> Result<Vec<u8>, hound::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::test_support::{find_subslice, spawn_server, Behavior};
+    use crate::http::test_support::{Behavior, find_subslice, spawn_server};
     use tokio::net::TcpListener;
 
     fn sample_audio() -> SegmentAudio {
@@ -570,9 +570,11 @@ mod tests {
         let req = server.await.unwrap();
         let req_text = String::from_utf8_lossy(&req);
         assert!(req_text.starts_with("POST /v1/audio/transcriptions"));
-        assert!(req_text
-            .to_ascii_lowercase()
-            .contains("multipart/form-data"));
+        assert!(
+            req_text
+                .to_ascii_lowercase()
+                .contains("multipart/form-data")
+        );
         assert!(req_text.contains(r#"name="model""#));
         assert!(req_text.contains("faster-whisper-small"));
         assert!(req_text.contains(r#"name="language""#));

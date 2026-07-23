@@ -25,8 +25,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc as fmpsc;
@@ -35,12 +35,12 @@ use pod_ingest::{HostMicros, SegmentRef};
 use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
-    stage_delta_us, tracking_event, AudioSpan, Brain, BrainEvent, BrainEventFn, BrainStats,
-    CarveTiming, CarvedUtterance, ConfidenceGate, DoaTrack, EndpointCause, FlushRejected,
-    GateReject, InterruptProgress, ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId,
-    Segment, SegmentAudio, SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings, TrackingEvent,
+    AudioSpan, Brain, BrainEvent, BrainEventFn, BrainStats, CarveTiming, CarvedUtterance,
+    ConfidenceGate, DoaTrack, EndpointCause, FlushRejected, GateReject, InterruptProgress,
+    ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, SPINE_FORMAT, Segment,
+    SegmentAudio, SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings, TrackingEvent,
     TranscribeError, Transcriber, Transcript, Utterance, UtteranceId, WakeCommandReason,
-    WakeConfirmation, SPINE_FORMAT,
+    WakeConfirmation, stage_delta_us, tracking_event,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -48,7 +48,7 @@ use tokio::task::AbortHandle;
 use crate::barge::TurnLedger;
 use crate::jsonl::JsonlHandle;
 use crate::recorder::{
-    sanitize_filename, set_wake_class, sidecar_path, WakeClass, WakeClassUpdate,
+    WakeClass, WakeClassUpdate, sanitize_filename, set_wake_class, sidecar_path,
 };
 
 /// The pipeline exited on an unrecoverable fault. The server renders this to a
@@ -572,11 +572,11 @@ async fn handle_listener(
             if utterance_id.epoch < state.epoch {
                 return;
             }
-            if let Some(f) = state.in_flight.as_ref() {
-                if f.id == utterance_id {
-                    f.abort.abort();
-                    state.in_flight = None;
-                }
+            if let Some(f) = state.in_flight.as_ref()
+                && f.id == utterance_id
+            {
+                f.abort.abort();
+                state.in_flight = None;
             }
         }
         ListenerEvent::UtteranceClosed { pod, utterance_id } => {
@@ -1123,9 +1123,9 @@ struct TrackingLine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use futures::future::BoxFuture;
     use futures::stream::BoxStream;
-    use futures::FutureExt;
     use serde_json::Value;
     use speech_pipeline::{
         CarveTiming, DropOldestQueue, EndpointState, EndpointTransition, InterruptProgress,

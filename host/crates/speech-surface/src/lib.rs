@@ -17,18 +17,18 @@ pub mod recorder;
 pub mod replay;
 pub mod server;
 
-pub use clip::{check_spine_format, load_clip, ClipError, SpineFormatViolation};
+pub use clip::{ClipError, SpineFormatViolation, check_spine_format, load_clip};
 pub use config::{
     Config, ConfigError, JsonlConfig, JsonlSink, PipelineConfig, PodConfig, RecordConfig,
     RoomLookup, UNMAPPED_ROOM,
 };
-pub use jsonl::{emit_line, format_line, JsonlHandle};
-pub use prune::{prune, PruneFailure, PruneHalt, PruneOutcome, PruneRequest, PruneTier, PrunedLog};
+pub use jsonl::{JsonlHandle, emit_line, format_line};
+pub use prune::{PruneFailure, PruneHalt, PruneOutcome, PruneRequest, PruneTier, PrunedLog, prune};
 pub use recorder::{
-    iso8601_ms, sanitize_filename, set_pinned, sidecar_path, Sidecar, SidecarError, SidecarSegment,
-    WakeClass,
+    Sidecar, SidecarError, SidecarSegment, WakeClass, iso8601_ms, sanitize_filename, set_pinned,
+    sidecar_path,
 };
-pub use replay::{replay_framelog, ReplayError, ReplayListener, ReplaySummary, StopReason};
+pub use replay::{ReplayError, ReplayListener, ReplaySummary, StopReason, replay_framelog};
 
 /// Shared `Segment` builder for the crate's test modules. `Segment` grows a
 /// field per increment (`StageTimings` especially), so keeping one constructor

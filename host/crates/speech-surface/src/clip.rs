@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 // The spine-format check lives in `speech-pipeline` beside `SPINE_FORMAT`; re-export
 // it here so this crate's loaders and `wav-import` reach it under one path.
-pub use speech_pipeline::{check_spine_format, SpineFormatViolation};
+pub use speech_pipeline::{SpineFormatViolation, check_spine_format};
 
 /// A failure loading the brain clip, carrying the offending path and property.
 #[derive(Debug, thiserror::Error)]

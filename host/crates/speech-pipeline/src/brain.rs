@@ -4,8 +4,8 @@
 //! and share these so `stage_health` and the JSONL adapter see one vocabulary
 //! regardless of which brain is wired.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 
