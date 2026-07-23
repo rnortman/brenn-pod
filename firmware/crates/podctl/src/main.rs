@@ -1,14 +1,12 @@
 //! `podctl` — operator CLI for provisioning respeaker pods.
 //!
 //! Provisions a respeaker pod's persistent config (NVS) over the existing
-//! framed USB-serial-JTAG protocol: WiFi credentials, network peer config,
-//! and audio receiver address.
+//! framed USB-serial-JTAG protocol: WiFi credentials and audio receiver address.
+//! HIL-only session state (peer config, audio-PSK override) is pushed by the
+//! HIL host, not podctl.
 //!
 //! Usage:
 //!   podctl provision-wifi      [--ssid <S>] [--passphrase <P>] [--port <PATH>] [--serial <SN>]
-//!   podctl provision-peer      [--host <IP>] [--udp-port <N>] [--tcp-port <N>]
-//!                              [--tls-host <IP>] [--tls-port <N>]
-//!                              [--inbound-frames-port <N>] [--port <PATH>] [--serial <SN>]
 //!   podctl provision-audio     [--host <IP>] [--port <N>] [--serial-port <PATH>] [--serial <SN>]
 //!   podctl provision-audio-psk [--generate | --psk-file <PATH>] [--host-psk-file <PATH>]
 //!                              [--serial-port <PATH>] [--serial <SN>]
@@ -19,9 +17,7 @@
 //!   podctl logs                [--log-jsonl <PATH>] [--port <PATH>] [--serial <SN>]
 //!
 //! Each input has an env-var fallback; explicit flags override env vars.
-//! Env vars: PODCTL_WIFI_SSID, PODCTL_WIFI_PASS, PODCTL_PEER_HOST,
-//!           PODCTL_UDP_PORT, PODCTL_TCP_PORT, PODCTL_TLS_HOST, PODCTL_TLS_PORT,
-//!           PODCTL_INBOUND_FRAMES_PORT,
+//! Env vars: PODCTL_WIFI_SSID, PODCTL_WIFI_PASS,
 //!           PODCTL_AUDIO_HOST, PODCTL_AUDIO_PORT,
 //!           PODCTL_AUDIO_PSK_FILE, PODCTL_HOST_PSK_FILE,
 //!           PODCTL_VAD_THRESHOLD, PODCTL_VAD_HANGOVER_MS,
@@ -48,10 +44,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[command(
     name = "podctl",
     about = "Operator CLI for provisioning respeaker pods",
-    after_help = "Env vars: PODCTL_WIFI_SSID, PODCTL_WIFI_PASS, PODCTL_PEER_HOST, \
-        PODCTL_UDP_PORT, PODCTL_TCP_PORT, PODCTL_TLS_HOST, PODCTL_TLS_PORT, \
-        PODCTL_INBOUND_FRAMES_PORT, PODCTL_BACKPRESSURE_PORT, PODCTL_LOG_JSONL, \
-        PODCTL_PORT, PODCTL_SERIAL"
+    after_help = "Env vars: PODCTL_WIFI_SSID, PODCTL_WIFI_PASS, \
+        PODCTL_AUDIO_HOST, PODCTL_AUDIO_PORT, PODCTL_AUDIO_PSK_FILE, \
+        PODCTL_HOST_PSK_FILE, PODCTL_LOG_JSONL, PODCTL_PORT, PODCTL_SERIAL"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -165,76 +160,9 @@ enum ProvisionCmd {
         serial: Option<String>,
     },
 
-    /// Provision the network peer config (host, ports) into device NVS.
-    ///
-    /// All IPs are dotted IPv4 (e.g. 192.168.1.10).
-    /// Ports are 0–65535.
-    ProvisionPeer {
-        /// Peer IPv4 address for UDP/TCP echo (dotted notation). Also $PODCTL_PEER_HOST.
-        #[arg(long, env = "PODCTL_PEER_HOST")]
-        host: Option<String>,
-
-        /// UDP echo port (0–65535). Also $PODCTL_UDP_PORT.
-        #[arg(long, env = "PODCTL_UDP_PORT")]
-        udp_port: Option<String>,
-
-        /// TCP echo port (0–65535). Also $PODCTL_TCP_PORT.
-        #[arg(long, env = "PODCTL_TCP_PORT")]
-        tcp_port: Option<String>,
-
-        /// TLS endpoint IPv4 address (dotted notation). Also $PODCTL_TLS_HOST.
-        #[arg(long, env = "PODCTL_TLS_HOST")]
-        tls_host: Option<String>,
-
-        /// TLS endpoint port (0–65535). Also $PODCTL_TLS_PORT.
-        #[arg(long, env = "PODCTL_TLS_PORT")]
-        tls_port: Option<String>,
-
-        /// Inbound-frames TCP port (0–65535) for the TcpInboundFrames self-test.
-        /// The host IP is the same as --host. Also $PODCTL_INBOUND_FRAMES_PORT.
-        #[arg(long, env = "PODCTL_INBOUND_FRAMES_PORT")]
-        inbound_frames_port: Option<String>,
-
-        /// Backpressure-source TCP port (0–65535) for the TcpSendBackpressure self-test.
-        /// The host IP is the same as --host. Also $PODCTL_BACKPRESSURE_PORT.
-        #[arg(long, env = "PODCTL_BACKPRESSURE_PORT")]
-        backpressure_port: Option<String>,
-
-        /// Poll-readiness adversary TCP port (0–65535) for the PollReadinessBidir self-test.
-        /// The host IP is the same as --host. Also $PODCTL_POLL_READINESS_PORT.
-        #[arg(long, env = "PODCTL_POLL_READINESS_PORT")]
-        poll_readiness_port: Option<String>,
-
-        /// StreamRealtimeDuplex listener TCP port (0–65535) for the StreamRealtimeDuplex
-        /// self-test. The host IP is the same as --host. Also $PODCTL_RTD_PORT.
-        #[arg(long, env = "PODCTL_RTD_PORT")]
-        rtd_port: Option<String>,
-
-        /// TLS-PSK listener TCP port (0–65535) for the TlsPskHandshake self-test — the
-        /// listener holding this pod's real audio-link key. The host IP is the same as
-        /// --host. Also $PODCTL_TLS_PSK_PORT.
-        #[arg(long, env = "PODCTL_TLS_PSK_PORT")]
-        tls_psk_port: Option<String>,
-
-        /// TLS-PSK listener TCP port (0–65535) for the TlsPskWrongKeyRejected self-test —
-        /// the listener holding a different key for this pod's identity. The host IP is
-        /// the same as --host. Also $PODCTL_TLS_PSK_BAD_PORT.
-        #[arg(long, env = "PODCTL_TLS_PSK_BAD_PORT")]
-        tls_psk_bad_port: Option<String>,
-
-        /// Target device by serial port path (e.g. /dev/ttyACM0). Also $PODCTL_PORT.
-        #[arg(long, env = "PODCTL_PORT")]
-        port: Option<String>,
-
-        /// Target device by USB serial number (best-effort). Also $PODCTL_SERIAL.
-        #[arg(long, env = "PODCTL_SERIAL")]
-        serial: Option<String>,
-    },
-
     /// Provision the audio receiver address (host, port) into device NVS.
     ///
     /// Writes NVS keys audio_ip + audio_port in the "wifi" namespace.
-    /// These are separate from the echo-server keys used by provision-peer.
     ProvisionAudio {
         /// Audio receiver IPv4 address (dotted notation). Also $PODCTL_AUDIO_HOST.
         #[arg(long, env = "PODCTL_AUDIO_HOST")]
@@ -541,21 +469,6 @@ struct WifiArgs {
     passphrase: Option<String>,
 }
 
-/// Arguments for provision-peer after clap parsing.
-struct PeerArgs {
-    host: Option<String>,
-    udp_port: Option<String>,
-    tcp_port: Option<String>,
-    tls_host: Option<String>,
-    tls_port: Option<String>,
-    inbound_frames_port: Option<String>,
-    backpressure_port: Option<String>,
-    poll_readiness_port: Option<String>,
-    rtd_port: Option<String>,
-    tls_psk_port: Option<String>,
-    tls_psk_bad_port: Option<String>,
-}
-
 /// Arguments for provision-audio after clap parsing.
 struct AudioArgs {
     host: Option<String>,
@@ -641,93 +554,6 @@ fn parse_port(s: &str, field: &'static str) -> Result<u16, ValidationError> {
     s.parse::<u16>().map_err(|_| ValidationError::InvalidField {
         field,
         expected: "port (0–65535)",
-    })
-}
-
-/// Validate peer args and construct the fully-formed Command.
-///
-/// Pure function — no USB access.
-fn validate_peer(args: PeerArgs) -> Result<Command, ValidationError> {
-    let host_str = args.host.ok_or(ValidationError::Missing {
-        input: "host",
-        flag: "host",
-        env: "PODCTL_PEER_HOST",
-    })?;
-    let udp_str = args.udp_port.ok_or(ValidationError::Missing {
-        input: "udp-port",
-        flag: "udp-port",
-        env: "PODCTL_UDP_PORT",
-    })?;
-    let tcp_str = args.tcp_port.ok_or(ValidationError::Missing {
-        input: "tcp-port",
-        flag: "tcp-port",
-        env: "PODCTL_TCP_PORT",
-    })?;
-    let tls_host_str = args.tls_host.ok_or(ValidationError::Missing {
-        input: "tls-host",
-        flag: "tls-host",
-        env: "PODCTL_TLS_HOST",
-    })?;
-    let tls_port_str = args.tls_port.ok_or(ValidationError::Missing {
-        input: "tls-port",
-        flag: "tls-port",
-        env: "PODCTL_TLS_PORT",
-    })?;
-    let inbound_frames_str = args.inbound_frames_port.ok_or(ValidationError::Missing {
-        input: "inbound-frames-port",
-        flag: "inbound-frames-port",
-        env: "PODCTL_INBOUND_FRAMES_PORT",
-    })?;
-    let backpressure_str = args.backpressure_port.ok_or(ValidationError::Missing {
-        input: "backpressure-port",
-        flag: "backpressure-port",
-        env: "PODCTL_BACKPRESSURE_PORT",
-    })?;
-    let poll_readiness_str = args.poll_readiness_port.ok_or(ValidationError::Missing {
-        input: "poll-readiness-port",
-        flag: "poll-readiness-port",
-        env: "PODCTL_POLL_READINESS_PORT",
-    })?;
-    let rtd_str = args.rtd_port.ok_or(ValidationError::Missing {
-        input: "rtd-port",
-        flag: "rtd-port",
-        env: "PODCTL_RTD_PORT",
-    })?;
-    let tls_psk_str = args.tls_psk_port.ok_or(ValidationError::Missing {
-        input: "tls-psk-port",
-        flag: "tls-psk-port",
-        env: "PODCTL_TLS_PSK_PORT",
-    })?;
-    let tls_psk_bad_str = args.tls_psk_bad_port.ok_or(ValidationError::Missing {
-        input: "tls-psk-bad-port",
-        flag: "tls-psk-bad-port",
-        env: "PODCTL_TLS_PSK_BAD_PORT",
-    })?;
-
-    let host = parse_ipv4(&host_str, "host")?;
-    let udp_port = parse_port(&udp_str, "udp-port")?;
-    let tcp_port = parse_port(&tcp_str, "tcp-port")?;
-    let tls_host = parse_ipv4(&tls_host_str, "tls-host")?;
-    let tls_port = parse_port(&tls_port_str, "tls-port")?;
-    let inbound_frames_port = parse_port(&inbound_frames_str, "inbound-frames-port")?;
-    let backpressure_port = parse_port(&backpressure_str, "backpressure-port")?;
-    let poll_readiness_port = parse_port(&poll_readiness_str, "poll-readiness-port")?;
-    let rtd_port = parse_port(&rtd_str, "rtd-port")?;
-    let tls_psk_port = parse_port(&tls_psk_str, "tls-psk-port")?;
-    let tls_psk_bad_port = parse_port(&tls_psk_bad_str, "tls-psk-bad-port")?;
-
-    Ok(Command::ProvisionPeer {
-        host,
-        udp_port,
-        tcp_port,
-        tls_host,
-        tls_port,
-        inbound_frames_port,
-        backpressure_port,
-        poll_readiness_port,
-        rtd_port,
-        tls_psk_port,
-        tls_psk_bad_port,
     })
 }
 
@@ -1081,7 +907,6 @@ fn success_line(identity: &str, cmd: &Command) -> String {
         Command::ProvisionWifi { ssid, .. } => {
             format!("provisioned wifi on {identity}: SSID \"{ssid}\"")
         }
-        Command::ProvisionPeer { .. } => format!("provisioned peer config on {identity}"),
         Command::ProvisionAudio { host, port } => {
             format!(
                 "provisioned audio receiver on {identity}: {}.{}.{}.{}:{}",
@@ -1109,8 +934,12 @@ fn success_line(identity: &str, cmd: &Command) -> String {
                 "cleared temporary wifi config on {identity} (reverted to persisted credentials, if any)"
             )
         }
-        // RunTest is dispatched by hil-host, not by podctl; podctl should not reach this arm.
-        Command::RunTest(_) => format!("sent command on {identity}"),
+        // These are dispatched by hil-host, not by podctl; podctl should not reach
+        // these arms. The peer/audio-PSK session overrides are HIL-only RAM state.
+        Command::RunTest(_)
+        | Command::SetTemporaryPeerConfig { .. }
+        | Command::SetTemporaryAudioPsk { .. }
+        | Command::ClearTemporaryAudioPsk => format!("sent command on {identity}"),
     }
 }
 
@@ -1150,36 +979,6 @@ fn run() -> i32 {
             serial,
         } => {
             let result = validate_wifi(WifiArgs { ssid, passphrase });
-            (result, port, serial)
-        }
-        ProvisionCmd::ProvisionPeer {
-            host,
-            udp_port,
-            tcp_port,
-            tls_host,
-            tls_port,
-            inbound_frames_port,
-            backpressure_port,
-            poll_readiness_port,
-            rtd_port,
-            tls_psk_port,
-            tls_psk_bad_port,
-            port,
-            serial,
-        } => {
-            let result = validate_peer(PeerArgs {
-                host,
-                udp_port,
-                tcp_port,
-                tls_host,
-                tls_port,
-                inbound_frames_port,
-                backpressure_port,
-                poll_readiness_port,
-                rtd_port,
-                tls_psk_port,
-                tls_psk_bad_port,
-            });
             (result, port, serial)
         }
         ProvisionCmd::ProvisionAudio {
@@ -1454,21 +1253,12 @@ mod tests {
         "PODCTL_AUDIO_HOST",
         "PODCTL_AUDIO_PORT",
         "PODCTL_AUDIO_PSK_FILE",
-        "PODCTL_BACKPRESSURE_PORT",
         "PODCTL_HOST_PSK_FILE",
-        "PODCTL_INBOUND_FRAMES_PORT",
         "PODCTL_LOG_JSONL",
-        "PODCTL_PEER_HOST",
-        "PODCTL_POLL_READINESS_PORT",
         "PODCTL_PORT",
-        "PODCTL_RTD_PORT",
         "PODCTL_SERIAL",
-        "PODCTL_TCP_PORT",
         "PODCTL_TEMP_WIFI_PASS",
         "PODCTL_TEMP_WIFI_SSID",
-        "PODCTL_TLS_HOST",
-        "PODCTL_TLS_PORT",
-        "PODCTL_UDP_PORT",
         "PODCTL_VAD_HANGOVER_MS",
         "PODCTL_VAD_THRESHOLD",
         "PODCTL_WIFI_PASS",
@@ -1762,412 +1552,6 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, ValidationError::Missing { input: "SSID", .. }),
-            "got {err:?}"
-        );
-    }
-
-    // ── Validation: provision-peer ────────────────────────────────────────────
-
-    #[test]
-    fn validate_peer_happy_path() {
-        let cmd = validate_peer(PeerArgs {
-            host: Some("192.168.1.10".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap();
-        match cmd {
-            Command::ProvisionPeer {
-                host,
-                udp_port,
-                tcp_port,
-                tls_host,
-                tls_port,
-                inbound_frames_port,
-                backpressure_port,
-                poll_readiness_port,
-                rtd_port,
-                tls_psk_port,
-                tls_psk_bad_port,
-            } => {
-                assert_eq!(host, [192, 168, 1, 10]);
-                assert_eq!(udp_port, 5000);
-                assert_eq!(tcp_port, 5001);
-                assert_eq!(tls_host, [10, 0, 0, 1]);
-                assert_eq!(tls_port, 8883);
-                assert_eq!(inbound_frames_port, 17382);
-                assert_eq!(backpressure_port, 17383);
-                assert_eq!(poll_readiness_port, 17384);
-                assert_eq!(rtd_port, 17385);
-                assert_eq!(tls_psk_port, 17386);
-                assert_eq!(tls_psk_bad_port, 17387);
-            }
-            _ => panic!("wrong command type"),
-        }
-    }
-
-    #[test]
-    fn validate_peer_missing_host() {
-        let err = validate_peer(PeerArgs {
-            host: None,
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            ValidationError::Missing { input: "host", .. }
-        ));
-    }
-
-    #[test]
-    fn validate_peer_bad_ipv4_host() {
-        let err = validate_peer(PeerArgs {
-            host: Some("not-an-ip".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::InvalidField {
-                    field: "host",
-                    expected: "dotted IPv4"
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_bad_ipv4_tls_host() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("999.999.999.999".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::InvalidField {
-                    field: "tls-host",
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_non_numeric_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("notaport".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::InvalidField {
-                    field: "udp-port",
-                    expected: "port (0–65535)"
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_port_overflow() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("65536".into()), // > u16::MAX
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::InvalidField {
-                    field: "udp-port",
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_inbound_frames_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: None,
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "inbound-frames-port",
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_backpressure_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: None,
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "backpressure-port",
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_poll_readiness_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: None,
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "poll-readiness-port",
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_tls_psk_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: None,
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "tls-psk-port",
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_tls_psk_bad_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: None,
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "tls-psk-bad-port",
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_rtd_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: None,
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "rtd-port",
-                    ..
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_non_numeric_inbound_frames_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("notaport".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::InvalidField {
-                    field: "inbound-frames-port",
-                    expected: "port (0–65535)"
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_inbound_frames_port_overflow() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("65536".into()), // > u16::MAX
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::InvalidField {
-                    field: "inbound-frames-port",
-                    ..
-                }
-            ),
             "got {err:?}"
         );
     }
@@ -2955,124 +2339,6 @@ mod tests {
                 Err(SelErr::NotFound(_))
             ),
             "--serial to DFU pod must fall to AC7 NotFound (not AC4) until HIL confirms"
-        );
-    }
-
-    // ── test-4: validate_peer missing-field coverage for all five fields ───────
-
-    #[test]
-    fn validate_peer_missing_udp_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: None,
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "udp-port",
-                    flag: "udp-port",
-                    env: "PODCTL_UDP_PORT"
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_tcp_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: None,
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "tcp-port",
-                    flag: "tcp-port",
-                    env: "PODCTL_TCP_PORT"
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_tls_host() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: None,
-            tls_port: Some("8883".into()),
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "tls-host",
-                    flag: "tls-host",
-                    env: "PODCTL_TLS_HOST"
-                }
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validate_peer_missing_tls_port() {
-        let err = validate_peer(PeerArgs {
-            host: Some("192.168.1.1".into()),
-            udp_port: Some("5000".into()),
-            tcp_port: Some("5001".into()),
-            tls_host: Some("10.0.0.1".into()),
-            tls_port: None,
-            inbound_frames_port: Some("17382".into()),
-            backpressure_port: Some("17383".into()),
-            poll_readiness_port: Some("17384".into()),
-            rtd_port: Some("17385".into()),
-            tls_psk_port: Some("17386".into()),
-            tls_psk_bad_port: Some("17387".into()),
-        })
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ValidationError::Missing {
-                    input: "tls-port",
-                    flag: "tls-port",
-                    env: "PODCTL_TLS_PORT"
-                }
-            ),
-            "got {err:?}"
         );
     }
 

@@ -41,6 +41,7 @@ mod wifi;
 mod aic3104;
 mod capture;
 mod hil;
+mod hil_session;
 mod inbound;
 mod net_tests;
 mod netpoll;
@@ -98,15 +99,14 @@ use hil::run_handler;
 use i2c::{make_i2c_driver, run_i2c_bus_scan, I2C_BUS};
 #[cfg(target_os = "espidf")]
 use net_tests::{
-    run_poll_readiness_bidir, run_stream_realtime_duplex, run_tcp_inbound_backpressure,
-    run_tcp_inbound_frames, run_tcp_roundtrip, run_tcp_send_backpressure, run_tls_reachability,
-    run_udp_roundtrip,
+    run_poll_readiness_bidir, run_stream_realtime_duplex, run_tls_inbound_backpressure,
+    run_tls_inbound_frames, run_tls_reachability, run_tls_send_backpressure, run_udp_roundtrip,
 };
 #[cfg(target_os = "espidf")]
 use nvs::{
     handle_clear_wifi_credentials, handle_provision_audio, handle_provision_audio_psk,
-    handle_provision_peer, handle_provision_wifi, handle_set_vad_hangover,
-    handle_set_vad_threshold, nvs_get_str, open_wifi_nvs,
+    handle_provision_wifi, handle_set_vad_hangover, handle_set_vad_threshold, nvs_get_str,
+    open_wifi_nvs,
 };
 #[cfg(target_os = "espidf")]
 use speaker::{
@@ -751,10 +751,9 @@ fn dispatch_request(req: Request) {
     let (status, payload) = match req.command {
         Command::RunTest(name) => run_handler(name),
         Command::ProvisionWifi { ssid, passphrase } => handle_provision_wifi(ssid, passphrase),
-        Command::ProvisionPeer {
+        Command::SetTemporaryPeerConfig {
             host,
             udp_port,
-            tcp_port,
             tls_host,
             tls_port,
             inbound_frames_port,
@@ -763,23 +762,24 @@ fn dispatch_request(req: Request) {
             rtd_port,
             tls_psk_port,
             tls_psk_bad_port,
-        } => handle_provision_peer(
+        } => crate::hil_session::handle_set_temporary_peer_config(crate::hil_session::PeerConfig {
             host,
-            &crate::nvs::PeerEndpoints {
-                udp_port,
-                tcp_port,
-                tls_host,
-                tls_port,
-                inbound_frames_port,
-                backpressure_port,
-                poll_readiness_port,
-                rtd_port,
-                tls_psk_port,
-                tls_psk_bad_port,
-            },
-        ),
+            udp_port,
+            tls_host,
+            tls_port,
+            inbound_frames_port,
+            backpressure_port,
+            poll_readiness_port,
+            rtd_port,
+            tls_psk_port,
+            tls_psk_bad_port,
+        }),
         Command::ProvisionAudio { host, port } => handle_provision_audio(host, port),
         Command::ProvisionAudioPsk { key } => handle_provision_audio_psk(key),
+        Command::SetTemporaryAudioPsk { key } => {
+            crate::hil_session::handle_set_temporary_audio_psk(key)
+        }
+        Command::ClearTemporaryAudioPsk => crate::hil_session::handle_clear_temporary_audio_psk(),
         Command::SetVadThreshold { threshold } => handle_set_vad_threshold(threshold),
         Command::SetVadHangover { hangover_ms } => handle_set_vad_hangover(hangover_ms),
         Command::ClearWifiCredentials => handle_clear_wifi_credentials(),

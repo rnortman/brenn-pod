@@ -61,7 +61,7 @@ export FAKE_OPEN_PORTS_FILE="$TMPDIR_TEST/open-ports"  # simulates firewalld run
 export PRINT_PORTS_OUTPUT_FILE="$TMPDIR_TEST/print-ports-output"
 
 # Write the fake print-ports output (default ports).
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
 # Fake cargo: when called with `-- --print-ports`, emit canned output.
 # FAKE_PRINT_PORTS_EXIT_CODE controls exit code (default 0).
@@ -187,16 +187,16 @@ reset_state() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 1: `open` with default ports opens 17380/udp, 17381/tcp, 7380/tcp
+# Test 1: `open` with default ports opens 17380/udp, the TLS fixture tcp ports, 7380/tcp
 # ---------------------------------------------------------------------------
 reset_state
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
 out1="$("$FIREWALL_SCRIPT" open 2>&1)"
 calls1="$(cat "$FAKE_CALLS_FILE")"
 
 assert_contains "open: adds 17380/udp"        "--add-port=17380/udp" "$calls1"
-assert_contains "open: adds 17381/tcp"        "--add-port=17381/tcp" "$calls1"
+assert_contains "open: adds 17382/tcp"        "--add-port=17382/tcp" "$calls1"
 assert_contains "open: adds 17384/tcp"        "--add-port=17384/tcp" "$calls1"
 # rtd_port (17385) is the regression this data-driven rewrite fixes: it must be
 # opened purely because --print-ports lists it, with no script-side entry.
@@ -205,7 +205,7 @@ assert_contains "open: adds 17386/tcp (tls-psk)"     "--add-port=17386/tcp" "$ca
 assert_contains "open: adds 17387/tcp (tls-psk-bad)" "--add-port=17387/tcp" "$calls1"
 assert_contains "open: adds 7380/tcp"         "--add-port=7380/tcp"  "$calls1"
 assert_contains "open: console mentions 17380/udp" "17380/udp" "$out1"
-assert_contains "open: console mentions 17381/tcp" "17381/tcp" "$out1"
+assert_contains "open: console mentions 17382/tcp" "17382/tcp" "$out1"
 assert_contains "open: console mentions 7380/tcp"  "7380/tcp"  "$out1"
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ assert_contains "open: console mentions 7380/tcp"  "7380/tcp"  "$out1"
 # (AC8 override case — helper opens whatever --print-ports reports, not hardcoded values)
 # ---------------------------------------------------------------------------
 reset_state
-printf 'udp_port=19000/udp\ntcp_port=19001/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=19000/udp\ninbound_frames_port=19001/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
 "$FIREWALL_SCRIPT" open >/dev/null 2>&1
 calls2="$(cat "$FAKE_CALLS_FILE")"
@@ -222,22 +222,22 @@ assert_contains     "open(override): adds 19000/udp"          "--add-port=19000/
 assert_contains     "open(override): adds 19001/tcp"          "--add-port=19001/tcp" "$calls2"
 assert_contains     "open(override): adds 7380/tcp"           "--add-port=7380/tcp"  "$calls2"
 assert_not_contains "open(override): does NOT add 17380/udp"  "--add-port=17380/udp" "$calls2"
-assert_not_contains "open(override): does NOT add 17381/tcp"  "--add-port=17381/tcp" "$calls2"
+assert_not_contains "open(override): does NOT add 17382/tcp"  "--add-port=17382/tcp" "$calls2"
 
 # ---------------------------------------------------------------------------
 # Test 3: `close` removes the ports it would open (default ports case)
 # ---------------------------------------------------------------------------
 reset_state
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
 # Pre-populate the fake open-ports set so close finds something to remove.
-printf '17380/udp\n17381/tcp\n7380/tcp\n' >> "$FAKE_OPEN_PORTS_FILE"
+printf '17380/udp\n17382/tcp\n7380/tcp\n' >> "$FAKE_OPEN_PORTS_FILE"
 
 "$FIREWALL_SCRIPT" close >/dev/null 2>&1
 calls3="$(cat "$FAKE_CALLS_FILE")"
 
 assert_contains "close: removes 17380/udp" "--remove-port=17380/udp" "$calls3"
-assert_contains "close: removes 17381/tcp" "--remove-port=17381/tcp" "$calls3"
+assert_contains "close: removes 17382/tcp" "--remove-port=17382/tcp" "$calls3"
 assert_contains "close: removes 17384/tcp" "--remove-port=17384/tcp" "$calls3"
 assert_contains "close: removes 7380/tcp"  "--remove-port=7380/tcp"  "$calls3"
 
@@ -245,18 +245,18 @@ assert_contains "close: removes 7380/tcp"  "--remove-port=7380/tcp"  "$calls3"
 # Test 4: `run` opens ports, runs make hil-test (fake success), reverts
 # ---------------------------------------------------------------------------
 reset_state
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 export FAKE_MAKE_EXIT_CODE=0
 
 "$FIREWALL_SCRIPT" run >/dev/null 2>&1 && exit4=0 || exit4=$?
 calls4="$(cat "$FAKE_CALLS_FILE")"
 
 assert_contains "run: opens 17380/udp"   "--add-port=17380/udp"    "$calls4"
-assert_contains "run: opens 17381/tcp"   "--add-port=17381/tcp"    "$calls4"
+assert_contains "run: opens 17382/tcp"   "--add-port=17382/tcp"    "$calls4"
 assert_contains "run: opens 17384/tcp"   "--add-port=17384/tcp"    "$calls4"
 assert_contains "run: opens 7380/tcp"    "--add-port=7380/tcp"     "$calls4"
 assert_contains "run: removes 17380/udp" "--remove-port=17380/udp" "$calls4"
-assert_contains "run: removes 17381/tcp" "--remove-port=17381/tcp" "$calls4"
+assert_contains "run: removes 17382/tcp" "--remove-port=17382/tcp" "$calls4"
 assert_contains "run: removes 17384/tcp" "--remove-port=17384/tcp" "$calls4"
 assert_contains "run: removes 7380/tcp"  "--remove-port=7380/tcp"  "$calls4"
 
@@ -270,7 +270,7 @@ fi
 # Test 5: `run` propagates non-zero exit code from make hil-test and still reverts
 # ---------------------------------------------------------------------------
 reset_state
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 export FAKE_MAKE_EXIT_CODE=1
 
 "$FIREWALL_SCRIPT" run >/dev/null 2>&1 && exit5=0 || exit5=$?
@@ -278,8 +278,8 @@ calls5="$(cat "$FAKE_CALLS_FILE")"
 
 assert_contains "run(fail): still removes 17380/udp after failure" \
     "--remove-port=17380/udp" "$calls5"
-assert_contains "run(fail): still removes 17381/tcp after failure" \
-    "--remove-port=17381/tcp" "$calls5"
+assert_contains "run(fail): still removes 17382/tcp after failure" \
+    "--remove-port=17382/tcp" "$calls5"
 assert_contains "run(fail): still removes 17384/tcp after failure" \
     "--remove-port=17384/tcp" "$calls5"
 assert_contains "run(fail): still removes 7380/tcp after failure" \
@@ -296,7 +296,7 @@ unset FAKE_MAKE_EXIT_CODE
 # Test 6: `run` with a pre-open port does NOT remove that port on revert (AC9)
 # ---------------------------------------------------------------------------
 reset_state
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 # 7380/tcp is pre-open before run starts.
 echo "7380/tcp" >> "$FAKE_OPEN_PORTS_FILE"
 export FAKE_MAKE_EXIT_CODE=0
@@ -310,15 +310,15 @@ assert_not_contains "run(pre-open 7380): does NOT remove pre-open 7380/tcp" \
 # The dynamic ports should still be reverted.
 assert_contains "run(pre-open 7380): still removes 17380/udp" \
     "--remove-port=17380/udp" "$calls6"
-assert_contains "run(pre-open 7380): still removes 17381/tcp" \
-    "--remove-port=17381/tcp" "$calls6"
+assert_contains "run(pre-open 7380): still removes 17382/tcp" \
+    "--remove-port=17382/tcp" "$calls6"
 unset FAKE_MAKE_EXIT_CODE
 
 # ---------------------------------------------------------------------------
 # Test 7: `run` reverts when SIGINT is sent (AC10 INT trap path)
 # ---------------------------------------------------------------------------
 reset_state
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
 # Make the fake make sleep so we have time to send SIGINT before it exits.
 cat > "$TMPDIR_TEST/make" <<'EOF'
@@ -345,7 +345,7 @@ calls7="$(cat "$FAKE_CALLS_FILE")"
 assert_contains "run(SIGINT): had opened 17380/udp before INT"  "--add-port=17380/udp"    "$calls7"
 # Cleanup trap should have removed them on INT.
 assert_contains "run(SIGINT): removes 17380/udp on INT cleanup" "--remove-port=17380/udp" "$calls7"
-assert_contains "run(SIGINT): removes 17381/tcp on INT cleanup" "--remove-port=17381/tcp" "$calls7"
+assert_contains "run(SIGINT): removes 17382/tcp on INT cleanup" "--remove-port=17382/tcp" "$calls7"
 assert_contains "run(SIGINT): removes 17384/tcp on INT cleanup" "--remove-port=17384/tcp" "$calls7"
 assert_contains "run(SIGINT): removes 7380/tcp on INT cleanup"  "--remove-port=7380/tcp"  "$calls7"
 
@@ -366,7 +366,7 @@ printf 'build error: could not compile\n' > "$PRINT_PORTS_OUTPUT_FILE"
 "$FIREWALL_SCRIPT" open >/dev/null 2>&1 && exit8=0 || exit8=$?
 calls8="$(cat "$FAKE_CALLS_FILE")"
 unset FAKE_PRINT_PORTS_EXIT_CODE
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
 if [[ "$exit8" != "0" ]]; then
     pass "open(print-ports-fail): exits non-zero when --print-ports fails"
@@ -387,7 +387,7 @@ printf 'garbage output no port lines here\n' > "$PRINT_PORTS_OUTPUT_FILE"
 out9="$("$FIREWALL_SCRIPT" open 2>&1)" && exit9=0 || exit9=$?
 calls9="$(cat "$FAKE_CALLS_FILE")"
 unset FAKE_PRINT_PORTS_EXIT_CODE
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
 if [[ "$exit9" != "0" ]]; then
     pass "open(garbage-output): exits non-zero when --print-ports output is unparseable"
@@ -402,7 +402,7 @@ assert_contains "open(garbage-output): error message mentions missing output" \
 # Test 10: preflight fails when firewalld is not running (test-7)
 # ---------------------------------------------------------------------------
 reset_state
-printf 'udp_port=17380/udp\ntcp_port=17381/tcp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
+printf 'udp_port=17380/udp\ninbound_frames_port=17382/tcp\nbackpressure_port=17383/tcp\npoll_readiness_port=17384/tcp\nrtd_port=17385/tcp\ntls_psk_port=17386/tcp\ntls_psk_bad_port=17387/tcp\n' > "$PRINT_PORTS_OUTPUT_FILE"
 
 # Replace the fake firewall-cmd with one that returns non-zero for --state.
 cat > "$TMPDIR_TEST/firewall-cmd" <<'FWEOF'

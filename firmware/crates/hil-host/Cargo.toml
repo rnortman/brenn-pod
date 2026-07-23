@@ -24,6 +24,9 @@ postcard = { version = "1", features = ["alloc"] }
 openssl = "0.10"
 # OS CSPRNG for the generated audio PSK.
 getrandom = "0.4"
+# Raw socket options std does not expose: the backpressure listener clamps SO_RCVBUF
+# before listen() so the withhold phase closes the TCP window by construction.
+socket2 = "0.6"
 
 [dev-dependencies]
 pod-transport = { path = "../pod-transport", features = ["test-helpers"] }

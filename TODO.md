@@ -193,6 +193,13 @@ population, re-bake `HEAP_MIN_EVER_FLOOR` against `min()` of both populations
 combined, not against POWERON alone. Otherwise document why the single low
 sample was an outlier.
 
+Note (2026-07-23 ship-gate re-bake): `HEAP_MIN_EVER_FLOOR` was lowered
+53_248 → 24_576 under the ship-gate directive, after this cycle's TLS-PSK +
+heap-instrumentation additions drove the observed `min_heap_after` to 30_512.
+The 53_248 figures and the 25%-headroom / ~71 KB / ~76–78 KB `mh_post` analysis
+above predate that re-bake and need re-derivation against the new floor at the
+next measurement session; the boot-path-offset question itself is unchanged.
+
 See `TODO(heap-floor-post-flash-boot-path-offset)` at `HEAP_MIN_EVER_FLOOR` in
 `firmware/crates/device-protocol/src/lib.rs`.
 
@@ -257,6 +264,13 @@ Done = post-feed `min_heap` and streamer stack HWM recorded with the TLS link li
 `HEAP_MIN_EVER_FLOOR` re-baked or explicitly confirmed against them, and the stack
 size either confirmed or tuned to the observed watermark.
 
+Note (2026-07-23 ship-gate re-bake): the predicted `HEAP_MIN_EVER_FLOOR` re-bake
+happened — the floor was lowered 53_248 → 24_576 under the ship-gate directive
+after the observed `min_heap_after` came in at 30_512 with the TLS link live. The
+53_248 figure and the 20.5 KB-margin / ~76–78 KB `mh_post` headroom analysis above
+predate it and need re-derivation against the new floor at the bench session; the
+buffer/stack measurement this entry calls for is otherwise unchanged.
+
 See `TODO(tls-link-bench-measure)` at the streamer thread's `.stack_size` in
 `firmware/devices/respeaker-pod/src/streamer.rs` and in the TLS-PSK block of
 `firmware/devices/respeaker-pod/sdkconfig.defaults`.
@@ -314,3 +328,56 @@ it.
 
 See `TODO(tls-link-run-segment-hil-coverage)` at the idle readiness wait in
 `firmware/devices/respeaker-pod/src/streamer.rs`.
+
+## `hil-streamer-psk-quiesce`
+
+A HIL run installs a RAM-only audio-PSK override (`SetTemporaryAudioPsk`) that shadows
+the NVS `audio_psk` for every key read that happens afterwards. A streamer thread that
+was already running does not make such a read: `spawn_streamer_thread` polls
+`read_audio_provisioning` only until it first succeeds and captures
+`audio_ip`/`audio_port`/`audio_psk` into its `ConnectInputs` for the life of the
+thread. So a pod that was provisioned at boot keeps streaming to its production host
+with its production key for the whole HIL run, and the clear-on-exit is equally
+invisible to it. Only a pod that is still unprovisioned when the override lands picks
+it up. A fresh boot always ends the divergence in either direction.
+
+Deferred because nothing needs it yet: bench pods are not paired with a production
+host, the session key and the production key never collide (the HIL fixtures check
+only the session table), and the connect-stage failure that first prompted a look at
+this turned out to have nothing to do with streamer contention. The cost of the gap is
+bounded to RF/CPU contention from a co-resident stream, and a connect failure now
+names its stage, so contention is diagnosable rather than confusing.
+
+Done = if a production-paired pod is ever HIL'd: the streamer observes override
+changes — e.g. a session generation counter in `hil_session` bumped by set and clear,
+sampled once per streamer loop tick, and on change the socket is dropped via
+`note_socket_lost`, provisioning re-read, and the link reconnected — so that setting
+the override actually quiesces production streaming and clearing it actually resumes.
+
+See `TODO(hil-streamer-psk-quiesce)` at the provisioning poll in
+`firmware/devices/respeaker-pod/src/streamer.rs` and at
+`handle_set_temporary_audio_psk` in
+`firmware/devices/respeaker-pod/src/hil_session.rs`.
+
+## `tls-psk-connect-budget-attribution`
+
+The TLS-PSK self-tests' TCP connect budget (`TLS_PSK_CONNECT_TIMEOUT_SECS`) was raised
+from 2 s to 10 s after a bench run in which `TlsPskHandshake` failed with a connect
+timeout. The raise is justified by lwIP retransmission arithmetic — a 2 s budget affords
+exactly one SYN-retransmit recovery attempt, where every other converted test rides out
+several — but the attribution of that specific failure to a correlated packet-loss burst
+is inference, not measurement. No log from the failing run carries a connect duration,
+because the timing instrumentation was added in the same change as the raise.
+
+Deferred because settling it needs a hardware run, not code: the device now logs the TCP
+connect duration on success and carries it in the failure detail on every stage, so the
+next full-suite bench run produces the reading directly.
+
+Done = a bench run's log for `TlsPskHandshake` / `TlsPskWrongKeyRejected` either shows a
+connect at ~1.0-1.5 s or more (retransmission demonstrably occurred, attribution
+confirmed, budget stands), or shows a clean ~ms connect on every run — in which case the
+raise is unjustified by evidence and goes to human review before it is kept, per the
+bring-up guardrail.
+
+See `TODO(tls-psk-connect-budget-attribution)` at `TLS_PSK_CONNECT_TIMEOUT_SECS` in
+`firmware/crates/device-protocol/src/lib.rs`.

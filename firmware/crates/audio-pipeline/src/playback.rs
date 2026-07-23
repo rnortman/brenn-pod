@@ -1073,8 +1073,8 @@ pub trait PlaybackSink {
 /// The process-lifetime producer comes from the production ring split at boot in `main.rs`
 /// (the `INBOUND_PCM_PRODUCER` global `static`, replacing `INBOUND_PCM_TX`); this struct is
 /// constructed via [`with_producer`](I2sStreamSink::with_producer) (the device crate resolves
-/// the static in a thin wrapper — design §6.2, §2.10). The `CountingSink` reference sink is
-/// retained in the device crate for the `TcpInboundFrames` HIL self-test.
+/// the static in a thin wrapper). The `CountingSink` reference sink is
+/// retained in the device crate for the `TlsInboundFrames` HIL self-test.
 pub struct I2sStreamSink {
     /// The ring producer (write end), held in place of the channel `SyncSender` the
     /// sink owned before the ring replaced the channel. `accept` writes expanded PCM into
@@ -1230,7 +1230,7 @@ impl PlaybackSink for I2sStreamSink {
                     // double-count on the retry).
                     //
                     // The socket-path read-throttle / TCP-window-close interaction this stall
-                    // feeds is covered on real hardware by the `TcpInboundBackpressure` HIL
+                    // feeds is covered on real hardware by the `TlsInboundBackpressure` HIL
                     // self-test (an unpaced flood through the production socket → ring path,
                     // asserting `full_stalls > 0`, an exact frame count, and a clean EOF).
                     self.full_stalls = self.full_stalls.wrapping_add(1);

@@ -6,7 +6,7 @@
 //! `run_gateway_probe_gate`). Extracted from `main.rs` per design.md §2.1.
 
 use crate::hil::test_report_fail_msg;
-use crate::nvs::{nvs_get_blob4, nvs_get_str, open_wifi_nvs};
+use crate::nvs::{nvs_get_str, open_wifi_nvs};
 use device_protocol::{
     log_tokens, test_report_fail, test_report_fail_data, test_report_fail_detail,
     test_report_fail_fmt, test_report_ok, truncate_utf8_prefix, Payload, Status, TestData,
@@ -555,7 +555,7 @@ pub(crate) fn snapshot_wifi_state() -> WifiSnapshot {
                 gw: None,
                 rssi: None,
                 ps_mode: None,
-            }
+            };
         }
     };
 
@@ -652,7 +652,9 @@ fn probe_gateway_reachable() -> GatewayProbe {
             }
         };
         let Some(stack) = guard.as_ref() else {
-            log::error!("gateway-probe: WIFI_STACK uninitialized — invariant violated; returning Indeterminate");
+            log::error!(
+                "gateway-probe: WIFI_STACK uninitialized — invariant violated; returning Indeterminate"
+            );
             return GatewayProbe::Indeterminate;
         };
         let ip_info = match stack.wifi.wifi().sta_netif().get_ip_info() {
@@ -891,7 +893,7 @@ pub(crate) fn run_wifi_associate() -> (Status, Payload) {
                 let ip_info = match stack.wifi.wifi().sta_netif().get_ip_info() {
                     Ok(i) => i,
                     Err(e) => {
-                        return test_report_fail_detail("get_ip_info (already up) failed", &e)
+                        return test_report_fail_detail("get_ip_info (already up) failed", &e);
                     }
                 };
                 let rssi = match stack.wifi.wifi().get_rssi() {
@@ -1007,7 +1009,7 @@ fn poll_for_wifi_up(label: &str) -> Result<([u8; 4], [u8; 4], i32), (Status, Pay
                 None => {
                     return Err(test_report_fail_fmt(format_args!(
                         "{label}: WIFI_STACK vanished after is_up reported true"
-                    )))
+                    )));
                 }
             };
             let ip_info = match stack.wifi.wifi().sta_netif().get_ip_info() {
@@ -1015,7 +1017,7 @@ fn poll_for_wifi_up(label: &str) -> Result<([u8; 4], [u8; 4], i32), (Status, Pay
                 Err(e) => {
                     return Err(test_report_fail_fmt(format_args!(
                         "{label}: get_ip_info failed: {e:?}"
-                    )))
+                    )));
                 }
             };
             let rssi = match stack.wifi.wifi().get_rssi() {
@@ -1023,7 +1025,7 @@ fn poll_for_wifi_up(label: &str) -> Result<([u8; 4], [u8; 4], i32), (Status, Pay
                 Err(e) => {
                     return Err(test_report_fail_fmt(format_args!(
                         "{label}: get_rssi failed: {e:?}"
-                    )))
+                    )));
                 }
             };
             let ip = ip_info.ip.octets();
@@ -1057,8 +1059,8 @@ pub(crate) fn run_wifi_reassociation() -> (Status, Payload) {
             Ok(true) => {} // good — proceed to disconnect
             Ok(false) => {
                 return test_report_fail_fmt(format_args!(
-                "WifiReassociation: WiFi not associated at test start — run WifiAssociate first",
-            ))
+                    "WifiReassociation: WiFi not associated at test start — run WifiAssociate first",
+                ));
             }
             Err(e) => return test_report_fail_detail("WifiReassociation: is_up query failed", &e),
         }
@@ -1070,7 +1072,9 @@ pub(crate) fn run_wifi_reassociation() -> (Status, Payload) {
                 e
             );
         } else {
-            log::info!("wifi_reassociation: forced disconnect issued — waiting for supervisor to re-associate");
+            log::info!(
+                "wifi_reassociation: forced disconnect issued — waiting for supervisor to re-associate"
+            );
         }
     }
     ring_wifi_wake();
@@ -1095,17 +1099,15 @@ pub(crate) fn run_wifi_reassociation() -> (Status, Payload) {
 /// - Half 2: pings a computed blackhole IP on the LAN, asserts `Unreachable`,
 ///   then forces disconnect + re-associate and waits for link recovery.
 ///
-/// Requires prior `WifiAssociate` and `ProvisionPeer`.
+/// Requires prior `WifiAssociate` and `SetTemporaryPeerConfig`.
 pub(crate) fn run_gateway_probe_gate() -> (Status, Payload) {
-    // Read peer_ip from NVS before acquiring WIFI_STACK.
-    let peer_ip_arr: [u8; 4] = {
-        let nvs = match open_wifi_nvs(false) {
-            Ok(n) => n,
-            Err(msg) => return test_report_fail_msg(msg),
-        };
-        match nvs_get_blob4(&nvs, "peer_ip") {
-            Ok(a) => a,
-            Err(msg) => return test_report_fail_msg(msg),
+    // Half-1 reachable target comes from the RAM-only session peer config.
+    let peer_ip_arr: [u8; 4] = match crate::hil_session::peer_config() {
+        Some(p) => p.host,
+        None => {
+            return test_report_fail_fmt(format_args!(
+                "no session peer config — run SetTemporaryPeerConfig first"
+            ));
         }
     };
 
@@ -1121,7 +1123,7 @@ pub(crate) fn run_gateway_probe_gate() -> (Status, Payload) {
             Ok(false) => {
                 return test_report_fail_fmt(format_args!(
                     "GatewayProbeGate: WiFi not associated at test start — run WifiAssociate first",
-                ))
+                ));
             }
             Err(e) => return test_report_fail_detail("GatewayProbeGate: is_up query failed", &e),
         }
@@ -1205,7 +1207,9 @@ pub(crate) fn run_gateway_probe_gate() -> (Status, Payload) {
     );
     match ping_reachable(blackhole, netif_index) {
         GatewayProbe::Unreachable => {
-            log::info!("gateway-probe-gate: half-2 blackhole probe=unreachable — proceeding to force-reassociate");
+            log::info!(
+                "gateway-probe-gate: half-2 blackhole probe=unreachable — proceeding to force-reassociate"
+            );
         }
         GatewayProbe::Reachable => {
             return test_report_fail_fmt(format_args!(

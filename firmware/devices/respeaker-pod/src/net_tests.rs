@@ -1,9 +1,8 @@
 //! Network self-test handlers for the respeaker-pod HIL suite.
 //!
-//! UDP/TCP echo round-trips, TLS reachability, inbound-frame drain, TCP
-//! send-backpressure (partial-write resume), and bidirectional `poll()`
+//! UDP echo round-trips, TLS reachability, inbound-frame drain, TLS
+//! send-backpressure (blocked-write resume), and bidirectional `poll()`
 //! readiness. Each `run_*` handler is dispatched from `hil::run_handler`.
-//! Move-only extraction from `main.rs` per the pod-main-split design (§2.1).
 
 // Host view: these items exist for the tests and for the device-gated call sites.
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
@@ -18,7 +17,7 @@ use crate::inbound::{
 #[cfg(target_os = "espidf")]
 use crate::netpoll::poll_one;
 #[cfg(target_os = "espidf")]
-use crate::nvs::{nvs_get_blob4, open_wifi_nvs};
+use crate::nvs::open_wifi_nvs;
 #[cfg(target_os = "espidf")]
 use crate::tls_link::LinkStream;
 #[cfg(target_os = "espidf")]
@@ -28,7 +27,8 @@ use audio_pipeline::stream_send::SendOutcome;
 #[cfg(target_os = "espidf")]
 use device_protocol::{
     test_report_fail, test_report_fail_detail, test_report_fail_fmt, test_report_ok,
-    test_report_ok_detail, Payload, Status, TestData,
+    test_report_ok_detail, Payload, Status, TestData, TLS_PSK_CONNECT_TIMEOUT_SECS,
+    TLS_PSK_ECHO_TIMEOUT_SECS,
 };
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::tls::{self, EspTls};
@@ -45,21 +45,14 @@ use wifi_diag::fmt_ipv4;
 pub(crate) fn run_udp_roundtrip() -> (Status, Payload) {
     use std::net::UdpSocket;
 
-    let nvs = match open_wifi_nvs(false) {
-        Ok(n) => n,
-        Err(msg) => return test_report_fail_msg(msg),
+    let peer = match crate::hil_session::peer_config() {
+        Some(p) => p,
+        None => {
+            return test_report_fail("no session peer config — run SetTemporaryPeerConfig first");
+        }
     };
-
-    let peer_ip: [u8; 4] = match nvs_get_blob4(&nvs, "peer_ip") {
-        Ok(a) => a,
-        Err(msg) => return test_report_fail_msg(msg),
-    };
-    let udp_port: u16 = match nvs.get_u16("peer_udp") {
-        Ok(Some(p)) => p,
-        Ok(None) => return test_report_fail("no peer_udp in NVS — run ProvisionPeer first"),
-        Err(e) => return test_report_fail_detail("nvs get_u16 peer_udp failed", &e),
-    };
-    drop(nvs);
+    let peer_ip = peer.host;
+    let udp_port = peer.udp_port;
 
     let nonce: [u8; 16] = [
         0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
@@ -105,91 +98,21 @@ pub(crate) fn run_udp_roundtrip() -> (Status, Payload) {
     })
 }
 
-/// TCP echo round-trip self-test.
-///
-/// Connects to the HIL-host echo server, writes a 16-byte nonce, reads it
-/// back, and asserts byte-match. Reads peer IP and port from NVS.
-#[cfg(target_os = "espidf")]
-pub(crate) fn run_tcp_roundtrip() -> (Status, Payload) {
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpStream;
-
-    let nvs = match open_wifi_nvs(false) {
-        Ok(n) => n,
-        Err(msg) => return test_report_fail_msg(msg),
-    };
-
-    let peer_ip: [u8; 4] = match nvs_get_blob4(&nvs, "peer_ip") {
-        Ok(a) => a,
-        Err(msg) => return test_report_fail_msg(msg),
-    };
-    let tcp_port: u16 = match nvs.get_u16("peer_tcp") {
-        Ok(Some(p)) => p,
-        Ok(None) => return test_report_fail("no peer_tcp in NVS — run ProvisionPeer first"),
-        Err(e) => return test_report_fail_detail("nvs get_u16 peer_tcp failed", &e),
-    };
-    drop(nvs);
-
-    let nonce: [u8; 16] = [
-        0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xC0, 0xDE, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88,
-    ];
-
-    let peer_addr = std::net::SocketAddr::from((peer_ip, tcp_port));
-    let mut stream =
-        match TcpStream::connect_timeout(&peer_addr, std::time::Duration::from_secs(10)) {
-            Ok(s) => s,
-            Err(e) => return test_report_fail_detail("tcp connect failed", &e),
-        };
-
-    if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(10))) {
-        return test_report_fail_detail("tcp set_read_timeout failed", &e);
-    }
-
-    if let Err(e) = stream.write_all(&nonce) {
-        return test_report_fail_detail("tcp write failed", &e);
-    }
-    if let Err(e) = stream.flush() {
-        return test_report_fail_detail("tcp flush failed", &e);
-    }
-
-    let mut reply = [0u8; 16];
-    if let Err(e) = stream.read_exact(&mut reply) {
-        return test_report_fail_detail("tcp read_exact failed", &e);
-    }
-
-    if reply != nonce {
-        return test_report_fail("FAIL tcp echo mismatch");
-    }
-
-    test_report_ok(TestData::TcpEcho {
-        bytes: nonce.len() as u32,
-        peer_ip,
-        peer_port: tcp_port,
-    })
-}
-
 /// TLS handshake reachability self-test.
 ///
-/// Connects via `EspTls` to a host read from NVS, verifying against the bundled
-/// CA store. A successful handshake proves the TLS stack works over live WiFi.
+/// Connects via `EspTls` to a host from the session peer config, verifying
+/// against the bundled CA store. A successful handshake proves the TLS stack
+/// works over live WiFi.
 #[cfg(target_os = "espidf")]
 pub(crate) fn run_tls_reachability() -> (Status, Payload) {
-    let nvs = match open_wifi_nvs(false) {
-        Ok(n) => n,
-        Err(msg) => return test_report_fail_msg(msg),
+    let peer = match crate::hil_session::peer_config() {
+        Some(p) => p,
+        None => {
+            return test_report_fail("no session peer config — run SetTemporaryPeerConfig first");
+        }
     };
-
-    let tls_host: [u8; 4] = match nvs_get_blob4(&nvs, "tls_host") {
-        Ok(a) => a,
-        Err(msg) => return test_report_fail_msg(msg),
-    };
-    let tls_port: u16 = match nvs.get_u16("peer_tls") {
-        Ok(Some(p)) => p,
-        Ok(None) => return test_report_fail("no peer_tls in NVS — run ProvisionPeer first"),
-        Err(e) => return test_report_fail_detail("nvs get_u16 peer_tls failed", &e),
-    };
-    drop(nvs);
+    let tls_host = peer.tls_host;
+    let tls_port = peer.tls_port;
 
     let host_str = fmt_ipv4(tls_host);
 
@@ -217,105 +140,79 @@ pub(crate) fn run_tls_reachability() -> (Status, Payload) {
     }
 }
 
-/// In-band selector byte written first on an inbound-frames connection to select the
-/// happy-path profile (fixed `INBOUND_FRAMES_COUNT` frames). `run_tcp_inbound_backpressure`
-/// writes `INBOUND_SELECTOR_FLOOD` instead to select the unpaced flood profile. The
-/// host's short-timeout selector read falls back to this happy-path profile on a
-/// stray/no-selector caller (e.g. an old device build), so omitting the write only
-/// costs latency, not correctness.
+/// In-band selector byte written first (inside the tunnel) on an inbound-frames
+/// connection to select the happy-path profile (fixed `INBOUND_FRAMES_COUNT`
+/// frames). `run_tls_inbound_backpressure` writes `INBOUND_SELECTOR_FLOOD`
+/// instead to select the unpaced flood profile. The host's short-timeout
+/// selector read falls back to this happy-path profile on a stray/no-selector
+/// caller (e.g. an old device build), so omitting the write only costs latency,
+/// not correctness.
 #[cfg(target_os = "espidf")]
 const INBOUND_SELECTOR_HAPPY_PATH: u8 = b'N';
 
 /// In-band selector byte written first on an inbound-frames connection to select the
-/// unpaced flood profile the `TcpInboundBackpressure` self-test needs.
+/// unpaced flood profile the `TlsInboundBackpressure` self-test needs.
 #[cfg(target_os = "espidf")]
 const INBOUND_SELECTOR_FLOOD: u8 = b'F';
 
-/// Shared preamble for both inbound-source self-tests: open the WiFi NVS namespace,
-/// read `peer_ip`/`peer_inb_tcp`, connect with `INBOUND_CONNECT_TIMEOUT_SECS`, write
-/// `selector` while still blocking (before the server's Hello — mirrors
-/// `run_tcp_send_backpressure`'s selector write; a stray old device/server that omits
-/// or ignores it falls back to the happy-path profile after a short server-side
-/// timeout), then switch to `INBOUND_READ_TIMEOUT_SECS` read timeouts.
+/// Shared preamble for both inbound-source self-tests: pull the session peer
+/// config + audio PSK, open a TLS-PSK connection to `inbound_frames_port` with
+/// `INBOUND_CONNECT_TIMEOUT_SECS`, then write `selector` inside the tunnel
+/// (after the handshake, before the server's Hello — a stray old device/server
+/// that omits or ignores it falls back to the happy-path profile after a short
+/// server-side timeout). The returned stream is non-blocking; callers drive it
+/// with the `tls_psk_wait` poll discipline.
 ///
-/// `err_prefix` (e.g. `"tcp inbound"` / `"tcp inbound-bp"`) distinguishes the two
-/// callers' connect/selector/timeout failure messages; NVS-lookup failures use their
-/// own fixed messages, identical for both callers.
+/// `err_prefix` (e.g. `"tls inbound"` / `"tls inbound-bp"`) distinguishes the two
+/// callers' connect failure messages; session-lookup failures use their own
+/// fixed messages, identical for both callers.
 #[allow(clippy::result_large_err)]
 #[cfg(target_os = "espidf")]
 fn connect_inbound_source(
     selector: u8,
     err_prefix: &str,
-) -> Result<(std::net::TcpStream, [u8; 4], u16), (Status, Payload)> {
-    use std::io::Write as _;
-    use std::net::TcpStream;
-
-    let nvs = open_wifi_nvs(false).map_err(test_report_fail_msg)?;
-
-    let peer_ip: [u8; 4] = match nvs_get_blob4(&nvs, "peer_ip") {
-        Ok(a) => a,
-        Err(msg) => return Err(test_report_fail_msg(msg)),
-    };
-    let inbound_port: u16 = match nvs.get_u16("peer_inb_tcp") {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Err(test_report_fail(
-                "no peer_inb_tcp in NVS — run ProvisionPeer first",
-            ));
-        }
-        Err(e) => {
-            return Err(test_report_fail_detail(
-                "nvs get_u16 peer_inb_tcp failed",
-                &e,
-            ));
-        }
-    };
-    drop(nvs);
+) -> Result<(crate::tls_link::TlsStream, [u8; 4], u16), (Status, Payload)> {
+    let TlsPskInputs {
+        peer_ip,
+        peer_port: inbound_port,
+        psk,
+        pod_id,
+    } = tls_psk_inputs(|p| p.inbound_frames_port)?;
 
     let peer_addr = std::net::SocketAddr::from((peer_ip, inbound_port));
-    let mut stream = match TcpStream::connect_timeout(
-        &peer_addr,
-        std::time::Duration::from_secs(device_protocol::INBOUND_CONNECT_TIMEOUT_SECS),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(test_report_fail_detail(
-                &format!("{err_prefix} connect failed"),
-                &e,
-            ));
-        }
-    };
+    let mut stream = crate::tls_link::tls_connect_psk(&crate::tls_link::TlsConnectParams {
+        peer: &peer_addr,
+        pod_id: pod_id.as_str(),
+        key: &psk,
+        connect_timeout: std::time::Duration::from_secs(
+            device_protocol::INBOUND_CONNECT_TIMEOUT_SECS,
+        ),
+        write_timeout: std::time::Duration::from_secs(device_protocol::INBOUND_READ_TIMEOUT_SECS),
+    })
+    .map_err(|e| {
+        test_report_fail_detail(&format!("{err_prefix} tls connect/handshake failed"), &e)
+    })?;
 
-    if let Err(e) = stream.write_all(&[selector]) {
-        return Err(test_report_fail_detail(
-            &format!("{err_prefix} selector write failed"),
-            &e,
-        ));
-    }
-
-    if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(
-        device_protocol::INBOUND_READ_TIMEOUT_SECS,
-    ))) {
-        return Err(test_report_fail_detail(
-            &format!("{err_prefix} set_read_timeout failed"),
-            &e,
-        ));
-    }
+    // Selector byte goes inside the tunnel, after the handshake.
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(device_protocol::INBOUND_READ_TIMEOUT_SECS);
+    tls_psk_write_all(&mut stream, &[selector], deadline)?;
 
     Ok((stream, peer_ip, inbound_port))
 }
 
-/// TCP inbound-frames self-test.
+/// TLS-PSK inbound-frames self-test.
 ///
-/// Connects to the HIL-host frame source, reads `StreamFrame::Audio` frames
-/// through `drain_inbound` until EOF, and reports the count. Exercises the
-/// inbound framing/decode path on a dedicated connection.
+/// Opens a TLS-PSK connection to the HIL-host frame source, reads
+/// `StreamFrame::Audio` frames inside the tunnel through `drain_inbound` until
+/// EOF, and reports the count. Exercises the inbound framing/decode path on a
+/// dedicated connection.
 ///
-/// Requires prior `WifiAssociate` and `ProvisionPeer`.
+/// Requires prior `WifiAssociate` and `SetTemporaryPeerConfig`.
 #[cfg(target_os = "espidf")]
-pub(crate) fn run_tcp_inbound_frames() -> (Status, Payload) {
+pub(crate) fn run_tls_inbound_frames() -> (Status, Payload) {
     let (mut stream, peer_ip, inbound_port) =
-        match connect_inbound_source(INBOUND_SELECTOR_HAPPY_PATH, "tcp inbound") {
+        match connect_inbound_source(INBOUND_SELECTOR_HAPPY_PATH, "tls inbound") {
             Ok(t) => t,
             Err(fail) => return fail,
         };
@@ -324,7 +221,8 @@ pub(crate) fn run_tcp_inbound_frames() -> (Status, Payload) {
     let mut sink = CountingSink::new();
     let mut inbound_state = InboundConnectionState::new();
     let mut total_frames: u32 = 0;
-    // Fail fast if the server stalls (MAX_IDLE_RETRIES consecutive timeouts with no frames).
+    // Fail fast if the server stalls (MAX_IDLE_RETRIES consecutive idle poll waits
+    // with no frames).
     let mut idle_count: u32 = 0;
 
     loop {
@@ -333,16 +231,29 @@ pub(crate) fn run_tcp_inbound_frames() -> (Status, Payload) {
                 total_frames += outcome.frames_routed;
                 idle_count = 0; // reset on progress
             }
+            // Buffered plaintext (poll discipline rule 1): a drain that read bytes but
+            // routed no frame keeps draining without a poll wait, because decrypted bytes
+            // can sit in the session buffer with no POLLIN to reveal them.
+            Ok(outcome) if outcome.made_progress() => {}
             Ok(_) => {
+                // Nothing pending: poll for readable up to the read-timeout budget rather
+                // than busy-spinning on the non-blocking tunnel. The wait happens before
+                // the limit check so `idle_count` counts waits actually performed and the
+                // total patience is MAX_IDLE_RETRIES × INBOUND_READ_TIMEOUT_SECS.
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(device_protocol::INBOUND_READ_TIMEOUT_SECS);
+                if let Err(fail) = tls_psk_wait(&stream, true, deadline) {
+                    return fail;
+                }
                 idle_count += 1;
                 if idle_count >= device_protocol::MAX_IDLE_RETRIES {
                     log::info!(
-                        "TcpInboundFrames: idle fail-fast after {} timeouts, frames so far={}",
+                        "TlsInboundFrames: idle fail-fast after {} waits, frames so far={}",
                         idle_count,
                         total_frames,
                     );
                     return test_report_fail_fmt(format_args!(
-                        "tcp inbound: server stalled after {} timeouts, frames={}",
+                        "tls inbound: server stalled after {} waits, frames={}",
                         idle_count, total_frames,
                     ));
                 }
@@ -353,13 +264,13 @@ pub(crate) fn run_tcp_inbound_frames() -> (Status, Payload) {
                 break;
             }
             Err(e) => {
-                return test_report_fail_detail("tcp inbound read/decode error", &e);
+                return test_report_fail_detail("tls inbound read/decode error", &e);
             }
         }
     }
 
-    log::info!("TcpInboundFrames: received {} frames", total_frames);
-    test_report_ok(TestData::TcpInboundFrames {
+    log::info!("TlsInboundFrames: received {} frames", total_frames);
+    test_report_ok(TestData::TlsInboundFrames {
         inbound_frames: total_frames,
         peer_ip,
         peer_port: inbound_port,
@@ -433,13 +344,13 @@ fn post_eof_tick(
     ))
 }
 
-/// Requires prior `WifiAssociate` and `ProvisionPeer`.
+/// Requires prior `WifiAssociate` and `SetTemporaryPeerConfig`.
 #[cfg(target_os = "espidf")]
-pub(crate) fn run_tcp_inbound_backpressure() -> (Status, Payload) {
+pub(crate) fn run_tls_inbound_backpressure() -> (Status, Payload) {
     use std::time::{Duration, Instant};
 
     let (mut stream, peer_ip, inbound_port) =
-        match connect_inbound_source(INBOUND_SELECTOR_FLOOD, "tcp inbound-bp") {
+        match connect_inbound_source(INBOUND_SELECTOR_FLOOD, "tls inbound-bp") {
             Ok(t) => t,
             Err(fail) => return fail,
         };
@@ -476,12 +387,12 @@ pub(crate) fn run_tcp_inbound_backpressure() -> (Status, Payload) {
     loop {
         if Instant::now() >= deadline {
             log::info!(
-                "TcpInboundBackpressure: deadline exceeded, frames={} full={}",
+                "TlsInboundBackpressure: deadline exceeded, frames={} full={}",
                 total_frames,
                 sink.full,
             );
             return test_report_fail_fmt(format_args!(
-                "tcp inbound-bp: {}s deadline exceeded, frames={}, full_stalls={}",
+                "tls inbound-bp: {}s deadline exceeded, frames={}, full_stalls={}",
                 device_protocol::INBOUND_BP_DEADLINE_SECS,
                 total_frames,
                 sink.full,
@@ -517,7 +428,7 @@ pub(crate) fn run_tcp_inbound_backpressure() -> (Status, Payload) {
                     }
                 }
                 Err(e) => {
-                    return test_report_fail_detail("tcp inbound-bp post-eof decode error", &e);
+                    return test_report_fail_detail("tls inbound-bp post-eof decode error", &e);
                 }
             }
             continue;
@@ -545,17 +456,17 @@ pub(crate) fn run_tcp_inbound_backpressure() -> (Status, Payload) {
                 eof = true;
             }
             Err(e) => {
-                return test_report_fail_detail("tcp inbound-bp read/decode error", &e);
+                return test_report_fail_detail("tls inbound-bp read/decode error", &e);
             }
         }
     }
 
     log::info!(
-        "TcpInboundBackpressure: received {} frames, full_stalls={}",
+        "TlsInboundBackpressure: received {} frames, full_stalls={}",
         total_frames,
         sink.full,
     );
-    test_report_ok(TestData::TcpInboundBackpressure {
+    test_report_ok(TestData::TlsInboundBackpressure {
         inbound_frames: total_frames,
         sink_full_events: sink.full,
         peer_ip,
@@ -563,39 +474,37 @@ pub(crate) fn run_tcp_inbound_backpressure() -> (Status, Payload) {
     })
 }
 
-/// TCP send-backpressure self-test.
+/// TLS-PSK send-backpressure self-test.
 ///
-/// Proves the `poll(POLLOUT)` backpressure + partial-write resume path on real
-/// lwIP. Connects to the HIL-host adversary server (selected by an in-band
-/// selector byte), which saturates the device's send buffer and then drains,
-/// forcing a genuine partial write that must resume to `Sent`.
+/// Proves the `poll(POLLOUT)` backpressure + resume path through the TLS record
+/// layer on real lwIP. Opens a TLS-PSK connection to the HIL-host adversary
+/// server (selected by an in-band selector byte inside the tunnel), which closes
+/// its receive window and then drains, forcing a write boundary that must resume
+/// to `Sent`.
 ///
 /// Uses the production `send_frame_bp` path so the tested code is exactly the
 /// path the streamer uses. The boundary frame (first send with `resume_cycles > 0`)
-/// proves a partial write actually occurred and resumed on real lwIP.
+/// proves the write blocked with `WANT_WRITE`, waited on `poll(POLLOUT)`, and
+/// completed on the same-bytes retry — the discipline the streamer depends on.
 ///
-/// Returns `TestData::TcpSendBackpressure`.
-/// Requires prior `WifiAssociate` and `ProvisionPeer`.
+/// Returns `TestData::TlsSendBackpressure`.
+/// Requires prior `WifiAssociate` and `SetTemporaryPeerConfig`.
 #[cfg(target_os = "espidf")]
-pub(crate) fn run_tcp_send_backpressure() -> (Status, Payload) {
+pub(crate) fn run_tls_send_backpressure() -> (Status, Payload) {
     use audio_pipeline::wire::{
         AudioFrame, StreamFrame, AUDIO_SAMPLES_PER_FRAME, MAX_AUDIO_PAYLOAD,
     };
+    use std::time::Duration;
 
-    let nvs = match open_wifi_nvs(false) {
-        Ok(n) => n,
-        Err(msg) => return test_report_fail_msg(msg),
+    let TlsPskInputs {
+        peer_ip,
+        peer_port: bp_port,
+        psk,
+        pod_id,
+    } = match tls_psk_inputs(|p| p.backpressure_port) {
+        Ok(v) => v,
+        Err(fail) => return fail,
     };
-    let peer_ip: [u8; 4] = match nvs_get_blob4(&nvs, "peer_ip") {
-        Ok(a) => a,
-        Err(msg) => return test_report_fail_msg(msg),
-    };
-    let bp_port: u16 = match nvs.get_u16("peer_bp_tcp") {
-        Ok(Some(p)) => p,
-        Ok(None) => return test_report_fail("no peer_bp_tcp in NVS — run ProvisionPeer first"),
-        Err(e) => return test_report_fail_detail("nvs get_u16 peer_bp_tcp failed", &e),
-    };
-    drop(nvs);
 
     let peer_addr = std::net::SocketAddr::from((peer_ip, bp_port));
 
@@ -612,15 +521,22 @@ pub(crate) fn run_tcp_send_backpressure() -> (Status, Payload) {
         pcm,
     });
 
-    // Run the saturate-then-drain adversary on a fresh connection.
-    let a = match run_bp_subcase(&peer_addr, &frame) {
+    // Run the saturate-then-drain adversary on a fresh TLS-PSK connection.
+    let params = crate::tls_link::TlsConnectParams {
+        peer: &peer_addr,
+        pod_id: pod_id.as_str(),
+        key: &psk,
+        connect_timeout: Duration::from_secs(TLS_PSK_CONNECT_TIMEOUT_SECS),
+        write_timeout: Duration::from_secs(10),
+    };
+    let a = match run_bp_subcase(&params, &frame) {
         Ok(r) => r,
         Err(fail) => return fail,
     };
 
-    log::info!("TcpSendBackpressure: A resumed cycles={}", a.resume_cycles,);
+    log::info!("TlsSendBackpressure: A resumed cycles={}", a.resume_cycles,);
 
-    test_report_ok(TestData::TcpSendBackpressure {
+    test_report_ok(TestData::TlsSendBackpressure {
         a_resumed: true,
         a_rc: a.resume_cycles,
         a_ru: a.reusable,
@@ -635,59 +551,47 @@ const BP_SUBCASE_A: u8 = b'A';
 /// Backpressure sub-case A verdict.
 #[cfg(target_os = "espidf")]
 struct BpSubcaseResult {
-    /// Number of partial-write resume cycles on the boundary frame. ≥1 proves a
-    /// genuine partial write occurred and resumed on real lwIP.
+    /// Resume cycles on the boundary frame: completed `poll(POLLOUT)` waits that
+    /// were followed by forward progress. ≥1 proves the write genuinely blocked on
+    /// real lwIP and resumed rather than being accepted outright.
     resume_cycles: u32,
     /// Whether a post-backpressure send succeeded on the kept socket.
     reusable: bool,
 }
 
-/// Cap on warm-up sends. The lwIP send buffer (~5760 B) holds only a handful of
-/// ~642 B frames, so the boundary must appear well within this bound.
+/// Cap on warm-up sends. The lwIP send buffer (`CONFIG_LWIP_TCP_SND_BUF_DEFAULT`,
+/// 2880 B) plus the host's clamped receive window hold only a handful of ~664 B
+/// TLS records, so the boundary must appear well within this bound.
 #[cfg(target_os = "espidf")]
 const BP_MAX_WARMUP_FRAMES: u32 = 200;
 
-/// Drive the backpressure adversary end-to-end: connect, write the selector byte,
-/// flip non-blocking, send frames until the boundary frame resumes to `Sent`, and
-/// confirm the socket is still usable.
+/// Drive the backpressure adversary end-to-end: open the TLS-PSK session, write
+/// the selector byte inside the tunnel, send frames until the boundary frame
+/// resumes to `Sent`, and confirm the socket is still usable.
 ///
 /// The boundary frame is the first `Sent` whose `resume_cycles > 0` (from
-/// `send_frame_bp_counted`). A `BackpressureAligned` boundary (buffer filled at a
-/// frame boundary, `written==0`) is a FAIL — the resume path was never exercised.
+/// `send_frame_bp_counted`) — i.e. the first frame whose write returned
+/// `WANT_WRITE`, waited on `poll(POLLOUT)`, and then completed on retry. A
+/// `BackpressureAligned` outcome (the wait budget elapsed with nothing written)
+/// is a FAIL — the resume path was never exercised.
+///
+/// The session is already non-blocking (esp-tls owns the adopted socket), so no
+/// explicit `set_nonblocking` is needed — it mirrors the streamer's own config.
 // Err variant is the test's (Status, Payload) FAIL — propagated via `?`.
 #[allow(clippy::result_large_err)]
 #[cfg(target_os = "espidf")]
 fn run_bp_subcase(
-    peer_addr: &std::net::SocketAddr,
+    connect: &crate::tls_link::TlsConnectParams,
     frame: &audio_pipeline::wire::StreamFrame,
 ) -> Result<BpSubcaseResult, (Status, Payload)> {
-    use std::io::Write as _;
-    use std::net::TcpStream;
     use std::time::{Duration, Instant};
 
-    let mut stream = match TcpStream::connect_timeout(peer_addr, Duration::from_secs(10)) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(test_report_fail_detail(
-                "FAIL backpressure[A] connect failed",
-                &e,
-            ));
-        }
-    };
-    // Write the selector byte while still blocking so it precedes any frame.
-    if let Err(e) = stream.write_all(&[BP_SUBCASE_A]) {
-        return Err(test_report_fail_detail(
-            "FAIL backpressure[A] selector write failed",
-            &e,
-        ));
-    }
-    // Non-blocking, mirroring the streamer's socket configuration.
-    if let Err(e) = stream.set_nonblocking(true) {
-        return Err(test_report_fail_detail(
-            "FAIL backpressure[A] set_nonblocking failed",
-            &e,
-        ));
-    }
+    let mut stream = crate::tls_link::tls_connect_psk(connect).map_err(|e| {
+        test_report_fail_detail("FAIL backpressure[A] tls connect/handshake failed", &e)
+    })?;
+    // Selector byte inside the tunnel, before any frame.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    tls_psk_write_all(&mut stream, &[BP_SUBCASE_A], deadline)?;
 
     let mut encode_buf = vec![0u8; 4100];
     let mut sent_count: u32 = 0;
@@ -699,12 +603,12 @@ fn run_bp_subcase(
             Ok(SendOutcome::Sent) => {
                 sent_count += 1;
                 if resume_cycles > 0 {
-                    // Boundary frame: partial write resumed to Sent.
+                    // Boundary frame: the write blocked, waited, and resumed to Sent.
                     if resume_cycles < BACKPRESSURE_A_MIN_RESUME_CYCLES {
                         return Err(test_report_fail_fmt(format_args!(
                             "FAIL backpressure[A] resumed but resume_cycles={resume_cycles} < \
-                             {BACKPRESSURE_A_MIN_RESUME_CYCLES} — no genuine partial write on \
-                             real lwIP",
+                             {BACKPRESSURE_A_MIN_RESUME_CYCLES} — no WANT_WRITE/poll/retry \
+                             cycle on real lwIP",
                         )));
                     }
                     let reusable = bp_confirm_reusable(&mut stream, frame, &mut encode_buf)?;
@@ -717,11 +621,9 @@ fn run_bp_subcase(
             }
             Ok(SendOutcome::BackpressureAligned) => {
                 let wait_ms = t0.elapsed().as_millis();
-                // Buffer filled at a frame boundary (written==0) — no partial write
-                // occurred, so the resume path was never exercised.
                 return Err(test_report_fail_fmt(format_args!(
                     "FAIL backpressure[A] aligned (written==0, wait_ms={wait_ms}) — \
-                     boundary frame took no partial write, so resume was not exercised",
+                     the blocked write never became writable, so resume was not exercised",
                 )));
             }
             Err(e) => {
@@ -741,10 +643,16 @@ fn run_bp_subcase(
     )))
 }
 
-/// Minimum resume cycles for a valid boundary frame. Set to 1: proving ≥1 genuine
-/// partial write on real lwIP is sufficient. Forcing ≥2 is unreliable on hardware
-/// (a single host read typically frees enough buffer for the entire remaining tail);
+/// Minimum resume cycles for a valid boundary frame. A cycle is a completed
+/// `poll(POLLOUT)` wait followed by forward progress — over TLS, a `WANT_WRITE`
+/// and the same-bytes retry that completes the record. Set to 1: proving one such
+/// cycle on real lwIP is sufficient. Forcing ≥2 is unreliable on hardware (a
+/// single host read typically frees enough window for everything queued);
 /// multi-cycle repeatability is proven by off-target unit tests.
+///
+/// Must match the host-side `BACKPRESSURE_A_MIN_RESUME_CYCLES`, including its
+/// `u32` type — the two crates share no constant module, so this is a manual-sync
+/// contract.
 #[cfg(target_os = "espidf")]
 const BACKPRESSURE_A_MIN_RESUME_CYCLES: u32 = 1;
 
@@ -753,7 +661,7 @@ const BACKPRESSURE_A_MIN_RESUME_CYCLES: u32 = 1;
 #[allow(clippy::result_large_err)]
 #[cfg(target_os = "espidf")]
 fn bp_confirm_reusable(
-    stream: &mut std::net::TcpStream,
+    stream: &mut crate::tls_link::TlsStream,
     frame: &audio_pipeline::wire::StreamFrame,
     encode_buf: &mut [u8],
 ) -> Result<bool, (Status, Payload)> {
@@ -789,20 +697,23 @@ fn bp_confirm_reusable(
 /// depends on. `poll(POLLOUT)` is already proven; `poll(POLLIN)` has never been
 /// exercised in any production path and is the key assertion here.
 ///
-/// Connects to the HIL-host poll-readiness adversary, writes a trigger byte,
-/// flips non-blocking, then asserts:
+/// Opens a TLS-PSK connection to the HIL-host poll-readiness adversary, writes a
+/// trigger byte inside the tunnel, then asserts:
 ///   1. `poll(POLLOUT)` reports ready on a fresh empty TX buffer.
-///   2. `poll(POLLIN)` reports ready once the host queues inbound bytes.
+///   2. `poll(POLLIN)` reports ready once the host queues inbound bytes as TLS
+///      records.
 ///   3. Both bits are set in one `revents` (single-fd multiplex proof).
 ///
+/// The poll runs against the adopted socket fd (`link_fd`), which reports
+/// *ciphertext* readiness: a read after `POLLIN` can return `WouldBlock` when only
+/// part of a record has landed, so poll and read share one wait budget and retry.
+///
 /// Returns `TestData::PollReadiness`.
-/// Requires prior `WifiAssociate` and `ProvisionPeer`.
+/// Requires prior `WifiAssociate` and `SetTemporaryPeerConfig`.
 #[cfg(target_os = "espidf")]
 pub(crate) fn run_poll_readiness_bidir() -> (Status, Payload) {
     use esp_idf_svc::sys::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpStream;
-    use std::os::fd::AsRawFd as _;
+    use std::io::Read as _;
     use std::time::{Duration, Instant};
 
     /// Trigger byte written first; the host responds by queuing inbound bytes back.
@@ -812,37 +723,37 @@ pub(crate) fn run_poll_readiness_bidir() -> (Status, Payload) {
     /// Total budget to observe POLLIN before declaring the path dead.
     const POLLIN_WAIT_BUDGET: Duration = Duration::from_secs(5);
 
-    let nvs = match open_wifi_nvs(false) {
-        Ok(n) => n,
-        Err(msg) => return test_report_fail_msg(msg),
+    let TlsPskInputs {
+        peer_ip,
+        peer_port: poll_port,
+        psk,
+        pod_id,
+    } = match tls_psk_inputs(|p| p.poll_readiness_port) {
+        Ok(v) => v,
+        Err(fail) => return fail,
     };
-    let peer_ip: [u8; 4] = match nvs_get_blob4(&nvs, "peer_ip") {
-        Ok(a) => a,
-        Err(msg) => return test_report_fail_msg(msg),
-    };
-    let poll_port: u16 = match nvs.get_u16("peer_poll_tcp") {
-        Ok(Some(p)) => p,
-        Ok(None) => return test_report_fail("no peer_poll_tcp in NVS — run ProvisionPeer first"),
-        Err(e) => return test_report_fail_detail("nvs get_u16 peer_poll_tcp failed", &e),
-    };
-    drop(nvs);
 
     let peer_addr = std::net::SocketAddr::from((peer_ip, poll_port));
-    let mut stream = match TcpStream::connect_timeout(&peer_addr, Duration::from_secs(10)) {
+    let mut stream = match crate::tls_link::tls_connect_psk(&crate::tls_link::TlsConnectParams {
+        peer: &peer_addr,
+        pod_id: pod_id.as_str(),
+        key: &psk,
+        connect_timeout: Duration::from_secs(TLS_PSK_CONNECT_TIMEOUT_SECS),
+        write_timeout: Duration::from_secs(10),
+    }) {
         Ok(s) => s,
-        Err(e) => return test_report_fail_detail("FAIL poll-readiness connect failed", &e),
+        Err(e) => {
+            return test_report_fail_detail("FAIL poll-readiness tls connect/handshake failed", &e);
+        }
     };
 
-    // Write the trigger byte while still blocking so it precedes the non-blocking polls.
-    if let Err(e) = stream.write_all(&[POLL_TRIGGER_BYTE]) {
-        return test_report_fail_detail("FAIL poll-readiness trigger write failed", &e);
-    }
-    // Non-blocking, mirroring the streamer's socket configuration.
-    if let Err(e) = stream.set_nonblocking(true) {
-        return test_report_fail_detail("FAIL poll-readiness set_nonblocking failed", &e);
+    // Trigger byte inside the tunnel, before the readiness polls.
+    let trigger_deadline = Instant::now() + Duration::from_secs(10);
+    if let Err(fail) = tls_psk_write_all(&mut stream, &[POLL_TRIGGER_BYTE], trigger_deadline) {
+        return fail;
     }
 
-    let fd = stream.as_raw_fd();
+    let fd = stream.link_fd();
 
     // ── Assertion 1: POLLOUT on a fresh, empty TX buffer ──────────────────────
     let pollout_ready = match poll_one(fd, POLLOUT, POLL_TIMEOUT_MS) {
@@ -864,8 +775,11 @@ pub(crate) fn run_poll_readiness_bidir() -> (Status, Payload) {
     }
 
     // ── Assertion 2 + 3: POLLIN + both-direction multiplex ───────────────────
+    // Ciphertext-readiness can yield WouldBlock on a healthy connection (partial TLS
+    // record). Only budget exhaustion is a poll-readiness failure.
     let deadline = Instant::now() + POLLIN_WAIT_BUDGET;
-    let both_ready = loop {
+    let mut rbuf = [0u8; 64];
+    let (both_ready, read_bytes) = loop {
         let revents = match poll_one(fd, POLLIN | POLLOUT, POLL_TIMEOUT_MS) {
             Ok(r) => r,
             Err(e) => {
@@ -880,31 +794,32 @@ pub(crate) fn run_poll_readiness_bidir() -> (Status, Payload) {
         }
         if revents & POLLIN != 0 {
             // The multiplex assertion: POLLIN and POLLOUT reported together in one syscall.
-            break revents & POLLOUT != 0;
+            let both = revents & POLLOUT != 0;
+            // Confirm POLLIN is backed by actual readable plaintext.
+            match stream.read(&mut rbuf) {
+                Ok(0) => {
+                    return test_report_fail(
+                        "FAIL poll-readiness POLLIN reported ready but read returned EOF \
+                         (0 bytes) — peer closed; readiness did not back real data",
+                    );
+                }
+                Ok(n) => break (both, n),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Partial record: more ciphertext is still in flight. Fall through to
+                    // the budget check and poll again.
+                }
+                Err(e) => {
+                    return test_report_fail_detail(
+                        "FAIL poll-readiness read after POLLIN failed",
+                        &e,
+                    );
+                }
+            }
         }
         if Instant::now() >= deadline {
             return test_report_fail(
-                "FAIL poll-readiness POLLIN never reported within budget — poll(POLLIN) does \
-                 not report read-readiness on this lwIP/VFS build",
-            );
-        }
-    };
-
-    // Confirm POLLIN is backed by actual readable data (not a false readiness signal).
-    let mut rbuf = [0u8; 64];
-    let read_bytes = match stream.read(&mut rbuf) {
-        Ok(0) => {
-            return test_report_fail(
-                "FAIL poll-readiness POLLIN reported ready but read returned EOF (0 bytes) — \
-                 peer closed; readiness did not back real data",
-            );
-        }
-        Ok(n) => n,
-        Err(e) => {
-            return test_report_fail_detail(
-                "FAIL poll-readiness read after POLLIN failed (WouldBlock here would mean a \
-                 false POLLIN readiness signal)",
-                &e,
+                "FAIL poll-readiness no readable plaintext within budget — poll(POLLIN) never \
+                 reported read-readiness backed by data on this lwIP/VFS build",
             );
         }
     };
@@ -985,21 +900,21 @@ const RTD_PRODUCER_STACK_BYTES: usize = 3_072;
 /// `min(hla, hlb)` — the lower of the two in-window free-heap samples taken during
 /// the run.
 ///
-/// Baked 2026-07-19 alongside `device_protocol::HEAP_MIN_EVER_FLOOR` from the same
-/// hardware session — see that constant's doc-comment for the run-record path, bake
-/// rule, and clean-link-only caveat. Observed `min(hla, hlb)` per run ranged
-/// 78_912–84_444; floor is the largest multiple of 4 KiB ≤ 0.75 × the observed
-/// minimum (78_912).
+/// Observed `min(hla, hlb)` with duplex TLS-PSK: 28_824. The floor must not
+/// exceed that (or the run fails) and must stay `>=`
+/// `device_protocol::HEAP_MIN_EVER_FLOOR` (24_576) to preserve the compile-time
+/// ordering below. The standard "largest 4 KiB multiple ≤ 0.75 × observed"
+/// formula gives 20_480, violating the ordering, so the floor is set to the
+/// invariant minimum (24_576), with ~4.2 KiB of margin.
 #[cfg(target_os = "espidf")]
-const RTD_HEAP_LOW_FLOOR: u32 = 57_344;
+const RTD_HEAP_LOW_FLOOR: u32 = 24_576;
 
 // Hardware-baked; a silent edit gets no host-test coverage (this module is
 // espidf-only), so pin the literal here and re-verify the design's required
 // ordering against `device_protocol::HEAP_MIN_EVER_FLOOR` at compile time. A move
-// forces a deliberate re-bake with fresh provenance — see
-// `docs/adr/2026/07/19-rtd-heap-floor-rebake/run-record.md`.
+// forces a deliberate re-bake with fresh provenance.
 #[cfg(target_os = "espidf")]
-const _: () = assert!(RTD_HEAP_LOW_FLOOR == 57_344);
+const _: () = assert!(RTD_HEAP_LOW_FLOOR == 24_576);
 #[cfg(target_os = "espidf")]
 const _: () = assert!(device_protocol::HEAP_MIN_EVER_FLOOR <= RTD_HEAP_LOW_FLOOR);
 
@@ -1136,7 +1051,7 @@ impl RtdMeasure {
 ///
 /// Per CLAUDE.md bring-up doctrine the host asserts the expected keep-up behavior and
 /// is allowed to FAIL first against the current one-action-per-wake loop. Requires
-/// prior `WifiAssociate` and `ProvisionPeer` (`peer_rtd_tcp`).
+/// prior `WifiAssociate` and `SetTemporaryPeerConfig` (session `rtd_port`).
 ///
 /// Runs the handler body on a dedicated large-stack thread (see `RTD_TEST_STACK_BYTES`);
 /// the main task's stack is too small for the `run_segment` frame.
@@ -1175,20 +1090,15 @@ fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    let nvs = match open_wifi_nvs(false) {
-        Ok(n) => n,
-        Err(msg) => return test_report_fail_msg(msg),
+    let TlsPskInputs {
+        peer_ip,
+        peer_port: rtd_port,
+        psk,
+        pod_id,
+    } = match tls_psk_inputs(|p| p.rtd_port) {
+        Ok(v) => v,
+        Err(fail) => return fail,
     };
-    let peer_ip: [u8; 4] = match nvs_get_blob4(&nvs, "peer_ip") {
-        Ok(a) => a,
-        Err(msg) => return test_report_fail_msg(msg),
-    };
-    let rtd_port: u16 = match nvs.get_u16("peer_rtd_tcp") {
-        Ok(Some(p)) => p,
-        Ok(None) => return test_report_fail("no peer_rtd_tcp in NVS — run ProvisionPeer first"),
-        Err(e) => return test_report_fail_detail("nvs get_u16 peer_rtd_tcp failed", &e),
-    };
-    drop(nvs);
 
     // Quiesce the production capture pathway and borrow CAPTURE_RING: the capture
     // thread stops committing mic chunks and the telemetry thread feeds the VAD
@@ -1244,8 +1154,12 @@ fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
     // (the host reads only, never paces playback on this connection).
     let mut sink_a = CountingSink::new();
     let a_seg = rtd_run_one_segment(
-        peer_ip,
-        rtd_port,
+        &RtdConnect {
+            peer_ip,
+            rtd_port,
+            psk: &psk,
+            pod_id: pod_id.as_str(),
+        },
         'A',
         &mut RtdSegmentIo {
             sink: &mut sink_a,
@@ -1285,8 +1199,12 @@ fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
     log::info!("rtd: heap waypoint before-B heap_free={free} min_heap={min}");
     let mut sink_b = crate::inbound::FakeDacSink::new();
     let b_seg = rtd_run_one_segment(
-        peer_ip,
-        rtd_port,
+        &RtdConnect {
+            peer_ip,
+            rtd_port,
+            psk: &psk,
+            pod_id: pod_id.as_str(),
+        },
         'B',
         &mut RtdSegmentIo {
             sink: &mut sink_b,
@@ -1365,10 +1283,24 @@ struct RtdSegmentIo<'a> {
     state: &'a mut crate::inbound::InboundConnectionState,
 }
 
+/// The per-connection TLS-PSK dial inputs for one RTD segment, bundled to stay
+/// inside the Xtensa realign-miscompile guard's argument-word budget.
+#[cfg(target_os = "espidf")]
+struct RtdConnect<'a> {
+    /// RTD listener host.
+    peer_ip: [u8; 4],
+    /// RTD listener port.
+    rtd_port: u16,
+    /// The session audio-link key.
+    psk: &'a [u8; crate::tls_link::PSK_LEN],
+    /// This pod's id — the TLS PSK identity.
+    pod_id: &'a str,
+}
+
 /// Run one `StreamRealtimeDuplex` segment against the rtd listener: borrow the
 /// boot-allocated `CAPTURE_RING` (the caller has quiesced production), pre-roll it,
-/// connect, send the outbound `Hello`/`SegmentStart` (blocking — the buffer is empty
-/// at onset), then drive the extracted `run_segment` drain loop against a synthetic
+/// open a TLS-PSK session and send the outbound `Hello`/`SegmentStart` via poll-driven
+/// backpressure, then drive the extracted `run_segment` drain loop against a synthetic
 /// real-time producer, feeding decoded inbound frames to `io.sink`. Returns the loop exit
 /// and the `SegmentStart`→exit wall time on success.
 ///
@@ -1379,8 +1311,7 @@ struct RtdSegmentIo<'a> {
 /// inbound playback differ.
 #[cfg(target_os = "espidf")]
 fn rtd_run_one_segment(
-    peer_ip: [u8; 4],
-    rtd_port: u16,
+    conn: &RtdConnect<'_>,
     scenario: char,
     io: &mut RtdSegmentIo<'_>,
 ) -> Result<(crate::streamer::SegmentExit, u128, SegMeas), String> {
@@ -1391,12 +1322,14 @@ fn rtd_run_one_segment(
         ChannelSource, Hello, SegmentStart, StreamFrame, AUDIO_PROTOCOL_VERSION,
         AUDIO_SAMPLES_PER_FRAME,
     };
-    use std::net::TcpStream;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
-    // Fresh per-connection inbound state — each scenario opens its own TcpStream.
+    let peer_ip = conn.peer_ip;
+    let rtd_port = conn.rtd_port;
+
+    // Fresh per-connection inbound state — each scenario opens its own TLS session.
     io.state.reset();
     io.accum.reset();
 
@@ -1422,10 +1355,13 @@ fn rtd_run_one_segment(
         (cursor, onset_write_head.saturating_sub(cursor) as u32)
     };
 
-    // Connect + outbound Hello + SegmentStart, all blocking (buffer empty at onset).
+    // Open the TLS-PSK session, then send the outbound Hello + SegmentStart through
+    // the tunnel (buffer empty at onset). The adopted socket is non-blocking from the
+    // handshake on, so `send_frame_bp`'s poll-driven backpressure carries the onset
+    // sends rather than a blocking write.
     let peer_addr = std::net::SocketAddr::from((peer_ip, rtd_port));
-    // Prove per-run which port the device dialed out of NVS, and for which scenario, so a
-    // misrouted connection is a transcript fact rather than an inference.
+    // Prove per-run which port the device dialed from the session config, and for which
+    // scenario, so a misrouted connection is a transcript fact rather than an inference.
     log::info!(
         "rtd: connecting to {}.{}.{}.{}:{} (scenario {})",
         peer_ip[0],
@@ -1435,13 +1371,16 @@ fn rtd_run_one_segment(
         rtd_port,
         scenario
     );
-    let mut socket = match TcpStream::connect_timeout(&peer_addr, Duration::from_secs(10)) {
+    let mut socket = match crate::tls_link::tls_connect_psk(&crate::tls_link::TlsConnectParams {
+        peer: &peer_addr,
+        pod_id: conn.pod_id,
+        key: conn.psk,
+        connect_timeout: Duration::from_secs(TLS_PSK_CONNECT_TIMEOUT_SECS),
+        write_timeout: Duration::from_secs(10),
+    }) {
         Ok(s) => s,
-        Err(e) => return Err(format!("connect failed: {e:?}")),
+        Err(e) => return Err(format!("tls connect/handshake failed: {e:?}")),
     };
-    if let Err(e) = socket.set_nodelay(true) {
-        log::warn!("rtd: set_nodelay failed: {:?}", e);
-    }
 
     let hello = StreamFrame::Hello(Hello {
         version: AUDIO_PROTOCOL_VERSION,
@@ -1460,9 +1399,6 @@ fn rtd_run_one_segment(
         preroll_samples: preroll_count,
     });
     rtd_send_blocking(&mut socket, &seg_start, &mut *io.scratch, "SegmentStart")?;
-    if let Err(e) = socket.set_nonblocking(true) {
-        return Err(format!("set_nonblocking failed: {e:?}"));
-    }
 
     // Synthetic real-time producer: commit synthetic 320-sample frames on an absolute
     // 20 ms schedule directly into CAPTURE_RING, then raise the vad-closed flag. The exact
@@ -1586,11 +1522,13 @@ fn rtd_run_one_segment(
     ))
 }
 
-/// Send one frame on a blocking socket, mapping any error to a bare failure reason (the
-/// caller wraps it with the measurement fields).
+/// Send one onset frame through the tunnel with `send_frame_bp`'s poll-driven
+/// backpressure, mapping any error to a bare failure reason (the caller wraps it
+/// with the measurement fields). At onset the send buffer is empty, so a
+/// `BackpressureAligned` outcome is a fault.
 #[cfg(target_os = "espidf")]
 fn rtd_send_blocking(
-    socket: &mut std::net::TcpStream,
+    socket: &mut crate::tls_link::TlsStream,
     frame: &audio_pipeline::wire::StreamFrame,
     encode_buf: &mut [u8],
     what: &str,
@@ -1605,12 +1543,6 @@ fn rtd_send_blocking(
 }
 
 // ── TLS-PSK audio-link self-tests ─────────────────────────────────────────────
-
-/// Wall-clock bound on the echo round-trip through the tunnel, after the
-/// handshake. Generous against a LAN turnaround so a failure names the echo, not
-/// a tight budget.
-#[cfg(target_os = "espidf")]
-const TLS_PSK_ECHO_TIMEOUT_SECS: u64 = 5;
 
 /// Payload echoed through the tunnel by `TlsPskHandshake`.
 #[cfg(target_os = "espidf")]
@@ -1629,28 +1561,25 @@ struct TlsPskInputs {
     pod_id: heapless::String<32>,
 }
 
-/// Read the audio-link key, this pod's identity, and the peer endpoint for one of
-/// the two TLS-PSK listeners (`port_key` selects which).
+/// Gather the peer endpoint, audio-link key, and pod identity for a TLS-PSK
+/// self-test. `port` selects which listener port to read from the session peer
+/// config.
 #[allow(clippy::result_large_err)]
 #[cfg(target_os = "espidf")]
-fn tls_psk_inputs(port_key: &str) -> Result<TlsPskInputs, (Status, Payload)> {
-    let nvs = open_wifi_nvs(false).map_err(test_report_fail_msg)?;
-    let peer_ip = nvs_get_blob4(&nvs, "peer_ip").map_err(test_report_fail_msg)?;
-    let peer_port = match nvs.get_u16(port_key) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Err(test_report_fail_fmt(format_args!(
-                "no {port_key} in NVS — run ProvisionPeer first"
-            )));
-        }
-        Err(e) => {
-            return Err(test_report_fail_fmt(format_args!(
-                "nvs get_u16 {port_key} failed: {e:?}"
-            )));
+fn tls_psk_inputs(
+    port: impl Fn(&crate::hil_session::PeerConfig) -> u16,
+) -> Result<TlsPskInputs, (Status, Payload)> {
+    let peer = crate::hil_session::peer_config().ok_or_else(|| {
+        test_report_fail("no session peer config — run SetTemporaryPeerConfig first")
+    })?;
+    let peer_port = port(&peer);
+    let psk = match crate::hil_session::audio_psk_override() {
+        Some(k) => k,
+        None => {
+            let nvs = open_wifi_nvs(false).map_err(test_report_fail_msg)?;
+            crate::hil_session::effective_audio_psk(&nvs).map_err(test_report_fail_msg)?
         }
     };
-    let psk = crate::nvs::nvs_get_blob32(&nvs, "audio_psk").map_err(test_report_fail_msg)?;
-    drop(nvs);
 
     let Some(pod_id) = crate::streamer::pod_id_snapshot() else {
         return Err(test_report_fail(
@@ -1658,7 +1587,7 @@ fn tls_psk_inputs(port_key: &str) -> Result<TlsPskInputs, (Status, Payload)> {
         ));
     };
     Ok(TlsPskInputs {
-        peer_ip,
+        peer_ip: peer.host,
         peer_port,
         psk,
         pod_id,
@@ -1758,10 +1687,14 @@ fn tls_psk_read_exact(
 /// TLS-PSK handshake proof over the production audio-link client.
 ///
 /// Connects to the HIL host's TLS-PSK listener with `tls_connect_psk` — the same
-/// call the streamer makes — using the key `ProvisionAudioPsk` wrote and this
+/// call the streamer makes — using the effective audio-link key (the session
+/// override set by `SetTemporaryAudioPsk`, else the NVS `audio_psk`) and this
 /// pod's id as the PSK identity, then echoes one payload through the tunnel.
 /// Reports the negotiated version and ciphersuite so the host asserts them
-/// against the pinned expectation.
+/// against the pinned expectation. The reported `handshake_ms` and the echo
+/// deadline are both charged from after the TCP connect, so a connect that spent
+/// its budget on SYN retransmits fails as a connect, not as a slow handshake or
+/// an expired echo.
 #[cfg(target_os = "espidf")]
 pub(crate) fn run_tls_psk_handshake() -> (Status, Payload) {
     use device_protocol::{TlsSuiteStr, TlsVersionStr};
@@ -1771,24 +1704,35 @@ pub(crate) fn run_tls_psk_handshake() -> (Status, Payload) {
         peer_port,
         psk,
         pod_id,
-    } = match tls_psk_inputs("peer_psk_tcp") {
+    } = match tls_psk_inputs(|p| p.tls_psk_port) {
         Ok(v) => v,
         Err(report) => return report,
     };
     let peer = std::net::SocketAddr::from((peer_ip, peer_port));
 
-    let started = std::time::Instant::now();
-    let mut stream = match crate::tls_link::tls_connect_psk(&crate::tls_link::TlsConnectParams {
+    let opened = match crate::tls_link::tls_connect_psk_staged(&crate::tls_link::TlsConnectParams {
         peer: &peer,
         pod_id: pod_id.as_str(),
         key: &psk,
-        connect_timeout: std::time::Duration::from_secs(2),
+        connect_timeout: std::time::Duration::from_secs(TLS_PSK_CONNECT_TIMEOUT_SECS),
         write_timeout: std::time::Duration::from_secs(2),
     }) {
-        Ok(s) => s,
-        Err(e) => return test_report_fail_detail("tls-psk handshake failed", &e),
+        Ok(c) => c,
+        Err(f) => {
+            return test_report_fail_fmt(format_args!(
+                "tls-psk {} failed after {} ms: {:?}",
+                f.stage.label(),
+                f.elapsed.as_millis(),
+                f.error
+            ));
+        }
     };
-    let handshake_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    let mut stream = opened.stream;
+    let handshake_ms = opened.handshake.as_millis().min(u32::MAX as u128) as u32;
+    log::info!(
+        "tls-psk: handshake with {peer} took {handshake_ms} ms after a {} ms connect",
+        opened.connect.as_millis()
+    );
 
     let (version, ciphersuite) = {
         let (v, c) = stream.negotiated();
@@ -1799,7 +1743,10 @@ pub(crate) fn run_tls_psk_handshake() -> (Status, Payload) {
         (vs, cs)
     };
 
-    let deadline = started + std::time::Duration::from_secs(TLS_PSK_ECHO_TIMEOUT_SECS);
+    // Anchored after the handshake: the echo budget bounds the round-trip, and a
+    // connect that spent its own budget on SYN retransmits must not consume it.
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(TLS_PSK_ECHO_TIMEOUT_SECS);
     if let Err(report) = tls_psk_write_all(&mut stream, &TLS_PSK_ECHO_NONCE, deadline) {
         return report;
     }
@@ -1828,11 +1775,14 @@ pub(crate) fn run_tls_psk_handshake() -> (Status, Payload) {
 /// byte can cross a link that was not authenticated; a completed handshake here
 /// means the key is not what gates the link and is a hard failure.
 ///
-/// The refusal only means something if TLS was actually spoken, so the two ways
-/// a broken fixture would otherwise look like a pass are failures here: an
-/// unreachable listener (proved reachable by a TCP probe first — a firewalled or
-/// absent port times out rather than refusing) and a handshake that ends by
-/// consuming its deadline instead of by an alert.
+/// The refusal only means something if TLS was actually spoken, so the ways a
+/// broken fixture or a flaky link would otherwise look like a pass are failures
+/// here: an unreachable listener (proved reachable by a TCP probe first — a
+/// firewalled or absent port times out rather than refusing), a failure from any
+/// stage before the handshake (connect or esp-tls setup), and a handshake that
+/// ends by consuming its deadline instead of by an alert. `reject_ms` measures
+/// the handshake stage alone, so the host bound on refusal latency is not
+/// polluted by connect time.
 #[cfg(target_os = "espidf")]
 pub(crate) fn run_tls_psk_wrong_key_rejected() -> (Status, Payload) {
     let TlsPskInputs {
@@ -1840,7 +1790,7 @@ pub(crate) fn run_tls_psk_wrong_key_rejected() -> (Status, Payload) {
         peer_port,
         psk,
         pod_id,
-    } = match tls_psk_inputs("peer_psk_bad") {
+    } = match tls_psk_inputs(|p| p.tls_psk_bad_port) {
         Ok(v) => v,
         Err(report) => return report,
     };
@@ -1848,39 +1798,62 @@ pub(crate) fn run_tls_psk_wrong_key_rejected() -> (Status, Payload) {
 
     // Reachability first, as its own phase: a listener that is not there cannot
     // refuse anything, and its connect error must not be read as a rejection.
-    match std::net::TcpStream::connect_timeout(&peer, std::time::Duration::from_secs(2)) {
-        Ok(probe) => drop(probe),
-        Err(e) => return test_report_fail_detail("tls-psk wrong-key listener unreachable", &e),
+    let probe_started = std::time::Instant::now();
+    match std::net::TcpStream::connect_timeout(
+        &peer,
+        std::time::Duration::from_secs(TLS_PSK_CONNECT_TIMEOUT_SECS),
+    ) {
+        Ok(probe) => {
+            drop(probe);
+            log::info!(
+                "tls-psk: wrong-key reachability probe to {peer} took {} ms",
+                probe_started.elapsed().as_millis()
+            );
+        }
+        Err(e) => {
+            return test_report_fail_fmt(format_args!(
+                "tls-psk wrong-key listener unreachable after {} ms: {e:?}",
+                probe_started.elapsed().as_millis()
+            ));
+        }
     }
 
-    let started = std::time::Instant::now();
-    let outcome = crate::tls_link::tls_connect_psk(&crate::tls_link::TlsConnectParams {
+    let outcome = crate::tls_link::tls_connect_psk_staged(&crate::tls_link::TlsConnectParams {
         peer: &peer,
         pod_id: pod_id.as_str(),
         key: &psk,
-        connect_timeout: std::time::Duration::from_secs(2),
+        connect_timeout: std::time::Duration::from_secs(TLS_PSK_CONNECT_TIMEOUT_SECS),
         write_timeout: std::time::Duration::from_secs(2),
     });
-    let reject_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
 
     match outcome {
         Ok(_) => test_report_fail(
             "tls-psk handshake COMPLETED against a peer holding a different key — \
              the key does not gate the link",
         ),
+        // Anything short of the handshake stage means TLS was never spoken (a lost
+        // link, a refused connect, an esp-tls setup fault), so the run proves
+        // nothing about the key and must not pass.
+        Err(f) if f.stage != crate::tls_link::TlsConnectStage::Handshake => {
+            test_report_fail_fmt(format_args!(
+                "tls-psk wrong-key run never reached the handshake: {} failed after {} ms: {:?}",
+                f.stage.label(),
+                f.elapsed.as_millis(),
+                f.error
+            ))
+        }
         // Deadline, not alert: the peer never refused, so this run proves nothing
         // about the key.
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => test_report_fail_detail(
+        Err(f) if f.error.kind() == std::io::ErrorKind::TimedOut => test_report_fail_detail(
             "tls-psk wrong-key handshake hit the deadline instead of being refused",
-            &e,
+            &f.error,
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            test_report_fail_detail("tls-psk wrong-key listener unreachable", &e)
-        }
-        Err(_) => test_report_ok(TestData::TlsPskRejected {
+        // Refusal latency only — the connect that preceded it is excluded, so a SYN
+        // retransmit cannot masquerade as a slow rejection.
+        Err(f) => test_report_ok(TestData::TlsPskRejected {
             peer_ip,
             peer_port,
-            reject_ms,
+            reject_ms: f.elapsed.as_millis().min(u32::MAX as u128) as u32,
         }),
     }
 }

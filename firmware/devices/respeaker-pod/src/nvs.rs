@@ -77,10 +77,7 @@ pub(crate) fn nvs_get_blob4(
         Ok(Some(b)) if b.len() == 4 => Ok([b[0], b[1], b[2], b[3]]),
         Ok(_) => {
             let mut s = device_protocol::TestResultMsg::new();
-            let _ = core::fmt::write(
-                &mut s,
-                format_args!("no {} in NVS — run ProvisionPeer first", key),
-            );
+            let _ = core::fmt::write(&mut s, format_args!("no {} in NVS", key));
             Err(s)
         }
         Err(e) => {
@@ -214,104 +211,10 @@ pub(crate) fn handle_clear_wifi_credentials() -> (Status, Payload) {
     (Status::Ok, Payload::Empty)
 }
 
-/// The HIL peer endpoints one `ProvisionPeer` writes, bundled.
-///
-/// A bundle rather than a parameter list: the handler would otherwise take eleven
-/// argument words, past the six the Xtensa realign-miscompile guard tolerates
-/// (`TODO(xtensa-realign-stack-args)`, `firmware/tools/check-realign-args.sh`).
-#[cfg(target_os = "espidf")]
-pub(crate) struct PeerEndpoints {
-    /// UDP echo port.
-    pub(crate) udp_port: u16,
-    /// TCP echo port.
-    pub(crate) tcp_port: u16,
-    /// Public TLS endpoint address, reached by literal IP.
-    pub(crate) tls_host: [u8; 4],
-    /// Public TLS endpoint port.
-    pub(crate) tls_port: u16,
-    /// Inbound audio-frame source port.
-    pub(crate) inbound_frames_port: u16,
-    /// Backpressure source port.
-    pub(crate) backpressure_port: u16,
-    /// Poll-readiness adversary port.
-    pub(crate) poll_readiness_port: u16,
-    /// `StreamRealtimeDuplex` listener port.
-    pub(crate) rtd_port: u16,
-    /// TLS-PSK listener holding this pod's real audio-link key.
-    pub(crate) tls_psk_port: u16,
-    /// TLS-PSK listener holding a different key for this pod's identity.
-    pub(crate) tls_psk_bad_port: u16,
-}
-
-/// Write peer host/port configuration to NVS.
-#[cfg(target_os = "espidf")]
-pub(crate) fn handle_provision_peer(host: [u8; 4], ports: &PeerEndpoints) -> (Status, Payload) {
-    let PeerEndpoints {
-        udp_port,
-        tcp_port,
-        tls_host,
-        tls_port,
-        inbound_frames_port,
-        backpressure_port,
-        poll_readiness_port,
-        rtd_port,
-        tls_psk_port,
-        tls_psk_bad_port,
-    } = *ports;
-    let nvs = match open_wifi_nvs(true) {
-        Ok(n) => n,
-        Err(msg) => return test_report_fail_msg(msg),
-    };
-    if let Err(e) = nvs.set_blob("peer_ip", &host) {
-        return test_report_fail_detail("nvs set_blob peer_ip failed", &e);
-    }
-    if let Err(e) = nvs.set_blob("tls_host", &tls_host) {
-        return test_report_fail_detail("nvs set_blob tls_host failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_udp", udp_port) {
-        return test_report_fail_detail("nvs set_u16 peer_udp failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_tcp", tcp_port) {
-        return test_report_fail_detail("nvs set_u16 peer_tcp failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_tls", tls_port) {
-        return test_report_fail_detail("nvs set_u16 peer_tls failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_inb_tcp", inbound_frames_port) {
-        return test_report_fail_detail("nvs set_u16 peer_inb_tcp failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_bp_tcp", backpressure_port) {
-        return test_report_fail_detail("nvs set_u16 peer_bp_tcp failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_poll_tcp", poll_readiness_port) {
-        return test_report_fail_detail("nvs set_u16 peer_poll_tcp failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_rtd_tcp", rtd_port) {
-        return test_report_fail_detail("nvs set_u16 peer_rtd_tcp failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_psk_tcp", tls_psk_port) {
-        return test_report_fail_detail("nvs set_u16 peer_psk_tcp failed", &e);
-    }
-    if let Err(e) = nvs.set_u16("peer_psk_bad", tls_psk_bad_port) {
-        return test_report_fail_detail("nvs set_u16 peer_psk_bad failed", &e);
-    }
-    log::info!(
-        "provisioned peer host={} udp={} tcp={} tls_host={} tls={} inbound_tcp={} bp_tcp={} \
-         poll_tcp={} rtd_tcp={} psk_tcp={} pskbad_tcp={}",
-        fmt_ipv4(host),
-        udp_port,
-        tcp_port,
-        fmt_ipv4(tls_host),
-        tls_port,
-        inbound_frames_port,
-        backpressure_port,
-        poll_readiness_port,
-        rtd_port,
-        tls_psk_port,
-        tls_psk_bad_port,
-    );
-    (Status::Ok, Payload::Empty)
-}
+// The bench peer endpoints live in the RAM-only HIL session store
+// (`hil_session`): `SetTemporaryPeerConfig` stores them without any flash write,
+// and a reboot discards them. The `peer_*`/`tls_host` NVS keys that older pods
+// may still hold are inert litter that nothing reads.
 
 /// Write audio receiver address + port to NVS.
 #[cfg(target_os = "espidf")]

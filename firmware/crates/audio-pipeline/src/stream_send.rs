@@ -1,4 +1,4 @@
-//! Host-testable streamer send-loop core (partial-write-fix design §2.3a).
+//! Host-testable streamer send-loop core.
 //!
 //! This module holds the **pure**, transport-agnostic part of the device
 //! streamer's backpressure-aware frame send: the `written`-tracking write loop,
@@ -115,31 +115,37 @@ pub enum Writable {
 /// - `Writable::Fault` or any non-`WouldBlock`/`TimedOut` write error → `Err`.
 ///
 /// Returns the [`SendOutcome`] plus a **resume-cycle count** — the number of genuine
-/// *resumes*: each time a writability wait (`poll(POLLOUT)`) completes and finds `written`
-/// advanced past the previous counted resume.  It is counted when a wait returns
-/// (`Ready`/`Progressed`), NOT on the bare partial `write`: a partial write immediately
-/// followed by another accepting write never went through a wait, so it is not a resume —
-/// counting it would let two back-to-back accepting writes report `resume_cycles=1` and
-/// make the HIL adversary-A "resumed via poll(POLLOUT)" probe pass vacuously
-/// (error-handling review errhandling-1).  The high-water-mark key still prevents a
-/// poll/write-readiness spin (a `Ready` that produces no advance) from inflating the count
-/// (correctness review).  `Sent` alone does not prove resumability (a frame that fit
-/// immediately is also `Sent`), so the count is the measured fact the HIL self-test asserts
-/// on (partial-write-fix design §4 "resume signal").  A fatal `Err` for the dead-mid-tail
-/// case is reported with `resume_cycles ≥ 1` so the caller can label it distinctly from a
-/// `written == 0` aligned outcome.
+/// *resumes*: a completed writability wait (`Ready`/`Progressed`) followed by forward
+/// progress of `written` before the next wait or loop exit.  The wait *arms* the count and
+/// the next accepting write — including the one that completes the frame — *converts* it.
+///
+/// The wait must come first: a partial write immediately followed by another accepting
+/// write never went through `poll(POLLOUT)`, so it is not a resume — counting it would let
+/// two back-to-back accepting writes report `resume_cycles=1` and make the HIL adversary-A
+/// "resumed via poll(POLLOUT)" probe pass vacuously.  A `Ready` that produces no progress
+/// arms but never converts, so a poll/write-readiness spin cannot inflate the count.
+///
+/// Counting the *converting write* rather than progress observed at the next wait is what
+/// keeps the metric meaningful over TLS: `esp_tls_conn_write` never yields a partial
+/// plaintext count for a single-record frame — mbedTLS either queues the whole record or
+/// returns `WANT_WRITE` (surfaced as `WouldBlock`) — so the only backpressure shape there
+/// is `WouldBlock` → wait → full-length retry.  That is exactly the production
+/// WANT_WRITE/poll/same-bytes-retry discipline, and it counts as one cycle.
+///
+/// `Sent` alone does not prove resumability (a frame that fit immediately is also `Sent`),
+/// so the count is the measured fact the HIL self-test asserts on.  On the fatal
+/// dead-mid-tail path the count may be 0 when the accepted prefix preceded the first wait
+/// — the common stall shape — so it does not distinguish that path from a `written == 0`
+/// aligned outcome; the outcome type does.
 pub fn write_frame_classified(
     writer: &mut dyn std::io::Write,
     frame: &crate::wire::StreamFrame,
     buf: &mut [u8],
     wait_writable: impl FnMut(std::time::Instant) -> Writable,
 ) -> (std::io::Result<SendOutcome>, u32) {
-    // The production caller takes the per-frame wall-clock ceiling at frame entry and
-    // reads time from the real monotonic clock.  The ceiling-and-clock-injecting
-    // `write_frame_classified_at` is the testable seam: a test can pass a ceiling already
-    // in the past to drive the ceiling exit deterministically (test review test-1), or a
-    // hand-advanced fake clock to prove the per-wait budget re-arms on every
-    // forward-progress step with zero hardware coupling (partial-write-fix §2.3/§4).
+    // Delegates to the ceiling-and-clock-injecting `write_frame_classified_at`, which is
+    // the testable seam: tests can pass a ceiling already in the past or a hand-advanced
+    // fake clock to drive budget/ceiling exits deterministically.
     let frame_ceiling =
         std::time::Instant::now() + std::time::Duration::from_millis(FRAME_WALL_CLOCK_MAX_MS);
     write_frame_classified_at(
@@ -156,16 +162,13 @@ pub fn write_frame_classified(
 /// but takes the absolute per-frame `frame_ceiling` instant *and* a monotonic clock
 /// source `now` explicitly so unit tests can drive both bounds deterministically.  A
 /// ceiling already in the past drives the `FRAME_WALL_CLOCK_MAX_MS` give-up path without
-/// sleeping (test review test-1); a hand-advanced fake `now` proves the per-wait budget
-/// re-arms on *every* forward-progress step — the repeatability the HIL adversary A no
-/// longer pins (partial-write-fix §2.3/§4).  All wall-clock reads in the loop (the
-/// per-wait `deadline` computation and the ceiling check) go through `now`, so a test
-/// that advances `now` by `WRITE_TIMEOUT_MS − ε` before each `Ready` and a partial write
-/// between proves the frame completes without ever hitting the stall arm even though total
-/// elapsed time far exceeds a single budget — and a regression that resets the budget
-/// once but not again FAILs deterministically (the bug class the dropped HIL `≥2` floor
-/// guarded).  The production wrapper passes `now + FRAME_WALL_CLOCK_MAX_MS` and the real
-/// `Instant::now`.
+/// sleeping; a hand-advanced fake `now` proves the per-wait budget re-arms on *every*
+/// forward-progress step.  All wall-clock reads in the loop go through `now`, so a test
+/// that advances `now` by `WRITE_TIMEOUT_MS − ε` before each `Ready` proves the frame
+/// completes without ever hitting the stall arm even though total elapsed time far exceeds
+/// a single budget — and a regression that resets the budget once but not again FAILs
+/// deterministically.  The production wrapper passes `now + FRAME_WALL_CLOCK_MAX_MS` and
+/// the real `Instant::now`.
 pub fn write_frame_classified_at(
     writer: &mut dyn std::io::Write,
     frame: &crate::wire::StreamFrame,
@@ -186,7 +189,7 @@ pub fn write_frame_classified_at(
     // progress.  The production waiter (`poll_writable`) already enforces the
     // per-wait `WRITE_TIMEOUT_MS` deadline as a hard bound, but a platform where
     // `poll` keeps reporting POLLOUT while `write` keeps refusing bytes (a
-    // poll/write readiness disagreement the design flags as unproven — §3.1/§5)
+    // poll/write readiness disagreement)
     // could otherwise busy-spin without yielding.  This iteration cap is a
     // belt-and-suspenders bound that terminates such a spin even if the waiter ever
     // returns `Ready` without honoring the deadline: it classifies a persistent
@@ -198,43 +201,30 @@ pub fn write_frame_classified_at(
     // `SPIN_GUARD_THRESHOLD` + a backoff tick instead of termination.
     const MAX_ZERO_PROGRESS_READY: u32 = 1024;
 
-    // `resume_cycles` counts genuine *resumes*: a writability wait that returned and
-    // found `written` advanced past the last counted resume.  It is counted when a wait
-    // completes (`Ready`/`Progressed`), NOT on the partial `write` itself: a partial
-    // write that is immediately followed by another accepting write — with no
-    // intervening `wait_writable` — never exercised `poll(POLLOUT)` and so is not a
-    // resume.  Counting on the bare partial write would let two back-to-back accepting
-    // writes report `resume_cycles=1` and make the HIL adversary-A "resumed via
-    // poll(POLLOUT)" probe pass vacuously (error-handling review errhandling-1).  The
-    // high-water-mark key (`written_at_resume`) still ensures a poll/write spin (a wait
-    // that produces no advance) cannot inflate the count (correctness review).
+    // See the doc comment on `write_frame_classified` for the resume-cycle contract.
+    // A wait arms `resume_pending`; the next accepting write converts it into a counted
+    // cycle.  Back-to-back accepting writes with no wait between them count nothing.
     let mut resume_cycles: u32 = 0;
     let mut written = 0usize;
-    // High-water mark of `written` at the last counted resume cycle: a wait only counts a
-    // new resume once `written` has advanced past this, so a poll/write spin (a wait with
-    // no advance) cannot inflate `resume_cycles` (correctness review).
-    let mut written_at_resume = 0usize;
+    // Set by a wait that returned `Ready`/`Progressed`, cleared by the accepting write that
+    // converts it into a counted cycle.  A wait that produces no progress leaves the flag
+    // armed but uncounted, so a poll/write readiness spin cannot inflate `resume_cycles`.
+    let mut resume_pending = false;
     let mut zero_progress_ready: u32 = 0;
-    // Per-wait budget (loop-owned, resettable on progress); the absolute per-frame
-    // wall-clock ceiling (`frame_ceiling`, NOT reset by progress) is injected by the
-    // caller — partial-write-fix §2.1.
-    // Per-wait deadline is clamped to never overshoot `frame_ceiling`: a `poll`
-    // blocks until its deadline with no mid-wait ceiling re-check, so an unclamped
-    // per-wait budget could overshoot the per-frame ceiling by a full
-    // `WRITE_TIMEOUT_MS` (the loop-top ceiling check fires only between waits).
-    // Clamping makes the per-frame total bound tight (≤ FRAME_WALL_CLOCK_MAX_MS, not
-    // + WRITE_TIMEOUT_MS) — the production guarantee the ceiling exists to give the
-    // five non-AudioFrame send sites, and what keeps the HIL adversary-C give-up time
-    // inside its asserted window (correctness review).
+    // Per-wait budget, clamped to `frame_ceiling` so a `poll` that blocks to its
+    // deadline cannot overshoot the per-frame ceiling.  Resets on forward progress;
+    // the absolute ceiling (injected, NOT reset) is checked at the loop top.
     let mut deadline = (now() + Duration::from_millis(WRITE_TIMEOUT_MS)).min(frame_ceiling);
-    // Bytes written as of the previous `Writable::TimedOut`: lets a `TimedOut` that
-    // followed forward progress *continue* (reset + retry) instead of terminating,
-    // distinguishing a slow-but-alive peer from a dead one (partial-write-fix §2.2a).
+    // Bytes written as of the previous `Writable::TimedOut`: a `TimedOut` that followed
+    // forward progress continues (reset + retry) instead of terminating, distinguishing
+    // a slow-but-alive peer from a dead one.
     let mut written_at_last_wait = 0usize;
 
     // Terminal no-progress classification (shared by the ceiling, the
     // no-progress-budget, and the spin-cap paths): a frame-boundary stall keeps the
-    // socket; a mid-tail stall is fatal (partial-write-fix design §2.2).
+    // socket; a mid-tail stall is fatal.  The mid-tail arm is unreachable over a TLS
+    // link, whose single-record writes are all-or-nothing; it stays for the raw-socket
+    // writers this loop also drives.
     let classify_no_progress = |written: usize| {
         if written == 0 {
             Ok(SendOutcome::BackpressureAligned)
@@ -248,10 +238,8 @@ pub fn write_frame_classified_at(
     };
 
     while written < n {
-        // Absolute per-frame ceiling: caps total time in the loop regardless of how
-        // often the per-wait budget resets, so every send site stays bounded even
-        // those with no overrun guard (partial-write-fix design §2.1).  Read through the
-        // injected `now` so a fake clock can drive this exit deterministically.
+        // Absolute per-frame ceiling: caps total time regardless of how often the
+        // per-wait budget resets.
         if now() >= frame_ceiling {
             return (classify_no_progress(written), resume_cycles);
         }
@@ -271,18 +259,15 @@ pub fn write_frame_classified_at(
             Ok(m) => {
                 written += m;
                 zero_progress_ready = 0;
-                // The resume-cycle count is taken when a writability wait completes (in
-                // the shared wait below), not here on the bare partial write: a partial
-                // write that is immediately followed by another accepting write never
-                // went through `poll(POLLOUT)`, so it is not a resume (errhandling-1).
+                // Convert a pending resume into a counted cycle.  The frame-completing
+                // write counts too — over TLS it is the only resume shape.
+                if resume_pending {
+                    resume_cycles += 1;
+                    resume_pending = false;
+                }
                 if written < n {
-                    // Forward progress → reset the per-wait budget (partial-write-fix
-                    // §2.1): a peer that grants any byte keeps the budget fresh.  Only
-                    // a wait that still follows needs the reset; the write that
-                    // completes the frame exits the loop and never reads `deadline`
-                    // again (efficiency review).  Clamped to the per-frame ceiling so a
-                    // subsequent wait cannot overshoot it (correctness review).  Read
-                    // through the injected `now` so a fake clock drives the reset.
+                    // Forward progress → reset the per-wait budget, clamped to the
+                    // per-frame ceiling.
                     deadline = (now() + Duration::from_millis(WRITE_TIMEOUT_MS)).min(frame_ceiling);
                 }
                 continue;
@@ -291,11 +276,8 @@ pub fn write_frame_classified_at(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                // Transient backpressure: the kernel send buffer is full.  Wait for
-                // the socket to become writable, then resume the same write loop
-                // (never re-issue already-written bytes — that is what the `written`
-                // cursor protects against, design §3.2).  Falls through to the shared
-                // wait below.
+                // Transient backpressure: send buffer full.  Falls through to the
+                // shared wait below.
             }
             Err(e) => {
                 // Genuine socket fault (BrokenPipe, ConnectionReset, …).
@@ -303,24 +285,8 @@ pub fn write_frame_classified_at(
             }
         }
 
-        // Shared post-no-byte wait for the `Ok(0)` and `WouldBlock`/`TimedOut` arms —
-        // both wait for writability then resume, and differ only in *why* no byte was
-        // written, not in what to do next (quality review: keep one copy of the wait
-        // policy).  A future editor adding a third no-byte arm must route it to this
-        // fall-through, not paste a copy.
-        //
-        // NOTE on `resume_cycles` (error-handling review errhandling-1, correctness
-        // review): a resume cycle is *a writability wait that completed and found
-        // `written` advanced past the last counted resume* — i.e. a partial write whose
-        // continuation genuinely went through `poll(POLLOUT)`.  It is counted here, when a
-        // wait returns `Ready`/`Progressed`, NOT on the partial `write` itself: a partial
-        // write immediately followed by another accepting write (no wait in between) never
-        // exercised the poll path, so it must not count (errhandling-1 — otherwise the HIL
-        // adversary-A "resumed via poll(POLLOUT)" probe passes vacuously).  The count is
-        // keyed on the `written_at_resume` high-water mark so a poll/write-readiness spin
-        // (a `Ready` that produces no advance — the `MAX_ZERO_PROGRESS_READY` failure
-        // mode) cannot inflate it (correctness review): a wait that did not advance
-        // `written` finds `written == written_at_resume` and is not counted.
+        // Shared wait for both no-byte arms (`Ok(0)` and `WouldBlock`/`TimedOut`).
+        // A third no-byte arm must fall through here, not duplicate the wait.
         match wait_for_writable(
             &mut wait_writable,
             written,
@@ -329,34 +295,20 @@ pub fn write_frame_classified_at(
             frame_ceiling,
             &now,
         ) {
-            // Both `Ready` and `Progressed` continue the write loop.  A wait that
-            // returned with `written` advanced past the last counted resume is a
-            // genuine resume cycle: a partial write was made and its continuation went
-            // through this wait (errhandling-1).  Count it once per high-water advance.
-            // A `Ready` wait advances the spin cap; a `Progressed` wait found forward
-            // progress, so any prior zero-progress-`Ready` run is broken and the spin
-            // cap resets (mirroring the reset on `Ok(m)` in the main loop) so
-            // `zero_progress_ready` provably counts only *consecutive* no-progress
-            // `Ready` cycles (quality-1).
+            // `zero_progress_ready` counts only *consecutive* no-progress `Ready`
+            // cycles; `Progressed` resets it (forward progress breaks the run).
             WaitStep::Ready => zero_progress_ready += 1,
             WaitStep::Progressed => zero_progress_ready = 0,
             WaitStep::Stalled => return (classify_no_progress(written), resume_cycles),
             WaitStep::Fault(e) => return (Err(e), resume_cycles),
         }
-        // Resume counting is shared by both continuing arms (errhandling-1): a wait
-        // that returned with `written` advanced past the last counted resume is a
-        // genuine resume cycle. Count it once per high-water advance.
-        if written < n && written > written_at_resume {
-            resume_cycles += 1;
-            written_at_resume = written;
-        }
+        resume_pending = true;
     }
 
     (Ok(SendOutcome::Sent), resume_cycles)
 }
 
-/// The result of one `wait_writable` cycle inside [`write_frame_classified`]
-/// (partial-write-fix design §2.2a).
+/// The result of one `wait_writable` cycle inside [`write_frame_classified`].
 enum WaitStep {
     /// The socket became writable — resume the write.
     Ready,
@@ -369,8 +321,7 @@ enum WaitStep {
     Fault(std::io::Error),
 }
 
-/// Run one writability wait against `*deadline`, then interpret the result with the
-/// progress-reset semantics of partial-write-fix design §2.2a:
+/// Run one writability wait against `*deadline`, then interpret the result:
 /// - `Writable::Ready` → `WaitStep::Ready`;
 /// - `Writable::TimedOut` with `written` advanced since the last wait → reset the
 ///   budget (`*deadline`, clamped to `frame_ceiling`), record the new high-water
@@ -380,7 +331,7 @@ enum WaitStep {
 /// - `Writable::Fault` → `WaitStep::Fault`.
 ///
 /// `frame_ceiling` clamps the reset budget so a subsequent wait cannot overshoot the
-/// absolute per-frame ceiling (correctness review).
+/// absolute per-frame ceiling.
 fn wait_for_writable(
     wait_writable: &mut impl FnMut(std::time::Instant) -> Writable,
     written: usize,
@@ -394,10 +345,7 @@ fn wait_for_writable(
         Writable::Ready => WaitStep::Ready,
         Writable::TimedOut => {
             if written > *written_at_last_wait {
-                // Progressed since the last wait → not a stall: reset & retry.  The
-                // reset budget is clamped to the per-frame ceiling so the next wait
-                // cannot overshoot it (correctness review).  Read through the injected
-                // `now` so a fake clock drives the reset.
+                // Progressed since the last wait → not a stall: reset & retry.
                 *written_at_last_wait = written;
                 *deadline = (now() + Duration::from_millis(WRITE_TIMEOUT_MS)).min(frame_ceiling);
                 WaitStep::Progressed
@@ -410,31 +358,21 @@ fn wait_for_writable(
     }
 }
 
-// ── Cross-iteration send-cursor state machine (design §2.4) ─────────────────────
+// ── Cross-iteration send-cursor state machine ───────────────────────────────────
 //
 // `write_frame_classified[_at]` above owns the whole write loop *and* the
-// `poll(POLLOUT)` wait internally: it parks in `wait_writable` until the frame is
-// `Sent`, the budget elapses, or the socket faults.  That is correct for today's
-// blocking-per-frame caller, but the event-loop architecture (design §2.1) must drive
-// the *same* `written`-cursor + two-tier-budget + classification logic **one
-// `POLLOUT`-gated attempt at a time**, with the cursor and budget state persisting
-// **across loop iterations** instead of inside one call (design §2.4).  The loop's own
-// `poll(fd, POLLOUT)` wake — not an internal `wait_writable` — is what gates each
-// resume; between wakes the loop services inbound and housekeeping (design §2.1), so the
-// outbound write can never park the thread (eliminating starvation site 2, design §1.1).
+// `poll(POLLOUT)` wait internally.  The event-loop architecture drives the *same*
+// cursor + two-tier-budget + classification logic **one `POLLOUT`-gated attempt at a
+// time**, with state persisting **across loop iterations**.  The loop's own
+// `poll(fd, POLLOUT)` wake gates each resume; between wakes it services inbound and
+// housekeeping, so the outbound write never parks the thread.
 //
-// This section provides that lifted state machine.  It reuses the byte-cursor framing
-// (`written` never re-issues sent bytes), the per-wait `WRITE_TIMEOUT_MS` budget reset
-// on forward progress, the per-frame `FRAME_WALL_CLOCK_MAX_MS` ceiling, and the
-// three-way `BackpressureAligned`/`Sent`/fatal-`Err` classification — **migrated, not
-// collapsed** (design §2.4).  No internal `poll(POLLOUT)` park; one non-blocking `write`
-// attempt per call.  The existing `write_frame_classified[_at]` is left untouched for
-// today's blocking send sites; the event loop (a later increment) selects this API.
+// This section provides that lifted state machine.  No internal `poll(POLLOUT)` park;
+// one non-blocking `write` attempt per call.  The blocking `write_frame_classified[_at]`
+// is left for today's blocking send sites; the event loop selects this API.
 
 /// The outcome of one [`FrameWriteState::step_writable`] non-blocking write attempt,
-/// driven by the event loop's own `poll(POLLOUT)` wake (design §2.4).  The loop maps
-/// these to its iteration control flow (the §2.1 sketch's `WroteWhole` /
-/// `WouldBlockMidFrame` / `Err`):
+/// driven by the event loop's own `poll(POLLOUT)` wake.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StepOutcome {
     /// The whole frame reached the kernel send buffer (across this and any prior
@@ -445,8 +383,8 @@ pub enum StepOutcome {
     WrotePartial,
     /// `write` returned `WouldBlock`/`Ok(0)`/`TimedOut` with no byte accepted this
     /// attempt — the kernel send buffer is full.  The cursor is unchanged; the loop
-    /// re-polls `POLLOUT` (and, per §2.4, the budget/ceiling are enforced separately by
-    /// [`FrameWriteState::check_deadlines`] on each wake, not by parking here).
+    /// re-polls `POLLOUT` (budget/ceiling are enforced by
+    /// [`FrameWriteState::check_deadlines`] on each wake, not here).
     WouldBlock,
 }
 
@@ -468,12 +406,11 @@ pub const SPIN_GUARD_THRESHOLD: u32 = 8;
 ///    per-frame ceiling and the first per-wait budget.
 /// 2. [`FrameWriteState::step_writable`] — on each `POLLOUT` wake, one non-blocking
 ///    `write` attempt; never parks.  Returns [`StepOutcome`] (or fatal `Err`).
-/// 3. [`FrameWriteState::check_deadlines`] — in the loop's housekeeping step (design
-///    §2.1 step 6 / §2.4 "evaluated in the housekeeping step on every `poll` wake"),
-///    enforce the two-tier budget/ceiling.  Returns the migrated three-way
-///    classification when a budget elapses.
+/// 3. [`FrameWriteState::check_deadlines`] — in the loop's housekeeping step, enforce the
+///    two-tier budget/ceiling.  Returns the migrated three-way classification when a
+///    budget elapses.
 ///
-/// **Cursor lifetime obligation (design §2.4, §5 risk #5).** A `FrameWriteState` holding
+/// **Cursor lifetime obligation.** A `FrameWriteState` holding
 /// a mid-frame `written > 0` must be **discarded on teardown/reconnect**, never carried
 /// onto a fresh socket — a stale tail would corrupt the first frame of the next
 /// connection.  This type owns no socket, so dropping it is the discard; the loop must
@@ -483,21 +420,19 @@ pub struct FrameWriteState {
     n: usize,
     /// Bytes already written to the socket — never re-issued (the framing invariant).
     written: usize,
-    /// High-water mark of `written` at the last counted resume cycle (mirrors
-    /// `write_frame_classified`'s `written_at_resume`): a wake counts a new resume only
-    /// once `written` advances past this, so a `poll`/`write` readiness disagreement
-    /// (a `POLLOUT` wake that produces no advance) cannot inflate the count.
-    written_at_resume: usize,
-    /// Genuine resume cycles: `POLLOUT`-gated wakes that advanced `written` past the
-    /// previous counted resume (the design §4 test-#4 / HIL resume signal).
+    /// Armed by a no-byte step, cleared by the next accepting step.  Every
+    /// `step_writable` call is already `POLLOUT`-gated, so a no-byte step is the pump's
+    /// analog of "entered a wait".  Re-arming an already-armed flag is a no-op.
+    resume_pending: bool,
+    /// Genuine resume cycles: steps that made forward progress after a no-byte step —
+    /// the same wait-then-progress metric the blocking write loop reports, and the HIL
+    /// resume signal.
     resume_cycles: u32,
-    /// Bytes written as of the last per-wait-budget arming — lets a budget that elapsed
-    /// *after* forward progress reset-and-continue rather than terminate, distinguishing
-    /// a slow-but-alive peer from a dead one (the `written_at_last_wait` semantics of
-    /// `wait_for_writable`, design §2.4 budget-resets-on-progress).
+    /// Bytes written as of the last per-wait-budget arming — a budget that elapsed
+    /// *after* forward progress resets and continues rather than terminating.
     written_at_budget: usize,
     /// Absolute per-frame wall-clock ceiling (`FRAME_WALL_CLOCK_MAX_MS`), NOT reset by
-    /// progress (design §2.4 tier 2 / the mic-ring-lap watchdog).
+    /// progress.
     frame_ceiling: std::time::Instant,
     /// Absolute per-wait budget deadline (`WRITE_TIMEOUT_MS`), reset on forward progress,
     /// clamped to `frame_ceiling` so a wait cannot overshoot the per-frame total.
@@ -524,7 +459,7 @@ pub struct FrameWriteState {
 
 impl FrameWriteState {
     /// Begin a new in-flight frame: encode it into the caller-held `buf` and arm the
-    /// per-frame ceiling + first per-wait budget against `now` (design §2.4).  `buf` must
+    /// per-frame ceiling + first per-wait budget against `now`.  `buf` must
     /// outlive the state — the loop re-passes the same `&buf[..n]` to each
     /// [`step_writable`](Self::step_writable).  Returns the encoded length on success so
     /// the caller can keep the matching slice, or an encode error (fatal — drop the frame).
@@ -545,8 +480,7 @@ impl FrameWriteState {
     /// Ceiling-injecting core of [`begin`](Self::begin): identical but takes the absolute
     /// per-frame `frame_ceiling` explicitly so unit tests can isolate the per-wait budget
     /// (a far-future ceiling) or drive the ceiling exit deterministically (a near/past
-    /// ceiling) — the same testable seam `write_frame_classified_at` exposes (design §2.4 /
-    /// §4 test #4).  The production [`begin`](Self::begin) passes
+    /// ceiling).  The production [`begin`](Self::begin) passes
     /// `now() + FRAME_WALL_CLOCK_MAX_MS`.
     pub fn begin_at(
         frame: &crate::wire::StreamFrame,
@@ -564,7 +498,7 @@ impl FrameWriteState {
         Ok(FrameWriteState {
             n,
             written: 0,
-            written_at_resume: 0,
+            resume_pending: false,
             resume_cycles: 0,
             written_at_budget: 0,
             frame_ceiling,
@@ -577,13 +511,13 @@ impl FrameWriteState {
     }
 
     /// Bytes written so far (the cursor); `written == 0` is the frame-aligned boundary the
-    /// `BackpressureAligned` classification keys on (design §2.4).
+    /// `BackpressureAligned` classification keys on.
     pub fn written(&self) -> usize {
         self.written
     }
 
-    /// Genuine resume cycles taken so far — `POLLOUT`-gated wakes that advanced the
-    /// cursor (design §4 test #4 / the HIL resume signal).
+    /// Genuine resume cycles taken so far — steps that advanced the cursor after a
+    /// no-byte step (the HIL resume signal).
     pub fn resume_cycles(&self) -> u32 {
         self.resume_cycles
     }
@@ -613,7 +547,7 @@ impl FrameWriteState {
     }
 
     /// One non-blocking `write` attempt against `writer`, driven by the event loop's own
-    /// `POLLOUT` wake — **never parks** (design §2.4).  `buf` must be the same buffer
+    /// `POLLOUT` wake — **never parks**.  `buf` must be the same buffer
     /// [`begin`](Self::begin) encoded into; `buf[self.written..self.n]` is the unsent
     /// tail.  `now` is the injected clock (budget re-arm on progress).
     ///
@@ -623,10 +557,10 @@ impl FrameWriteState {
     /// - `Ok(StepOutcome::WouldBlock)` — send buffer full, no byte this attempt; re-poll;
     /// - `Err(e)` — a genuine socket fault (BrokenPipe/ConnectionReset/…) → drop socket.
     ///
-    /// The budget/ceiling *give-up* classification is NOT done here (that would require
-    /// parking semantics); it is done in [`check_deadlines`](Self::check_deadlines) on the
-    /// loop's housekeeping step (design §2.1 step 6 / §2.4), so a still-progressing peer is
-    /// never torn down by a single attempt and the loop stays non-parking.
+    /// The budget/ceiling *give-up* classification is NOT done here; it is done in
+    /// [`check_deadlines`](Self::check_deadlines) on the loop's housekeeping step, so a
+    /// still-progressing peer is never torn down by a single attempt and the loop stays
+    /// non-parking.
     pub fn step_writable(
         &mut self,
         writer: &mut dyn std::io::Write,
@@ -642,25 +576,21 @@ impl FrameWriteState {
             Ok(0) => {
                 self.would_blocks += 1;
                 self.consecutive_no_progress += 1;
+                self.resume_pending = true;
                 Ok(StepOutcome::WouldBlock)
             }
             Ok(m) => {
                 self.consecutive_no_progress = 0;
                 self.written += m;
+                // Convert a pending resume into a counted cycle.  The frame-completing
+                // step counts too — over TLS it is the only resume shape.
+                if self.resume_pending {
+                    self.resume_cycles += 1;
+                    self.resume_pending = false;
+                }
                 if self.written < self.n {
-                    // A partial that did not finish the frame and advanced past the last
-                    // counted resume is a genuine resume cycle: a `POLLOUT`-gated wake
-                    // drove forward progress on the unsent tail (mirrors
-                    // `write_frame_classified`'s `written < n && written > written_at_resume`
-                    // guard — a write that *completes* the frame is NOT a resume, and a
-                    // frame that fit in one attempt never resumed).
-                    if self.written > self.written_at_resume {
-                        self.resume_cycles += 1;
-                        self.written_at_resume = self.written;
-                    }
-                    // Forward progress → re-arm the per-wait budget (design §2.4 tier 1),
-                    // clamped to the per-frame ceiling so a subsequent wait cannot overshoot
-                    // it.
+                    // Forward progress → reset the per-wait budget, clamped to the
+                    // per-frame ceiling.
                     self.written_at_budget = self.written;
                     self.budget_deadline =
                         (now() + Duration::from_millis(WRITE_TIMEOUT_MS)).min(self.frame_ceiling);
@@ -675,9 +605,10 @@ impl FrameWriteState {
             {
                 // Transient backpressure: send buffer full, no byte accepted.  Cursor
                 // unchanged; the loop re-polls POLLOUT.  No park — the give-up budget is
-                // enforced by `check_deadlines` on the housekeeping step (design §2.4).
+                // enforced by `check_deadlines` on the housekeeping step.
                 self.would_blocks += 1;
                 self.consecutive_no_progress += 1;
+                self.resume_pending = true;
                 Ok(StepOutcome::WouldBlock)
             }
             // Genuine socket fault (BrokenPipe, ConnectionReset, …) → drop the socket.
@@ -685,25 +616,22 @@ impl FrameWriteState {
         }
     }
 
-    /// Housekeeping deadline check, run on every `poll` wake (design §2.1 step 6 / §2.4
-    /// "evaluated in the housekeeping step on every `poll` wake"): enforce the two-tier
-    /// budget/ceiling and, when one elapses, return the migrated three-way classification.
+    /// Housekeeping deadline check, run on every `poll` wake: enforce the two-tier
+    /// budget/ceiling and, when one elapses, return the three-way classification.
     ///
     /// Returns:
     /// - `None` — the frame is still within both the per-wait budget and the per-frame
     ///   ceiling; keep waiting on `POLLOUT`;
     /// - `Some(Ok(SendOutcome::BackpressureAligned))` — a budget/ceiling elapsed with
     ///   `written == 0`: the byte stream is still frame-aligned → **drop the segment, keep
-    ///   the socket** (design §2.4 tier-3 `written == 0`);
+    ///   the socket**;
     /// - `Some(Err(_))` — a budget/ceiling elapsed with `written > 0` (mid-tail dead): the
-    ///   unsent tail is undeliverable → **drop the segment and clear the socket** (design
-    ///   §2.4 tier-3 `written > 0`).
+    ///   unsent tail is undeliverable → **drop the segment and clear the socket**.
     ///
-    /// The per-wait budget is treated exactly as `wait_for_writable` does: a budget that
-    /// elapsed *after* forward progress since it was armed (`written > written_at_budget`)
-    /// is **not** a stall — it re-arms and returns `None` (the loop keeps the frame alive;
-    /// design §2.4 "resets on forward progress").  Only a per-wait budget that elapsed with
-    /// the cursor unchanged since arming, or the absolute per-frame ceiling, is terminal.
+    /// A budget that elapsed *after* forward progress since it was armed
+    /// (`written > written_at_budget`) is **not** a stall — it re-arms and returns `None`.
+    /// Only a budget with no cursor advance since arming, or the absolute ceiling, is
+    /// terminal.
     pub fn check_deadlines(
         &mut self,
         now: impl Fn() -> std::time::Instant,
@@ -735,16 +663,15 @@ impl FrameWriteState {
 
     /// Absolute deadline (the *earlier* of the per-wait budget and the per-frame ceiling)
     /// at which this in-flight frame must next be re-checked — folded into the event
-    /// loop's `timeout_to_next_deadline` so the give-up classification fires on time even
-    /// while `POLLOUT` never becomes writable (design §2.6 deadline set, §2.4 watchdog).
+    /// loop's poll timeout so the give-up classification fires on time even while `POLLOUT`
+    /// never becomes writable.
     pub fn next_deadline(&self) -> std::time::Instant {
         self.budget_deadline.min(self.frame_ceiling)
     }
 
-    /// Terminal no-progress classification — the migrated tier-3 three-way split (design
-    /// §2.4): `written == 0` is frame-aligned (`BackpressureAligned`, keep socket);
-    /// `written > 0` is mid-tail dead (fatal `Err`, clear socket).  Identical to
-    /// `write_frame_classified`'s `classify_no_progress` closure.
+    /// Terminal no-progress classification: `written == 0` is frame-aligned
+    /// (`BackpressureAligned`, keep socket); `written > 0` is mid-tail dead (fatal `Err`,
+    /// clear socket).
     fn classify_no_progress(&self, elapsed_ms: u64) -> std::io::Result<SendOutcome> {
         if self.written == 0 {
             Ok(SendOutcome::BackpressureAligned)
@@ -952,17 +879,20 @@ mod tests {
             waits, 2,
             "first TimedOut continues (progress made); second is the stall"
         );
-        assert!(
-            resume_cycles >= 1,
-            "a partial write occurred → the Err carries resume_cycles ≥ 1 \
-             (distinguishes mid-tail-dead from a written==0 aligned outcome)"
+        assert_eq!(
+            resume_cycles, 0,
+            "the accepted prefix preceded the first wait, and no write made progress after \
+             one, so no resume cycle converted — the outcome type, not the count, is what \
+             separates mid-tail-dead from a written==0 aligned outcome"
         );
         assert_eq!(writer.written, 5, "partial bytes already committed");
     }
 
     /// A partial write, then the socket becomes writable, then the frame completes →
-    /// `Sent` (the core fix: a partial write is *resumable*, not a desync).  The
-    /// resume-cycle count is ≥1 because the loop took a `Ready` after a partial write.
+    /// `Sent` (the core fix: a partial write is *resumable*, not a desync).  The script is
+    /// fully deterministic, so the count is pinned exactly at 1: one wait arms the pending
+    /// flag, the completing write converts it once.  An over-counting regression (arming on
+    /// an accepting write, or failing to clear the flag on conversion) FAILs here.
     #[test]
     fn send_classified_partial_then_writable_completes_is_sent() {
         let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
@@ -975,9 +905,9 @@ mod tests {
             write_frame_classified(&mut writer, &frame, &mut buf, |_deadline| Writable::Ready);
         let outcome = result.expect("classification");
         assert_eq!(outcome, SendOutcome::Sent);
-        assert!(
-            resume_cycles >= 1,
-            "a Ready taken after a 0<written<n partial write is a resume cycle"
+        assert_eq!(
+            resume_cycles, 1,
+            "one wait followed by forward progress is exactly one resume cycle"
         );
         assert!(
             writer.written >= n,
@@ -987,12 +917,9 @@ mod tests {
 
     /// `Writable::Ready` resumes the write loop and the frame completes → `Sent`,
     /// across two distinct partial-write edges; the resume-cycle count reports exactly 2.
-    /// The lighter smoke companion to the many-cycle repeatability test below
-    /// (partial-write-fix §4).  This asserts an EXACT count (test review test-2): two
-    /// `Accept`+`WouldBlock` edges → two resume cycles in a correct implementation, so a
-    /// regression that counts only the first edge FAILs here.  This is a deterministic
-    /// off-target bound on a fixed two-edge script, NOT the calibrated hardware claim the
-    /// HIL adversary-A bar relaxed to ≥1 (`notes-design-backpressure-pw-user-2.md`).
+    /// The lighter smoke companion to the many-cycle repeatability test below.
+    /// This asserts an EXACT count: two `Accept`+`WouldBlock` edges → two resume cycles in
+    /// a correct implementation, so a regression that counts only the first edge FAILs here.
     #[test]
     fn send_classified_resumes_after_writable() {
         let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
@@ -1024,8 +951,84 @@ mod tests {
         assert_eq!(writer.written, n, "whole frame eventually written");
     }
 
-    /// **Many-cycle slow drain — the deterministic repeatability proof
-    /// (partial-write-fix §4, `notes-design-backpressure-pw-user-2.md`).**
+    /// **The TLS boundary shape.**  A single-record TLS write is all-or-nothing: mbedTLS
+    /// either queues the whole frame or returns `WANT_WRITE`, surfaced as `WouldBlock`, so
+    /// a resume is `WouldBlock` → `poll` → full-length retry with no partial count in
+    /// sight.  That must report `Sent` with exactly one resume cycle — it is the
+    /// WANT_WRITE/poll/same-bytes-retry discipline the HIL send-backpressure test exists to
+    /// prove on real lwIP, and a metric that only counts partial writes reports 0 here and
+    /// makes the test's pass condition unreachable.
+    #[test]
+    fn send_classified_tls_shaped_wouldblock_then_full_write_counts_one_cycle() {
+        let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let n = crate::wire::encode_frame(&frame, &mut vec![0u8; MAX_FRAME_BYTES + 2])
+            .expect("encode for length");
+        // WouldBlock (WANT_WRITE), then the retry accepts the whole frame.
+        let mut writer = ScriptedWriter::new(vec![WriteStep::WouldBlock]);
+        let mut waits = 0;
+        let (result, resume_cycles) =
+            write_frame_classified(&mut writer, &frame, &mut buf, |_deadline| {
+                waits += 1;
+                Writable::Ready
+            });
+        assert_eq!(result.expect("classification"), SendOutcome::Sent);
+        assert_eq!(waits, 1, "the WouldBlock took exactly one writability wait");
+        assert_eq!(
+            resume_cycles, 1,
+            "a wait followed by the full-length retry is one resume cycle even though no \
+             partial write ever occurred"
+        );
+        assert_eq!(writer.written, n, "whole frame written on the retry");
+    }
+
+    /// Repeated block/resume on one frame with no byte accepted in between: `WouldBlock`,
+    /// wait, `WouldBlock`, wait, then the full write.  Only one *progress* event occurred,
+    /// so exactly one cycle is counted — repeated waits with nothing to convert must not
+    /// inflate the count.
+    #[test]
+    fn send_classified_repeated_block_before_progress_counts_one_cycle() {
+        let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let mut writer = ScriptedWriter::new(vec![WriteStep::WouldBlock, WriteStep::WouldBlock]);
+        let mut waits = 0;
+        let (result, resume_cycles) =
+            write_frame_classified(&mut writer, &frame, &mut buf, |_deadline| {
+                waits += 1;
+                Writable::Ready
+            });
+        assert_eq!(result.expect("classification"), SendOutcome::Sent);
+        assert_eq!(waits, 2, "two WouldBlocks, two waits");
+        assert_eq!(
+            resume_cycles, 1,
+            "two waits but a single progress event → one cycle"
+        );
+    }
+
+    /// **Anti-vacuous guard.**  A partial write immediately followed by an accepting write,
+    /// with no wait in between, never exercised `poll(POLLOUT)` and must count 0 — otherwise
+    /// the HIL adversary-A "resumed via poll" probe would pass on a connection that never
+    /// experienced backpressure at all.
+    #[test]
+    fn send_classified_partial_then_immediate_accept_counts_no_cycle() {
+        let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let n = crate::wire::encode_frame(&frame, &mut vec![0u8; MAX_FRAME_BYTES + 2])
+            .expect("encode for length");
+        // Accept 5, then (no script) accept the rest — the loop never waits.
+        let mut writer = ScriptedWriter::new(vec![WriteStep::Accept(5)]);
+        let (result, resume_cycles) = write_frame_classified(&mut writer, &frame, &mut buf, |_| {
+            panic!("no wait is reachable: every write accepted bytes")
+        });
+        assert_eq!(result.expect("classification"), SendOutcome::Sent);
+        assert_eq!(
+            resume_cycles, 0,
+            "back-to-back accepting writes never traversed poll(POLLOUT)"
+        );
+        assert_eq!(writer.written, n, "whole frame written");
+    }
+
+    /// **Many-cycle slow drain — the deterministic repeatability proof.**
     ///
     /// This is the off-target test that carries the property the HIL adversary A no longer
     /// pins: that the per-wait budget re-arms on **every** forward-progress step, not just
@@ -1133,10 +1136,10 @@ mod tests {
             waits as usize >= edges,
             "every WouldBlock edge must take a wait (got {waits} for {edges} edges)"
         );
-        assert!(
-            resume_cycles as usize >= edges,
+        assert_eq!(
+            resume_cycles as usize, edges,
             "resume_cycles must equal the number of distinct intermediate partial writes \
-             (≥{edges}, the repeatability evidence — the reset fired more than once); got \
+             ({edges}, the repeatability evidence — the reset fired more than once); got \
              {resume_cycles}"
         );
         assert!(
@@ -1151,9 +1154,8 @@ mod tests {
 
     /// A `Writable::TimedOut` that arrives *after* forward progress is no longer
     /// terminal: the loop records the new high-water mark, resets the budget, and
-    /// continues to completion → `Sent`.  This distinguishes the §2.2a loop from the
-    /// shallow timeout-closure tweak the design warns against (a `TimedOut` would have
-    /// been terminal on first occurrence) — partial-write-fix §4.
+    /// continues to completion → `Sent`.  This distinguishes the budget-reset loop from
+    /// a naive timeout that is terminal on first occurrence.
     #[test]
     fn send_classified_timedout_after_progress_continues() {
         let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
@@ -1173,13 +1175,13 @@ mod tests {
         assert_eq!(outcome, SendOutcome::Sent);
         assert_eq!(waits, 1, "one wait; it Progressed rather than Stalled");
         assert_eq!(writer.written, n, "whole frame eventually written");
-        // The partial write (Accept(9)) before the wait is a genuine forward-progress
-        // resume cycle and must be counted, so the HIL A sub-case can prove the reset is
-        // repeatable (test review test-3).
-        assert!(
-            resume_cycles >= 1,
-            "a partial write that advanced before the TimedOut-after-progress must count \
-             as a resume cycle (got {resume_cycles})"
+        // The `Progressed` wait arms the pending flag and the completing write converts it
+        // once, so the HIL A sub-case can prove the reset is repeatable.  The script is
+        // deterministic, so pin the exact count: an over-counting regression FAILs here.
+        assert_eq!(
+            resume_cycles, 1,
+            "a completed TimedOut-after-progress wait followed by forward progress is \
+             exactly one resume cycle (got {resume_cycles})"
         );
     }
 
@@ -1297,9 +1299,10 @@ mod tests {
         let err = result.expect_err("Ok(0) with no progress after a prefix is fatal");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(waits, 2, "first TimedOut Progressed; second is the stall");
-        assert!(
-            resume_cycles >= 1,
-            "a partial write occurred before the stall"
+        assert_eq!(
+            resume_cycles, 0,
+            "the accepted prefix preceded the first wait and nothing progressed after it, \
+             so no resume cycle converted"
         );
         assert_eq!(writer.written, 7, "partial bytes already committed");
     }
@@ -1395,8 +1398,8 @@ mod tests {
         assert_eq!(writer.written, 0, "no bytes written → stream stays aligned");
     }
 
-    /// The per-frame wall-clock ceiling with `written > 0` → fatal `Err` (mid-tail-dead),
-    /// `resume_cycles >= 1`.  Accept a partial prefix, then let the next loop top hit a
+    /// The per-frame wall-clock ceiling with `written > 0` → fatal `Err` (mid-tail-dead).
+    /// Accept a partial prefix, then let the next loop top hit a
     /// ceiling in the past: the unsent tail is undeliverable so the socket must be
     /// dropped, distinctly from the `written==0` aligned case (test review test-1).
     #[test]
@@ -1411,7 +1414,7 @@ mod tests {
         // Hand-advanced fake clock instead of a real sleep (test review test-3): the
         // injected `now` is what makes the "ceiling elapsed on re-entry" condition
         // deterministic without coupling the test to wall time.  The clock starts at
-        // `base` (so iteration 1's top-check passes and Accept(5) runs, counting a resume),
+        // `base` (so iteration 1's top-check passes and Accept(5) runs),
         // then the wait closure jumps it past the ceiling so iteration 2's top-check fires
         // the mid-tail-dead arm.  `now` and the waiter closure intentionally alias the same
         // `Cell`: the waiter advances it, `now` reads it (single-threaded shared clock).
@@ -1434,9 +1437,10 @@ mod tests {
         );
         let err = result.expect_err("ceiling with written>0 is mid-tail-dead (fatal Err)");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
-        assert!(
-            resume_cycles >= 1,
-            "a partial write occurred before the ceiling fired (got {resume_cycles})"
+        assert_eq!(
+            resume_cycles, 0,
+            "the prefix was accepted before any wait and the ceiling fired before the wait \
+             could convert into progress (got {resume_cycles})"
         );
         assert_eq!(writer.written, 5, "the accepted prefix stays committed");
     }
@@ -1482,9 +1486,9 @@ mod host_socket_tests {
     // and `SO_RCVBUF` at 2304, so the send buffer always has room for a whole frame
     // the instant the peer reads even one byte — across every (sndbuf, rcvbuf, drain
     // pace) combination probed, `write` returned the full frame in one call and
-    // `resume_cycles` was 0.  A sub-frame straddle on lwIP (5760-byte buffer, frames
-    // landing on a sub-MSS remainder) simply has no localhost analogue for a frame
-    // this small.
+    // `resume_cycles` was 0.  A sub-frame straddle on lwIP (a 2880-byte send buffer,
+    // frames landing on a sub-MSS remainder) simply has no localhost analogue for a
+    // frame this small.
     //
     // So the partial is forced at the `Write` boundary instead, with everything else
     // real: `ChunkedSocket` wraps a real non-blocking localhost `TcpStream` and caps
@@ -1871,8 +1875,9 @@ mod cross_iteration_tests {
         assert_eq!(st.written(), 10, "cursor advanced to the partial prefix");
         assert_eq!(
             st.resume_cycles(),
-            1,
-            "the advancing first attempt is a resume cycle"
+            0,
+            "a first attempt that accepts bytes never waited on backpressure, so it is not \
+             a resume cycle"
         );
         let out2 = st.step_writable(&mut w, &buf, now).expect("step 2");
         assert_eq!(out2, StepOutcome::WroteWhole);
@@ -1911,7 +1916,96 @@ mod cross_iteration_tests {
         assert_eq!(
             st.resume_cycles(),
             1,
-            "completing the frame does not add a resume cycle — still exactly one (test-2)"
+            "completing the frame does not add a resume cycle — the WouldBlock's cycle was \
+             already converted by the partial that followed it (test-2)"
+        );
+    }
+
+    /// The pump's TLS boundary shape: a no-byte step (the pump's stand-in for entering a
+    /// wait — the next step only runs after a fresh `POLLOUT` wake) followed by a step that
+    /// writes the whole frame counts one resume cycle.  A single-record TLS write is
+    /// all-or-nothing, so this is the only shape a resume can take there.
+    #[test]
+    fn no_byte_step_then_whole_write_counts_one_cycle() {
+        let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let now = Instant::now;
+        let mut st = FrameWriteState::begin(&frame, &mut buf, now).expect("begin");
+        // Attempt 1: WouldBlock. Attempt 2 (no script): accept the whole frame.
+        let mut w = StepWriter::new(vec![0]);
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("s1"),
+            StepOutcome::WouldBlock
+        );
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("s2"),
+            StepOutcome::WroteWhole
+        );
+        assert_eq!(
+            st.resume_cycles(),
+            1,
+            "the frame-completing write after a no-byte step is a resume cycle"
+        );
+    }
+
+    /// Progressing partials with no no-byte step between them count nothing: the pump's
+    /// anti-vacuous guard, mirroring the blocking loop's "no wait in between" rule.
+    #[test]
+    fn consecutive_progressing_steps_count_no_cycle() {
+        let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let now = Instant::now;
+        let mut st = FrameWriteState::begin(&frame, &mut buf, now).expect("begin");
+        // Three accepting attempts in a row, the last (no script) finishing the frame.
+        let mut w = StepWriter::new(vec![10, 10]);
+        for label in ["s1", "s2"] {
+            assert_eq!(
+                st.step_writable(&mut w, &buf, now).expect(label),
+                StepOutcome::WrotePartial
+            );
+        }
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("s3"),
+            StepOutcome::WroteWhole
+        );
+        assert_eq!(
+            st.resume_cycles(),
+            0,
+            "no step was ever refused a byte, so no resume cycle was ever armed"
+        );
+    }
+
+    /// Two separate wait-then-progress events on one frame count twice: no-byte step,
+    /// partial, no-byte step, then the frame-completing write.
+    #[test]
+    fn two_no_byte_steps_each_followed_by_progress_count_twice() {
+        let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let now = Instant::now;
+        let mut st = FrameWriteState::begin(&frame, &mut buf, now).expect("begin");
+        // WouldBlock, partial(9), WouldBlock, then (no script) finish.
+        let mut w = StepWriter::new(vec![0, 9, 0]);
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("s1"),
+            StepOutcome::WouldBlock
+        );
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("s2"),
+            StepOutcome::WrotePartial
+        );
+        assert_eq!(st.resume_cycles(), 1, "first wait-then-progress event");
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("s3"),
+            StepOutcome::WouldBlock
+        );
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("s4"),
+            StepOutcome::WroteWhole
+        );
+        assert_eq!(
+            st.resume_cycles(),
+            2,
+            "the completing write converts the second armed cycle"
         );
     }
 
@@ -1966,9 +2060,12 @@ mod cross_iteration_tests {
         let out = st.step_writable(&mut w, &buf, now).expect("finishing step");
         assert_eq!(out, StepOutcome::WroteWhole);
         assert_eq!(st.written(), n);
-        assert!(
-            (st.resume_cycles() as usize) >= edges,
-            "every progressing attempt counts as a resume cycle (≥{edges}); got {}",
+        assert_eq!(
+            st.resume_cycles(),
+            0,
+            "every attempt here accepted bytes, with no no-byte step between them, so \
+             nothing armed a resume cycle — this case pins the budget re-arm, not the \
+             counter (the counter's own cases live below); got {}",
             st.resume_cycles()
         );
     }
@@ -2253,7 +2350,9 @@ mod cross_iteration_tests {
     }
 
     /// The mid-tail-dead error string embeds the frame post-mortem — the enriched message
-    /// that reaches the device log via the streamer warn's `{:?}` (delta-2 §5 D1).
+    /// that reaches the device log via the streamer warn's `{:?}`.  `resumes=0` is pinned,
+    /// not merely present: the accepted prefix precedes any no-byte step here, so nothing
+    /// ever armed the pending flag and the counter must report zero on this shape.
     #[test]
     fn mid_tail_dead_error_embeds_post_mortem() {
         let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
@@ -2280,7 +2379,7 @@ mod cross_iteration_tests {
         let msg = err.to_string();
         for needle in [
             "written=6/",
-            "resumes=",
+            "resumes=0",
             "attempts=",
             "would_blocks=",
             "elapsed_ms=",
@@ -2290,6 +2389,50 @@ mod cross_iteration_tests {
                 "post-mortem must embed `{needle}`; got: {msg}"
             );
         }
+    }
+
+    /// The complementary post-mortem shape: a no-byte step *precedes* the partial, so the
+    /// pending flag is armed when the partial lands and the counter converts once —
+    /// `resumes=1`.  Together with the `resumes=0` sibling above this pins both ends of the
+    /// field's meaning, so the forensic counter block cannot start reporting a constant (or
+    /// a double count) with the suite green.
+    #[test]
+    fn mid_tail_dead_error_post_mortem_counts_resume_before_partial() {
+        let frame = audio_frame(AUDIO_SAMPLES_PER_FRAME);
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let base = Instant::now();
+        let clock = Cell::new(base);
+        let now = || clock.get();
+        let mut st = FrameWriteState::begin(&frame, &mut buf, now).expect("begin");
+        // WouldBlock (arms), accept 6 (converts → resumes=1), WouldBlock; then the budget
+        // elapses with the cursor stuck at 6.
+        let mut w = StepWriter::new(vec![0, 6, 0]);
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("wouldblock"),
+            StepOutcome::WouldBlock
+        );
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("partial"),
+            StepOutcome::WrotePartial
+        );
+        assert_eq!(
+            st.step_writable(&mut w, &buf, now).expect("wouldblock"),
+            StepOutcome::WouldBlock
+        );
+        clock.set(base + Duration::from_millis(WRITE_TIMEOUT_MS + 1));
+        let verdict = st
+            .check_deadlines(now)
+            .expect("budget elapsed mid-tail → terminal");
+        let err = verdict.expect_err("written>0 at budget elapse is fatal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resumes=1"),
+            "a no-byte step before the partial converts exactly one resume cycle; got: {msg}"
+        );
+        assert!(
+            msg.contains("written=6/"),
+            "post-mortem must embed the stuck cursor; got: {msg}"
+        );
     }
 
     /// The mid-tail-dead post-mortem counter block survives the log transport's 200-byte
@@ -2315,7 +2458,8 @@ mod cross_iteration_tests {
         // short id, so the cap check reflects a long-lived device.
         let warn_line = format!(
             "streamer: outbound write ceiling/budget elapsed mid-tail (seg {}): {:?} — dropping segment, clearing socket",
-            u32::MAX, err,
+            u32::MAX,
+            err,
         );
         let close = warn_line
             .find(']')

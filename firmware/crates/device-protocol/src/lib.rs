@@ -62,14 +62,13 @@ pub const REGISTERED_TESTS: &[TestName] = &[
     TestName::I2sWaveformSanity,
     TestName::WifiAssociate,
     TestName::UdpRoundtrip,
-    TestName::TcpRoundtrip,
     TestName::TlsReachability,
     TestName::WifiScan,
     TestName::Xvf3800SpEnergy,
     TestName::WifiReassociation,
     TestName::GatewayProbeGate,
-    TestName::TcpInboundFrames,
-    TestName::TcpSendBackpressure,
+    TestName::TlsInboundFrames,
+    TestName::TlsSendBackpressure,
     TestName::SpeakerOutput,
     TestName::AmpAlwaysOnGpoInert,
     TestName::CapturePeriodicLine,
@@ -79,41 +78,42 @@ pub const REGISTERED_TESTS: &[TestName] = &[
     TestName::StreamRealtimeDuplex,
     TestName::PsramIdentity,
     TestName::WifiPowerSaveCheck,
-    TestName::TcpInboundBackpressure,
+    TestName::TlsInboundBackpressure,
     TestName::TlsPskHandshake,
     TestName::TlsPskWrongKeyRejected,
 ];
 
-// ── `TcpInboundFrames` drain-budget tuning constants ──────────────────────────
+// ── `TlsInboundFrames` drain-budget tuning constants ──────────────────────────
 //
 // **Tuning constants, NOT wire/serde schema.** Unlike `MAX_TESTS` / `REGISTERED_TESTS`
 // above (which are part of the wire contract and must never decrease), these three
 // values carry no serialization role: they bound how long the device's
-// `run_tcp_inbound_frames` handler waits before producing a `TestReport`. They live
+// `run_tls_inbound_frames` handler waits before producing a `TestReport`. They live
 // here so the device firmware *and* the host-side budget-invariant test reference a
 // single source (mirroring the `REGISTERED_TESTS` single-source-of-truth pattern).
 //
 // They are plain integer seconds / counts, **not** `core::time::Duration` — this crate
 // is `#![cfg_attr(not(test), no_std)]` and references no `Duration`/`std::time`. The
 // device wraps them in `Duration::from_secs(...)` at the call sites; the host invariant
-// test does plain integer arithmetic against `test_timeout(TcpInboundFrames).as_secs()`.
+// test does plain integer arithmetic against `test_timeout(TlsInboundFrames).as_secs()`.
 //
 // **Invariant the host test asserts** (a conservative upper bound on the true device
 // worst case, which is `max(connect, retries × read)` since connect and drain are on
 // mutually exclusive paths):
 //
 //   MAX_IDLE_RETRIES × INBOUND_READ_TIMEOUT_SECS + INBOUND_CONNECT_TIMEOUT_SECS
-//       < host test_timeout(TcpInboundFrames) − serial-round-trip margin
+//       + TLS_HANDSHAKE_TIMEOUT_SECS
+//       < host test_timeout(TlsInboundFrames) − serial-round-trip margin
 //
 // The device's post-connect worst case (idle fail-fast) must land comfortably below the
 // host's RunTest budget so the host always sees a typed `TestReport` rather than a silent
-// "device not responding" hang (see design-hil-tcpinbound-fix.md §2.1).
+// "device not responding" hang.
 
-/// Per-read blocking timeout (seconds) for the `TcpInboundFrames` drain loop.
+/// Per-read blocking timeout (seconds) for the `TlsInboundFrames` drain loop.
 /// Tuning constant, no wire/serde role. See the section comment above.
 pub const INBOUND_READ_TIMEOUT_SECS: u64 = 2;
 
-/// Connect timeout (seconds) for the `TcpInboundFrames` dedicated TCP connection.
+/// Connect timeout (seconds) for the `TlsInboundFrames` dedicated connection.
 /// Pulled under the host RunTest budget so even a reachable-but-slow connect surfaces as
 /// a typed Fail rather than a host-side "not responding."
 /// Tuning constant, no wire/serde role. See the section comment above.
@@ -127,11 +127,47 @@ pub const MAX_IDLE_RETRIES: u32 = 3;
 
 /// Device-side wall-clock cap (seconds, connect excluded) for the whole
 /// `run_tcp_inbound_backpressure` flood drain. Sized ≥ 2× the expected drain-bound
-/// duration (inbound-backpressure-hil design §2.4): the flood is drain-bound at ~6 s,
-/// so 20 s leaves ample margin while still failing typed well inside the host's
-/// `TcpInboundBackpressure` RunTest budget. Tuning constant, no wire/serde role. See
+/// duration (the flood is drain-bound at ~6 s), so 20 s leaves ample margin while
+/// still failing typed well inside the host's
+/// `TlsInboundBackpressure` RunTest budget. Tuning constant, no wire/serde role. See
 /// the section comment above.
 pub const INBOUND_BP_DEADLINE_SECS: u64 = 20;
+
+/// Device-side wall-clock cap (seconds) on a TLS handshake, charged after TCP
+/// connect completes. Every TLS-carrying self-test costs up to this much beyond
+/// its connect budget, so the host timeout-budget invariants add it as a term.
+/// Canonical source: the device's `tls_link::HANDSHAKE_TIMEOUT` is derived from
+/// this constant so the two cannot drift. Tuning constant, no wire/serde role.
+pub const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 3;
+
+/// TCP connect budget (seconds) for the TLS-PSK self-tests, charged before any TLS is
+/// spoken.
+///
+/// Sized against lwIP's SYN retransmission, not against a healthy LAN RTT: the initial
+/// RTO is 1500 ms on a 500 ms slow timer, so the first retransmit of a lost SYN fires
+/// 1.0-1.5 s after the connect, and `SYN_SENT` does not double the RTO, so later ones
+/// follow at ~1.5 s. A 2 s budget therefore covers exactly one recovery attempt, which a
+/// single correlated loss burst exhausts; 10 s covers about six.
+///
+/// Scope: `TlsPskHandshake`, `TlsPskWrongKeyRejected` (both its reachability pre-probe
+/// and its connect), `TlsSendBackpressure`, `PollReadinessBidir`, and
+/// `StreamRealtimeDuplex`. The inbound pair (`TlsInboundFrames`,
+/// `TlsInboundBackpressure`) deliberately keeps its own, tighter
+/// `INBOUND_CONNECT_TIMEOUT_SECS`, so a retune here does not move those two.
+///
+/// This is transport plumbing, not an assertion — the handshake, echo, and rejection
+/// deadlines are separate. It lives here, not in the device crate, so the host-side
+/// budget-invariant tests can charge it against `test_timeout(...)`.
+///
+/// TODO(tls-psk-connect-budget-attribution): the raise from 2 s rests on inference.
+/// Tuning constant, no wire/serde role.
+pub const TLS_PSK_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Wall-clock budget (seconds) for the `TlsPskHandshake` echo round-trip through the
+/// tunnel, charged from after the handshake completes so a slow connect cannot eat it.
+/// Generous against a LAN turnaround so a failure names the echo, not a tight budget.
+/// Tuning constant, no wire/serde role.
+pub const TLS_PSK_ECHO_TIMEOUT_SECS: u64 = 5;
 
 // ── Top-level frame types ─────────────────────────────────────────────────────
 
@@ -171,40 +207,39 @@ pub enum Command {
         ssid: heapless::String<32>,
         passphrase: heapless::String<64>,
     },
-    /// Provision the HIL-host echo-server peer address and ports into device NVS
-    /// (discriminant 2). The device reads these at test time to locate the UDP/TCP
-    /// echo servers and the TLS target.
+    /// Apply a RAM-only HIL session peer config, bypassing NVS (discriminant 2).
     ///
-    /// - `host`: HIL-host LAN IP for UDP/TCP echo (4-byte big-endian octets).
+    /// Stored in the device's HIL session slot — never written to flash. A power cycle
+    /// discards it; overwriting an existing config is allowed (last write wins). There
+    /// is no clear command: a stale RAM peer config points only at dead HIL listeners
+    /// that no production path reads, and a reboot clears it. The device reads these at
+    /// test time to locate the UDP echo server, the fixture listeners, and the TLS
+    /// target.
+    ///
+    /// - `host`: HIL-host LAN IP for UDP echo + fixture listeners (4-byte big-endian
+    ///   octets).
     /// - `udp_port`: UDP echo port.
-    /// - `tcp_port`: TCP echo port.
     /// - `tls_host`: Public-IP TLS endpoint (4-byte big-endian octets, NOT the HIL host).
     /// - `tls_port`: TLS endpoint port.
     /// - `inbound_frames_port`: TCP port of the audio-frame source server for the
-    ///   `TcpInboundFrames` self-test. The host IP is the same as `host`. Stored in
-    ///   NVS as `peer_inb_tcp` (u16).
+    ///   `TlsInboundFrames` self-test. The host IP is the same as `host`.
     /// - `backpressure_port`: TCP port of the backpressure source server for the
-    ///   `TcpSendBackpressure` self-test (the server withholds reads so the device
-    ///   send buffer fills). The host IP is the same as `host`. Stored in NVS as
-    ///   `peer_bp_tcp` (u16).
+    ///   `TlsSendBackpressure` self-test (the server withholds reads so the device
+    ///   send buffer fills). The host IP is the same as `host`.
     /// - `poll_readiness_port`: TCP port of the poll-readiness adversary server for the
     ///   `PollReadinessBidir` self-test (the server queues inbound bytes so the device can
     ///   prove `poll(POLLIN)` readiness on real lwIP). The host IP is the same as `host`.
-    ///   Stored in NVS as `peer_poll_tcp` (u16).
     /// - `rtd_port`: TCP port of the `StreamRealtimeDuplex` listener server for the
     ///   `StreamRealtimeDuplex` self-test (the device connects and streams a synthetic
     ///   segment so the host can time the drain). The host IP is the same as `host`.
-    ///   Stored in NVS as `peer_rtd_tcp` (u16).
     /// - `tls_psk_port`: TCP port of the TLS-PSK listener holding this pod's real
     ///   audio-link key, for the `TlsPskHandshake` self-test. The host IP is the same as
-    ///   `host`. Stored in NVS as `peer_psk_tcp` (u16).
+    ///   `host`.
     /// - `tls_psk_bad_port`: TCP port of the TLS-PSK listener holding a *different* key
-    ///   for the same identity, for the `TlsPskWrongKeyRejected` self-test. Stored in NVS
-    ///   as `peer_pskbad_tcp` (u16).
-    ProvisionPeer {
+    ///   for the same identity, for the `TlsPskWrongKeyRejected` self-test.
+    SetTemporaryPeerConfig {
         host: [u8; 4],
         udp_port: u16,
-        tcp_port: u16,
         tls_host: [u8; 4],
         tls_port: u16,
         inbound_frames_port: u16,
@@ -217,8 +252,8 @@ pub enum Command {
     /// Provision the audio receiver address and port into device NVS (discriminant 3).
     ///
     /// Written to the `"wifi"` NVS namespace as `audio_ip` (4 bytes) and `audio_port`
-    /// (u16). Separate from `ProvisionPeer` so the echo self-tests (`TcpRoundtrip`,
-    /// `UdpRoundtrip`) are not disturbed. If unprovisioned, the audio streamer thread
+    /// (u16). Separate from `SetTemporaryPeerConfig` so the `UdpRoundtrip` echo
+    /// self-test is not disturbed. If unprovisioned, the audio streamer thread
     /// logs once and parks; all other device behavior is unaffected.
     ///
     /// - `host`: Audio receiver LAN IP (4-byte big-endian octets).
@@ -302,6 +337,29 @@ pub enum Command {
     /// device presents as the TLS PSK identity, so the provisioning host needs it to
     /// write its own `pod_id → key` table entry, and it is authoritative only here.
     ProvisionAudioPsk { key: [u8; 32] },
+    /// Apply a RAM-only audio-link PSK override, bypassing NVS (discriminant 10).
+    ///
+    /// Stores `key` in the device's HIL session slot — never written to flash. Takes
+    /// effect on the streamer's next connect and on every audio-PSK consumer through a
+    /// single accessor; a power cycle or [`Command::ClearTemporaryAudioPsk`] reverts to
+    /// the persisted (NVS) key. Overwriting an existing override is allowed (last write
+    /// wins); the previous key bytes are zeroized on overwrite.
+    ///
+    /// Precedence mirrors [`Command::SetTemporaryWifiConfig`]: while set it wins over
+    /// NVS unconditionally, including over a [`Command::ProvisionAudioPsk`] that lands
+    /// while it is active.
+    ///
+    /// Fails with [`Status::Fail`] and stores nothing if the pod identity is not yet
+    /// available (the response carries [`Payload::PodId`] and the identity is
+    /// authoritative only on-device, so there is nothing useful to do without it). The
+    /// key is never echoed.
+    SetTemporaryAudioPsk { key: [u8; 32] },
+    /// Clear the RAM-only audio-link PSK override, if any (discriminant 11).
+    ///
+    /// Zeroizes and drops the slot; the streamer reverts to the persisted (NVS) key on
+    /// its next connect. A clear with no override active is a pure no-op returning
+    /// [`Status::Ok`], mirroring [`Command::ClearTemporaryWifiConfig`].
+    ClearTemporaryAudioPsk,
 }
 
 /// Registered self-test names. Using an enum (not a free string) makes registry
@@ -380,22 +438,18 @@ pub enum TestName {
     WifiAssociate,
     /// UDP round-trip self-test (discriminant 9).
     ///
-    /// Reads peer IP and UDP port from NVS (`"wifi"` namespace), sends a fixed nonce,
-    /// and asserts the echoed reply byte-matches (requires `ProvisionPeer` first).
+    /// Reads peer IP and UDP port from the HIL session store, sends a fixed nonce,
+    /// and asserts the echoed reply byte-matches (requires `SetTemporaryPeerConfig`
+    /// first).
     UdpRoundtrip,
-    /// TCP round-trip self-test (discriminant 10).
+    /// TLS reachability proof self-test (discriminant 10).
     ///
-    /// Reads peer IP and TCP port from NVS, connects, writes a nonce, reads it back,
-    /// asserts byte-match (primary). Fallback: reads SSH banner prefix from pve00:22.
-    TcpRoundtrip,
-    /// TLS reachability proof self-test (discriminant 11).
-    ///
-    /// Reads TLS host IP and port from NVS, connects via `EspTls` with
-    /// `use_crt_bundle_attach: true` (verifies against ESP-IDF bundled public CA store;
-    /// `skip_common_name: true` since target is reached by literal IP).
-    /// Asserts handshake completes (AC-B5.1/B5.2).
+    /// Reads TLS host IP and port from the session peer config, connects via `EspTls`
+    /// with `use_crt_bundle_attach: true` (verifies against ESP-IDF bundled public CA
+    /// store; `skip_common_name: true` since target is reached by literal IP).
+    /// Asserts handshake completes.
     TlsReachability,
-    /// WiFi credential-less radio + AP scan self-test (discriminant 12).
+    /// WiFi credential-less radio + AP scan self-test (discriminant 11).
     ///
     /// Starts the WiFi radio (`wifi.start()`) without any credentials or association,
     /// performs a passive AP scan, and asserts at least one AP is found.
@@ -406,7 +460,7 @@ pub enum TestName {
     /// discovery, not an auto-pass. Requires no NVS credentials; runs on a factory-fresh
     /// device.
     WifiScan,
-    /// XVF3800 SPENERGY plausibility self-test — assertion-as-probe (discriminant 13).
+    /// XVF3800 SPENERGY plausibility self-test — assertion-as-probe (discriminant 12).
     ///
     /// Reads `AEC_SPENERGY_VALUES` (resid=33, cmd=80, 4×f32 LE, 17 bytes) via
     /// `xvf3800_control_read`. Mirrors `Xvf3800DoAPlausibility` in structure.
@@ -420,7 +474,7 @@ pub enum TestName {
     /// requiring human review before pinning as accepted truth (bring-up guardrail).
     /// Source: design §2.5.
     Xvf3800SpEnergy,
-    /// WiFi re-association after forced drop (discriminant 14).
+    /// WiFi re-association after forced drop (discriminant 13).
     ///
     /// Asserts the WiFi supervisor autonomously re-associates after a controlled
     /// disconnect. The test:
@@ -439,12 +493,12 @@ pub enum TestName {
     /// frames during the test, observable on the host. The host-side eval asserts
     /// both the typed report and those log lines.
     WifiReassociation,
-    /// Gateway-reachability probe gate self-test (discriminant 15).
+    /// Gateway-reachability probe gate self-test (discriminant 14).
     ///
     /// Validates the gateway-probe decision logic in both directions by calling
     /// `ping_reachable` (the same inner probe used by the production supervisor)
-    /// against a provisioned target IP (`peer_ip` NVS blob written by `ProvisionPeer`),
-    /// rather than the live default gateway:
+    /// against a session-provided target IP (the `peer` config set by
+    /// `SetTemporaryPeerConfig`), rather than the live default gateway:
     ///
     ///   - **Reachable half:** device calls `ping_reachable(peer_ip, index)` where
     ///     `peer_ip` is the host's own (reachable) IP. Returns
@@ -454,31 +508,31 @@ pub enum TestName {
     ///     `blackhole_ip` is an unused-but-routable subnet IP (no host answers, so all
     ///     echoes time out). Returns `"PASS probe=unreachable reassociated=true ip=… gw=…"`.
     ///
-    /// The host provisions the blackhole address as a second `ProvisionPeer` call before
-    /// invoking the unreachable half. The two halves run as sequential sub-steps within
-    /// a single `TestName::GatewayProbeGate` dispatch.
-    ///
-    /// Design: docs/adr/2026/06/16-wifi-gateway-reachability-gate/design.md §4.
+    /// The device derives the blackhole address itself from its own subnet (no
+    /// second peer-config push is sent). The two halves run as sequential
+    /// sub-steps within a single `TestName::GatewayProbeGate` dispatch.
     GatewayProbeGate,
-    /// TCP inbound-frames self-test (discriminant 16).
+    /// TLS-PSK inbound-frames self-test (discriminant 15).
     ///
-    /// Opens a dedicated TCP connection to the HIL-host audio-frame source server
-    /// (provisioned via `ProvisionPeer` → `peer_ip` + `peer_inbound_tcp` NVS keys).
-    /// The server sends a fixed number of `StreamFrame::Audio` frames using the shared
+    /// Opens a dedicated TLS-PSK connection to the HIL-host audio-frame source server
+    /// (located via the `peer` config set by `SetTemporaryPeerConfig` →
+    /// `inbound_frames_port`, keyed by the session audio PSK). The server sends a fixed
+    /// number of `StreamFrame::Audio` frames inside the tunnel using the shared
     /// `encode_frame` codec. The device reads them via `drain_inbound` (the same
     /// reassembly/decode path used by the streamer's inbound drain), asserts it received
-    /// exactly the expected count, and returns `TestData::TcpInboundFrames`.
+    /// exactly the expected count, and returns `TestData::TlsInboundFrames`.
     ///
     /// This test exercises the inbound framing/decode path on a dedicated connection,
     /// independent of the VAD-driven streamer. The concurrent capture-write + inbound-drain
     /// interleaving on the streamer's live socket is not covered here.
     ///
     /// Design: docs/adr/2026/06/17-audio-output-fullduplex/design.md §6.
-    TcpInboundFrames,
-    /// TCP send-backpressure self-test (discriminant 17).
+    TlsInboundFrames,
+    /// TLS-PSK send-backpressure self-test (discriminant 16).
     ///
-    /// Opens a dedicated TCP connection to the HIL-host *backpressure* source server
-    /// (provisioned via `ProvisionPeer` → `peer_ip` + `peer_bp_tcp` NVS keys), puts
+    /// Opens a dedicated TLS-PSK connection to the HIL-host *backpressure* source server
+    /// (located via the `peer` config set by `SetTemporaryPeerConfig` →
+    /// `backpressure_port`, keyed by the session audio PSK), puts
     /// the socket into non-blocking mode (mirroring the streamer), and sends
     /// `StreamFrame::Audio` frames through the production `send_frame_bp` path. The
     /// server deliberately withholds reads after accepting, so the device send buffer
@@ -490,7 +544,7 @@ pub enum TestName {
     /// (`Sent`/`BackpressureAligned`, **never** a fatal `Err`); the bounded wait
     /// actually *waited* (elapsed on the order of the `WRITE_TIMEOUT_MS` budget when
     /// reads are withheld, not a near-instant spin); and the connection is still
-    /// usable once the server resumes reading. Returns `TestData::TcpSendBackpressure`;
+    /// usable once the server resumes reading. Returns `TestData::TlsSendBackpressure`;
     /// the host-side eval enforces the same.
     ///
     /// Per CLAUDE.md bring-up doctrine the first observed timing/outcome gets human
@@ -499,8 +553,8 @@ pub enum TestName {
     /// the streamer's own socket is not covered here.
     ///
     /// Design: docs/adr/2026/06/17-audio-output-fullduplex/design-streamer-backpressure.md §6.
-    TcpSendBackpressure,
-    /// Speaker output (playback) bring-up self-test (discriminant 18).
+    TlsSendBackpressure,
+    /// Speaker output (playback) bring-up self-test (discriminant 17).
     ///
     /// Synthesizes a 440 Hz sine tone on-device and pushes it through the full TX chain:
     /// I2S0 TX (GPIO44 DOUT) → XVF3800 → AIC3104 codec → TPA3139D2 amplifier → speaker.
@@ -521,7 +575,7 @@ pub enum TestName {
     ///
     /// Design: docs/adr/2026/06/20-audio-output-speaker-bringup/design.md §2.7.
     SpeakerOutput,
-    /// Amp always-on / GPO-inert regression guard (discriminant 19).
+    /// Amp always-on / GPO-inert regression guard (discriminant 18).
     ///
     /// Does **not** toggle the amp (impossible on this board — the TPA3139D2 is always-on
     /// hardware and not software-gateable). It asserts the *observable* inert reality so the
@@ -540,7 +594,7 @@ pub enum TestName {
     ///
     /// Design: docs/adr/2026/06/21-audio-output-clean-shutdown/design-realfix.md §2.4.
     AmpAlwaysOnGpoInert,
-    /// Capture-thread periodic-summary-line observability regression guard (discriminant 20).
+    /// Capture-thread periodic-summary-line observability regression guard (discriminant 19).
     ///
     /// Drives inbound audio through the **production** playback path (the device builds an
     /// `I2sStreamSink` wired to the same inbound PCM ring the live streamer uses, and
@@ -559,7 +613,7 @@ pub enum TestName {
     ///
     /// Design: docs/adr/2026/06/22-audio-pipeline-observability/design.md §5.
     CapturePeriodicLine,
-    /// Playback drain-rate discrimination self-test (discriminant 21).
+    /// Playback drain-rate discrimination self-test (discriminant 20).
     ///
     /// A numeric-bound timing/identity guard (kept SEPARATE from the `CapturePeriodicLine`
     /// presence/cadence guard, per CLAUDE.md "do not fold identity into presence"). It drives a
@@ -589,18 +643,21 @@ pub enum TestName {
     ///
     /// Design: docs/adr/2026/06/23-audio-consumer-throughput-stutter/design.md §2.
     PlaybackDrainRate,
-    /// Bidirectional `poll()` readiness bring-up self-test (discriminant 22).
+    /// Bidirectional `poll()` readiness bring-up self-test (discriminant 21).
     ///
     /// The gating failing-assert-first proof that `poll(fd, POLLIN|POLLOUT, timeout)`
     /// reports per-direction readiness correctly on *this* lwIP/VFS firmware — the single
     /// platform fact the entire audio I/O event-loop architecture rests on
     /// (event-loop design §4 test #1, §5 risk #1). `set_nonblocking`/`poll(POLLOUT)` are
-    /// already exercised by `TcpSendBackpressure`; `poll(POLLIN)` has **never** been
+    /// already exercised by `TlsSendBackpressure`; `poll(POLLIN)` has **never** been
     /// exercised in any production path and is unproven. This test exercises it.
     ///
-    /// Opens a dedicated TCP connection to the HIL-host *poll-readiness* adversary server
-    /// (provisioned via `ProvisionPeer` → `peer_ip` + `peer_poll_tcp` NVS keys), flips the
-    /// socket non-blocking (mirroring the streamer), and asserts on real lwIP:
+    /// The transport is TLS-PSK: the adversary's queued bytes arrive as TLS records, so
+    /// `poll(POLLIN)` readiness is proven against the same buffered-plaintext discipline
+    /// production runs. Opens a dedicated TLS-PSK connection to the HIL-host
+    /// *poll-readiness* adversary server (located via the `peer` config set by
+    /// `SetTemporaryPeerConfig` → `poll_readiness_port`, keyed by the session audio PSK),
+    /// flips the socket non-blocking (mirroring the streamer), and asserts on real lwIP:
     ///   - With the host having queued inbound bytes, `poll` reports **POLLIN** (and the
     ///     bytes then `read()` non-blocking) — the never-before-exercised readiness path.
     ///   - With the TX buffer holding room, `poll` reports **POLLOUT**.
@@ -611,11 +668,12 @@ pub enum TestName {
     /// allowed to FAIL first: the failure output is the proof that `POLLIN` readiness works
     /// on this firmware (or the discovery that it does not, which kills the event-loop
     /// design before any production cutover). Returns `TestData::PollReadiness`; the
-    /// host-side eval enforces the same. Requires prior `WifiAssociate` and `ProvisionPeer`.
+    /// host-side eval enforces the same. Requires prior `WifiAssociate` and
+    /// `SetTemporaryPeerConfig`.
     ///
     /// Design: docs/adr/2026/06/24-audio-io-architecture/design-event-loop.md §4 test #1.
     PollReadinessBidir,
-    /// Full-duplex mic-RX integrity under playback self-test (discriminant 23).
+    /// Full-duplex mic-RX integrity under playback self-test (discriminant 22).
     ///
     /// The direct regression guard that splitting TX from RX servicing (NON_BLOCK TX +
     /// core-1 pinning) eliminated the mic-capture starvation the root-cause analysis found:
@@ -638,22 +696,25 @@ pub enum TestName {
     ///
     /// Design: docs/adr/2026/07/01-host-to-device-dropout/design.md §5 (`FullDuplexRxIntegrity`).
     FullDuplexRxIntegrity,
-    /// Streamer real-time duplex drain self-test (discriminant 24).
+    /// Streamer real-time duplex drain self-test (discriminant 23).
     ///
     /// The throughput/keep-up regression guard for the outbound streamer path (and, once
     /// Scenario B lands, the socket→sink playback path). The device drives the extracted
     /// `run_segment` drain loop against a test-owned capture ring and a synthetic producer
-    /// thread, connecting to the HIL-host `StreamRealtimeDuplex` listener (provisioned via
-    /// `ProvisionPeer` → `peer_ip` + `peer_rtd_tcp` NVS keys). The host times how fast the
-    /// pre-roll burst drains and asserts the streamer keeps up with real time.
+    /// thread, connecting over TLS-PSK to the HIL-host `StreamRealtimeDuplex` listener
+    /// (located via the `peer` config set by `SetTemporaryPeerConfig` → `rtd_port`, keyed
+    /// by the session audio PSK). The transport is TLS-PSK, so the drain is measured
+    /// reading from the `SslStream` and the handshake time is excluded from the
+    /// streaming-phase measurement. The host times how fast the pre-roll burst drains and
+    /// asserts the streamer keeps up with real time.
     ///
     /// Written per CLAUDE.md §"Hardware Bring-Up" to ASSERT the expected behavior and be
     /// allowed to FAIL first against the current one-action-per-wake loop: the recorded
     /// burst wall time is the discovery. Returns `TestData::Rtd`;
     /// the host-side eval owns the burst-drain and catch-up bounds. Requires prior
-    /// `WifiAssociate` and `ProvisionPeer`.
+    /// `WifiAssociate` and `SetTemporaryPeerConfig`.
     StreamRealtimeDuplex,
-    /// PSRAM presence + identity self-test (discriminant 25).
+    /// PSRAM presence + identity self-test (discriminant 24).
     ///
     /// Asserts the on-module octal PSRAM initialized and reads its size, per the
     /// CLAUDE.md bring-up doctrine: presence (`esp_psram_is_initialized()`) and identity
@@ -663,7 +724,7 @@ pub enum TestName {
     /// identity are asserted in the same handler but reported distinctly so a failure
     /// classifies itself.
     PsramIdentity,
-    /// WiFi modem power-save identity self-test (discriminant 26).
+    /// WiFi modem power-save identity self-test (discriminant 25).
     ///
     /// Reads `esp_wifi_get_ps` back after `ensure_wifi_started` (the start path that
     /// forces `WIFI_PS_NONE`) and asserts the radio is in `WIFI_PS_NONE`. Modem power
@@ -673,11 +734,13 @@ pub enum TestName {
     /// not a bool, so an unexpected reading is visible verbatim per bring-up doctrine.
     /// Requires no NVS credentials — a started radio suffices, like `WifiScan`.
     WifiPowerSaveCheck,
-    /// TCP inbound-backpressure self-test (discriminant 27).
+    /// TLS-PSK inbound-backpressure self-test (discriminant 26).
     ///
-    /// Connects to the HIL-host inbound-frames source (provisioned via `ProvisionPeer` →
-    /// `peer_ip` + `peer_inb_tcp` NVS keys), selects the flood profile with an in-band
-    /// selector byte (`b'F'`), and drains an unpaced over-capacity Audio flood through the
+    /// Connects over TLS-PSK to the HIL-host inbound-frames source (located via the
+    /// `peer` config set by `SetTemporaryPeerConfig` → `inbound_frames_port`, keyed by the
+    /// session audio PSK), selects the flood profile with an in-band selector byte
+    /// (`b'F'`) inside the tunnel, and drains an unpaced over-capacity Audio flood
+    /// (backing up through the mbedTLS record layer) through the
     /// **production** socket → `drain_inbound` → ring path (a `StallCountingSink` wrapping
     /// `build_inbound_stream_sink()`'s `I2sStreamSink`) while the real capture thread drains
     /// at real time. Asserts `full_stalls > 0` (the socket-level accumulator-full read-skip
@@ -687,28 +750,39 @@ pub enum TestName {
     /// existing test reaches on hardware: every in-repo producer that drives the real
     /// socket path paces at real time and never fills the ring off-socket.
     ///
-    /// Returns `TestData::TcpInboundBackpressure`; the host-side eval enforces the same.
-    /// Requires prior `WifiAssociate` and `ProvisionPeer`.
-    TcpInboundBackpressure,
-    /// TLS-PSK handshake proof over the production audio-link client (discriminant 28).
+    /// Returns `TestData::TlsInboundBackpressure`; the host-side eval enforces the same.
+    /// Requires prior `WifiAssociate` and `SetTemporaryPeerConfig`.
     ///
-    /// Reads the audio-link key (`audio_psk`, written by [`Command::ProvisionAudioPsk`])
-    /// and the host's TLS-PSK listener port (`peer_psk_tcp`) from NVS, then connects with
+    /// Side effect: returns with the inbound PCM ring near full, and that backlog drains
+    /// to the DAC in real time across subsequent tests' windows, interleaving
+    /// `capture: playback tx` summary lines and possibly a ring-emptied WARN with later
+    /// output. The tail is bounded by the ring (65 536 B = ~2.0 s of mono S16 at 16 kHz),
+    /// so nothing beyond that window belongs to it. Reading the interleave needs care in
+    /// both directions: summary lines are also emitted on an idle cadence, so a summary
+    /// line alone proves nothing about drain; the ring-emptied WARN with the DAC active is
+    /// the evidence that the backlog was actually playing out.
+    TlsInboundBackpressure,
+    /// TLS-PSK handshake proof over the production audio-link client (discriminant 27).
+    ///
+    /// Reads the effective audio-link key (the session override if set, else the NVS
+    /// `audio_psk`) and the host's TLS-PSK listener port (the `peer` config's
+    /// `tls_psk_port`) from the HIL session store, then connects with
     /// the same `tls_connect_psk` path the streamer uses. Asserts the handshake completes,
     /// reports the negotiated protocol version and ciphersuite for host-side assertion,
     /// and round-trips one echo payload through the tunnel.
     ///
     /// Returns `TestData::TlsPskHandshake`. An unexpected negotiated version or suite is a
     /// discovery requiring human review before the host-side expectation is adjusted
-    /// (bring-up guardrail). Requires prior `WifiAssociate`, `ProvisionPeer` and
-    /// `ProvisionAudioPsk`.
+    /// (bring-up guardrail). Requires prior `WifiAssociate`, `SetTemporaryPeerConfig` and
+    /// an effective audio PSK (`SetTemporaryAudioPsk` or a persisted `ProvisionAudioPsk`).
     TlsPskHandshake,
-    /// TLS-PSK identity-negative self-test (discriminant 29).
+    /// TLS-PSK identity-negative self-test (discriminant 28).
     ///
     /// Connects to the listener that holds a *different* key for this pod's identity
-    /// (`peer_pskbad_tcp`) and asserts the handshake fails — promptly, by a TLS alert
-    /// rather than by the deadline expiring. No application byte can cross, because a
-    /// failed handshake yields no stream to write to. Kept separate from
+    /// (the `peer` config's `tls_psk_bad_port`) and asserts the handshake fails —
+    /// promptly, by a TLS alert rather than by the deadline expiring. No application
+    /// byte can cross, because a failed handshake yields no stream to write to. Kept
+    /// separate from
     /// [`TestName::TlsPskHandshake`] per the presence-vs-identity doctrine: one
     /// proves the link works, this one proves the key is what makes it work.
     ///
@@ -884,6 +958,10 @@ pub enum TestData {
         peer_ip: [u8; 4],
         peer_port: u16,
     },
+    /// Retired alongside `TestName::TcpRoundtrip`; no producer remains. Kept
+    /// solely to pin the postcard discriminants of the variants declared after
+    /// it — `TestData` has no run-start set-equality guard, so removing it would
+    /// silently renumber those variants against a stale device image.
     TcpEcho {
         bytes: u32,
         peer_ip: [u8; 4],
@@ -893,12 +971,12 @@ pub enum TestData {
         peer_ip: [u8; 4],
         peer_port: u16,
     },
-    TcpInboundFrames {
+    TlsInboundFrames {
         inbound_frames: u32,
         peer_ip: [u8; 4],
         peer_port: u16,
     },
-    TcpSendBackpressure {
+    TlsSendBackpressure {
         a_resumed: bool,
         a_rc: u32,
         a_ru: bool,
@@ -959,7 +1037,7 @@ pub enum TestData {
         /// itself diagnostic.
         ps_mode: u32,
     },
-    TcpInboundBackpressure {
+    TlsInboundBackpressure {
         /// Total Audio frames the device decoded and routed to the sink on this
         /// connection. Must equal the host's flood size exactly.
         inbound_frames: u32,
@@ -972,8 +1050,9 @@ pub enum TestData {
     TlsPskHandshake {
         peer_ip: [u8; 4],
         peer_port: u16,
-        /// Wall-clock milliseconds from TCP connect to completed handshake (the
-        /// cold-connect latency the streamer pays once per connect).
+        /// Wall-clock milliseconds spent driving the handshake to completion,
+        /// charged from after the TCP connect so a retransmitting connect cannot
+        /// inflate it.
         handshake_ms: u32,
         /// Negotiated protocol version as mbedTLS spells it, e.g. `"TLSv1.2"`.
         version: TlsVersionStr,
@@ -1155,48 +1234,39 @@ pub fn test_report_fail_data(data: TestData, args: core::fmt::Arguments) -> (Sta
 
 /// Minimum acceptable free heap (bytes). This is the primary leak guard.
 ///
-/// The ~43.3 KB steady-state figure this floor was originally sized against predates the
-/// PSRAM migration (design-delta-13/14) and is now stale: `heap-gate-measure`
-/// (`docs/adr/2026/07/19-heap-gate-measure/implementation-log.md`) recorded post-PSRAM
-/// `free_heap` of 124_164-125_824 B (~121-123 KiB) with WiFi/lwIP streaming and the inbound
-/// PCM ring active, consistent with the post-PSRAM `min_heap` population independently
-/// baked in `rtd-heap-floor-rebake`. The 36 KB floor is unchanged and still sits well below
-/// every observed steady state.
+/// Observed steady-state `free_heap` is 124_164–125_824 B (~121–123 KiB) with WiFi/lwIP
+/// streaming and the inbound PCM ring active. The 36 KB floor sits well below every
+/// observed steady state.
 ///
-/// Since the 2026-07-19 heap-floor rebake, `HEAP_MIN_EVER_FLOOR` (53_248) sits
-/// *above* this floor. `min_heap` is a since-boot low watermark of `free_heap`,
-/// so `min_heap ≤ free_heap` always; `free_heap < HEAP_FREE_FLOOR` therefore
-/// implies `min_heap < HEAP_MIN_EVER_FLOOR` too. This floor's independent
-/// failure mode is dominated in practice — `evaluate_health` checks `min_heap`
-/// first so the more-informative (more-breached) failure is reported; this
-/// floor is retained for message specificity and pure-predicate coverage, not
-/// for independent detection.
+/// `HEAP_MIN_EVER_FLOOR` (24_576) sits below this floor. `min_heap` is a
+/// since-boot low watermark of `free_heap`, so `min_heap <= free_heap` always;
+/// a `free_heap < HEAP_FREE_FLOOR` breach does not imply
+/// `min_heap < HEAP_MIN_EVER_FLOOR`. This floor is an independent leak guard
+/// that can trip on its own — e.g. `free_heap = 35_000`, `min_heap = 28_000`
+/// breaches this floor while `min_heap` clears its own. `evaluate_health`
+/// checks `min_heap` first, so when both floors trip the deeper ratchet breach
+/// is the one reported.
 pub const HEAP_FREE_FLOOR: u32 = 36_864;
 
 /// Minimum acceptable lifetime-minimum free heap (bytes) — the since-boot
 /// low-watermark, which only ratchets down.
 ///
-/// Baked 2026-07-19 from five power-cycled cold-boot full-suite HIL runs at
-/// normal signal strength (`docs/adr/2026/07/19-rtd-heap-floor-rebake/run-record.md`),
-/// post-PSRAM-redesign: observed `mh_post` (the since-boot internal-RAM low
-/// watermark, which also gates the DeviceHealthCheck self-test that samples
-/// this same metric earlier in every suite run) ranged 76_008–78_564. Floor is
-/// the largest multiple of 4 KiB ≤ 0.75 × the observed minimum (76_008), with
-/// 25% headroom for run-to-run spread. Clean-link samples only (RSSI −60 to
-/// −67 dBm at RTD start) — the weak-signal/stressed-link condition was not
-/// measured; margin was not widened to compensate.
+/// Baked from power-cycled cold-boot full-suite HIL runs on real hardware.
+/// The floor is 24_576 (24 KiB), set roughly 6 KiB below the observed
+/// worst-case `min_heap_after` of 30_512 B — enough run-to-run margin to
+/// avoid false trips while still catching regressions.
 ///
 /// TODO(heap-floor-post-flash-boot-path-offset): baked exclusively on `POWERON`
 /// samples, but this floor also gates `DeviceHealthCheck` on every boot path
 /// including post-flash resets; a single post-flash sample measured 8 KB below the
 /// bake minimum. See `TODO.md` for the reconciliation plan.
 ///
-/// Triage rule for the unmeasured stressed-link condition (`design-delta-1.md` §1
-/// skipped the weak-signal sample; margin was not widened to compensate): a floor
+/// Triage rule for the unmeasured stressed-link condition (the weak-signal sample
+/// was skipped during baking; margin was not widened to compensate): a floor
 /// failure observed at RSSI ≤ −70 dBm at RTD/health-check start is presumed to be
 /// this unmeasured regime, not a regression, and requires a paired clean-link run
 /// before the floor itself is touched.
-pub const HEAP_MIN_EVER_FLOOR: u32 = 53_248;
+pub const HEAP_MIN_EVER_FLOOR: u32 = 24_576;
 
 /// Minimum acceptable stack high-water mark for the protocol loop task (bytes).
 /// `CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384` (sdkconfig.defaults). A floor of 1 KB
@@ -1227,9 +1297,10 @@ pub fn evaluate_health(
     tx_write_failures: u32,
 ) -> Option<(Status, Payload)> {
     // min_heap is checked before free_heap: since min_heap <= free_heap always
-    // (min_heap is a since-boot low watermark of free_heap), a free_heap breach
-    // never occurs without a min_heap breach at least as severe. Checking
-    // min_heap first surfaces the binding constraint's message.
+    // (min_heap is a since-boot low watermark of free_heap), when both floors
+    // trip min_heap is the deeper ratchet breach, so checking it first surfaces
+    // the binding constraint's message. free_heap can also trip on its own,
+    // since HEAP_MIN_EVER_FLOOR sits below HEAP_FREE_FLOOR.
     if min_heap < HEAP_MIN_EVER_FLOOR {
         return Some(test_report_fail_fmt(format_args!(
             "FAIL min_heap={min_heap}<{HEAP_MIN_EVER_FLOOR} heap_free={free_heap} stack_hwm={stack_hwm} tx_write_failures={tx_write_failures}"
@@ -1436,11 +1507,13 @@ mod tests {
     /// Postcard discriminants (id=0, Command::RunTest=discriminant 0):
     ///   TestName: Ping=0, Identify=1, GpioSelfTest=2, DeviceHealthCheck=3, I2cBusScan=4,
     ///   Xvf3800RegRead=5, Xvf3800DoAPlausibility=6, I2sWaveformSanity=7,
-    ///   WifiAssociate=8, UdpRoundtrip=9, TcpRoundtrip=10, TlsReachability=11, WifiScan=12,
-    ///   Xvf3800SpEnergy=13, WifiReassociation=14, GatewayProbeGate=15, TcpInboundFrames=16,
-    ///   TcpSendBackpressure=17, SpeakerOutput=18, AmpAlwaysOnGpoInert=19,
-    ///   CapturePeriodicLine=20, PlaybackDrainRate=21, PollReadinessBidir=22,
-    ///   FullDuplexRxIntegrity=23, StreamRealtimeDuplex=24, PsramIdentity=25
+    ///   WifiAssociate=8, UdpRoundtrip=9, TlsReachability=10, WifiScan=11,
+    ///   Xvf3800SpEnergy=12, WifiReassociation=13, GatewayProbeGate=14, TlsInboundFrames=15,
+    ///   TlsSendBackpressure=16, SpeakerOutput=17, AmpAlwaysOnGpoInert=18,
+    ///   CapturePeriodicLine=19, PlaybackDrainRate=20, PollReadinessBidir=21,
+    ///   FullDuplexRxIntegrity=22, StreamRealtimeDuplex=23, PsramIdentity=24,
+    ///   WifiPowerSaveCheck=25, TlsInboundBackpressure=26, TlsPskHandshake=27,
+    ///   TlsPskWrongKeyRejected=28
     ///
     /// Ping encodes to all-0x01 COBS bytes (before the 0x00 delimiter) because all three
     /// postcard bytes are 0x00 (id=0, cmd=0, testname=0), and COBS replaces each zero with
@@ -1448,9 +1521,9 @@ mod tests {
     /// testname discriminant, which COBS leaves in place and changes only the preceding
     /// chain pointer.
     ///
-    /// For discriminants 8–13, the testname varint encodes as a single byte (varint for
-    /// 8–127 is just the byte itself, high bit clear). The COBS encoding for these follows
-    /// the same pattern as 1–7.
+    /// For discriminants 1–127 the testname varint encodes as a single byte (high bit
+    /// clear), so the COBS encoding is `[0x01, 0x01, 0x02, disc, 0x00]` for every non-Ping
+    /// variant.
     #[test]
     fn request_run_test_golden_bytes_all_variants() {
         let cases: &[(TestName, &[u8])] = &[
@@ -1467,40 +1540,52 @@ mod tests {
             (TestName::I2sWaveformSanity, &[0x01, 0x01, 0x02, 0x07, 0x00]),
             (TestName::WifiAssociate, &[0x01, 0x01, 0x02, 0x08, 0x00]),
             (TestName::UdpRoundtrip, &[0x01, 0x01, 0x02, 0x09, 0x00]),
-            (TestName::TcpRoundtrip, &[0x01, 0x01, 0x02, 0x0a, 0x00]),
-            (TestName::TlsReachability, &[0x01, 0x01, 0x02, 0x0b, 0x00]),
-            (TestName::WifiScan, &[0x01, 0x01, 0x02, 0x0c, 0x00]),
-            (TestName::Xvf3800SpEnergy, &[0x01, 0x01, 0x02, 0x0d, 0x00]),
-            (TestName::WifiReassociation, &[0x01, 0x01, 0x02, 0x0e, 0x00]),
-            (TestName::GatewayProbeGate, &[0x01, 0x01, 0x02, 0x0f, 0x00]),
-            (TestName::TcpInboundFrames, &[0x01, 0x01, 0x02, 0x10, 0x00]),
+            (TestName::TlsReachability, &[0x01, 0x01, 0x02, 0x0a, 0x00]),
+            (TestName::WifiScan, &[0x01, 0x01, 0x02, 0x0b, 0x00]),
+            (TestName::Xvf3800SpEnergy, &[0x01, 0x01, 0x02, 0x0c, 0x00]),
+            (TestName::WifiReassociation, &[0x01, 0x01, 0x02, 0x0d, 0x00]),
+            (TestName::GatewayProbeGate, &[0x01, 0x01, 0x02, 0x0e, 0x00]),
+            (TestName::TlsInboundFrames, &[0x01, 0x01, 0x02, 0x0f, 0x00]),
             (
-                TestName::TcpSendBackpressure,
-                &[0x01, 0x01, 0x02, 0x11, 0x00],
+                TestName::TlsSendBackpressure,
+                &[0x01, 0x01, 0x02, 0x10, 0x00],
             ),
-            (TestName::SpeakerOutput, &[0x01, 0x01, 0x02, 0x12, 0x00]),
+            (TestName::SpeakerOutput, &[0x01, 0x01, 0x02, 0x11, 0x00]),
             (
                 TestName::AmpAlwaysOnGpoInert,
-                &[0x01, 0x01, 0x02, 0x13, 0x00],
+                &[0x01, 0x01, 0x02, 0x12, 0x00],
             ),
             (
                 TestName::CapturePeriodicLine,
-                &[0x01, 0x01, 0x02, 0x14, 0x00],
+                &[0x01, 0x01, 0x02, 0x13, 0x00],
             ),
-            (TestName::PlaybackDrainRate, &[0x01, 0x01, 0x02, 0x15, 0x00]),
+            (TestName::PlaybackDrainRate, &[0x01, 0x01, 0x02, 0x14, 0x00]),
             (
                 TestName::PollReadinessBidir,
-                &[0x01, 0x01, 0x02, 0x16, 0x00],
+                &[0x01, 0x01, 0x02, 0x15, 0x00],
             ),
             (
                 TestName::FullDuplexRxIntegrity,
-                &[0x01, 0x01, 0x02, 0x17, 0x00],
+                &[0x01, 0x01, 0x02, 0x16, 0x00],
             ),
             (
                 TestName::StreamRealtimeDuplex,
-                &[0x01, 0x01, 0x02, 0x18, 0x00],
+                &[0x01, 0x01, 0x02, 0x17, 0x00],
             ),
-            (TestName::PsramIdentity, &[0x01, 0x01, 0x02, 0x19, 0x00]),
+            (TestName::PsramIdentity, &[0x01, 0x01, 0x02, 0x18, 0x00]),
+            (
+                TestName::WifiPowerSaveCheck,
+                &[0x01, 0x01, 0x02, 0x19, 0x00],
+            ),
+            (
+                TestName::TlsInboundBackpressure,
+                &[0x01, 0x01, 0x02, 0x1a, 0x00],
+            ),
+            (TestName::TlsPskHandshake, &[0x01, 0x01, 0x02, 0x1b, 0x00]),
+            (
+                TestName::TlsPskWrongKeyRejected,
+                &[0x01, 0x01, 0x02, 0x1c, 0x00],
+            ),
         ];
         for (variant, expected) in cases {
             let req = Request {
@@ -1566,12 +1651,13 @@ mod tests {
     // the real device floors and guarded by evaluate_health_floor_constants_match_literals.
     //
     // `evaluate_health` is a pure predicate that does not cross-validate its two heap
-    // arguments, so some boundary tests below (e.g. `free_heap` below floor with
-    // `min_heap` at floor, where `min_heap > free_heap`) construct combinations that
-    // cannot occur on real hardware — there `min_heap <= free_heap` always holds,
-    // since `min_heap` is a since-boot low watermark of `free_heap`. Those tests still
-    // exercise the branch logic itself in isolation; they are not evidence the
-    // `heap_free` branch fires independently in production (see `HEAP_FREE_FLOOR`'s
+    // arguments. `HEAP_MIN_EVER_FLOOR` (24_576) sits below `HEAP_FREE_FLOOR` (36_864),
+    // so the `heap_free` branch fires independently in production: e.g.
+    // `free_heap = 36_863, min_heap = 24_576` satisfies `min_heap <= free_heap` yet
+    // breaches only the `heap_free` floor. Some boundary tests below construct
+    // `min_heap > free_heap`, which the hardware invariant (`min_heap` is a since-boot
+    // low watermark of `free_heap`, so `min_heap <= free_heap`) never produces; those
+    // cases exercise the branch logic in isolation only (see `HEAP_FREE_FLOOR`'s
     // doc-comment).
 
     /// Unwrap a fail report from `evaluate_health` into (status, detail).
@@ -1625,7 +1711,7 @@ mod tests {
         // interpolates): witnesses both the baked number and the message format
         // independently of `evaluate_health_floor_constants_match_literals`.
         assert!(
-            msg.starts_with("FAIL min_heap=53247<53248"),
+            msg.starts_with("FAIL min_heap=24575<24576"),
             "expected FAIL min_heap prefix; got: {msg}"
         );
     }
@@ -1680,7 +1766,7 @@ mod tests {
              update the run record with fresh provenance before changing it"
         );
         assert_eq!(
-            HEAP_MIN_EVER_FLOOR, 53_248,
+            HEAP_MIN_EVER_FLOOR, 24_576,
             "HEAP_MIN_EVER_FLOOR changed; this floor is hardware-baked — update \
              docs/adr/2026/07/19-rtd-heap-floor-rebake/run-record.md with fresh provenance \
              before changing it"
@@ -1955,11 +2041,33 @@ mod tests {
             "discriminant 9 (ProvisionAudioPsk) must decode successfully; got: {result:?}"
         );
 
-        let raw: &[u8] = &[10u8];
+        // Discriminant 10 (SetTemporaryAudioPsk) must decode successfully: the varint
+        // discriminant is followed by the 32 raw key bytes (fixed-size array, no length
+        // prefix).
+        let mut raw_temp_psk = [0u8; 33];
+        raw_temp_psk[0] = 10;
+        for (i, b) in raw_temp_psk[1..].iter_mut().enumerate() {
+            *b = (i + 1) as u8;
+        }
+        let result = postcard::from_bytes::<Command>(&raw_temp_psk);
+        assert!(
+            matches!(result, Ok(Command::SetTemporaryAudioPsk { key }) if key[0] == 1 && key[31] == 32),
+            "discriminant 10 (SetTemporaryAudioPsk) must decode successfully; got: {result:?}"
+        );
+
+        // Discriminant 11 (ClearTemporaryAudioPsk) must decode successfully.
+        let raw_clear_temp_psk: &[u8] = &[11u8];
+        let result = postcard::from_bytes::<Command>(raw_clear_temp_psk);
+        assert!(
+            matches!(result, Ok(Command::ClearTemporaryAudioPsk)),
+            "discriminant 11 (ClearTemporaryAudioPsk) must decode successfully; got: {result:?}"
+        );
+
+        let raw: &[u8] = &[12u8];
         let result = postcard::from_bytes::<Command>(raw);
         assert!(
             result.is_err(),
-            "unknown Command discriminant 10 must produce Err, not silent decode; got: {result:?}"
+            "unknown Command discriminant 12 must produce Err, not silent decode; got: {result:?}"
         );
     }
 
@@ -2085,6 +2193,57 @@ mod tests {
             &buf[..len],
             expected,
             "ClearTemporaryWifiConfig golden bytes mismatch — discriminant or layout regression"
+        );
+    }
+
+    /// `Command::SetTemporaryAudioPsk` golden bytes and roundtrip.
+    ///
+    /// Postcard encodes `[u8; 32]` as 32 raw bytes with no length prefix, so the raw
+    /// payload for `Request { id: 0, .. }` is `[id=0x00, disc=0x0a, key[0..32]]`. The key
+    /// used here is `1..=32` (no zero bytes), so COBS emits one escape byte for the zero
+    /// id and then a single 34-byte run.
+    #[test]
+    fn set_temporary_audio_psk_golden_roundtrip() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i + 1) as u8;
+        }
+        let req = Request {
+            id: 0,
+            command: Command::SetTemporaryAudioPsk { key },
+        };
+        let mut buf = [0u8; 64];
+        let len = framing::encode_request(&req, &mut buf).expect("encode failed");
+        assert_eq!(decode_one_cobs::<Request>(&buf[..len]), req);
+
+        let mut expected = alloc::vec![0x01u8, 0x22, 0x0a];
+        expected.extend_from_slice(&key);
+        expected.push(0x00);
+        assert_eq!(
+            &buf[..len],
+            expected.as_slice(),
+            "SetTemporaryAudioPsk golden bytes mismatch — discriminant or array layout regression"
+        );
+    }
+
+    /// `Command::ClearTemporaryAudioPsk` golden bytes and roundtrip.
+    ///
+    /// Unit variant, so the postcard payload for `Request { id: 0, .. }` is
+    /// `[id-varint=0x00, cmd-discriminant=0x0b]`; COBS escapes the zero id byte.
+    #[test]
+    fn clear_temporary_audio_psk_golden_roundtrip() {
+        let req = Request {
+            id: 0,
+            command: Command::ClearTemporaryAudioPsk,
+        };
+        let mut buf = [0u8; 32];
+        let len = framing::encode_request(&req, &mut buf).expect("encode failed");
+        assert_eq!(decode_one_cobs::<Request>(&buf[..len]), req);
+        let expected: &[u8] = &[0x01, 0x02, 0x0b, 0x00];
+        assert_eq!(
+            &buf[..len],
+            expected,
+            "ClearTemporaryAudioPsk golden bytes mismatch — discriminant or layout regression"
         );
     }
 
@@ -2264,14 +2423,13 @@ mod tests {
             I2sWaveformSanity,
             WifiAssociate,
             UdpRoundtrip,
-            TcpRoundtrip,
             TlsReachability,
             WifiScan,
             Xvf3800SpEnergy,
             WifiReassociation,
             GatewayProbeGate,
-            TcpInboundFrames,
-            TcpSendBackpressure,
+            TlsInboundFrames,
+            TlsSendBackpressure,
             SpeakerOutput,
             AmpAlwaysOnGpoInert,
             CapturePeriodicLine,
@@ -2281,7 +2439,7 @@ mod tests {
             StreamRealtimeDuplex,
             PsramIdentity,
             WifiPowerSaveCheck,
-            TcpInboundBackpressure,
+            TlsInboundBackpressure,
             TlsPskHandshake,
             TlsPskWrongKeyRejected,
         );
@@ -2327,131 +2485,48 @@ mod tests {
     ///
     /// This test uses `test_name_discriminant` from `device-protocol` (derived via
     /// `postcard::to_slice`, not a hand table), so it also exercises the derived helper.
-    /// Extends the former `hil-host` guard to include discriminant 16 (`TcpInboundFrames`),
-    /// which was missing from the previous full guard.
+    /// Covers the whole registry through `TlsPskWrongKeyRejected` (28).
     #[test]
     fn discriminant_values_are_stable() {
         use super::test_name_discriminant;
-        assert_eq!(
-            test_name_discriminant(&TestName::Ping),
-            0,
-            "Ping discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::Identify),
-            1,
-            "Identify discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::GpioSelfTest),
-            2,
-            "GpioSelfTest discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::DeviceHealthCheck),
-            3,
-            "DeviceHealthCheck discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::I2cBusScan),
-            4,
-            "I2cBusScan discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::Xvf3800RegRead),
-            5,
-            "Xvf3800RegRead discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::Xvf3800DoAPlausibility),
-            6,
-            "Xvf3800DoAPlausibility discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::I2sWaveformSanity),
-            7,
-            "I2sWaveformSanity discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::WifiAssociate),
-            8,
-            "WifiAssociate discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::UdpRoundtrip),
-            9,
-            "UdpRoundtrip discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::TcpRoundtrip),
-            10,
-            "TcpRoundtrip discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::TlsReachability),
-            11,
-            "TlsReachability discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::WifiScan),
-            12,
-            "WifiScan discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::Xvf3800SpEnergy),
-            13,
-            "Xvf3800SpEnergy discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::WifiReassociation),
-            14,
-            "WifiReassociation discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::GatewayProbeGate),
-            15,
-            "GatewayProbeGate discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::TcpInboundFrames),
-            16,
-            "TcpInboundFrames discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::TcpSendBackpressure),
-            17,
-            "TcpSendBackpressure discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::SpeakerOutput),
-            18,
-            "SpeakerOutput discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::AmpAlwaysOnGpoInert),
-            19,
-            "AmpAlwaysOnGpoInert discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::CapturePeriodicLine),
-            20,
-            "CapturePeriodicLine discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::PlaybackDrainRate),
-            21,
-            "PlaybackDrainRate discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::PollReadinessBidir),
-            22,
-            "PollReadinessBidir discriminant changed"
-        );
-        assert_eq!(
-            test_name_discriminant(&TestName::FullDuplexRxIntegrity),
-            23,
-            "FullDuplexRxIntegrity discriminant changed"
-        );
+        let pins: &[(TestName, u8)] = &[
+            (TestName::Ping, 0),
+            (TestName::Identify, 1),
+            (TestName::GpioSelfTest, 2),
+            (TestName::DeviceHealthCheck, 3),
+            (TestName::I2cBusScan, 4),
+            (TestName::Xvf3800RegRead, 5),
+            (TestName::Xvf3800DoAPlausibility, 6),
+            (TestName::I2sWaveformSanity, 7),
+            (TestName::WifiAssociate, 8),
+            (TestName::UdpRoundtrip, 9),
+            (TestName::TlsReachability, 10),
+            (TestName::WifiScan, 11),
+            (TestName::Xvf3800SpEnergy, 12),
+            (TestName::WifiReassociation, 13),
+            (TestName::GatewayProbeGate, 14),
+            (TestName::TlsInboundFrames, 15),
+            (TestName::TlsSendBackpressure, 16),
+            (TestName::SpeakerOutput, 17),
+            (TestName::AmpAlwaysOnGpoInert, 18),
+            (TestName::CapturePeriodicLine, 19),
+            (TestName::PlaybackDrainRate, 20),
+            (TestName::PollReadinessBidir, 21),
+            (TestName::FullDuplexRxIntegrity, 22),
+            (TestName::StreamRealtimeDuplex, 23),
+            (TestName::PsramIdentity, 24),
+            (TestName::WifiPowerSaveCheck, 25),
+            (TestName::TlsInboundBackpressure, 26),
+            (TestName::TlsPskHandshake, 27),
+            (TestName::TlsPskWrongKeyRejected, 28),
+        ];
+        for (variant, expected) in pins {
+            assert_eq!(
+                test_name_discriminant(variant),
+                *expected,
+                "discriminant changed for TestName::{variant:?}"
+            );
+        }
     }
 
     /// `Command::ProvisionWifi` golden bytes and roundtrip.
@@ -2488,20 +2563,18 @@ mod tests {
         );
     }
 
-    /// `Command::ProvisionPeer` golden bytes and roundtrip.
+    /// `Command::SetTemporaryPeerConfig` golden bytes and roundtrip.
     ///
-    /// Verifies discriminant 2 and that all fields (host, udp_port, tcp_port,
-    /// tls_host, tls_port, inbound_frames_port, backpressure_port, poll_readiness_port,
-    /// rtd_port, tls_psk_port, tls_psk_bad_port) survive a COBS/postcard round-trip
-    /// unchanged.
+    /// Verifies discriminant 2 and that all fields (host, udp_port, tls_host, tls_port,
+    /// inbound_frames_port, backpressure_port, poll_readiness_port, rtd_port,
+    /// tls_psk_port, tls_psk_bad_port) survive a COBS/postcard round-trip unchanged.
     #[test]
-    fn provision_peer_golden_roundtrip() {
+    fn set_temporary_peer_config_golden_roundtrip() {
         let req = Request {
             id: 0,
-            command: Command::ProvisionPeer {
+            command: Command::SetTemporaryPeerConfig {
                 host: [192, 168, 1, 50],
                 udp_port: 9,
-                tcp_port: 7,
                 tls_host: [1, 1, 1, 1],
                 tls_port: 443,
                 inbound_frames_port: 17382,
@@ -2519,35 +2592,32 @@ mod tests {
         // The frame must be well under the 512-byte buffer limit.
         assert!(
             len <= 512,
-            "ProvisionPeer frame ({len} bytes) exceeds 512-byte buffer limit"
+            "SetTemporaryPeerConfig frame ({len} bytes) exceeds 512-byte buffer limit"
         );
         // Pin the golden bytes to catch discriminant or field-order regressions.
         // Layout: COBS overhead byte (points past the next embedded 0x00), id=0x00
         // (embedded zero → COBS-encoded), discriminant=0x02, host bytes, udp_port varint,
-        // tcp_port varint, tls_host bytes, tls_port varint, inbound_frames_port varint,
+        // tls_host bytes, tls_port varint, inbound_frames_port varint,
         // backpressure_port varint, poll_readiness_port varint, rtd_port varint,
         // tls_psk_port varint, tls_psk_bad_port varint.
         // postcard encodes u16 as a variable-length integer (not raw LE bytes).
-        // Generated from a test run: id=0, ProvisionPeer discriminant=2 in postcard,
-        // host=[192,168,1,50], udp=9, tcp=7, tls_host=[1,1,1,1], tls_port=443,
+        // id=0, SetTemporaryPeerConfig discriminant=2 in postcard,
+        // host=[192,168,1,50], udp=9, tls_host=[1,1,1,1], tls_port=443,
         // inbound_frames_port=17382, backpressure_port=17383, poll_readiness_port=17384,
         // rtd_port=17385, tls_psk_port=17386, tls_psk_bad_port=17387.
-        // Postcard encodes u16 as a varint; 17382=0x43E6 → 0xE6,0x87,0x01,
-        // 17383=0x43E7 → 0xE7,0x87,0x01, 17384=0x43E8 → 0xE8,0x87,0x01,
-        // 17385=0x43E9 → 0xE9,0x87,0x01, 17386=0x43EA → 0xEA,0x87,0x01,
-        // 17387=0x43EB → 0xEB,0x87,0x01 (COBS leaves non-zero bytes in place).
+        // Postcard encodes u16 as a varint; 17382=0x43E6 → 0xE6,0x87,0x01, etc.
         // COBS: overhead byte 0x01 points to the embedded zero (id=0x00) at index 1;
-        // 0x20 (32) then points 32 bytes ahead to the trailing 0x00 frame delimiter
+        // 0x1F (31) then points 31 bytes ahead to the trailing 0x00 frame delimiter
         // (the rest of the payload has no embedded zeros).
         let expected: &[u8] = &[
-            0x01, 0x20, 0x02, 0xc0, 0xa8, 0x01, 0x32, 0x09, 0x07, 0x01, 0x01, 0x01, 0x01, 0xbb,
-            0x03, 0xe6, 0x87, 0x01, 0xe7, 0x87, 0x01, 0xe8, 0x87, 0x01, 0xe9, 0x87, 0x01, 0xea,
-            0x87, 0x01, 0xeb, 0x87, 0x01, 0x00,
+            0x01, 0x1f, 0x02, 0xc0, 0xa8, 0x01, 0x32, 0x09, 0x01, 0x01, 0x01, 0x01, 0xbb, 0x03,
+            0xe6, 0x87, 0x01, 0xe7, 0x87, 0x01, 0xe8, 0x87, 0x01, 0xe9, 0x87, 0x01, 0xea, 0x87,
+            0x01, 0xeb, 0x87, 0x01, 0x00,
         ];
         assert_eq!(
             &buf[..len],
             expected,
-            "ProvisionPeer golden bytes mismatch — discriminant or layout regression\n\
+            "SetTemporaryPeerConfig golden bytes mismatch — discriminant or layout regression\n\
              actual bytes: {buf:02x?}",
         );
     }
@@ -2556,7 +2626,7 @@ mod tests {
     ///
     /// Verifies discriminant 3 and that both fields (host, port) survive a
     /// COBS/postcard round-trip unchanged. Pins exact bytes so a discriminant collision
-    /// with `ProvisionPeer` (discriminant 2) is detected immediately.
+    /// with `SetTemporaryPeerConfig` (discriminant 2) is detected immediately.
     #[test]
     fn provision_audio_golden_roundtrip() {
         let req = Request {
@@ -2669,8 +2739,8 @@ mod typed_report_tests {
             TestData::UdpEcho { .. } => 10,
             TestData::TcpEcho { .. } => 11,
             TestData::TlsHandshake { .. } => 12,
-            TestData::TcpInboundFrames { .. } => 13,
-            TestData::TcpSendBackpressure { .. } => 14,
+            TestData::TlsInboundFrames { .. } => 13,
+            TestData::TlsSendBackpressure { .. } => 14,
             TestData::PollReadiness { .. } => 15,
             TestData::Rtd { .. } => 16,
             TestData::WifiReassociation { .. } => 17,
@@ -2681,7 +2751,7 @@ mod typed_report_tests {
             TestData::FullDuplexRxIntegrity { .. } => 22,
             TestData::PsramIdentity { .. } => 23,
             TestData::WifiPowerSaveCheck { .. } => 24,
-            TestData::TcpInboundBackpressure { .. } => 25,
+            TestData::TlsInboundBackpressure { .. } => 25,
             TestData::TlsPskHandshake { .. } => 26,
             TestData::TlsPskRejected { .. } => 27,
         }
@@ -2766,12 +2836,12 @@ mod typed_report_tests {
                 peer_ip: [1, 1, 1, 1],
                 peer_port: 443,
             },
-            TestData::TcpInboundFrames {
+            TestData::TlsInboundFrames {
                 inbound_frames: 3,
                 peer_ip: [10, 0, 0, 2],
                 peer_port: 9002,
             },
-            TestData::TcpSendBackpressure {
+            TestData::TlsSendBackpressure {
                 a_resumed: true,
                 a_rc: 2,
                 a_ru: true,
@@ -2825,7 +2895,7 @@ mod typed_report_tests {
                 malloc_probe: MallocProbe::External,
             },
             TestData::WifiPowerSaveCheck { ps_mode: 0 },
-            TestData::TcpInboundBackpressure {
+            TestData::TlsInboundBackpressure {
                 inbound_frames: 300,
                 sink_full_events: 12,
                 peer_ip: [10, 0, 0, 3],

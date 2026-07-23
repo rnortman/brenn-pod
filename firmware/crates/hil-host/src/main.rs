@@ -25,7 +25,7 @@ use pod_transport::{
 };
 use std::{
     collections::BTreeSet,
-    io::{BufRead, Read as _, Write as _},
+    io::{BufRead, Read as _},
     net::{Ipv4Addr, TcpListener, UdpSocket},
     sync::{Arc, Mutex},
     thread,
@@ -47,7 +47,6 @@ fn main() {
 /// without encoding a port-name-to-proto table of its own:
 /// ```text
 /// udp_port=17380/udp
-/// tcp_port=17381/tcp
 /// inbound_frames_port=17382/tcp
 /// backpressure_port=17383/tcp
 /// poll_readiness_port=17384/tcp
@@ -56,7 +55,7 @@ fn main() {
 /// tls_psk_bad_port=17387/tcp
 /// ```
 ///
-/// Values reflect overrides from `RESPEAKER_HIL_UDP_PORT` / `RESPEAKER_HIL_TCP_PORT` /
+/// Values reflect overrides from `RESPEAKER_HIL_UDP_PORT` /
 /// `RESPEAKER_HIL_INBOUND_FRAMES_PORT` / `RESPEAKER_HIL_BACKPRESSURE_PORT` /
 /// `RESPEAKER_HIL_POLL_READINESS_PORT` (env or `.hil-secrets`), falling back to the
 /// compiled-in defaults.  No device enumeration, no socket binds, no side effects.
@@ -67,7 +66,6 @@ fn main() {
 #[allow(clippy::too_many_arguments)]
 fn format_port_lines(
     udp: u16,
-    tcp: u16,
     inbound: u16,
     backpressure: u16,
     poll_readiness: u16,
@@ -76,7 +74,7 @@ fn format_port_lines(
     tls_psk_bad: u16,
 ) -> String {
     format!(
-        "udp_port={udp}/udp\ntcp_port={tcp}/tcp\ninbound_frames_port={inbound}/tcp\nbackpressure_port={backpressure}/tcp\npoll_readiness_port={poll_readiness}/tcp\nrtd_port={rtd}/tcp\ntls_psk_port={tls_psk}/tcp\ntls_psk_bad_port={tls_psk_bad}/tcp\n"
+        "udp_port={udp}/udp\ninbound_frames_port={inbound}/tcp\nbackpressure_port={backpressure}/tcp\npoll_readiness_port={poll_readiness}/tcp\nrtd_port={rtd}/tcp\ntls_psk_port={tls_psk}/tcp\ntls_psk_bad_port={tls_psk_bad}/tcp\n"
     )
 }
 
@@ -87,7 +85,6 @@ fn print_ports() -> i32 {
                 "{}",
                 format_port_lines(
                     secrets.udp_echo_port,
-                    secrets.tcp_echo_port,
                     secrets.inbound_frames_port,
                     secrets.backpressure_port,
                     secrets.poll_readiness_port,
@@ -174,8 +171,6 @@ fn run() -> i32 {
              test (the infrastructure chain still runs)"
         );
     }
-    // True when no selector is active, or `t` is the selected test.
-    let want = |t: TestName| selector_wants(only, t);
 
     // ── Step 1: enumerate by VID:PID ─────────────────────────────────────────
 
@@ -230,6 +225,57 @@ fn run() -> i32 {
     let harness_build = build_id();
     let mut harness = Harness::new(transport);
 
+    // The volatile audio-PSK override goes live inside the suite (step 3b'); the suite
+    // records that in this cell so this outer frame can clear it on every exit path.
+    let override_live = std::cell::Cell::new(false);
+    let code = run_suite(&mut harness, &harness_build, only, &override_live);
+
+    // Clear-on-exit: once the temporary audio PSK went live, drop it on every exit path so
+    // NVS-key precedence is restored for future key reads without a power cycle. Best-effort
+    // — a killed process or a dead serial link leaves the override armed until the next
+    // reboot, which also clears it.
+    if override_live.get() {
+        println!(
+            "  *** NOTICE: clearing the temporary audio-PSK override; this restores NVS-key \
+             precedence for future reads (a reboot also clears it). A streamer running from \
+             boot-time provisioning holds its boot-time key either way. ***"
+        );
+        match harness.send_command(Command::ClearTemporaryAudioPsk) {
+            Ok(r) if r.status == Status::Ok => {
+                println!("  ClearTemporaryAudioPsk: OK");
+            }
+            Ok(r) => {
+                eprintln!(
+                    "  *** NOTICE: device refused ClearTemporaryAudioPsk (status {:?}); reboot \
+                     the pod to clear the override and restore NVS-key precedence. ***",
+                    r.status
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "  *** NOTICE: best-effort ClearTemporaryAudioPsk failed ({e}); reboot the \
+                     pod to clear the override and restore NVS-key precedence. ***"
+                );
+            }
+        }
+    }
+
+    code
+}
+
+/// Run the full HIL check/self-test suite over an already-opened `harness`.
+///
+/// The caller owns `harness` after this returns and clears the temporary audio-PSK override
+/// on every exit path (pass, fail, or early `return 1`). This function records in
+/// `override_live` whether the override went live (step 3b'); the caller reads it afterward.
+fn run_suite(
+    harness: &mut Harness,
+    harness_build: &device_protocol::BuildId,
+    only: Option<TestName>,
+    override_live: &std::cell::Cell<bool>,
+) -> i32 {
+    let want = |t: TestName| selector_wants(only, t);
+
     // ── Step 3: four independent checks ──────────────────────────────────────
 
     // Send Identify command to gather info for checks 1–3.
@@ -278,7 +324,7 @@ fn run() -> i32 {
     };
 
     // Check 1: Build-ID match.
-    if let Err(msg) = compare_build_ids(&harness_build, &device_build) {
+    if let Err(msg) = compare_build_ids(harness_build, &device_build) {
         eprintln!("ERROR [check 1 — build-ID]: {msg}");
         return 1;
     }
@@ -312,7 +358,7 @@ fn run() -> i32 {
     // provisioning). Runs between the Step-3 identity checks and the self-test suite.
     // It only mutates the device's in-memory `deser_error_count`, harmless to every
     // other check and reset on reboot.
-    if run_deser_error_check(&mut harness).is_err() {
+    if run_deser_error_check(harness).is_err() {
         return 1;
     }
     println!("deser-error recovery check: PASS");
@@ -556,7 +602,7 @@ fn run() -> i32 {
     // WifiScan stays ungated even under a single-test selector: it starts and proves
     // the credential-less radio the later network-phase blocks build on.
     if run_dedicated_test(
-        &mut harness,
+        harness,
         TestName::WifiScan,
         "credential-less radio + scan",
         eval_wifi_scan,
@@ -574,7 +620,7 @@ fn run() -> i32 {
     // must not fail-fast-abort unrelated RESPEAKER_HIL_ONLY iterations.
     if want(TestName::WifiPowerSaveCheck)
         && run_dedicated_test(
-            &mut harness,
+            harness,
             TestName::WifiPowerSaveCheck,
             "modem power save off",
             eval_wifi_power_save,
@@ -690,9 +736,11 @@ fn run() -> i32 {
         println!("  self-test WifiAssociate: PASS");
     }
 
-    // 3b'. Provision a fresh audio-link PSK through the real production command, and
-    // learn the pod identity from the device's own answer — that identity is what the
-    // TLS-PSK listeners will authenticate, and it is authoritative only on the device.
+    // 3b'. Install a fresh audio-link PSK as a RAM-only override — never persisted to NVS —
+    // and learn the pod identity from the device's own answer. That identity is what the
+    // TLS-PSK listeners will authenticate, and it is authoritative only on the device. The
+    // override shadows the pod's stored production key for the run and is cleared on exit
+    // (or the next reboot), so a HIL run never overwrites the production key in flash.
     let pod_psk = {
         let key = match generate_audio_psk() {
             Ok(k) => k,
@@ -701,31 +749,36 @@ fn run() -> i32 {
                 return 1;
             }
         };
-        let psk_resp = match harness.send_command(Command::ProvisionAudioPsk { key }) {
+        // Arm clear-on-exit *before* the send: a timeout or transport error leaves the
+        // outcome unknown, and the device may well have stored the override. A clear with
+        // no override active is a documented Ok no-op, so arming early only ever costs one
+        // harmless command.
+        override_live.set(true);
+        let psk_resp = match harness.send_command(Command::SetTemporaryAudioPsk { key }) {
             Ok(r) => r,
             Err(HarnessError::Timeout) => {
                 eprintln!(
-                    "ERROR [AC9]: device not responding to ProvisionAudioPsk — wrong/old firmware?"
+                    "ERROR [AC9]: device not responding to SetTemporaryAudioPsk — wrong/old firmware?"
                 );
                 return 1;
             }
             Err(e) => {
-                eprintln!("ERROR [check 4 — network]: ProvisionAudioPsk failed: {e}");
+                eprintln!("ERROR [check 4 — network]: SetTemporaryAudioPsk failed: {e}");
                 return 1;
             }
         };
-        if check_status(&psk_resp, "ProvisionAudioPsk").is_err() {
+        if check_status(&psk_resp, "SetTemporaryAudioPsk").is_err() {
             return 1;
         }
         let Payload::PodId(pod_id) = &psk_resp.payload else {
             eprintln!(
-                "FAIL [check 4 — behavioral]: ProvisionAudioPsk did not answer with a PodId \
+                "FAIL [check 4 — behavioral]: SetTemporaryAudioPsk did not answer with a PodId \
                  payload: {:?}",
                 psk_resp.payload
             );
             return 1;
         };
-        println!("  ProvisionAudioPsk: OK pod_id={}", pod_id.as_str());
+        println!("  SetTemporaryAudioPsk: OK pod_id={}", pod_id.as_str());
         PodPsk {
             identity: pod_id.as_str().to_string(),
             key,
@@ -743,17 +796,16 @@ fn run() -> i32 {
     };
     {
         let peer_host_arr: [u8; 4] = peer_servers.host_ip;
-        // Use TLS config from secrets if present; otherwise provision zeros so the
-        // device still has a ProvisionPeer record (TLS test will be skipped host-side).
+        // Use TLS config from secrets if present; otherwise push zeros so the device still
+        // has a session peer record (TLS test will be skipped host-side).
         let (tls_host, tls_port) = secrets
             .tls
             .as_ref()
             .map(|t| (t.host, t.port))
             .unwrap_or(([0u8; 4], 0u16));
-        let peer_resp = match harness.send_command(Command::ProvisionPeer {
+        let peer_resp = match harness.send_command(Command::SetTemporaryPeerConfig {
             host: peer_host_arr,
             udp_port: peer_servers.udp_port,
-            tcp_port: peer_servers.tcp_port,
             tls_host,
             tls_port,
             inbound_frames_port: peer_servers.inbound_frames_port,
@@ -766,19 +818,19 @@ fn run() -> i32 {
             Ok(r) => r,
             Err(HarnessError::Timeout) => {
                 eprintln!(
-                    "ERROR [AC9]: device not responding to ProvisionPeer — wrong/old firmware?"
+                    "ERROR [AC9]: device not responding to SetTemporaryPeerConfig — wrong/old firmware?"
                 );
                 return 1;
             }
             Err(e) => {
-                eprintln!("ERROR [check 4 — network]: ProvisionPeer failed: {e}");
+                eprintln!("ERROR [check 4 — network]: SetTemporaryPeerConfig failed: {e}");
                 return 1;
             }
         };
-        if check_status(&peer_resp, "ProvisionPeer").is_err() {
+        if check_status(&peer_resp, "SetTemporaryPeerConfig").is_err() {
             return 1;
         }
-        println!("  ProvisionPeer: OK");
+        println!("  SetTemporaryPeerConfig: OK");
     }
 
     // Announce TLS skip before the loop so the operator knows before any test runs.
@@ -789,14 +841,13 @@ fn run() -> i32 {
         );
     }
 
-    // ── Network reachability loop (design §3.4 step 4) ───────────────────────
+    // ── Network reachability loop ──────────────────────────────────────────────
     let reachability_tests = [
         TestName::UdpRoundtrip,
-        TestName::TcpRoundtrip,
         TestName::TlsReachability,
-        TestName::TcpInboundFrames,
-        TestName::TcpSendBackpressure,
-        TestName::TcpInboundBackpressure,
+        TestName::TlsInboundFrames,
+        TestName::TlsSendBackpressure,
+        TestName::TlsInboundBackpressure,
         TestName::PollReadinessBidir,
         TestName::TlsPskHandshake,
         TestName::TlsPskWrongKeyRejected,
@@ -845,11 +896,10 @@ fn run() -> i32 {
         let data = &report.data;
         let outcome = match test_name {
             TestName::UdpRoundtrip => eval_udp_roundtrip(data),
-            TestName::TcpRoundtrip => eval_tcp_roundtrip(data),
             TestName::TlsReachability => eval_tls_reachability(data),
-            TestName::TcpInboundFrames => eval_tcp_inbound_frames(data),
-            TestName::TcpSendBackpressure => eval_tcp_send_backpressure(data),
-            TestName::TcpInboundBackpressure => eval_tcp_inbound_backpressure(data),
+            TestName::TlsInboundFrames => eval_tls_inbound_frames(data),
+            TestName::TlsSendBackpressure => eval_tls_send_backpressure(data),
+            TestName::TlsInboundBackpressure => eval_tls_inbound_backpressure(data),
             TestName::PollReadinessBidir => eval_poll_readiness_bidir(data),
             TestName::TlsPskHandshake => eval_tls_psk_handshake(data),
             TestName::TlsPskWrongKeyRejected => eval_tls_psk_wrong_key_rejected(data),
@@ -1237,7 +1287,7 @@ fn run() -> i32 {
             );
             match precheck {
                 Ok(resp) if resp.status == Status::Ok => {
-                    let mut guard = TempConfigGuard::arm(&mut harness, "BootAssociationRetry");
+                    let mut guard = TempConfigGuard::arm(harness, "BootAssociationRetry");
 
                     // 2. Apply a fixed, improbable bogus SSID.
                     let set_resp = match guard
@@ -1397,7 +1447,7 @@ fn run() -> i32 {
             // BootAssociationRetry arms it: any early exit between the override landing
             // and `ClearWifiCredentials` succeeding (which itself clears the override
             // device-side) leaves the device chasing the bogus SSID otherwise.
-            let mut override_guard = TempConfigGuard::arm(&mut harness, "NoCredentialsPark");
+            let mut override_guard = TempConfigGuard::arm(harness, "NoCredentialsPark");
             let override_resp = match override_guard
                 .harness
                 .send_command_timeout(bogus_temp_wifi_command(), TEMP_WIFI_COMMAND_TIMEOUT)
@@ -2312,28 +2362,32 @@ const fn test_meta(t: &TestName) -> TestMeta {
             // 25 s — accommodates first-connect 5–15 s + DHCP, with margin.
             timeout: Duration::from_secs(25),
         },
-        TestName::UdpRoundtrip
-        | TestName::TcpRoundtrip
-        | TestName::TlsReachability
-        | TestName::TcpInboundFrames => TestMeta {
+        TestName::UdpRoundtrip | TestName::TlsReachability => TestMeta {
             phase: TestPhase::Network,
             // 15 s — network I/O with margin.
             timeout: Duration::from_secs(15),
         },
-        TestName::TcpSendBackpressure => TestMeta {
+        TestName::TlsInboundFrames => TestMeta {
+            phase: TestPhase::Network,
+            // Idle fail-fast budget (3 × 2 s) + connect (5 s) + TLS-PSK handshake (3 s)
+            // + serial-round-trip margin. See the budget-invariant test for the exact
+            // accounting.
+            timeout: Duration::from_secs(20),
+        },
+        TestName::TlsSendBackpressure => TestMeta {
             phase: TestPhase::Network,
             // Backpressure: two sub-cases run sequentially — A saturate-then-drain plus
-            // C's ~1.0 s ceiling + bounded byte-drip grants — plus per-sub-case warm-up
-            // and generous network/IO margin.
-            timeout: Duration::from_secs(30),
+            // C's ~1.0 s ceiling + bounded byte-drip grants — plus per-sub-case warm-up,
+            // the TLS-PSK handshake (3 s per connection), and generous network/IO margin.
+            timeout: Duration::from_secs(35),
         },
-        TestName::TcpInboundBackpressure => TestMeta {
+        TestName::TlsInboundBackpressure => TestMeta {
             phase: TestPhase::Network,
-            // Device deadline (INBOUND_BP_DEADLINE_SECS 20s) + connect + one in-flight
-            // read overshoot + serial-round-trip margin, so the host always sees a typed
-            // TestReport rather than a hang. See the budget-invariant test for the exact
-            // accounting.
-            timeout: Duration::from_secs(30),
+            // Device deadline (INBOUND_BP_DEADLINE_SECS 20s) + connect + TLS-PSK handshake
+            // + one in-flight read overshoot + serial-round-trip margin, so the host always
+            // sees a typed TestReport rather than a hang. See the budget-invariant test for
+            // the exact accounting.
+            timeout: Duration::from_secs(35),
         },
         TestName::WifiReassociation => TestMeta {
             phase: TestPhase::Network,
@@ -2345,26 +2399,38 @@ const fn test_meta(t: &TestName) -> TestMeta {
             // 2 × ping-budget (~8 s) + 90 s device-side poll + ~15 s association + 15 s margin.
             timeout: Duration::from_secs(130),
         },
-        TestName::TlsPskHandshake | TestName::TlsPskWrongKeyRejected => TestMeta {
+        TestName::TlsPskHandshake => TestMeta {
             phase: TestPhase::Network,
-            // Device-side handshake deadline (3 s) + TCP connect + echo round-trip +
-            // serial round-trip, with margin so the host always sees the typed
-            // TestReport rather than a hang.
-            timeout: Duration::from_secs(15),
+            // Device worst case: TCP connect (TLS_PSK_CONNECT_TIMEOUT_SECS 10 s) +
+            // handshake deadline (TLS_HANDSHAKE_TIMEOUT_SECS 3 s) + echo round-trip
+            // (TLS_PSK_ECHO_TIMEOUT_SECS 5 s) = 18 s, plus serial-round-trip margin,
+            // so the host always sees the typed TestReport rather than a hang. See
+            // the budget-invariant test for the exact accounting.
+            timeout: Duration::from_secs(25),
+        },
+        TestName::TlsPskWrongKeyRejected => TestMeta {
+            phase: TestPhase::Network,
+            // Device worst case: reachability pre-probe connect + the TLS connect
+            // (2 × TLS_PSK_CONNECT_TIMEOUT_SECS = 20 s) + handshake deadline
+            // (TLS_HANDSHAKE_TIMEOUT_SECS 3 s) = 23 s, plus serial-round-trip margin.
+            // See the budget-invariant test for the exact accounting.
+            timeout: Duration::from_secs(30),
         },
         TestName::PollReadinessBidir => TestMeta {
             phase: TestPhase::Network,
-            // POLLOUT poll + up to a 5 s POLLIN_WAIT_BUDGET (device-side) + connect + serial
-            // round-trip, with margin so the host always sees the typed TestReport.
-            timeout: Duration::from_secs(15),
+            // POLLOUT poll + up to a 5 s POLLIN_WAIT_BUDGET (device-side) + connect +
+            // TLS-PSK handshake (3 s) + serial round-trip, with margin so the host always
+            // sees the typed TestReport.
+            timeout: Duration::from_secs(20),
         },
         TestName::StreamRealtimeDuplex => TestMeta {
             phase: TestPhase::Network,
             // Two sequential ~5 s synthetic segments (Scenario A outbound-only, then Scenario B
-            // duplex — each RTD_PRODUCER_FRAMES × 20 ms) + two connects + drain tails + serial
-            // round-trip, with margin so the host always sees the typed TestReport even when the
-            // current (slow) loop stretches each catch-up wall well past 5 s.
-            timeout: Duration::from_secs(40),
+            // duplex — each RTD_PRODUCER_FRAMES × 20 ms) + two connects + two TLS-PSK
+            // handshakes (3 s each) + drain tails + serial round-trip, with margin so the host
+            // always sees the typed TestReport even when the current (slow) loop stretches each
+            // catch-up wall well past 5 s.
+            timeout: Duration::from_secs(45),
         },
         // WifiScan and WifiPowerSaveCheck are Network-phase but use the default timeout
         // (both are credential-less, manually dispatched before provisioning; the quirk
@@ -2445,30 +2511,28 @@ struct TlsConfig {
 
 /// Default fixed port for the UDP echo server (below OS ephemeral range 32768–60999).
 const DEFAULT_HIL_UDP_PORT: u16 = 17380;
-/// Default fixed port for the TCP echo server (below OS ephemeral range 32768–60999).
-const DEFAULT_HIL_TCP_PORT: u16 = 17381;
-/// Default fixed port for the TCP audio-frame source server used by `TcpInboundFrames`.
+/// Default fixed port for the TCP audio-frame source server used by `TlsInboundFrames`.
 const DEFAULT_HIL_INBOUND_FRAMES_PORT: u16 = 17382;
 /// Number of `StreamFrame::Audio` frames the inbound-frames-source server sends per connection.
-/// The device must receive exactly this many; `eval_tcp_inbound_frames` enforces the count.
+/// The device must receive exactly this many; `eval_tls_inbound_frames` enforces the count.
 const INBOUND_FRAMES_COUNT: u32 = 10;
 /// Number of `StreamFrame::Audio` frames the inbound-frames-source server's **flood**
-/// profile sends, unpaced, per `TcpInboundBackpressure` connection. Host-only constant:
+/// profile sends, unpaced, per `TlsInboundBackpressure` connection. Host-only constant:
 /// the host both sends and evaluates the count; the device merely reports what it
-/// received. Sized (inbound-backpressure-hil design §2.4) to clear the ring (~102
+/// received. Sized to clear the ring (~102
 /// frames) + `FrameAccumulator` (~1 frame) + lwIP recv buffer (~8 frames) + in-flight
 /// drain (tens of frames) with ≥ 2× margin, guaranteeing a sustained window-closed
 /// regime: 300 frames (~197 KB wire, 6 s of audio) against ~115 frames of total
 /// elastic capacity.
 const INBOUND_BP_FLOOD_FRAMES: u32 = 300;
-/// Default fixed port for the TCP backpressure source server used by `TcpSendBackpressure`.
+/// Default fixed port for the TCP backpressure source server used by `TlsSendBackpressure`.
 /// The server accepts a connection and then deliberately withholds reads so the device's
-/// send buffer fills, driving `send_frame_bp` into its `poll(POLLOUT)` wait (design §6).
+/// send buffer fills, driving `send_frame_bp` into its `poll(POLLOUT)` wait.
 const DEFAULT_HIL_BACKPRESSURE_PORT: u16 = 17383;
 /// Default fixed port for the TCP poll-readiness adversary server used by
 /// `PollReadinessBidir`. The server accepts a connection, consumes the device's in-band
 /// trigger byte, then immediately queues a fixed payload of inbound bytes back so the device
-/// can prove `poll(POLLIN)` readiness on real lwIP (event-loop design §4 test #1).
+/// can prove `poll(POLLIN)` readiness on real lwIP.
 const DEFAULT_HIL_POLL_READINESS_PORT: u16 = 17384;
 /// Default fixed port for the `StreamRealtimeDuplex` listener server. The server accepts the
 /// device's outbound streamer connection, decodes the `Hello`/`SegmentStart`/`Audio`/
@@ -2514,41 +2578,69 @@ const RTD_PLAYBACK_LEAD_MS: u64 = audio_pipeline::playback::PLAYBACK_BURST_LEAD_
 /// count is reported on the device PASS line but not asserted against this value.
 const POLL_READINESS_PAYLOAD_BYTES: usize = 16;
 
-/// Short saturate-only withhold (ms) for the profiles that must take a partial write on a
+/// Short saturate-only withhold (ms) for the profiles that must hit a write boundary on a
 /// still-alive boundary frame (A saturate-then-drain, C just-over-ceiling).  These
 /// profiles must resume (A) or begin dripping (C) while the boundary frame is still alive
 /// — i.e. before the device's 1.0 s per-frame `FRAME_WALL_CLOCK_MAX_MS` ceiling fires.
 /// A ceiling-length withhold would keep the server silent past the device's ceiling, so
 /// the device would always give up *before* the drain resumes: adversary A could never
-/// reach `resumed`, and adversary C's drip would never causally drive `c_resume_cycles`
-/// (correctness review).  300 ms is long enough to saturate the ~5760 B send buffer during
-/// the device's warm-up sends, yet well under the 750 ms per-wait budget so the
+/// reach `resumed`, and adversary C's drip would never causally drive `c_resume_cycles`.
+/// With the receive window clamped to
+/// `BACKPRESSURE_RCVBUF_BYTES` the pipe fills within a handful of the device's ~664 B TLS
+/// records, so 300 ms is ample, and it stays well under the 750 ms per-wait budget so the
 /// resume/first drip lands inside the boundary frame's first wait window.
 const BACKPRESSURE_SATURATE_MS: u64 = 300;
 
+/// Requested `SO_RCVBUF` on the backpressure listener, applied before `listen(2)` so
+/// accepted sockets inherit it and the window scale advertised at SYN-ACK reflects it
+/// (shrinking after accept is unreliable on Linux).
+///
+/// This is what makes the withhold phase close the TCP window *by construction* rather
+/// than by kernel-autotune accident: with no clamp the host kernel keeps ACKing into a
+/// 128 KiB autotuned receive buffer, which the device's whole warm-up volume barely
+/// reaches, so whether the device ever sees a write boundary depends on the environment.
+/// Linux roughly doubles the request and advertises about half of the result as window, so
+/// 4096 lands near a 4 KiB window; with the device's 2880 B `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`
+/// the end-to-end pipe saturates within ~10 records.  The accepted socket's effective value
+/// is logged at accept — kernel rounding is not contractual.
+const BACKPRESSURE_RCVBUF_BYTES: usize = 4096;
+
+/// Loose upper bound on the accepted backpressure socket's effective `SO_RCVBUF`.
+///
+/// Kernel rounding of the [`BACKPRESSURE_RCVBUF_BYTES`] request is not contractual, so this
+/// is not an assertion — it is the threshold above which the clamp evidently did not take
+/// (an unclamped Linux socket autotunes toward `tcp_rmem[1]`, 128 KiB by default, far above
+/// this).  Crossing it means the withhold phase cannot close the TCP window, so the device
+/// will run its whole warm-up without ever hitting a write boundary; the accept-time WARN
+/// makes that self-diagnosing in the HIL log instead of surfacing as an unexplained
+/// `TlsSendBackpressure` exhaustion that reads like a device regression.
+const BACKPRESSURE_RCVBUF_CEILING_BYTES: usize = 32 * 1024;
+
 // The device writes a single in-band sub-case selector byte first on a backpressure
-// connection (design §4 / §2.3 — no new protocol message type; one in-band byte on the
-// raw backpressure TCP socket, not a `Command`/`DeviceFrame` message).  Revision 4
-// reduced HIL `TcpSendBackpressure` to the single `A` saturate-then-drain sub-case
-// (adversaries B and C were dropped — design §2.3 *Revision-4 HIL reduction*), so the
-// host no longer dispatches on the byte: `consume_backpressure_selector_byte` reads it
-// off the stream and discards it, and every connection runs the one remaining `A`
-// profile.  The device's `BP_SUBCASE_A` (its `main.rs`) is the source of truth for the
-// byte actually sent.
+// connection (one in-band byte on the raw backpressure socket, not a `Command`/`DeviceFrame`
+// message).  Only the `A` saturate-then-drain sub-case remains, so the host no longer
+// dispatches on the byte: `consume_backpressure_selector_byte` reads it off the stream and
+// discards it, and every connection runs the one remaining `A` profile.  The device's
+// `BP_SUBCASE_A` (its `main.rs`) is the source of truth for the byte actually sent.
 
 /// Minimum resume cycles the eval requires on adversary A's boundary frame: ≥1 proves the
-/// device took **at least one** genuine partial write on real lwIP and resumed the tail to
-/// `Sent` rather than false-desyncing — the one fact only hardware can establish (design
-/// §4 adversary A; `notes-design-backpressure-pw-user-2.md`).  Deliberately **not** ≥2:
-/// forcing a second distinct device-side partial write on hardware is unreliable (a single
-/// host `read` frees far more than one byte of device-side headroom;
-/// `hil-backpressure-resumecycles-rootcause.md`).  The per-wait reset's *repeatability* is
-/// proven deterministically off-target by the device's many-cycle slow-drain unit test.
+/// device hit a genuine write boundary on real lwIP and resumed the frame to `Sent` rather
+/// than false-desyncing — the one fact only hardware can establish.
+///
+/// A resume cycle is *a completed writability wait followed by forward progress*.  Over
+/// the TLS link that is `WANT_WRITE` → `poll` → same-bytes retry accepting the whole
+/// record; a partial plaintext count never occurs for a single-record frame.  Back-to-back
+/// accepting writes with no wait between them count nothing, which is what keeps this floor
+/// from passing vacuously.
+///
+/// Deliberately **not** ≥2: forcing a second distinct device-side boundary on hardware
+/// is unreliable (a single host `read` frees far more than one byte of device-side
+/// headroom).  The per-wait reset's *repeatability* is proven deterministically off-target
+/// by the device's many-cycle slow-drain unit test.
 /// Must match the device-side `BACKPRESSURE_A_MIN_RESUME_CYCLES` floor — and its **type**:
 /// both are `u32` (the two crates have no shared constant module, so the type is part of
-/// the manual-sync contract; a divergent type is the first sign of a drifted copy — quality
-/// review quality-1).  The eval compares it against `parse_token_i32`'s `i32`, so the one
-/// comparison site casts locally.
+/// the manual-sync contract).  The eval compares it against `parse_token_i32`'s `i32`, so
+/// the one comparison site casts locally.
 const BACKPRESSURE_A_MIN_RESUME_CYCLES: u32 = 1;
 
 /// All optional HIL config loaded from the environment or a gitignored local file.
@@ -2565,12 +2657,10 @@ struct HilSecrets {
     tls: Option<TlsConfig>,
     /// Resolved UDP echo port (override from RESPEAKER_HIL_UDP_PORT or DEFAULT_HIL_UDP_PORT).
     udp_echo_port: u16,
-    /// Resolved TCP echo port (override from RESPEAKER_HIL_TCP_PORT or DEFAULT_HIL_TCP_PORT).
-    tcp_echo_port: u16,
-    /// Resolved TCP audio-frame source port for `TcpInboundFrames`
+    /// Resolved TCP audio-frame source port for `TlsInboundFrames`
     /// (override from RESPEAKER_HIL_INBOUND_FRAMES_PORT or DEFAULT_HIL_INBOUND_FRAMES_PORT).
     inbound_frames_port: u16,
-    /// Resolved TCP backpressure source port for `TcpSendBackpressure`
+    /// Resolved TCP backpressure source port for `TlsSendBackpressure`
     /// (override from RESPEAKER_HIL_BACKPRESSURE_PORT or DEFAULT_HIL_BACKPRESSURE_PORT).
     backpressure_port: u16,
     /// Resolved TCP poll-readiness adversary port for `PollReadinessBidir`
@@ -2730,12 +2820,6 @@ fn resolve_secrets(get: impl Fn(&str) -> Option<String>, secrets_path: &str) -> 
         DEFAULT_HIL_UDP_PORT,
         secrets_path,
     );
-    let tcp_echo_port = resolve_hil_port(
-        &get,
-        "RESPEAKER_HIL_TCP_PORT",
-        DEFAULT_HIL_TCP_PORT,
-        secrets_path,
-    );
     let inbound_frames_port = resolve_hil_port(
         &get,
         "RESPEAKER_HIL_INBOUND_FRAMES_PORT",
@@ -2777,7 +2861,6 @@ fn resolve_secrets(get: impl Fn(&str) -> Option<String>, secrets_path: &str) -> 
         wifi,
         tls,
         udp_echo_port,
-        tcp_echo_port,
         inbound_frames_port,
         backpressure_port,
         poll_readiness_port,
@@ -2971,6 +3054,90 @@ fn spawn_tls_psk_listener(
         .map_err(|e| format!("failed to spawn {name} thread: {e}"))
 }
 
+/// An established server-side TLS-PSK connection over a TCP socket. Every converted HIL
+/// fixture runs its byte logic over one of these instead of a raw `TcpStream`; socket
+/// options (read/write timeouts, blocking mode) are still reachable via `get_ref()`.
+type TlsServerStream = openssl::ssl::SslStream<std::net::TcpStream>;
+
+/// Bind a listening socket on `0.0.0.0:port` whose accepted connections inherit a
+/// `SO_RCVBUF` of about `rcvbuf` bytes.
+///
+/// `std::net::TcpListener` exposes no buffer-size setting, and setting it on an already
+/// accepted socket is unreliable on Linux — the receive window scale is advertised in the
+/// SYN-ACK, so the clamp has to be in place before `listen(2)`. Hence the raw socket
+/// construction. `SO_REUSEADDR` matches what `TcpListener::bind` sets, so a rerun after a
+/// closed connection lingers in `TIME_WAIT` still binds.
+///
+/// The kernel treats the request as a hint (it roughly doubles it and enforces its own
+/// floor), so callers must log the effective value rather than assert on it.
+fn bind_clamped_rcvbuf_listener(port: u16, rcvbuf: usize) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_recv_buffer_size(rcvbuf)?;
+    let addr: std::net::SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, port).into();
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
+/// Effective `SO_RCVBUF` of an accepted socket, for the accept-time diagnostic. Returns
+/// `None` if the query fails — a diagnostic must never take a fixture down.
+fn effective_recv_buffer_size(stream: &std::net::TcpStream) -> Option<usize> {
+    socket2::SockRef::from(stream).recv_buffer_size().ok()
+}
+
+/// Complete the server side of a TLS-PSK handshake on one accepted TCP connection.
+///
+/// Puts the socket in blocking mode with handshake read/write timeouts, negotiates with
+/// `ctx`, and returns the established stream. A refused handshake — wrong key, or a
+/// plaintext client hitting a TLS fixture — is logged and yields `None`; on the wrong-key
+/// listener that is the expected outcome, so it is a normal event, not a warning. The
+/// caller sets whatever per-phase socket timeouts its byte logic needs via `get_ref()`.
+fn tls_accept(
+    ctx: &openssl::ssl::SslContext,
+    stream: std::net::TcpStream,
+    peer: &std::net::SocketAddr,
+    name: &str,
+) -> Option<TlsServerStream> {
+    let io_timeout = Duration::from_secs(5);
+    if let Err(e) = stream
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(Some(io_timeout)))
+        .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
+    {
+        eprintln!("WARN [{name}]: {peer} socket setup failed: {e}");
+        return None;
+    }
+    let ssl = match openssl::ssl::Ssl::new(ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("WARN [{name}]: Ssl::new failed: {e}");
+            return None;
+        }
+    };
+    let mut tls = match openssl::ssl::SslStream::new(ssl, stream) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("WARN [{name}]: SslStream::new failed: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = tls.accept() {
+        println!("[{name}] {peer} handshake refused: {e}");
+        return None;
+    }
+    println!(
+        "[{name}] {peer} handshake OK version={} cipher={}",
+        tls.ssl().version_str(),
+        tls.ssl()
+            .current_cipher()
+            .map(|c| c.name())
+            .unwrap_or("<none>")
+    );
+    Some(tls)
+}
+
 /// Complete the TLS-PSK handshake on one accepted connection and echo until EOF.
 ///
 /// The socket goes blocking with read/write timeouts for both the handshake and the
@@ -2984,41 +3151,10 @@ fn tls_psk_serve(
 ) {
     use std::io::{Read as _, Write as _};
 
-    let io_timeout = Duration::from_secs(5);
-    if let Err(e) = stream
-        .set_nonblocking(false)
-        .and_then(|()| stream.set_read_timeout(Some(io_timeout)))
-        .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
-    {
-        eprintln!("WARN [{name}]: {peer} socket setup failed: {e}");
-        return;
-    }
-    let ssl = match openssl::ssl::Ssl::new(ctx) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("WARN [{name}]: Ssl::new failed: {e}");
-            return;
-        }
+    let mut tls = match tls_accept(ctx, stream, peer, name) {
+        Some(t) => t,
+        None => return,
     };
-    let mut tls = match openssl::ssl::SslStream::new(ssl, stream) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("WARN [{name}]: SslStream::new failed: {e}");
-            return;
-        }
-    };
-    if let Err(e) = tls.accept() {
-        println!("[{name}] {peer} handshake refused: {e}");
-        return;
-    }
-    println!(
-        "[{name}] {peer} handshake OK version={} cipher={}",
-        tls.ssl().version_str(),
-        tls.ssl()
-            .current_cipher()
-            .map(|c| c.name())
-            .unwrap_or("<none>")
-    );
 
     let mut buf = [0u8; 512];
     loop {
@@ -3042,28 +3178,25 @@ fn tls_psk_serve(
 
 // ── PeerServers RAII guard ─────────────────────────────────────────────────────
 
-/// RAII guard that owns the UDP and TCP echo server threads for the duration of the
-/// network reachability tests.
+/// RAII guard that owns the UDP echo and TLS-PSK fixture server threads for the duration of
+/// the network reachability tests.
 ///
 /// - **UDP echo**: a thread that loops `recv_from` → `send_to` the same bytes back.
-/// - **TCP echo**: a `TcpListener` that accepts one connection, reads N bytes, writes
-///   them back, then loops for the next connection until dropped.
+/// - **TLS-PSK fixtures**: per-fixture `TcpListener`s that accept a connection, complete the
+///   session-key TLS handshake, and run their byte logic inside the tunnel until dropped.
 ///
-/// `Drop` signals both threads to stop (via a shared `Arc<Mutex<bool>>` flag) and
-/// joins them so repeated `make hil-test` runs do not collide on bound ports.
-/// Fixed ports (configured or `DEFAULT_HIL_UDP_PORT`/`DEFAULT_HIL_TCP_PORT`) allow
-/// static firewall rules; `Drop` joins threads and closes the listeners so the next
-/// run can re-bind the same ports without racing against a still-live prior process.
+/// `Drop` signals every thread to stop (via a shared `Arc<Mutex<bool>>` flag) and joins them
+/// so repeated `make hil-test` runs do not collide on bound ports. Fixed ports (configured or
+/// the compiled-in defaults) allow static firewall rules; `Drop` joins threads and closes the
+/// listeners so the next run can re-bind the same ports without racing a still-live prior process.
 struct PeerServers {
-    /// Host LAN IP used as the `host` field in `ProvisionPeer`.
+    /// Host LAN IP used as the `host` field in `SetTemporaryPeerConfig`.
     host_ip: [u8; 4],
     /// Fixed UDP echo port (configured or default).
     udp_port: u16,
-    /// Fixed TCP echo port (configured or default).
-    tcp_port: u16,
-    /// Fixed TCP audio-frame source port for `TcpInboundFrames` (configured or default).
+    /// Fixed TCP audio-frame source port for `TlsInboundFrames` (configured or default).
     inbound_frames_port: u16,
-    /// Fixed TCP backpressure source port for `TcpSendBackpressure` (configured or default).
+    /// Fixed TCP backpressure source port for `TlsSendBackpressure` (configured or default).
     backpressure_port: u16,
     /// Fixed TCP poll-readiness adversary port for `PollReadinessBidir` (configured or default).
     poll_readiness_port: u16,
@@ -3085,11 +3218,9 @@ struct PeerServers {
     stop: Arc<Mutex<bool>>,
     /// UDP server thread handle.
     udp_thread: Option<thread::JoinHandle<()>>,
-    /// TCP server thread handle.
-    tcp_thread: Option<thread::JoinHandle<()>>,
-    /// TCP audio-frame source thread handle for `TcpInboundFrames`.
+    /// TLS-PSK audio-frame source thread handle for `TlsInboundFrames`.
     inbound_frames_thread: Option<thread::JoinHandle<()>>,
-    /// TCP backpressure source thread handle for `TcpSendBackpressure`.
+    /// TCP backpressure source thread handle for `TlsSendBackpressure`.
     backpressure_thread: Option<thread::JoinHandle<()>>,
     /// TCP poll-readiness adversary thread handle for `PollReadinessBidir`.
     poll_readiness_thread: Option<thread::JoinHandle<()>>,
@@ -3110,7 +3241,6 @@ impl PeerServers {
     fn start(pod_ip: [u8; 4], secrets: &HilSecrets, psk: &PodPsk) -> Result<Self, String> {
         let HilSecrets {
             udp_echo_port: udp_port,
-            tcp_echo_port: tcp_port,
             inbound_frames_port,
             backpressure_port,
             poll_readiness_port,
@@ -3145,15 +3275,6 @@ impl PeerServers {
                 "failed to bind UDP echo socket on 0.0.0.0:{udp_port}: {e}\n  \
                  (port already in use? a prior hil-host may still hold it — wait for it to \
                  exit, or set RESPEAKER_HIL_UDP_PORT to a free port)"
-            )
-        })?;
-
-        // Bind TCP listener on the fixed port (no :0 fallback — AC7).
-        let tcp_listener = TcpListener::bind(("0.0.0.0", tcp_port)).map_err(|e| {
-            format!(
-                "failed to bind TCP echo listener on 0.0.0.0:{tcp_port}: {e}\n  \
-                 (port already in use? a prior hil-host may still hold it — wait for it to \
-                 exit, or set RESPEAKER_HIL_TCP_PORT to a free port)"
             )
         })?;
 
@@ -3200,76 +3321,12 @@ impl PeerServers {
             })
             .map_err(|e| format!("failed to spawn UDP echo thread: {e}"))?;
 
-        // ── TCP echo thread ───────────────────────────────────────────────────
-        let stop_tcp = Arc::clone(&stop);
-        // Use accept timeout via nonblocking + poll instead of SO_TIMEOUT (not portable).
-        tcp_listener
-            .set_nonblocking(true)
-            .map_err(|e| format!("failed to set TCP listener non-blocking: {e}"))?;
-        let tcp_thread = thread::Builder::new()
-            .name("tcp-echo".to_string())
-            .spawn(move || {
-                loop {
-                    if *stop_tcp.lock().unwrap() {
-                        break;
-                    }
-                    match tcp_listener.accept() {
-                        Ok((mut stream, peer)) => {
-                            // Read up to 512 bytes, echo back, close.
-                            // Graceful close (FIN) is used here — SO_LINGER(0) was
-                            // previously set to avoid TIME_WAIT, but TIME_WAIT on a
-                            // passively-accepted connection doesn't block re-bind of the
-                            // listener port.  Worse, abortive RST with SO_LINGER(0) can
-                            // discard echo bytes still in the send buffer before the
-                            // device reads them, causing spurious test failures.  Graceful
-                            // FIN ensures the 16-byte response is delivered.  See
-                            // design §2.4 for the full analysis.
-                            if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
-                                eprintln!(
-                                    "WARN [tcp-echo]: set_read_timeout for {peer} failed: {e}"
-                                );
-                                continue;
-                            }
-                            // Use read_exact(16) to mirror the device's nonce size
-                            // and guarantee we echo all 16 bytes. A single read()
-                            // may return fewer bytes on a segmented TCP delivery,
-                            // causing the device's read_exact to get UnexpectedEof.
-                            let mut buf = [0u8; 16];
-                            match stream.read_exact(&mut buf) {
-                                Ok(()) => {
-                                    if let Err(e) = stream.write_all(&buf) {
-                                        eprintln!(
-                                            "WARN [tcp-echo]: write_all to {peer} failed: {e}"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "WARN [tcp-echo]: read_exact from {peer} failed: {e}"
-                                    );
-                                }
-                            }
-                            // Connection closes when `stream` drops.
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // No pending connection; sleep briefly.
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(e) => {
-                            if *stop_tcp.lock().unwrap() {
-                                break;
-                            }
-                            eprintln!("WARN [tcp-echo]: accept error: {e}");
-                        }
-                    }
-                }
-            })
-            .map_err(|e| format!("failed to spawn TCP echo thread: {e}"))?;
-
-        // ── TCP audio-frame source thread (for TcpInboundFrames self-test) ─────
-        // Accepts one connection at a time, sends INBOUND_FRAMES_COUNT StreamFrame::Audio
-        // frames using the shared encode_frame codec, then closes the connection.
-        // The device reads until EOF to know when all frames have been delivered.
+        // ── TLS-PSK audio-frame source thread (for TlsInboundFrames self-test) ─────
+        // Accepts one connection at a time, completes the session-key TLS handshake, then
+        // sends INBOUND_FRAMES_COUNT StreamFrame::Audio frames inside the tunnel using the
+        // shared encode_frame codec, then closes the connection. The device reads until EOF
+        // to know when all frames have been delivered.
+        let inbound_ctx = psk_server_context(psk)?;
         let inbound_listener =
             TcpListener::bind(("0.0.0.0", inbound_frames_port)).map_err(|e| {
                 format!(
@@ -3309,12 +3366,12 @@ impl PeerServers {
                 };
                 let encoded_frame: Vec<u8> = encode_buf[..encoded_frame_len].to_vec();
 
-                // Pre-encode a leading Hello declaring the device format (design §2a). The
-                // device requires a conforming Hello before any Audio (design §2b); without it
-                // the device drops the connection on the first Audio frame and TcpInboundFrames
+                // Pre-encode a leading Hello declaring the device format. The device
+                // requires a conforming Hello before any Audio; without it
+                // the device drops the connection on the first Audio frame and TlsInboundFrames
                 // fails. The Hello is written once per accepted connection, before the
                 // INBOUND_FRAMES_COUNT Audio frames; it is not an Audio frame and is not counted
-                // by eval_tcp_inbound_frames.
+                // by eval_tls_inbound_frames.
                 let hello_template = StreamFrame::Hello(Hello {
                     version: AUDIO_PROTOCOL_VERSION,
                     pod_id: heapless::String::new(),
@@ -3339,76 +3396,36 @@ impl PeerServers {
                         break;
                     }
                     match inbound_listener.accept() {
-                        Ok((mut stream, peer)) => {
+                        Ok((stream, peer)) => {
                             println!(
                                 "[inbound-frames-source] accepted {peer} t={}",
                                 servers_start.elapsed().as_millis()
                             );
-                            if let Err(e) =
-                                stream.set_write_timeout(Some(Duration::from_secs(10)))
+                            let mut stream = match tls_accept(
+                                &inbound_ctx,
+                                stream,
+                                &peer,
+                                "inbound-frames-source",
+                            ) {
+                                Some(t) => t,
+                                None => continue,
+                            };
+                            if let Err(e) = stream
+                                .get_ref()
+                                .set_write_timeout(Some(Duration::from_secs(10)))
                             {
                                 eprintln!(
                                     "WARN [inbound-frames-source]: set_write_timeout for {peer} failed: {e}"
                                 );
                                 continue;
                             }
-                            use std::io::Write as _;
-                            // Selector byte (inbound-backpressure-hil design §2.2): 'F' ->
-                            // unpaced flood profile (TcpInboundBackpressure); anything else,
-                            // or a timeout/EOF/error, -> the happy-path profile
-                            // (INBOUND_FRAMES_COUNT frames), covering any straggler firmware
-                            // that omits the selector write.
-                            let selector = read_trigger_byte(
+                            inbound_frames_serve(
                                 &mut stream,
                                 &peer,
-                                "inbound-frames-source",
-                                "running happy-path profile",
-                                Duration::from_secs(2),
+                                &stop_inbound,
+                                &encoded_hello,
+                                &encoded_frame,
                             );
-                            let flood = selector == Some(b'F');
-                            let frame_count = if flood {
-                                INBOUND_BP_FLOOD_FRAMES
-                            } else {
-                                INBOUND_FRAMES_COUNT
-                            };
-                            println!(
-                                "[inbound-frames-source] {peer} profile={}",
-                                if flood { "flood" } else { "happy-path" }
-                            );
-                            let mut ok = true;
-                            // Conforming sender: declare the format with a leading Hello before
-                            // any Audio (design §2a). The device's Hello-required gate (§2b)
-                            // drops the connection on Audio-before-Hello.
-                            if let Err(e) = stream.write_all(&encoded_hello) {
-                                eprintln!(
-                                    "WARN [inbound-frames-source]: Hello write to {peer} failed: {e}"
-                                );
-                                ok = false;
-                            }
-                            for _ in 0..frame_count {
-                                if !ok {
-                                    break;
-                                }
-                                // Straggler-at-teardown guard (flood profile only reaches this
-                                // many iterations; the happy-path's 10 writes finish quickly
-                                // regardless): stop mid-flood rather than blocking runner
-                                // shutdown behind the write timeout.
-                                if *stop_inbound.lock().unwrap() {
-                                    ok = false;
-                                    break;
-                                }
-                                if let Err(e) = stream.write_all(&encoded_frame) {
-                                    eprintln!(
-                                        "WARN [inbound-frames-source]: write to {peer} failed: {e}"
-                                    );
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            if ok {
-                                // Flush and close (graceful FIN) to signal EOF to the device.
-                                let _ = stream.flush();
-                            }
                             // stream drops here → FIN or RST depending on prior errors.
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3428,34 +3445,33 @@ impl PeerServers {
             })
             .map_err(|e| format!("failed to spawn inbound-frames-source thread: {e}"))?;
 
-        // ── TCP backpressure source thread (for TcpSendBackpressure self-test) ──
-        // Accepts one connection at a time and runs one of two adversary drain
-        // profiles (design §4 / §2.3; sub-case B zero-drain was dropped — design §4 HIL
-        // reduction, revision-3 item 1), selected by the single in-band selector byte the
-        // device writes first on the connection (no new protocol message type):
-        //   - A saturate-then-drain: withhold reads briefly so the boundary frame takes a
-        //     genuine partial write, then resume draining at line rate so it completes
-        //     (Sent) under the device's 1.0 s per-frame ceiling.  Proves the device's
-        //     resume-the-tail loop on real lwIP (resume_cycles ≥ 1).  The per-wait reset's
-        //     repeatability is proven off-target by the device's many-cycle unit test.
-        //   - C just-over-ceiling: grant ~1 byte every ~900 ms so the boundary frame
-        //     makes progress but cannot complete within the 1.0 s ceiling → the
-        //     device's per-frame ceiling fires the mid-tail-dead terminal arm.
-        // A connection whose selector byte is not C falls back to the A saturate-then-drain
-        // profile (covering the no-selector / unknown-selector caller).
-        // The device never reads on this socket (beyond the selector write, device→host
-        // only), so the server only ever writes the graceful FIN; all flow control is
-        // one-directional (device → host) after the selector byte.
+        // ── TCP backpressure source thread (for TlsSendBackpressure self-test) ──
+        // Accepts one connection at a time and runs the adversary A saturate-then-drain
+        // profile, selected by the single in-band selector byte the device writes first on
+        // the connection: withhold reads briefly so the device's next record hits a write
+        // boundary (WANT_WRITE), then resume draining at line rate so the frame completes
+        // (Sent) under the device's 1.0 s per-frame ceiling. Proves the device's
+        // resume-the-tail loop on real lwIP (resume_cycles >= 1). Any stray/no-selector
+        // caller runs the same profile. The device never reads on this socket (beyond the
+        // selector write, device->host only), so all flow control is one-directional after
+        // the selector.
+        //
+        // This is the one fixture whose listener is not a plain `TcpListener::bind`: its
+        // receive buffer is clamped so the withhold closes the TCP window deterministically
+        // (see `BACKPRESSURE_RCVBUF_BYTES`).
         let backpressure_listener =
-            TcpListener::bind(("0.0.0.0", backpressure_port)).map_err(|e| {
-                format!(
-                    "failed to bind backpressure listener on 0.0.0.0:{backpressure_port}: {e}\n  \
+            bind_clamped_rcvbuf_listener(backpressure_port, BACKPRESSURE_RCVBUF_BYTES).map_err(
+                |e| {
+                    format!(
+                "failed to bind backpressure listener on 0.0.0.0:{backpressure_port}: {e}\n  \
                  (port already in use? set RESPEAKER_HIL_BACKPRESSURE_PORT to a free port)"
-                )
-            })?;
+            )
+                },
+            )?;
         backpressure_listener
             .set_nonblocking(true)
             .map_err(|e| format!("failed to set backpressure listener non-blocking: {e}"))?;
+        let backpressure_ctx = psk_server_context(psk)?;
         let stop_bp = Arc::clone(&stop);
         let backpressure_thread = thread::Builder::new()
             .name("backpressure-source".to_string())
@@ -3466,20 +3482,48 @@ impl PeerServers {
                         break;
                     }
                     match backpressure_listener.accept() {
-                        Ok((mut stream, peer)) => {
+                        Ok((stream, peer)) => {
+                            // The effective SO_RCVBUF is the saturation mechanism: it
+                            // bounds the window the device can fill during the withhold.
+                            // Log it so an exhausted warm-up can be told apart from a
+                            // clamp the kernel did not honour.
+                            let so_rcvbuf = effective_recv_buffer_size(&stream);
                             println!(
-                                "[backpressure-source] accepted {peer} conn={bp_conn} t={}",
-                                servers_start.elapsed().as_millis()
+                                "[backpressure-source] accepted {peer} conn={bp_conn} t={} \
+                                 so_rcvbuf={}",
+                                servers_start.elapsed().as_millis(),
+                                so_rcvbuf
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string()),
                             );
+                            // A socket that did not inherit the clamp cannot be saturated by
+                            // the withhold, so the test would exhaust its warm-up for a
+                            // fixture-side reason. Say so here rather than let it read as a
+                            // device regression.
+                            if let Some(v) = so_rcvbuf {
+                                if v > BACKPRESSURE_RCVBUF_CEILING_BYTES {
+                                    eprintln!(
+                                        "WARN [backpressure-source]: SO_RCVBUF={v} exceeds the \
+                                         clamp ceiling {BACKPRESSURE_RCVBUF_CEILING_BYTES} \
+                                         (requested {BACKPRESSURE_RCVBUF_BYTES}) — the withhold \
+                                         will not close the TCP window, so the device may send \
+                                         its whole warm-up without hitting a write boundary"
+                                    );
+                                }
+                            }
                             bp_conn += 1;
-                            // Consume the single in-band sub-case selector byte the device
-                            // writes first (design §4 / §2.3).  Revision 4 reduced HIL to
-                            // adversary A only (B/C dropped — design §2.3 *Revision-4 HIL
-                            // reduction*), so the selector no longer chooses a profile: the
-                            // device only ever sends `A`, and any stray/no-selector caller
-                            // runs the same benign saturate-then-drain resume profile.  The
-                            // read is retained only to take the selector byte off the stream
-                            // so it is not mistaken for frame data by the drain.
+                            let mut stream = match tls_accept(
+                                &backpressure_ctx,
+                                stream,
+                                &peer,
+                                "backpressure-source",
+                            ) {
+                                Some(t) => t,
+                                None => continue,
+                            };
+                            // Take the selector byte off the stream so it is not mistaken
+                            // for frame data by the drain. Only the A profile remains, so
+                            // the value is not inspected.
                             consume_backpressure_selector_byte(&mut stream, &peer);
                             if backpressure_profile_a(&mut stream, &peer, &stop_bp) {
                                 return; // stop requested mid-profile
@@ -3505,7 +3549,7 @@ impl PeerServers {
         // Accepts one connection at a time, consumes the device's single in-band trigger
         // byte (device→host, no new protocol message type), then immediately queues a small
         // fixed payload of inbound bytes back so the device can observe `poll(POLLIN)`
-        // readiness on real lwIP (event-loop design §4 test #1). The device never reads more
+        // readiness on real lwIP. The device never reads more
         // than once and writes only the trigger byte, so flow control is trivial; the
         // connection is left open briefly (the device polls, reads, then drops its end) and
         // the stream drops here → FIN.
@@ -3519,6 +3563,7 @@ impl PeerServers {
         poll_readiness_listener
             .set_nonblocking(true)
             .map_err(|e| format!("failed to set poll-readiness listener non-blocking: {e}"))?;
+        let poll_readiness_ctx = psk_server_context(psk)?;
         let stop_poll = Arc::clone(&stop);
         let poll_readiness_thread = thread::Builder::new()
             .name("poll-readiness-source".to_string())
@@ -3529,12 +3574,21 @@ impl PeerServers {
                         break;
                     }
                     match poll_readiness_listener.accept() {
-                        Ok((mut stream, peer)) => {
+                        Ok((stream, peer)) => {
                             println!(
                                 "[poll-readiness-source] accepted {peer} conn={pr_conn} t={}",
                                 servers_start.elapsed().as_millis()
                             );
                             pr_conn += 1;
+                            let mut stream = match tls_accept(
+                                &poll_readiness_ctx,
+                                stream,
+                                &peer,
+                                "poll-readiness-source",
+                            ) {
+                                Some(t) => t,
+                                None => continue,
+                            };
                             poll_readiness_serve(&mut stream, &peer);
                             // stream drops here → FIN to the device.
                         }
@@ -3553,10 +3607,12 @@ impl PeerServers {
             })
             .map_err(|e| format!("failed to spawn poll-readiness-source thread: {e}"))?;
 
-        // ── TCP StreamRealtimeDuplex listener thread ───────────────────────────
-        // Accepts the device's outbound streamer connection, decodes the
-        // Hello/SegmentStart/Audio/SegmentEnd frames, and records burst-drain timing +
-        // received sample count + end reason into the shared observation for the runner.
+        // ── TLS-PSK StreamRealtimeDuplex listener thread ───────────────────────
+        // Accepts the device's outbound streamer connection, completes the session-key TLS
+        // handshake, then decodes the Hello/SegmentStart/Audio/SegmentEnd frames and records
+        // burst-drain timing + received sample count + end reason into the shared observation
+        // for the runner.
+        let rtd_ctx = psk_server_context(psk)?;
         let rtd_listener = TcpListener::bind(("0.0.0.0", rtd_port)).map_err(|e| {
             format!(
                 "failed to bind rtd listener on 0.0.0.0:{rtd_port}: {e}\n  \
@@ -3584,11 +3640,16 @@ impl PeerServers {
                         break;
                     }
                     match rtd_listener.accept() {
-                        Ok((mut stream, peer)) => {
+                        Ok((stream, peer)) => {
                             println!(
                                 "[rtd-listener] accepted {peer} conn={conn_index} t={}",
                                 servers_start.elapsed().as_millis()
                             );
+                            let mut stream =
+                                match tls_accept(&rtd_ctx, stream, &peer, "rtd-listener") {
+                                    Some(t) => t,
+                                    None => continue,
+                                };
                             let paced = conn_index >= 1;
                             let obs = if paced {
                                 &rtd_obs_b_thread
@@ -3642,14 +3703,13 @@ impl PeerServers {
         )?;
 
         println!(
-            "  PeerServers: host_ip={} udp_port={udp_port} tcp_port={tcp_port} inbound_frames_port={inbound_frames_port} backpressure_port={backpressure_port} poll_readiness_port={poll_readiness_port} rtd_port={rtd_port} tls_psk_port={tls_psk_port} tls_psk_bad_port={tls_psk_bad_port}",
+            "  PeerServers: host_ip={} udp_port={udp_port} inbound_frames_port={inbound_frames_port} backpressure_port={backpressure_port} poll_readiness_port={poll_readiness_port} rtd_port={rtd_port} tls_psk_port={tls_psk_port} tls_psk_bad_port={tls_psk_bad_port}",
             Ipv4Addr::from(host_ip)
         );
 
         Ok(PeerServers {
             host_ip,
             udp_port,
-            tcp_port,
             inbound_frames_port,
             backpressure_port,
             poll_readiness_port,
@@ -3660,7 +3720,6 @@ impl PeerServers {
             rtd_observation_b,
             stop,
             udp_thread: Some(udp_thread),
-            tcp_thread: Some(tcp_thread),
             inbound_frames_thread: Some(inbound_frames_thread),
             backpressure_thread: Some(backpressure_thread),
             poll_readiness_thread: Some(poll_readiness_thread),
@@ -3671,39 +3730,18 @@ impl PeerServers {
     }
 }
 
-/// Serve one poll-readiness connection (event-loop design §4 test #1): consume the device's
-/// single in-band trigger byte, then immediately write a small fixed payload back so the
-/// device's `poll(POLLIN)` reports read-readiness. The trigger byte's presence (not value) is
-/// the cue; EOF/timeout/error are logged (a device-side early teardown before the trigger
-/// leaves a correlatable server-side event) but are otherwise benign — the payload is queued
-/// regardless so a stray caller still gets a well-formed response rather than a silent hang.
 /// Read the single in-band trigger/selector byte the device writes first on a just-accepted
-/// connection.  Shared by `poll_readiness_serve`, `consume_backpressure_selector_byte`,
-/// and the `inbound-frames-source` flood-profile dispatch: all set a
-/// caller-chosen read timeout and consume one byte, logging EOF/error with the caller's
-/// `prefix` (e.g. `poll-readiness-source`) and `on_missing` clause so the message reads
-/// correctly for the caller.  Returns the byte read, or `None` on EOF/timeout/error — the
-/// two non-dispatching callers ignore the value (the read only takes the byte off the
-/// stream so it is not mistaken for frame data); the inbound-frames-source flood dispatch
-/// inspects it.
-///
-/// The timeout is caller-chosen rather than fixed because callers differ in how tight a
-/// bound they can afford: `poll_readiness_serve` and `consume_backpressure_selector_byte`
-/// pass 5 s, a generous bound covering connect+first-write latency for a caller with no
-/// tighter budget of its own. The inbound-frames-source flood dispatch passes 2 s instead,
-/// matching the device's own `INBOUND_READ_TIMEOUT_SECS` — that connection's selector write
-/// is the device's very first write after `connect_timeout` returns, with no other work in
-/// between, so a tight bound is safe and keeps a stray/no-selector caller's happy-path
-/// fallback latency small.
+/// connection, with a caller-chosen read timeout. Returns the byte, or `None` on
+/// EOF/timeout/error (logged with `prefix` and `on_missing`).
 fn read_trigger_byte(
-    stream: &mut std::net::TcpStream,
+    stream: &mut TlsServerStream,
     peer: &std::net::SocketAddr,
     prefix: &str,
     on_missing: &str,
     timeout: Duration,
 ) -> Option<u8> {
     use std::io::Read as _;
-    if let Err(e) = stream.set_read_timeout(Some(timeout)) {
+    if let Err(e) = stream.get_ref().set_read_timeout(Some(timeout)) {
         eprintln!("WARN [{prefix}]: set_read_timeout for {peer} failed: {e}");
         // Fall through: still take the byte / serve below.
     }
@@ -3721,7 +3759,11 @@ fn read_trigger_byte(
     }
 }
 
-fn poll_readiness_serve(stream: &mut std::net::TcpStream, peer: &std::net::SocketAddr) {
+/// Serve one poll-readiness connection: consume the device's trigger byte, then write a
+/// small fixed payload back so the device's `poll(POLLIN)` reports read-readiness. The
+/// payload is queued regardless of EOF/timeout/error on the trigger read, so a stray caller
+/// still gets a well-formed response.
+fn poll_readiness_serve(stream: &mut TlsServerStream, peer: &std::net::SocketAddr) {
     use std::io::Write as _;
 
     read_trigger_byte(
@@ -3743,21 +3785,75 @@ fn poll_readiness_serve(stream: &mut std::net::TcpStream, peer: &std::net::Socke
     }
 }
 
-/// Consume the single in-band sub-case selector byte the device writes first on a
-/// backpressure connection (design §4 / §2.3).  Revision 4 reduced HIL to adversary A
-/// only (B/C dropped — design §2.3 *Revision-4 HIL reduction*), so the byte no longer
-/// chooses a profile: every connection runs the same saturate-then-drain (A) profile.
-/// The read is retained solely to take the selector byte off the stream so it is not
-/// mistaken for frame data by the drain; its value is intentionally not inspected.
-/// Uses a short blocking read with a generous timeout; the device writes the selector
-/// immediately after connecting, before any Audio frame.  EOF/timeout/error are benign
-/// (the same A profile runs regardless) but are logged so a device-side early teardown
-/// before the selector write leaves a correlatable server-side event rather than a
-/// silent divergence the operator must packet-capture to diagnose (error-handling review).
-fn consume_backpressure_selector_byte(
-    stream: &mut std::net::TcpStream,
+/// Serve one accepted inbound-frames connection inside the tunnel: read the in-band
+/// selector byte, then write a leading `Hello` followed by the profile's Audio frames.
+///
+/// Selector byte: `'F'` selects the unpaced flood profile (`TlsInboundBackpressure`);
+/// anything else, or a timeout/EOF/error, selects the happy-path profile
+/// (`INBOUND_FRAMES_COUNT` frames), covering any straggler firmware that omits the
+/// selector write. Returns the number of Audio frames written.
+fn inbound_frames_serve(
+    stream: &mut TlsServerStream,
     peer: &std::net::SocketAddr,
-) {
+    stop: &Arc<Mutex<bool>>,
+    encoded_hello: &[u8],
+    encoded_frame: &[u8],
+) -> u32 {
+    use std::io::Write as _;
+    let selector = read_trigger_byte(
+        stream,
+        peer,
+        "inbound-frames-source",
+        "running happy-path profile",
+        Duration::from_secs(2),
+    );
+    let flood = selector == Some(b'F');
+    let frame_count = if flood {
+        INBOUND_BP_FLOOD_FRAMES
+    } else {
+        INBOUND_FRAMES_COUNT
+    };
+    println!(
+        "[inbound-frames-source] {peer} profile={}",
+        if flood { "flood" } else { "happy-path" }
+    );
+    let mut written: u32 = 0;
+    let mut ok = true;
+    // Conforming sender: declare the format with a leading Hello before any Audio. The
+    // device drops the connection on Audio-before-Hello.
+    if let Err(e) = stream.write_all(encoded_hello) {
+        eprintln!("WARN [inbound-frames-source]: Hello write to {peer} failed: {e}");
+        ok = false;
+    }
+    for _ in 0..frame_count {
+        if !ok {
+            break;
+        }
+        // Straggler-at-teardown guard (flood profile only reaches this many iterations;
+        // the happy-path's 10 writes finish quickly regardless): stop mid-flood rather
+        // than blocking runner shutdown behind the write timeout.
+        if *stop.lock().unwrap() {
+            ok = false;
+            break;
+        }
+        if let Err(e) = stream.write_all(encoded_frame) {
+            eprintln!("WARN [inbound-frames-source]: write to {peer} failed: {e}");
+            ok = false;
+            break;
+        }
+        written += 1;
+    }
+    if ok {
+        // Flush and close (graceful FIN) to signal EOF to the device.
+        let _ = stream.flush();
+    }
+    written
+}
+
+/// Take the selector byte off the stream so it is not mistaken for frame data by the drain.
+/// Only the A profile remains, so the value is not inspected. EOF/timeout/error are benign
+/// (the same A profile runs regardless).
+fn consume_backpressure_selector_byte(stream: &mut TlsServerStream, peer: &std::net::SocketAddr) {
     // Shared one-byte trigger read (reuse-2).  EOF/timeout/error are benign — the same A
     // profile runs regardless — so the on-missing clause names that fallback.
     read_trigger_byte(
@@ -3781,31 +3877,48 @@ fn consume_backpressure_selector_byte(
 /// server's first read, the drain loop must not time out and close mid-retry (that would
 /// surface as `reusable=false` and flake the test).  15 s leaves ~2× margin.
 fn backpressure_drain_to_eof(
-    stream: &mut std::net::TcpStream,
+    stream: &mut TlsServerStream,
     peer: &std::net::SocketAddr,
     stop_bp: &Arc<Mutex<bool>>,
 ) -> bool {
-    if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(15))) {
+    if let Err(e) = stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+    {
         eprintln!("WARN [backpressure-source]: set_read_timeout (drain) for {peer} failed: {e}");
         return false;
     }
     let mut drain_buf = [0u8; 4096];
+    // Total plaintext discarded, reported at drain end. It separates "the device sent
+    // everything freely" (a volume near the whole warm-up) from "the device stalled
+    // somewhere else" (a short count) when the warm-up loop exhausts with no boundary.
+    let mut drained: u64 = 0;
     loop {
         if *stop_bp.lock().unwrap() {
+            println!("[backpressure-source] {peer}: drain stopped, {drained} bytes discarded");
             return true;
         }
         match stream.read(&mut drain_buf) {
-            Ok(0) => return false, // device closed (EOF)
-            Ok(_) => {}            // discard drained bytes
+            Ok(0) => {
+                // Device closed (EOF).
+                println!("[backpressure-source] {peer}: drain saw EOF, {drained} bytes discarded");
+                return false;
+            }
+            Ok(m) => drained += m as u64, // discard drained bytes
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 // No more bytes within the read timeout; the device has stopped sending.
+                println!(
+                    "[backpressure-source] {peer}: drain read timeout, {drained} bytes discarded"
+                );
                 return false;
             }
             Err(e) => {
-                eprintln!("WARN [backpressure-source]: read from {peer} failed: {e}");
+                eprintln!(
+                    "WARN [backpressure-source]: read from {peer} failed after {drained} bytes: {e}"
+                );
                 return false;
             }
         }
@@ -3825,61 +3938,62 @@ fn backpressure_stoppable_sleep(dur: Duration, stop_bp: &Arc<Mutex<bool>>) -> bo
     false
 }
 
-/// Adversary A — adversarial-but-ALIVE (design §4): saturate-then-drain to prove the
+/// Adversary A — adversarial-but-ALIVE: saturate-then-drain to prove the
 /// device's resume-the-tail loop on real lwIP.
 ///
-/// First fill the device send buffer (withhold reads so the end-to-end pipe saturates and
-/// the device's boundary frame takes a genuine partial write — `0 < written < n` on its
-/// first `write`), then resume draining at line rate so the device's next `write` accepts
-/// the remaining tail and the frame reaches `Sent` well inside the device's 1.0 s
-/// per-frame ceiling (→ device `bp_outcome=resumed`, `resume_cycles ≥ 1`).
+/// First fill the end-to-end pipe: the clamped receive buffer
+/// (`BACKPRESSURE_RCVBUF_BYTES`) plus the withhold closes the TCP window, the device's
+/// 2880 B lwIP send buffer fills behind it, and mbedTLS returns `WANT_WRITE` on the
+/// boundary frame.  Then resume draining at line rate so the device's same-bytes retry
+/// after `poll(POLLOUT)` accepts the record and the frame reaches `Sent` well inside the
+/// device's 1.0 s per-frame ceiling (→ device `bp_outcome=resumed`, `resume_cycles ≥ 1`).
 ///
-/// The bar this adversary proves is the one **only hardware can establish**: that real
-/// lwIP returns a partial count and the device resumes the tail rather than
-/// false-desyncing.  It asserts only `resume_cycles ≥ 1` — it does **not** chase a second
-/// distinct device-side partial write.  Forcing ≥2 distinct intermediate advances on
-/// hardware is not reliably producible: a single host `read` frees far more than one byte
-/// of device-side send-buffer headroom, so the device typically completes the whole
-/// remaining tail in one accepting `write` (`hil-backpressure-resumecycles-rootcause.md`).
-/// The earlier byte-drip-at-the-per-wait-edge machinery (a paced single-byte grant cadence
-/// tuned to force a second cycle) is dropped — its grant size/cadence hinged on lwIP
-/// buffer / MSS / frame size and silently rot on unrelated config changes.  The
-/// *repeatability* of the per-wait reset is proven deterministically off-target by the
-/// device's many-cycle slow-drain unit test (`notes-design-backpressure-pw-user-2.md`).
+/// The observable is `WANT_WRITE` → poll → same-bytes retry, not a partial byte count:
+/// a single-record TLS write is all-or-nothing, so the raw-TCP `0 < written < n` shape
+/// this fixture once chased cannot occur on this link.
+///
+/// The bar this adversary proves is the one **only hardware can establish**: that the
+/// device hits a real write boundary on real lwIP and resumes rather than false-desyncing.
+/// It asserts only `resume_cycles ≥ 1` — it does **not** chase a second distinct boundary.
+/// Forcing ≥2 on hardware is not reliably producible: a single host `read` frees far more
+/// than one record of device-side send-buffer headroom, so the device typically completes
+/// everything queued in one accepting write.  The per-wait reset's *repeatability* is
+/// proven deterministically off-target by the device's many-cycle slow-drain unit test.
 ///
 /// Returns `true` if the stop flag was set (caller should return from the thread).
 fn backpressure_profile_a(
-    stream: &mut std::net::TcpStream,
+    stream: &mut TlsServerStream,
     peer: &std::net::SocketAddr,
     stop_bp: &Arc<Mutex<bool>>,
 ) -> bool {
     let entry = std::time::Instant::now();
-    // Phase 1: saturate-only withhold so the device send buffer fills and its boundary
-    // frame takes a partial write (the resume case).  This MUST be short (well under the
-    // device's 1.0 s per-frame ceiling) so the drain in Phase 2 begins while the boundary
-    // frame is still alive — a ceiling-length withhold would kill the frame before the
-    // drain resumes and A could never reach `resumed` (correctness review).
+    // Phase 1: saturate-only withhold so the clamped window closes, the device send buffer
+    // fills, and its next record hits a write boundary (the resume case).  This MUST be
+    // short (well under the device's 1.0 s per-frame ceiling) so the drain in Phase 2
+    // begins while the boundary frame is still alive — a ceiling-length withhold would
+    // kill the frame before the drain resumes and A could never reach `resumed`.
     if backpressure_stoppable_sleep(Duration::from_millis(BACKPRESSURE_SATURATE_MS), stop_bp) {
         return true;
     }
 
-    // Diagnostic for the "drain started too early" failure mode (error-handling review
-    // errhandling-3): this saturate-then-drain choreography relies on
-    // BACKPRESSURE_SATURATE_MS being long enough to fill the device send buffer *before*
-    // the drain starts.  If it is not — e.g. a config change grows the send buffer — the
-    // boundary frame fits in one accepting write, the device reports resume_cycles=0, and
-    // the warmup loop exhausts with no adversary-A verdict.  Logging the saturate window
-    // and the elapsed-at-drain-start lets on-call distinguish that mode from a genuine
-    // device-side resume failure without source-code archaeology.
+    // Diagnostic for the "drain started too early" failure mode: this saturate-then-drain
+    // choreography relies on BACKPRESSURE_SATURATE_MS being long enough for the clamped
+    // window plus the device send buffer to fill *before* the drain starts.  If it is not
+    // — e.g. a config change grows either buffer — every device write is accepted
+    // outright, the device reports resume_cycles=0, and the warmup loop exhausts with no
+    // adversary-A verdict.  Logging the saturate window and the elapsed-at-drain-start
+    // lets on-call distinguish that mode from a genuine device-side resume failure
+    // without source-code archaeology; the accept-time so_rcvbuf line and the drain byte
+    // count bracket it.
     eprintln!(
         "[backpressure-source A] {peer}: saturate window {BACKPRESSURE_SATURATE_MS} ms elapsed \
-         ({} ms since entry); beginning drain-to-EOF (if the device never takes a partial \
-         write here, BACKPRESSURE_SATURATE_MS may be too short to saturate the send buffer)",
+         ({} ms since entry); beginning drain-to-EOF (if the device never hits WANT_WRITE \
+         here, the window/send-buffer sizing or BACKPRESSURE_SATURATE_MS is off)",
         entry.elapsed().as_millis(),
     );
 
-    // Phase 2: resume reading at line rate so the device's next `write` accepts the
-    // remaining tail and the boundary frame completes (`Sent`) well inside the device's
+    // Phase 2: resume reading at line rate so the device's same-bytes retry accepts the
+    // blocked record and the boundary frame completes (`Sent`) well inside the device's
     // 1.0 s per-frame ceiling, then read to EOF.
     backpressure_drain_to_eof(stream, peer, stop_bp)
 }
@@ -3923,41 +4037,106 @@ fn dump_rtd_observations(a: &RtdObservation, b: &RtdObservation) {
     eprintln!("[rtd] observation B (duplex):        {b:?}");
 }
 
-/// Read one length-prefixed `StreamFrame` off the stream into `buf`, returning the framed
-/// length (`2 + payload_len`) or `None` on a clean EOF before the next frame.
-fn rtd_read_frame(
-    stream: &mut std::net::TcpStream,
-    buf: &mut [u8],
-) -> std::io::Result<Option<usize>> {
-    use std::io::Read as _;
-    match stream.read_exact(&mut buf[0..2]) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    if 2 + len > buf.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("rtd frame length {len} exceeds buffer"),
-        ));
-    }
-    stream.read_exact(&mut buf[2..2 + len])?;
-    Ok(Some(2 + len))
+/// Outcome of one non-blocking pull from [`RtdFrameReader::poll_frame`].
+enum RtdRead {
+    /// A whole length-prefixed frame occupies `RtdFrameReader::buf[..n]`.
+    Frame(usize),
+    /// No complete frame yet; the caller should pace, yield, and retry.
+    WouldBlock,
+    /// The device closed the connection at a clean frame boundary.
+    Eof,
 }
 
-/// Serve one `StreamRealtimeDuplex` connection: decode the device's outbound
+/// Non-blocking, resumable reader for length-prefixed `StreamFrame`s over a TLS stream.
+///
+/// The RTD listener reads the device's outbound frames while, in Scenario B, pacing inbound
+/// playback on the *same* TLS connection. One `SslStream` cannot be read and written from two
+/// threads, so both directions run in a single thread over a non-blocking socket; this reader
+/// accumulates a length prefix or payload split across several reads so partial frames are
+/// reassembled without blocking the interleaved writer.
+struct RtdFrameReader {
+    buf: Vec<u8>,
+    filled: usize,
+    need: usize,
+    have_len: bool,
+}
+
+impl RtdFrameReader {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: vec![0u8; cap],
+            filled: 0,
+            need: 2,
+            have_len: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.filled = 0;
+        self.need = 2;
+        self.have_len = false;
+    }
+
+    /// Pull whatever bytes are available toward the current frame. Returns `Frame(n)` once a
+    /// full frame occupies `self.buf[..n]`, `WouldBlock` when more bytes are still needed, or
+    /// `Eof` on a clean close; a mid-frame EOF or a read error is an `Err`.
+    fn poll_frame(&mut self, stream: &mut TlsServerStream) -> std::io::Result<RtdRead> {
+        use std::io::Read as _;
+        loop {
+            if self.have_len && self.filled >= self.need {
+                let n = self.need;
+                self.reset();
+                return Ok(RtdRead::Frame(n));
+            }
+            if !self.have_len && self.filled >= 2 {
+                let len = u16::from_le_bytes([self.buf[0], self.buf[1]]) as usize;
+                if 2 + len > self.buf.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("rtd frame length {len} exceeds buffer"),
+                    ));
+                }
+                self.need = 2 + len;
+                self.have_len = true;
+                continue;
+            }
+            match stream.read(&mut self.buf[self.filled..self.need]) {
+                Ok(0) => {
+                    if self.filled == 0 {
+                        return Ok(RtdRead::Eof);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "rtd stream closed mid-frame",
+                    ));
+                }
+                Ok(k) => self.filled += k,
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(RtdRead::WouldBlock);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Serve one `StreamRealtimeDuplex` connection over TLS: decode the device's outbound
 /// Hello/SegmentStart/Audio/SegmentEnd frames and record burst-drain timing, received sample
 /// count, and end reason into the shared observation. Returns when `SegmentEnd` arrives, on
 /// EOF, or on a read/decode error (all captured in the observation).
 ///
-/// When `paced` is set (the Scenario B duplex connection), a writer thread simultaneously
-/// paces inbound playback `Audio` frames to the device at real-time rate on the same socket
-/// (a leading inbound `Hello` first, per the device's inbound handshake), stopping 500 ms
-/// before the device's scripted vad-close. The count it sends is recorded so the host can
-/// assert the device consumed exactly that many.
+/// When `paced` is set (the Scenario B duplex connection), an inline [`RtdPacer`] writes
+/// inbound playback `Audio` frames to the device at real-time rate on the *same* TLS
+/// connection, a leading inbound `Hello` first. A single `SslStream` cannot be split across a
+/// reader and a writer thread, so the socket goes non-blocking and this loop interleaves the
+/// pacer's writes with the frame reads. The pacer stops 500 ms before the device's scripted
+/// vad-close; the count it sent is recorded so the host can assert the device consumed exactly
+/// that many.
 fn rtd_serve(
-    stream: &mut std::net::TcpStream,
+    stream: &mut TlsServerStream,
     peer: &std::net::SocketAddr,
     obs: &Arc<Mutex<RtdObservation>>,
     paced: bool,
@@ -3967,36 +4146,15 @@ fn rtd_serve(
     use audio_pipeline::wire::{decode_frame, StreamFrame, MAX_FRAME_BYTES};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    // 8 s comfortably outlasts the ~5 s synthetic segment plus the current slow loop's
-    // catch-up stretch, without hanging the accept loop on a silent client.
-    if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(8))) {
-        eprintln!("WARN [rtd-listener]: set_read_timeout for {peer} failed: {e}");
+    // Both directions share this one TLS connection in this thread, so the socket goes
+    // non-blocking and the loop interleaves reads with the Scenario-B playback pacer.
+    if let Err(e) = stream.get_ref().set_nonblocking(true) {
+        eprintln!("WARN [rtd-listener]: set_nonblocking for {peer} failed: {e}");
     }
 
-    // Scenario B: pace inbound playback on a cloned handle while this thread reads the
-    // device's outbound frames. The counter records frames actually written.
-    let sent = Arc::new(AtomicU32::new(0));
-    let playback_writer = if paced {
-        match stream.try_clone() {
-            Ok(mut wstream) => {
-                let sent_w = Arc::clone(&sent);
-                let stop_w = Arc::clone(stop);
-                let peer_w = *peer;
-                Some(
-                    thread::Builder::new()
-                        .name("rtd-playback".to_string())
-                        .spawn(move || rtd_pace_playback(&mut wstream, &peer_w, &sent_w, &stop_w))
-                        .expect("spawn rtd-playback thread"),
-                )
-            }
-            Err(e) => {
-                eprintln!("WARN [rtd-listener]: try_clone for {peer} playback pacer failed: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Counts inbound playback frames handed to the device (Scenario B; stays 0 for A).
+    let sent = AtomicU32::new(0);
+    let mut pacer = if paced { RtdPacer::new(peer) } else { None };
 
     let mut o = RtdObservation {
         connected: true,
@@ -4018,33 +4176,57 @@ fn rtd_serve(
         }
     };
     publish(&o);
+    let mut reader = RtdFrameReader::new(MAX_FRAME_BYTES + 2);
     let mut t0: Option<std::time::Instant> = None;
-    let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
-    // Read-cadence forensics (delta-2 §5 D2): turns "the host read continuously" from an
-    // assumption into evidence in every recorded run — a device 750 ms no-progress stall
-    // paired with a small host max_read_gap exonerates the host conclusively.
+    // Read-cadence forensics: turns "the host read continuously" from an assumption into
+    // evidence in every recorded run — a device 750 ms no-progress stall paired with a small
+    // host max_read_gap exonerates the host conclusively.
     let serve_start = std::time::Instant::now();
     let mut total_bytes: u64 = 0;
     let mut frame_count: u64 = 0;
     let mut max_read_gap = Duration::ZERO;
     let mut last_read: Option<std::time::Instant> = None;
+    // Inactivity guard: with a non-blocking socket the loop can no longer lean on a blocking
+    // read timeout, so the wait for the next frame is bounded explicitly. 8 s comfortably
+    // outlasts the ~5 s synthetic segment plus the current slow loop's catch-up stretch.
+    let mut last_activity = std::time::Instant::now();
+    let inactivity_limit = Duration::from_secs(8);
     loop {
-        let framed = match rtd_read_frame(stream, &mut buf) {
-            Ok(Some(n)) => n,
-            Ok(None) => break, // clean EOF
+        if *stop.lock().unwrap() {
+            break;
+        }
+        if let Some(p) = pacer.as_mut() {
+            p.pump(stream, peer, &sent);
+        }
+        let framed = match reader.poll_frame(stream) {
+            Ok(RtdRead::Frame(n)) => n,
+            Ok(RtdRead::WouldBlock) => {
+                if last_activity.elapsed() > inactivity_limit {
+                    o.error = Some(format!(
+                        "no frame for {} s (device stalled or gone)",
+                        inactivity_limit.as_secs()
+                    ));
+                    break;
+                }
+                // Nothing to read yet; yield briefly so the pacer paces and the CPU idles.
+                thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            Ok(RtdRead::Eof) => break,
             Err(e) => {
                 o.error = Some(format!("read: {e}"));
                 break;
             }
         };
         let read_at = std::time::Instant::now();
+        last_activity = read_at;
         if let Some(prev) = last_read {
             max_read_gap = max_read_gap.max(read_at.duration_since(prev));
         }
         last_read = Some(read_at);
         total_bytes += framed as u64;
         frame_count += 1;
-        match decode_frame(&buf[..framed]) {
+        match decode_frame(&reader.buf[..framed]) {
             Ok(StreamFrame::SegmentStart(s)) => {
                 t0 = Some(std::time::Instant::now());
                 o.segment_start_seen = true;
@@ -4077,11 +4259,6 @@ fn rtd_serve(
         }
         publish(&o);
     }
-    if let Some(h) = playback_writer {
-        if let Err(e) = h.join() {
-            eprintln!("WARN [rtd-listener]: playback pacer thread panicked: {e:?}");
-        }
-    }
     o.playback_frames_sent = sent.load(Ordering::Relaxed);
     // Report the drain/catch-up observations even here (sentinel `-` when not yet
     // measured) so a run that panics before end-of-test evaluation still surfaces them.
@@ -4094,98 +4271,156 @@ fn rtd_serve(
         fmt_opt(o.burst_drain_ms),
         fmt_opt(o.catch_up_ms),
     );
-    // Terminal fields (end_reason / error from the break arms, playback_frames_sent from the
-    // join above) reach the slot only here, in one atomic whole-struct swap after the join.
-    // The runner's wait predicate keys on end_reason/error, so this ordering guarantees they
-    // never become visible before playback_frames_sent is final — the B evaluator asserts
-    // consumed == playback_frames_sent and would spuriously fail on a torn read. Any future
-    // terminal-state mutation must land here, not mid-loop.
+    // Terminal fields (end_reason / error from the break arms, playback_frames_sent) reach the
+    // slot only here, in one atomic whole-struct swap. The runner's wait predicate keys on
+    // end_reason/error, so this ordering guarantees they never become visible before
+    // playback_frames_sent is final — the B evaluator asserts consumed == playback_frames_sent
+    // and would spuriously fail on a torn read. Any future terminal-state mutation lands here.
     *obs.lock().unwrap() = o;
 }
 
-/// Pace inbound playback `Audio` frames to the device for Scenario B: a front-loaded
-/// `RTD_PLAYBACK_LEAD_MS` burst, then real-time cadence, mirroring the product host pacer.
+/// Inline Scenario-B playback pacer, driven from the RTD serve loop between reads on the same
+/// non-blocking TLS connection.
 ///
-/// Sends a leading inbound `Hello` (the device rejects `Audio` before a conforming Hello),
-/// then `RTD_PLAYBACK_FRAMES` zero-PCM `Audio` frames, front-loading up to `RTD_PLAYBACK_LEAD_MS`
-/// before pacing the remainder one per `RTD_PLAYBACK_FRAME_INTERVAL`,
-/// bumping `sent` after each write. Stops early if the stop flag is set or a write fails
-/// (the connection closed). The frame count deliberately stops 500 ms before the device's
-/// scripted vad-close so all sent frames are consumed before the segment exits.
-fn rtd_pace_playback(
-    stream: &mut std::net::TcpStream,
-    peer: &std::net::SocketAddr,
-    sent: &std::sync::atomic::AtomicU32,
-    stop: &Arc<Mutex<bool>>,
-) {
-    use audio_pipeline::wire::{
-        encode_frame, AudioFrame, ChannelSource, Hello, StreamFrame, AUDIO_PROTOCOL_VERSION,
-        AUDIO_SAMPLES_PER_FRAME, DEVICE_PLAYBACK_FORMAT, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES,
-    };
-    use std::io::Write as _;
-    use std::sync::atomic::Ordering;
+/// Mirrors the product host pacer: a leading inbound `Hello` (the device rejects `Audio`
+/// before a conforming Hello), then `RTD_PLAYBACK_FRAMES` zero-PCM `Audio` frames, front-loaded
+/// up to `RTD_PLAYBACK_LEAD_MS` before pacing the remainder one per `RTD_PLAYBACK_FRAME_INTERVAL`.
+/// The count stops 500 ms before the device's scripted vad-close so all sent frames are consumed
+/// before the segment exits. A `WouldBlock` (TLS `WANT_WRITE`) leaves the current frame pending
+/// and retries it on the next pump with the identical buffer, as `SSL_write` requires.
+struct RtdPacer {
+    hello: Vec<u8>,
+    audio: Vec<u8>,
+    hello_sent: bool,
+    frames_queued: u64,
+    pending: Option<Vec<u8>>,
+    pending_is_audio: bool,
+    start: std::time::Instant,
+    lead: Duration,
+    failed: bool,
+}
 
-    let mut pcm: heapless::Vec<u8, MAX_AUDIO_PAYLOAD> = heapless::Vec::new();
-    for _ in 0..AUDIO_SAMPLES_PER_FRAME * 2 {
-        pcm.push(0u8).expect("zero PCM fits MAX_AUDIO_PAYLOAD");
+impl RtdPacer {
+    fn new(peer: &std::net::SocketAddr) -> Option<Self> {
+        use audio_pipeline::wire::{
+            encode_frame, AudioFrame, ChannelSource, Hello, StreamFrame, AUDIO_PROTOCOL_VERSION,
+            AUDIO_SAMPLES_PER_FRAME, DEVICE_PLAYBACK_FORMAT, MAX_AUDIO_PAYLOAD, MAX_FRAME_BYTES,
+        };
+        let mut pcm: heapless::Vec<u8, MAX_AUDIO_PAYLOAD> = heapless::Vec::new();
+        for _ in 0..AUDIO_SAMPLES_PER_FRAME * 2 {
+            pcm.push(0u8).expect("zero PCM fits MAX_AUDIO_PAYLOAD");
+        }
+        let hello_frame = StreamFrame::Hello(Hello {
+            version: AUDIO_PROTOCOL_VERSION,
+            pod_id: heapless::String::new(),
+            sample_rate_hz: DEVICE_PLAYBACK_FORMAT.sample_rate_hz,
+            bits_per_sample: DEVICE_PLAYBACK_FORMAT.bits_per_sample,
+            channels: DEVICE_PLAYBACK_FORMAT.channels,
+            codec: DEVICE_PLAYBACK_FORMAT.codec,
+            channel_source: ChannelSource::CommunicationBeam,
+        });
+        let audio_frame = StreamFrame::Audio(AudioFrame {
+            segment_id: 0,
+            first_sample_index: 0,
+            device_ts_us: 0,
+            pcm,
+        });
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let hello = match encode_frame(&hello_frame, &mut buf) {
+            Ok(n) => buf[..n].to_vec(),
+            Err(e) => {
+                eprintln!("WARN [rtd-playback {peer}]: Hello encode failed: {e:?}");
+                return None;
+            }
+        };
+        let audio = match encode_frame(&audio_frame, &mut buf) {
+            Ok(n) => buf[..n].to_vec(),
+            Err(e) => {
+                eprintln!("WARN [rtd-playback {peer}]: Audio encode failed: {e:?}");
+                return None;
+            }
+        };
+        Some(Self {
+            hello,
+            audio,
+            hello_sent: false,
+            frames_queued: 0,
+            pending: None,
+            pending_is_audio: false,
+            start: std::time::Instant::now(),
+            lead: Duration::from_millis(RTD_PLAYBACK_LEAD_MS),
+            failed: false,
+        })
     }
-    let hello = StreamFrame::Hello(Hello {
-        version: AUDIO_PROTOCOL_VERSION,
-        pod_id: heapless::String::new(),
-        sample_rate_hz: DEVICE_PLAYBACK_FORMAT.sample_rate_hz,
-        bits_per_sample: DEVICE_PLAYBACK_FORMAT.bits_per_sample,
-        channels: DEVICE_PLAYBACK_FORMAT.channels,
-        codec: DEVICE_PLAYBACK_FORMAT.codec,
-        channel_source: ChannelSource::CommunicationBeam,
-    });
-    let audio = StreamFrame::Audio(AudioFrame {
-        segment_id: 0,
-        first_sample_index: 0,
-        device_ts_us: 0,
-        pcm,
-    });
-    let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
 
-    let hello_len = match encode_frame(&hello, &mut buf) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("WARN [rtd-playback {peer}]: Hello encode failed: {e:?}");
+    /// Advance the pacer: flush any pending frame, then queue the next due frame. On a write
+    /// error (connection closed) the pacer latches failed and stops.
+    fn pump(
+        &mut self,
+        stream: &mut TlsServerStream,
+        peer: &std::net::SocketAddr,
+        sent: &std::sync::atomic::AtomicU32,
+    ) {
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering;
+        if self.failed {
             return;
         }
-    };
-    if let Err(e) = stream.write_all(&buf[..hello_len]) {
-        eprintln!("WARN [rtd-playback {peer}]: Hello write failed: {e}");
-        return;
-    }
-    let audio_len = match encode_frame(&audio, &mut buf) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("WARN [rtd-playback {peer}]: Audio encode failed: {e:?}");
-            return;
+        // Flush a pending (possibly WANT_WRITE-resumed) frame first, retrying the identical
+        // buffer as SSL_write requires.
+        if let Some(bytes) = self.pending.take() {
+            match stream.write(&bytes) {
+                Ok(n) if n != bytes.len() => {
+                    // The server context runs OpenSSL's default write mode (no
+                    // SSL_MODE_ENABLE_PARTIAL_WRITE), so SSL_write is all-or-WANT_WRITE.
+                    // That is an environmental invariant, not a local one: a short write
+                    // would splice a truncated frame into the length-prefixed stream and
+                    // desync the device, so name it here instead of counting the frame.
+                    eprintln!(
+                        "WARN [rtd-playback {peer}]: partial TLS write ({n} of {} bytes) — \
+                         aborting the pacer rather than splicing a truncated frame",
+                        bytes.len()
+                    );
+                    self.failed = true;
+                    return;
+                }
+                Ok(_) => {
+                    if self.pending_is_audio {
+                        self.frames_queued += 1;
+                        sent.store(self.frames_queued as u32, Ordering::Relaxed);
+                    } else {
+                        self.hello_sent = true;
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    self.pending = Some(bytes);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("WARN [rtd-playback {peer}]: write failed (connection closed?): {e}");
+                    self.failed = true;
+                    return;
+                }
+            }
         }
-    };
-    let audio_bytes = buf[..audio_len].to_vec();
-
-    // Absolute-deadline pacing with a front-loaded burst, mirroring the product host pacer:
-    // frame k's send targets start + (k+1)*interval - lead, floored at start. While the target
-    // is within the lead the deadline is start (already past), so frames go out as fast as writes
-    // complete; past the lead the schedule tracks real-time cadence. Per-write time and sleep
-    // overshoot are absorbed by the next deadline instead of accumulating.
-    let lead = Duration::from_millis(RTD_PLAYBACK_LEAD_MS);
-    let start = std::time::Instant::now();
-    for k in 0..RTD_PLAYBACK_FRAMES {
-        if *stop.lock().unwrap() {
-            return;
-        }
-        if let Err(e) = stream.write_all(&audio_bytes) {
-            eprintln!("WARN [rtd-playback {peer}]: Audio write failed (connection closed?): {e}");
-            return;
-        }
-        sent.fetch_add(1, Ordering::Relaxed);
-        let target = RTD_PLAYBACK_FRAME_INTERVAL * (k as u32 + 1);
-        let deadline = start + target.saturating_sub(lead);
-        if let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
-            thread::sleep(remaining);
+        // Queue the next frame if one is due.
+        if !self.hello_sent {
+            self.pending = Some(self.hello.clone());
+            self.pending_is_audio = false;
+        } else if self.frames_queued < RTD_PLAYBACK_FRAMES {
+            // Absolute-deadline pacing with a front-loaded burst: frame k targets
+            // start + (k+1)*interval - lead, floored at start. While the target is within the
+            // lead the deadline is already past, so frames go out as fast as writes complete;
+            // past the lead the schedule tracks real-time cadence.
+            let target = RTD_PLAYBACK_FRAME_INTERVAL * (self.frames_queued as u32 + 1);
+            let deadline = self.start + target.saturating_sub(self.lead);
+            if std::time::Instant::now() >= deadline {
+                self.pending = Some(self.audio.clone());
+                self.pending_is_audio = true;
+            }
         }
     }
 }
@@ -4196,11 +4431,6 @@ impl Drop for PeerServers {
         if let Some(t) = self.udp_thread.take() {
             if let Err(e) = t.join() {
                 eprintln!("WARN [peer-servers]: UDP echo thread panicked: {e:?}");
-            }
-        }
-        if let Some(t) = self.tcp_thread.take() {
-            if let Err(e) = t.join() {
-                eprintln!("WARN [peer-servers]: TCP echo thread panicked: {e:?}");
             }
         }
         if let Some(t) = self.inbound_frames_thread.take() {
@@ -4575,33 +4805,6 @@ fn eval_udp_roundtrip(data: &TestData) -> Result<(), String> {
     }
 }
 
-/// Assert a `TcpRoundtrip` result (AC-B4.2 host-side enforcement).
-///
-/// Returns `Ok(())` if the device reported a `TcpEcho` verdict — reaching that variant
-/// *is* the echo-match assertion.
-///
-/// Note: an SSH-banner fallback is NOT accepted here because the device does not
-/// implement the fallback path. If one is ever added to the device, give it its own
-/// verdict shape and accept it here, with a `TODO(tcp-ssh-fallback)` entry.
-fn eval_tcp_roundtrip(data: &TestData) -> Result<(), String> {
-    match data {
-        TestData::TcpEcho {
-            bytes,
-            peer_ip,
-            peer_port,
-        } => {
-            println!(
-                "  TcpRoundtrip: echoed {bytes} bytes with {}:{peer_port}",
-                Ipv4Addr::from(*peer_ip)
-            );
-            Ok(())
-        }
-        other => Err(format!(
-            "TcpRoundtrip did not report a TcpEcho verdict: {other:?}"
-        )),
-    }
-}
-
 /// Assert a `TlsReachability` result (AC-B5.1/B5.2 host-side enforcement).
 ///
 /// Returns `Ok(())` if the device reported a `TlsHandshake` verdict — the handshake
@@ -4622,117 +4825,99 @@ fn eval_tls_reachability(data: &TestData) -> Result<(), String> {
     }
 }
 
-/// Assert a `TcpInboundFrames` result.
+/// Assert a `TlsInboundFrames` result.
 ///
 /// Returns `Ok(())` if the device reported `inbound_frames == INBOUND_FRAMES_COUNT`
-/// (the server sends exactly that many frames; the device must receive all of them).
-fn eval_tcp_inbound_frames(data: &TestData) -> Result<(), String> {
-    let TestData::TcpInboundFrames {
+/// (the server sends exactly that many frames inside the TLS tunnel; the device must
+/// receive all of them).
+fn eval_tls_inbound_frames(data: &TestData) -> Result<(), String> {
+    let TestData::TlsInboundFrames {
         inbound_frames,
         peer_ip,
         peer_port,
     } = data
     else {
         return Err(format!(
-            "TcpInboundFrames did not report a TcpInboundFrames verdict: {data:?}"
+            "TlsInboundFrames did not report a TlsInboundFrames verdict: {data:?}"
         ));
     };
     if *inbound_frames != INBOUND_FRAMES_COUNT {
         return Err(format!(
-            "TcpInboundFrames: device received {inbound_frames} frames, expected \
+            "TlsInboundFrames: device received {inbound_frames} frames, expected \
              {INBOUND_FRAMES_COUNT} — reassembly bug or partial delivery"
         ));
     }
     println!(
-        "  TcpInboundFrames: device received {inbound_frames}/{INBOUND_FRAMES_COUNT} inbound \
+        "  TlsInboundFrames: device received {inbound_frames}/{INBOUND_FRAMES_COUNT} inbound \
          frames from {}:{peer_port}",
         Ipv4Addr::from(*peer_ip)
     );
     Ok(())
 }
 
-/// Assert a `TcpSendBackpressure` result (partial-write design §4).
+/// Assert a `TlsSendBackpressure` result (blocked-write resume path).
 ///
-/// Revision 4 reduced HIL `TcpSendBackpressure` to adversary A only (B/C dropped —
-/// design §2.3 *Revision-4 HIL reduction*).
-///
-/// The device drives the production `send_frame_bp` path on a non-blocking socket
-/// against the one adversary drain profile that pins the device's resume bound:
-///  - **A (adversarial-but-ALIVE → resume).** Saturate-then-drain proves the
-///    resume-the-tail loop on real lwIP (the fix) — the one thing only real lwIP can
-///    establish (design §2.3 *Revision-4 HIL reduction*).  Requires `a_resumed`,
-///    `a_rc ≥ 1` (≥1 genuine partial write resumed to `Sent`), and `a_ru`.
-///    A `ceiling_dead`/dead-mid-tail `Err` on the device means resume-on-partial-write
-///    regressed → the device reports `TestData::None` and this eval rejects it
-///    (design §4 (b)).  Not ≥2 — forcing a second distinct hardware partial write is
-///    unreliable; the per-wait reset's repeatability is proven off-target by the
-///    device's many-cycle unit test (`notes-design-backpressure-pw-user-2.md`).
-///
-/// The dropped properties stay covered off-target (no laundering — design §4
-/// "verification verdict"): the dead-peer/ceiling give-up (old adversary C) by the
-/// device fake-clock unit tests (`send_classified_ceiling_mid_tail_is_err` and
-/// siblings), the per-wait reset's repeatability by the many-cycle fake-clock unit
-/// test, and the `aligned` classification (old adversary B) by
-/// `send_classified_wouldblock_zero_bytes_is_aligned` in `audio-pipeline::stream_send`.
+/// Only the adversary A saturate-then-drain profile remains. Requires `a_resumed`,
+/// `a_rc >= 1` (at least one blocked write waited on `poll(POLLOUT)` and then completed),
+/// and `a_ru`. A `ceiling_dead`/dead-mid-tail `Err` on the device means the resume path
+/// regressed; the device reports `TestData::None` and this eval rejects it.
 ///
 /// Every cross-wired A verdict (an `aligned`/`ceiling_dead` where `resumed` is required,
 /// etc.) reaches the host as `TestData::None` and is rejected here, so a mis-wired
-/// profile cannot pass (design §4 "do not loosen").
-fn eval_tcp_send_backpressure(data: &TestData) -> Result<(), String> {
-    let TestData::TcpSendBackpressure {
+/// profile cannot pass.
+fn eval_tls_send_backpressure(data: &TestData) -> Result<(), String> {
+    let TestData::TlsSendBackpressure {
         a_resumed,
         a_rc,
         a_ru,
     } = data
     else {
         return Err(format!(
-            "TcpSendBackpressure did not report a TcpSendBackpressure verdict — \
-             a dead-mid-tail/ceiling outcome here means resume-on-partial-write regressed \
-             and the boundary frame false-desynced on its partial write (design §4 (b)): \
-             {data:?}"
+            "TlsSendBackpressure did not report a TlsSendBackpressure verdict — \
+             a dead-mid-tail/ceiling outcome here means the blocked boundary frame never \
+             resumed: {data:?}"
         ));
     };
     if !*a_resumed {
         return Err(format!(
-            "TcpSendBackpressure A (saturate-then-drain): a_resumed must be true — \
+            "TlsSendBackpressure A (saturate-then-drain): a_resumed must be true — \
              the boundary frame did not resume to Sent: {data:?}"
         ));
     }
     if *a_rc < BACKPRESSURE_A_MIN_RESUME_CYCLES {
         return Err(format!(
-            "TcpSendBackpressure A: a_rc (resume_cycles)={a_rc} < \
-             {BACKPRESSURE_A_MIN_RESUME_CYCLES} — the boundary frame did not take a genuine \
-             partial write and resume on real lwIP (design §4 adversary A; \
-             notes-design-backpressure-pw-user-2.md)"
+            "TlsSendBackpressure A: a_rc (resume_cycles)={a_rc} < \
+             {BACKPRESSURE_A_MIN_RESUME_CYCLES} — the boundary frame never blocked and \
+             resumed through poll(POLLOUT) on real lwIP (adversary A)"
         ));
     }
     if !*a_ru {
         return Err(
-            "TcpSendBackpressure A: connection not reusable after a resumed frame \
+            "TlsSendBackpressure A: connection not reusable after a resumed frame \
              (expected a_ru=true)"
                 .to_string(),
         );
     }
 
-    println!("  TcpSendBackpressure: A resumed (cycles={a_rc})");
+    println!("  TlsSendBackpressure: A resumed (cycles={a_rc})");
     Ok(())
 }
 
-/// Assert a `TcpInboundBackpressure` result — the socket-path counterpart to
-/// `TcpInboundFrames`'s inbound-frames assertion.
+/// Assert a `TlsInboundBackpressure` result — the socket-path counterpart to
+/// `TlsInboundFrames`'s inbound-frames assertion.
 ///
 /// Returns `Ok(())` iff:
-/// 1. the device reported a `TcpInboundBackpressure` verdict (shape check);
+/// 1. the device reported a `TlsInboundBackpressure` verdict (shape check);
 /// 2. `inbound_frames == INBOUND_BP_FLOOD_FRAMES` — exact, both directions: a shortfall
 ///    is a fullness drop or truncation, an excess is a codec/accounting bug (same
-///    doctrine as `eval_tcp_inbound_frames`);
+///    doctrine as `eval_tls_inbound_frames`);
 /// 3. `sink_full_events > 0` — the ring actually backpressured. This is also the guard
-///    against the unwired-producer silent-drop mode (inbound-backpressure-hil design §3):
+///    against the unwired-producer silent-drop mode:
 ///    a `None`-producer `I2sStreamSink` returns `Enqueued` while dropping everything,
 ///    which would satisfy assertion 2 alone — a dead channel can never return `Full`, so
 ///    this assertion catches it.
-fn eval_tcp_inbound_backpressure(data: &TestData) -> Result<(), String> {
-    let TestData::TcpInboundBackpressure {
+fn eval_tls_inbound_backpressure(data: &TestData) -> Result<(), String> {
+    let TestData::TlsInboundBackpressure {
         inbound_frames,
         sink_full_events,
         peer_ip,
@@ -4740,18 +4925,18 @@ fn eval_tcp_inbound_backpressure(data: &TestData) -> Result<(), String> {
     } = data
     else {
         return Err(format!(
-            "TcpInboundBackpressure did not report a TcpInboundBackpressure verdict: {data:?}"
+            "TlsInboundBackpressure did not report a TlsInboundBackpressure verdict: {data:?}"
         ));
     };
     if *inbound_frames != INBOUND_BP_FLOOD_FRAMES {
         return Err(format!(
-            "TcpInboundBackpressure: device received {inbound_frames} frames, expected \
+            "TlsInboundBackpressure: device received {inbound_frames} frames, expected \
              {INBOUND_BP_FLOOD_FRAMES} — reassembly bug, fullness drop, or partial delivery"
         ));
     }
     if *sink_full_events == 0 {
         return Err(format!(
-            "TcpInboundBackpressure: sink_full_events=0 — the ring never backpressured. \
+            "TlsInboundBackpressure: sink_full_events=0 — the ring never backpressured. \
              Either the inbound PCM ring producer is unwired (I2sStreamSink drops instead of \
              stalling) or the delivery rate averaged under real time (~32 KB/s), neither of \
              which exercises the accumulator-full read-skip / TCP-window-close path this test \
@@ -4759,7 +4944,7 @@ fn eval_tcp_inbound_backpressure(data: &TestData) -> Result<(), String> {
         ));
     }
     println!(
-        "  TcpInboundBackpressure: device received {inbound_frames}/{INBOUND_BP_FLOOD_FRAMES} \
+        "  TlsInboundBackpressure: device received {inbound_frames}/{INBOUND_BP_FLOOD_FRAMES} \
          frames, sink_full_events={sink_full_events}, from {}:{peer_port}",
         Ipv4Addr::from(*peer_ip)
     );
@@ -4885,7 +5070,9 @@ fn eval_tls_psk_handshake(data: &TestData) -> Result<(), String> {
 /// already means a real refusal. What is checked here is the measured latency of
 /// that refusal: an ECDHE-PSK exchange on this silicon costs 100–300 ms, so a
 /// refusal an order of magnitude slower is an unexpected reading for human review
-/// (a stalling fixture, a retransmit storm) rather than a pass.
+/// (a stalling fixture, a retransmit storm) rather than a pass. `reject_ms` covers
+/// the handshake stage alone — the TCP connect that preceded it is excluded — so
+/// this bound measures the peer's rejection, not the link's connect latency.
 fn eval_tls_psk_wrong_key_rejected(data: &TestData) -> Result<(), String> {
     /// Upper bound on a LAN TLS-PSK refusal, generous against the 100–300 ms the
     /// exchange itself costs and well under the device's 3 s handshake deadline.
@@ -7585,15 +7772,12 @@ mod tests {
         );
     }
 
-    /// Reachability tests get the 15 s timeout.
+    /// Reachability tests get the 15 s timeout. `TlsInboundFrames` is not among them:
+    /// it carries the drain-loop budget plus a TLS handshake and is pinned separately
+    /// by `test_timeout_remaining_network_budgets_pinned`.
     #[test]
     fn test_timeout_reachability_tests_are_15s() {
-        for t in [
-            TestName::UdpRoundtrip,
-            TestName::TcpRoundtrip,
-            TestName::TlsReachability,
-            TestName::TcpInboundFrames,
-        ] {
+        for t in [TestName::UdpRoundtrip, TestName::TlsReachability] {
             assert_eq!(
                 test_timeout(&t),
                 Duration::from_secs(15),
@@ -7648,17 +7832,21 @@ mod tests {
     /// The remaining non-default Network timeouts are pinned to their exact values.
     ///
     /// `test_meta_phase_matches_expected_partition` checks only `phase` for Network tests,
-    /// and the per-test tests above cover the reachability/wifi budgets — but these four
+    /// and the per-test tests above cover the reachability/wifi budgets — but these
     /// carry non-default budgets with no other value assertion. Without this an accidental
     /// edit (e.g. StreamRealtimeDuplex 40 s → 4 s) would compile and pass every test,
     /// silently reintroducing the timeout-too-short failure mode the arm comments warn about.
     #[test]
     fn test_timeout_remaining_network_budgets_pinned() {
         for (t, secs) in [
-            (TestName::TcpSendBackpressure, 30),
+            (TestName::TlsInboundFrames, 20),
+            (TestName::TlsSendBackpressure, 35),
+            (TestName::TlsInboundBackpressure, 35),
             (TestName::GatewayProbeGate, 130),
-            (TestName::PollReadinessBidir, 15),
-            (TestName::StreamRealtimeDuplex, 40),
+            (TestName::PollReadinessBidir, 20),
+            (TestName::StreamRealtimeDuplex, 45),
+            (TestName::TlsPskHandshake, 25),
+            (TestName::TlsPskWrongKeyRejected, 30),
         ] {
             assert_eq!(
                 test_timeout(&t),
@@ -8156,43 +8344,6 @@ mod tests {
         }
     }
 
-    // ── eval_tcp_roundtrip tests ───────────────────────────────────────────────
-
-    /// A `TcpEcho` verdict passes.
-    #[test]
-    fn eval_tcp_roundtrip_echo_verdict_passes() {
-        let data = TestData::TcpEcho {
-            bytes: 16,
-            peer_ip: [192, 168, 1, 5],
-            peer_port: 54321,
-        };
-        assert!(
-            eval_tcp_roundtrip(&data).is_ok(),
-            "a TcpEcho verdict must pass"
-        );
-    }
-
-    /// Any other variant fails — including the *UDP* echo verdict, which the string evals
-    /// could not tell apart (both said "echo match"). Succeeds the "missing token" case.
-    #[test]
-    fn eval_tcp_roundtrip_rejects_non_echo_data() {
-        for data in [
-            TestData::None,
-            TestData::UdpEcho {
-                bytes: 16,
-                peer_ip: [192, 168, 1, 5],
-                peer_port: 12345,
-            },
-        ] {
-            let result = eval_tcp_roundtrip(&data);
-            assert!(result.is_err(), "non-TcpEcho data must fail: {data:?}");
-            assert!(
-                result.unwrap_err().contains("TcpEcho"),
-                "error must name the expected verdict"
-            );
-        }
-    }
-
     // ── eval_tls_reachability tests ────────────────────────────────────────────
 
     /// A `TlsHandshake` verdict passes.
@@ -8220,11 +8371,11 @@ mod tests {
         );
     }
 
-    // ── eval_tcp_inbound_frames tests ────────────────────────────────────────
+    // ── eval_tls_inbound_frames tests ────────────────────────────────────────
 
     /// Build an inbound-frames verdict with the given frame count.
     fn inbound_verdict(inbound_frames: u32) -> TestData {
-        TestData::TcpInboundFrames {
+        TestData::TlsInboundFrames {
             inbound_frames,
             peer_ip: [192, 168, 1, 5],
             peer_port: 17382,
@@ -8233,17 +8384,17 @@ mod tests {
 
     /// The exact expected frame count passes.
     #[test]
-    fn eval_tcp_inbound_frames_exact_count_passes() {
+    fn eval_tls_inbound_frames_exact_count_passes() {
         assert!(
-            eval_tcp_inbound_frames(&inbound_verdict(INBOUND_FRAMES_COUNT)).is_ok(),
+            eval_tls_inbound_frames(&inbound_verdict(INBOUND_FRAMES_COUNT)).is_ok(),
             "the exact count must pass"
         );
     }
 
     /// Fewer frames than expected fails (partial delivery).
     #[test]
-    fn eval_tcp_inbound_frames_partial_count_fails() {
-        let result = eval_tcp_inbound_frames(&inbound_verdict(INBOUND_FRAMES_COUNT - 1));
+    fn eval_tls_inbound_frames_partial_count_fails() {
+        let result = eval_tls_inbound_frames(&inbound_verdict(INBOUND_FRAMES_COUNT - 1));
         assert!(result.is_err(), "partial delivery must fail");
         assert!(
             result.unwrap_err().contains("expected"),
@@ -8253,9 +8404,9 @@ mod tests {
 
     /// `inbound_frames=0` fails (no frames received).
     #[test]
-    fn eval_tcp_inbound_frames_zero_count_fails() {
+    fn eval_tls_inbound_frames_zero_count_fails() {
         assert!(
-            eval_tcp_inbound_frames(&inbound_verdict(0)).is_err(),
+            eval_tls_inbound_frames(&inbound_verdict(0)).is_err(),
             "zero frames must fail"
         );
     }
@@ -8264,25 +8415,25 @@ mod tests {
     /// prefix", the idle-fail-fast stall payload, and the "missing inbound_frames= token"
     /// message — all of which are now the single `TestData::None` fail shape.
     #[test]
-    fn eval_tcp_inbound_frames_rejects_fail_data() {
-        let result = eval_tcp_inbound_frames(&TestData::None);
+    fn eval_tls_inbound_frames_rejects_fail_data() {
+        let result = eval_tls_inbound_frames(&TestData::None);
         assert!(result.is_err(), "fail-path data must be rejected");
         assert!(
-            result.unwrap_err().contains("TcpInboundFrames verdict"),
+            result.unwrap_err().contains("TlsInboundFrames verdict"),
             "error must name the expected verdict"
         );
     }
 
     /// Another test's verdict cannot be accepted as this one's.
     #[test]
-    fn eval_tcp_inbound_frames_rejects_wrong_variant() {
+    fn eval_tls_inbound_frames_rejects_wrong_variant() {
         let wrong = TestData::TcpEcho {
             bytes: 16,
             peer_ip: [192, 168, 1, 5],
             peer_port: 17382,
         };
         assert!(
-            eval_tcp_inbound_frames(&wrong).is_err(),
+            eval_tls_inbound_frames(&wrong).is_err(),
             "a wrong variant must fail"
         );
     }
@@ -8404,17 +8555,11 @@ mod tests {
         );
     }
 
-    // ── eval_tcp_send_backpressure tests (single-verdict A, design §4) ────────
+    // ── eval_tls_send_backpressure tests (single-verdict A) ────────
     //
-    // Revision 4 reduced HIL `TcpSendBackpressure` to adversary A only (B/C dropped —
-    // design §2.3 *Revision-4 HIL reduction*).  The device emits one namespaced PASS line
-    // carrying the A saturate-then-drain → resumed verdict.  The dropped properties stay
-    // proven off-target: the `aligned` classification (old sub-case B) by
-    // `send_classified_wouldblock_zero_bytes_is_aligned`, and the ceiling give-up (old
-    // sub-case C) by the device fake-clock unit tests.  The eval rejects every cross-wired
-    // / out-of-bound A verdict (design §4 "do not loosen").  These helpers build a
-    // fully-valid PASS line and let each test corrupt exactly one field, isolating the
-    // gate under test.
+    // Only the A saturate-then-drain profile remains. The eval rejects every cross-wired
+    // / out-of-bound A verdict. These helpers build a fully-valid PASS line and let each
+    // test corrupt exactly one field, isolating the gate under test.
 
     /// A fully-valid single-verdict PASS line: the A sub-case at a passing value.
     fn bp_pass_line() -> TestData {
@@ -8423,7 +8568,7 @@ mod tests {
 
     /// Build a single-verdict (A) backpressure verdict from its parts.
     fn bp_verdict(a_resumed: bool, a_rc: u32, a_ru: bool) -> TestData {
-        TestData::TcpSendBackpressure {
+        TestData::TlsSendBackpressure {
             a_resumed,
             a_rc,
             a_ru,
@@ -8629,22 +8774,22 @@ mod tests {
 
     /// The canonical all-pass A verdict passes.
     #[test]
-    fn eval_tcp_send_backpressure_a_verdict_passes() {
+    fn eval_tls_send_backpressure_a_verdict_passes() {
         assert!(
-            eval_tcp_send_backpressure(&bp_pass_line()).is_ok(),
+            eval_tls_send_backpressure(&bp_pass_line()).is_ok(),
             "A resumed (≥1 cycle, reusable) must pass"
         );
     }
 
     // ── Sub-case A (saturate-then-drain → resume) ────────────────────────────
 
-    /// `a_resumed=false` fails: resume-on-partial-write regressed and the boundary frame
-    /// false-desynced on its partial write (design §4 (b)). Succeeds the string-era
+    /// `a_resumed=false` fails: the blocked boundary frame never resumed to `Sent`.
+    /// Succeeds the string-era
     /// `ceiling_dead`/`aligned` mislabel cases — both non-resumed outcomes now reach the
     /// host as this one field being false (or, from the real device, as `TestData::None`).
     #[test]
-    fn eval_tcp_send_backpressure_a_not_resumed_fails() {
-        let result = eval_tcp_send_backpressure(&bp_verdict(false, 2, true));
+    fn eval_tls_send_backpressure_a_not_resumed_fails() {
+        let result = eval_tls_send_backpressure(&bp_verdict(false, 2, true));
         assert!(result.is_err(), "a non-resumed outcome must fail");
         assert!(
             result.unwrap_err().contains("a_resumed must be true"),
@@ -8654,19 +8799,19 @@ mod tests {
 
     /// A resume_cycles at the floor (== BACKPRESSURE_A_MIN_RESUME_CYCLES) passes.
     #[test]
-    fn eval_tcp_send_backpressure_a_cycles_at_floor_passes() {
+    fn eval_tls_send_backpressure_a_cycles_at_floor_passes() {
         assert!(
-            eval_tcp_send_backpressure(&bp_verdict(true, BACKPRESSURE_A_MIN_RESUME_CYCLES, true))
+            eval_tls_send_backpressure(&bp_verdict(true, BACKPRESSURE_A_MIN_RESUME_CYCLES, true))
                 .is_ok(),
             "a_rc exactly at the ≥1 floor must pass"
         );
     }
 
-    /// A resume_cycles one below the floor (== 0) fails: the boundary frame took no genuine
-    /// partial write, so it never exercised the resume-the-tail path on real lwIP.
+    /// A resume_cycles one below the floor (== 0) fails: every write was accepted
+    /// outright, so the resume path was never exercised on real lwIP.
     #[test]
-    fn eval_tcp_send_backpressure_a_cycles_below_floor_fails() {
-        let result = eval_tcp_send_backpressure(&bp_verdict(
+    fn eval_tls_send_backpressure_a_cycles_below_floor_fails() {
+        let result = eval_tls_send_backpressure(&bp_verdict(
             true,
             BACKPRESSURE_A_MIN_RESUME_CYCLES - 1,
             true,
@@ -8680,8 +8825,8 @@ mod tests {
 
     /// A non-reusable connection after a resumed frame fails.
     #[test]
-    fn eval_tcp_send_backpressure_a_not_reusable_fails() {
-        let result = eval_tcp_send_backpressure(&bp_verdict(true, 2, false));
+    fn eval_tls_send_backpressure_a_not_reusable_fails() {
+        let result = eval_tls_send_backpressure(&bp_verdict(true, 2, false));
         assert!(result.is_err(), "a_ru=false must fail");
         assert!(
             result.unwrap_err().contains("a_ru"),
@@ -8696,18 +8841,18 @@ mod tests {
     /// A verdict — for any reason, including a stale build with a different result shape —
     /// cannot produce this variant at all.
     #[test]
-    fn eval_tcp_send_backpressure_rejects_fail_data() {
-        let result = eval_tcp_send_backpressure(&TestData::None);
+    fn eval_tls_send_backpressure_rejects_fail_data() {
+        let result = eval_tls_send_backpressure(&TestData::None);
         assert!(result.is_err(), "fail-path data must be rejected");
         assert!(
-            result.unwrap_err().contains("TcpSendBackpressure verdict"),
+            result.unwrap_err().contains("TlsSendBackpressure verdict"),
             "error must name the expected verdict"
         );
     }
 
     /// Another test's verdict cannot be accepted as this one's.
     #[test]
-    fn eval_tcp_send_backpressure_rejects_wrong_variant() {
+    fn eval_tls_send_backpressure_rejects_wrong_variant() {
         let wrong = TestData::PollReadiness {
             pollin: true,
             pollout: true,
@@ -8715,16 +8860,16 @@ mod tests {
             read_bytes: 16,
         };
         assert!(
-            eval_tcp_send_backpressure(&wrong).is_err(),
+            eval_tls_send_backpressure(&wrong).is_err(),
             "a wrong variant must fail"
         );
     }
 
-    // ── eval_tcp_inbound_backpressure tests ───────────────────────────────────
+    // ── eval_tls_inbound_backpressure tests ───────────────────────────────────
 
-    /// Build a `TcpInboundBackpressure` verdict from its parts.
+    /// Build a `TlsInboundBackpressure` verdict from its parts.
     fn inbound_bp_verdict(inbound_frames: u32, sink_full_events: u32) -> TestData {
-        TestData::TcpInboundBackpressure {
+        TestData::TlsInboundBackpressure {
             inbound_frames,
             sink_full_events,
             peer_ip: [10, 0, 0, 3],
@@ -8734,18 +8879,18 @@ mod tests {
 
     /// The exact-count, nonzero-full verdict passes.
     #[test]
-    fn eval_tcp_inbound_backpressure_pass_verdict_passes() {
+    fn eval_tls_inbound_backpressure_pass_verdict_passes() {
         assert!(
-            eval_tcp_inbound_backpressure(&inbound_bp_verdict(INBOUND_BP_FLOOD_FRAMES, 12)).is_ok(),
+            eval_tls_inbound_backpressure(&inbound_bp_verdict(INBOUND_BP_FLOOD_FRAMES, 12)).is_ok(),
             "exact frame count with sink_full_events > 0 must pass"
         );
     }
 
     /// A frame-count shortfall (fullness drop or partial delivery) fails.
     #[test]
-    fn eval_tcp_inbound_backpressure_short_count_fails() {
+    fn eval_tls_inbound_backpressure_short_count_fails() {
         let result =
-            eval_tcp_inbound_backpressure(&inbound_bp_verdict(INBOUND_BP_FLOOD_FRAMES - 1, 12));
+            eval_tls_inbound_backpressure(&inbound_bp_verdict(INBOUND_BP_FLOOD_FRAMES - 1, 12));
         assert!(result.is_err(), "a frame shortfall must fail");
         assert!(
             result.unwrap_err().contains("expected"),
@@ -8754,11 +8899,11 @@ mod tests {
     }
 
     /// A frame-count excess (codec/accounting bug) fails — symmetrical with the shortfall
-    /// case, same doctrine as `eval_tcp_inbound_frames`.
+    /// case, same doctrine as `eval_tls_inbound_frames`.
     #[test]
-    fn eval_tcp_inbound_backpressure_excess_count_fails() {
+    fn eval_tls_inbound_backpressure_excess_count_fails() {
         assert!(
-            eval_tcp_inbound_backpressure(&inbound_bp_verdict(INBOUND_BP_FLOOD_FRAMES + 1, 12))
+            eval_tls_inbound_backpressure(&inbound_bp_verdict(INBOUND_BP_FLOOD_FRAMES + 1, 12))
                 .is_err(),
             "a frame excess must fail"
         );
@@ -8768,8 +8913,8 @@ mod tests {
     /// is unwired (silent drop) or delivery averaged under real time. This is the guard
     /// against the unwired-producer silent-drop mode (inbound-backpressure-hil design §3).
     #[test]
-    fn eval_tcp_inbound_backpressure_zero_full_events_fails() {
-        let result = eval_tcp_inbound_backpressure(&inbound_bp_verdict(INBOUND_BP_FLOOD_FRAMES, 0));
+    fn eval_tls_inbound_backpressure_zero_full_events_fails() {
+        let result = eval_tls_inbound_backpressure(&inbound_bp_verdict(INBOUND_BP_FLOOD_FRAMES, 0));
         assert!(result.is_err(), "zero full events must fail");
         assert!(
             result.unwrap_err().contains("sink_full_events=0"),
@@ -8779,27 +8924,27 @@ mod tests {
 
     /// Fail-path data is rejected.
     #[test]
-    fn eval_tcp_inbound_backpressure_rejects_fail_data() {
-        let result = eval_tcp_inbound_backpressure(&TestData::None);
+    fn eval_tls_inbound_backpressure_rejects_fail_data() {
+        let result = eval_tls_inbound_backpressure(&TestData::None);
         assert!(result.is_err(), "fail-path data must be rejected");
         assert!(
             result
                 .unwrap_err()
-                .contains("TcpInboundBackpressure verdict"),
+                .contains("TlsInboundBackpressure verdict"),
             "error must name the expected verdict"
         );
     }
 
     /// Another test's verdict cannot be accepted as this one's.
     #[test]
-    fn eval_tcp_inbound_backpressure_rejects_wrong_variant() {
-        let wrong = TestData::TcpInboundFrames {
+    fn eval_tls_inbound_backpressure_rejects_wrong_variant() {
+        let wrong = TestData::TlsInboundFrames {
             inbound_frames: INBOUND_FRAMES_COUNT,
             peer_ip: [10, 0, 0, 2],
             peer_port: 9002,
         };
         assert!(
-            eval_tcp_inbound_backpressure(&wrong).is_err(),
+            eval_tls_inbound_backpressure(&wrong).is_err(),
             "a wrong variant must fail"
         );
     }
@@ -9034,6 +9179,154 @@ mod tests {
         );
 
         server.join().expect("listener thread panicked");
+    }
+
+    /// A plaintext client hitting a TLS fixture must be refused at the handshake, never
+    /// served. Guards the invariant that all fixtures speak TLS: a resurrected plaintext
+    /// path fails here.
+    #[test]
+    fn tls_accept_refuses_a_plaintext_client() {
+        use std::io::Write as _;
+
+        let psk = PodPsk {
+            identity: "pod-fixture".to_string(),
+            key: [0x22u8; AUDIO_PSK_LEN],
+        };
+        let server_ctx = psk_server_context(&psk).expect("server context");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let server = thread::spawn(move || {
+            let (tcp, peer) = listener.accept().expect("accept");
+            tls_accept(&server_ctx, tcp, &peer, "plaintext-test").is_some()
+        });
+
+        let mut tcp = std::net::TcpStream::connect(addr).expect("connect loopback");
+        // Raw application bytes where a ClientHello belongs.
+        let _ = tcp.write_all(b"GET / HTTP/1.0\r\n\r\n");
+        let _ = tcp.flush();
+
+        assert!(
+            !server.join().expect("server thread panicked"),
+            "tls_accept must refuse a plaintext client rather than serving its bytes"
+        );
+    }
+
+    /// Encode one `StreamFrame` to an owned buffer (fixture-side pre-encode shape).
+    fn encoded_frame_bytes(frame: &audio_pipeline::wire::StreamFrame) -> Vec<u8> {
+        use audio_pipeline::wire::{encode_frame, MAX_FRAME_BYTES};
+        let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
+        let n = encode_frame(frame, &mut buf).expect("frame encodes");
+        buf[..n].to_vec()
+    }
+
+    /// Run `inbound_frames_serve` over a loopback TLS-PSK pair with `selector` written
+    /// first by the client. Returns (frames the fixture reported writing, bytes the
+    /// client read out of the tunnel before EOF, encoded Hello len, encoded Audio len).
+    fn drive_inbound_frames_fixture(selector: u8) -> (u32, usize, usize, usize) {
+        use std::io::{Read as _, Write as _};
+
+        let (mut server, mut client) = tls_loopback_pair();
+        client.write_all(&[selector]).expect("selector write");
+        client.flush().expect("selector flush");
+
+        let hello = encoded_frame_bytes(&rtd_test_hello());
+        let audio = encoded_frame_bytes(&rtd_test_audio());
+        let (hello_len, audio_len) = (hello.len(), audio.len());
+        let peer = client.get_ref().local_addr().expect("local_addr");
+        let stop = Arc::new(Mutex::new(false));
+        let jh = thread::spawn(move || {
+            inbound_frames_serve(&mut server, &peer, &stop, &hello, &audio)
+            // server drops → FIN → the client below sees EOF.
+        });
+
+        let mut sink = Vec::new();
+        client.read_to_end(&mut sink).expect("read to EOF");
+        let written = jh.join().expect("fixture thread panicked");
+        (written, sink.len(), hello_len, audio_len)
+    }
+
+    /// Happy-path loopback coverage for the inbound-frames fixture: the selector byte is
+    /// read *inside* the tunnel and the Hello plus `INBOUND_FRAMES_COUNT` Audio frames
+    /// cross it. Dropping `tls_accept` from this fixture (or serving plaintext) breaks it.
+    #[test]
+    fn inbound_frames_fixture_serves_the_happy_path_profile_over_tls() {
+        let (written, bytes, hello_len, audio_len) = drive_inbound_frames_fixture(b'N');
+        assert_eq!(
+            written, INBOUND_FRAMES_COUNT,
+            "the happy-path profile must write INBOUND_FRAMES_COUNT Audio frames"
+        );
+        assert_eq!(
+            bytes,
+            hello_len + audio_len * INBOUND_FRAMES_COUNT as usize,
+            "the client must receive the leading Hello plus every Audio frame"
+        );
+    }
+
+    /// The `'F'` selector — read post-handshake, inside the tunnel — selects the flood
+    /// profile on the same fixture.
+    #[test]
+    fn inbound_frames_fixture_flood_selector_sends_the_flood_count() {
+        let (written, bytes, hello_len, audio_len) = drive_inbound_frames_fixture(b'F');
+        assert_eq!(
+            written, INBOUND_BP_FLOOD_FRAMES,
+            "the 'F' selector must select the unpaced flood profile"
+        );
+        assert_eq!(
+            bytes,
+            hello_len + audio_len * INBOUND_BP_FLOOD_FRAMES as usize,
+            "every flood frame must cross the tunnel"
+        );
+    }
+
+    /// Loopback coverage for the backpressure fixture: it consumes the in-band selector
+    /// byte and then drains application bytes inside the tunnel to a clean EOF.
+    #[test]
+    fn backpressure_fixture_consumes_selector_then_drains_over_tls() {
+        use std::io::Write as _;
+
+        let (mut server, mut client) = tls_loopback_pair();
+        let peer = client.get_ref().local_addr().expect("local_addr");
+        let stop = Arc::new(Mutex::new(false));
+        let jh = thread::spawn(move || {
+            consume_backpressure_selector_byte(&mut server, &peer);
+            backpressure_profile_a(&mut server, &peer, &stop)
+        });
+
+        // Selector byte, then a payload the fixture must drain (larger than the socket
+        // buffers, so completing the write proves the server side kept reading).
+        client.write_all(b"A").expect("selector write");
+        let payload = vec![0x5au8; 512 * 1024];
+        client.write_all(&payload).expect("payload write");
+        client.flush().expect("payload flush");
+        // Clean close → the drain sees EOF and returns.
+        client.shutdown().expect("tls shutdown");
+        drop(client);
+
+        assert!(
+            !jh.join().expect("fixture thread panicked"),
+            "the drain must end on the client's EOF, not on the stop flag"
+        );
+    }
+
+    /// Loopback coverage for the poll-readiness adversary: it consumes the device's
+    /// in-band trigger byte inside the tunnel and queues the fixed payload back.
+    #[test]
+    fn poll_readiness_fixture_answers_the_trigger_byte_over_tls() {
+        use std::io::{Read as _, Write as _};
+
+        let (mut server, mut client) = tls_loopback_pair();
+        let peer = client.get_ref().local_addr().expect("local_addr");
+        let jh = thread::spawn(move || poll_readiness_serve(&mut server, &peer));
+
+        client.write_all(b"P").expect("trigger write");
+        client.flush().expect("trigger flush");
+        let mut payload = [0u8; POLL_READINESS_PAYLOAD_BYTES];
+        client.read_exact(&mut payload).expect("payload read");
+        assert_eq!(
+            payload, [0xA5u8; POLL_READINESS_PAYLOAD_BYTES],
+            "the adversary must queue its fixed payload inside the tunnel"
+        );
+        jh.join().expect("fixture thread panicked");
     }
 
     /// Build a poll-readiness verdict from its parts.
@@ -9675,11 +9968,10 @@ mod tests {
         let network = [
             TestName::WifiAssociate,
             TestName::UdpRoundtrip,
-            TestName::TcpRoundtrip,
             TestName::TlsReachability,
-            TestName::TcpInboundFrames,
-            TestName::TcpSendBackpressure,
-            TestName::TcpInboundBackpressure,
+            TestName::TlsInboundFrames,
+            TestName::TlsSendBackpressure,
+            TestName::TlsInboundBackpressure,
             TestName::PollReadinessBidir,
             TestName::WifiScan,
             TestName::WifiPowerSaveCheck,
@@ -9715,12 +10007,12 @@ mod tests {
         }
     }
 
-    // ── TcpInboundFrames timeout-budget invariant ─────────────────────────────
+    // ── TlsInboundFrames timeout-budget invariant ─────────────────────────────
 
-    /// Regression guard for the `TcpInboundFrames` timeout *inversion* (the AC9
-    /// "device not responding" hang — see design-hil-tcpinbound-fix.md §2.1/§4).
+    /// Regression guard for the `TlsInboundFrames` timeout *inversion* (the AC9
+    /// "device not responding" hang).
     ///
-    /// The device's `run_tcp_inbound_frames` must always produce a `TestReport`
+    /// The device's `run_tls_inbound_frames` must always produce a `TestReport`
     /// strictly inside the host's RunTest window, or the host reports a silent
     /// "not responding" instead of a typed PASS/Fail. The device's post-connect
     /// worst case is `MAX_IDLE_RETRIES × INBOUND_READ_TIMEOUT_SECS` (idle fail-fast),
@@ -9735,6 +10027,7 @@ mod tests {
     fn tcp_inbound_frames_device_budget_under_host_timeout() {
         use device_protocol::{
             TestName, INBOUND_CONNECT_TIMEOUT_SECS, INBOUND_READ_TIMEOUT_SECS, MAX_IDLE_RETRIES,
+            TLS_HANDSHAKE_TIMEOUT_SECS,
         };
 
         // Serial round-trip + connect/transfer margin: the device must finish, encode,
@@ -9745,7 +10038,7 @@ mod tests {
         // an engineered number.
         const SERIAL_ROUND_TRIP_MARGIN_SECS: u64 = 3;
 
-        let host_budget = test_timeout(&TestName::TcpInboundFrames);
+        let host_budget = test_timeout(&TestName::TlsInboundFrames);
         // `.as_secs()` truncates sub-second components. The budget invariant compares
         // whole seconds on both sides, which is only sound if the host budget is a whole
         // number of seconds — assert that precondition so a future fractional budget
@@ -9754,7 +10047,7 @@ mod tests {
         assert_eq!(
             host_budget.subsec_millis(),
             0,
-            "TcpInboundFrames host budget must be whole seconds for the .as_secs() \
+            "TlsInboundFrames host budget must be whole seconds for the .as_secs() \
              comparison below to be sound; got {host_budget:?}",
         );
         let host_budget_secs = host_budget.as_secs();
@@ -9768,20 +10061,25 @@ mod tests {
              ({SERIAL_ROUND_TRIP_MARGIN_SECS}s) for the margin to be meaningful",
         );
 
-        // Conservative upper bound on the device worst case (sum, not max).
-        let device_conservative_bound_secs =
-            u64::from(MAX_IDLE_RETRIES) * INBOUND_READ_TIMEOUT_SECS + INBOUND_CONNECT_TIMEOUT_SECS;
+        // Conservative upper bound on the device worst case (sum, not max). The handshake
+        // term is charged on top of connect (the handshake runs under its own deadline
+        // after the socket is up).
+        let device_conservative_bound_secs = u64::from(MAX_IDLE_RETRIES)
+            * INBOUND_READ_TIMEOUT_SECS
+            + INBOUND_CONNECT_TIMEOUT_SECS
+            + TLS_HANDSHAKE_TIMEOUT_SECS;
 
         assert!(
             device_conservative_bound_secs + SERIAL_ROUND_TRIP_MARGIN_SECS < host_budget_secs,
-            "TcpInboundFrames timeout inversion: device conservative worst case \
-             ({}s = {} retries × {}s read + {}s connect) + {}s serial margin must be < \
-             host budget ({}s). Shrink the device drain constants in device-protocol or \
-             raise test_timeout(TcpInboundFrames).",
+            "TlsInboundFrames timeout inversion: device conservative worst case \
+             ({}s = {} retries × {}s read + {}s connect + {}s TLS handshake) + {}s serial \
+             margin must be < host budget ({}s). Shrink the device drain constants in \
+             device-protocol or raise test_timeout(TlsInboundFrames).",
             device_conservative_bound_secs,
             MAX_IDLE_RETRIES,
             INBOUND_READ_TIMEOUT_SECS,
             INBOUND_CONNECT_TIMEOUT_SECS,
+            TLS_HANDSHAKE_TIMEOUT_SECS,
             SERIAL_ROUND_TRIP_MARGIN_SECS,
             host_budget_secs,
         );
@@ -9815,20 +10113,20 @@ mod tests {
         );
     }
 
-    // ── TcpInboundBackpressure timeout-budget invariant ───────────────────────
+    // ── TlsInboundBackpressure timeout-budget invariant ───────────────────────
 
     /// Regression guard mirroring `tcp_inbound_frames_device_budget_under_host_timeout`:
-    /// the device's `run_tcp_inbound_backpressure` wall-clock deadline
+    /// the device's `run_tls_inbound_backpressure` wall-clock deadline
     /// (`INBOUND_BP_DEADLINE_SECS`) plus connect (`INBOUND_CONNECT_TIMEOUT_SECS`) plus one
     /// in-flight blocking read (`INBOUND_READ_TIMEOUT_SECS`) must land strictly inside the
-    /// host's `TcpInboundBackpressure` RunTest budget, so the host always sees a typed
+    /// host's `TlsInboundBackpressure` RunTest budget, so the host always sees a typed
     /// `TestReport` (a deadline-exceeded typed Fail on a wedged flood) rather than a
     /// silent "not responding" hang. The read timeout is folded in because the deadline is
     /// only checked at the top of the loop: a `drain_inbound` read that begins just before
     /// the deadline can block up to `INBOUND_READ_TIMEOUT_SECS` past it before the next
     /// check fires, so the device's true worst case is deadline + connect + one read, not
     /// deadline + connect.
-    /// The `TcpInboundBackpressure` budget-inversion predicate, shared by the positive
+    /// The `TlsInboundBackpressure` budget-inversion predicate, shared by the positive
     /// (`tcp_inbound_backpressure_device_budget_under_host_timeout`) and negative
     /// (`tcp_inbound_backpressure_budget_invariant_fires_when_violated`) tests below, so
     /// the negative case exercises the actual expression the live guard evaluates rather
@@ -9845,20 +10143,20 @@ mod tests {
     fn tcp_inbound_backpressure_device_budget_under_host_timeout() {
         use device_protocol::{
             TestName, INBOUND_BP_DEADLINE_SECS, INBOUND_CONNECT_TIMEOUT_SECS,
-            INBOUND_READ_TIMEOUT_SECS,
+            INBOUND_READ_TIMEOUT_SECS, TLS_HANDSHAKE_TIMEOUT_SECS,
         };
 
-        // Read-overshoot bound leaves only ~1s of true, unaccounted-for spare inside the
-        // 30s host budget (30 - 27 = 3, less this margin) — tight but positive today; a
-        // future bump to any of the three device constants must shrink in step or this
-        // guard fires.
+        // The bound (20s deadline + 5s connect + 3s handshake + 2s read overshoot = 30s)
+        // leaves ~3s of spare inside the 35s host budget, less this margin — tight but
+        // positive today; a future bump to any of the four device constants must shrink
+        // another in step or this guard fires.
         const SERIAL_ROUND_TRIP_MARGIN_SECS: u64 = 2;
 
-        let host_budget = test_timeout(&TestName::TcpInboundBackpressure);
+        let host_budget = test_timeout(&TestName::TlsInboundBackpressure);
         assert_eq!(
             host_budget.subsec_millis(),
             0,
-            "TcpInboundBackpressure host budget must be whole seconds for the .as_secs() \
+            "TlsInboundBackpressure host budget must be whole seconds for the .as_secs() \
              comparison below to be sound; got {host_budget:?}",
         );
         let host_budget_secs = host_budget.as_secs();
@@ -9868,8 +10166,10 @@ mod tests {
              ({SERIAL_ROUND_TRIP_MARGIN_SECS}s) for the margin to be meaningful",
         );
 
-        let device_conservative_bound_secs =
-            INBOUND_BP_DEADLINE_SECS + INBOUND_CONNECT_TIMEOUT_SECS + INBOUND_READ_TIMEOUT_SECS;
+        let device_conservative_bound_secs = INBOUND_BP_DEADLINE_SECS
+            + INBOUND_CONNECT_TIMEOUT_SECS
+            + TLS_HANDSHAKE_TIMEOUT_SECS
+            + INBOUND_READ_TIMEOUT_SECS;
 
         assert!(
             inbound_bp_budget_ok(
@@ -9877,13 +10177,14 @@ mod tests {
                 SERIAL_ROUND_TRIP_MARGIN_SECS,
                 host_budget_secs
             ),
-            "TcpInboundBackpressure timeout inversion: device conservative worst case \
-             ({}s = {}s deadline + {}s connect + {}s in-flight read overshoot) + {}s serial \
-             margin must be < host budget ({}s). Shrink the device constants in \
-             device-protocol or raise test_timeout(TcpInboundBackpressure).",
+            "TlsInboundBackpressure timeout inversion: device conservative worst case \
+             ({}s = {}s deadline + {}s connect + {}s TLS handshake + {}s in-flight read \
+             overshoot) + {}s serial margin must be < host budget ({}s). Shrink the device \
+             constants in device-protocol or raise test_timeout(TlsInboundBackpressure).",
             device_conservative_bound_secs,
             INBOUND_BP_DEADLINE_SECS,
             INBOUND_CONNECT_TIMEOUT_SECS,
+            TLS_HANDSHAKE_TIMEOUT_SECS,
             INBOUND_READ_TIMEOUT_SECS,
             SERIAL_ROUND_TRIP_MARGIN_SECS,
             host_budget_secs,
@@ -9910,21 +10211,169 @@ mod tests {
         );
     }
 
+    // ── TLS-PSK pair timeout-budget invariant ─────────────────────────────────
+
+    /// The TLS-PSK budget-inversion predicate, shared by the positive and negative
+    /// tests below so the negative case exercises the expression the live guard
+    /// evaluates rather than a copy of it.
+    fn tls_psk_budget_ok(
+        device_conservative_bound_secs: u64,
+        margin_secs: u64,
+        host_budget_secs: u64,
+    ) -> bool {
+        device_conservative_bound_secs + margin_secs < host_budget_secs
+    }
+
+    /// Regression guard for a timeout inversion on the TLS-PSK pair, mirroring
+    /// `tcp_inbound_frames_device_budget_under_host_timeout`.
+    ///
+    /// `TlsPskHandshake` charges a connect, then a handshake, then the echo
+    /// round-trip (each budget anchored after the previous stage completes, so the
+    /// sum is the worst case, not an over-count). `TlsPskWrongKeyRejected` charges
+    /// its reachability pre-probe connect **and** the TLS connect — two full
+    /// connect budgets — plus the handshake deadline. Both must land strictly
+    /// inside the host's RunTest window or the host prints "device not responding"
+    /// and drops the typed `TestReport` carrying the very timing evidence these
+    /// tests exist to produce. The device constants are imported from
+    /// `device-protocol`, their single source, so this is a single-site assertion.
+    #[test]
+    fn tls_psk_device_budgets_under_host_timeouts() {
+        use device_protocol::{
+            TestName, TLS_HANDSHAKE_TIMEOUT_SECS, TLS_PSK_CONNECT_TIMEOUT_SECS,
+            TLS_PSK_ECHO_TIMEOUT_SECS,
+        };
+
+        // Same conservative stand-in as the inbound guards: serial round-trip for a
+        // small Response is sub-millisecond; 3s covers encode + transfer + RTT.
+        const SERIAL_ROUND_TRIP_MARGIN_SECS: u64 = 3;
+
+        for (test, device_bound_secs, terms) in [
+            (
+                TestName::TlsPskHandshake,
+                TLS_PSK_CONNECT_TIMEOUT_SECS
+                    + TLS_HANDSHAKE_TIMEOUT_SECS
+                    + TLS_PSK_ECHO_TIMEOUT_SECS,
+                "connect + TLS handshake + echo round-trip",
+            ),
+            (
+                TestName::TlsPskWrongKeyRejected,
+                2 * TLS_PSK_CONNECT_TIMEOUT_SECS + TLS_HANDSHAKE_TIMEOUT_SECS,
+                "reachability pre-probe connect + connect + TLS handshake",
+            ),
+        ] {
+            let host_budget = test_timeout(&test);
+            assert_eq!(
+                host_budget.subsec_millis(),
+                0,
+                "{test:?} host budget must be whole seconds for the .as_secs() comparison \
+                 below to be sound; got {host_budget:?}",
+            );
+            let host_budget_secs = host_budget.as_secs();
+            assert!(
+                host_budget_secs > SERIAL_ROUND_TRIP_MARGIN_SECS,
+                "{test:?} host budget ({host_budget_secs}s) must exceed the serial \
+                 round-trip margin ({SERIAL_ROUND_TRIP_MARGIN_SECS}s) for the margin to \
+                 be meaningful",
+            );
+            assert!(
+                tls_psk_budget_ok(
+                    device_bound_secs,
+                    SERIAL_ROUND_TRIP_MARGIN_SECS,
+                    host_budget_secs
+                ),
+                "{test:?} timeout inversion: device worst case ({device_bound_secs}s = \
+                 {terms}) + {SERIAL_ROUND_TRIP_MARGIN_SECS}s serial margin must be < host \
+                 budget ({host_budget_secs}s). Shrink TLS_PSK_CONNECT_TIMEOUT_SECS in \
+                 device-protocol or raise test_timeout({test:?}).",
+            );
+        }
+    }
+
+    /// Negative companion: proves `tls_psk_budget_ok` rejects a device worst case
+    /// that exceeds the host budget, so a future edit flipping `<` to `<=` or
+    /// swapping the operands cannot silently neuter the guard above.
+    #[test]
+    fn tls_psk_budget_invariant_fires_when_violated() {
+        const DEVICE_BOUND_SECS: u64 = 23;
+        const MARGIN_SECS: u64 = 3;
+        const BUDGET_SECS: u64 = 15;
+
+        assert!(
+            !tls_psk_budget_ok(DEVICE_BOUND_SECS, MARGIN_SECS, BUDGET_SECS),
+            "budget invariant must REJECT a device worst case ({DEVICE_BOUND_SECS}s) + \
+             margin ({MARGIN_SECS}s) that exceeds the host budget ({BUDGET_SECS}s)",
+        );
+    }
+
+    // ── backpressure listener receive-buffer clamp ─────────────────────────────
+
+    /// The clamp must be inherited by accepted sockets, which is the whole point of
+    /// applying it before `listen(2)`: it is the accepted socket's window that bounds how
+    /// much the device can push during the withhold. The kernel doubles the request and
+    /// enforces its own floor, so the absolute assertion is a generous ceiling rather than
+    /// an exact value.
+    ///
+    /// The ceiling alone would not establish that the *clamp* produced the value: on a host
+    /// whose `net.ipv4.tcp_rmem` middle value is already small, an unclamped socket passes
+    /// it too, so deleting the `set_recv_buffer_size` call would leave the test green. Hence
+    /// the plain-`TcpListener` control: the clamped socket must come out strictly smaller
+    /// than an unclamped one on this same host. Where the host default is itself under the
+    /// ceiling the comparison is skipped with an explanatory message, so the test states
+    /// what it proved instead of silently passing.
+    #[test]
+    fn backpressure_listener_clamps_accepted_socket_recv_buffer() {
+        /// Accept one loopback connection on `listener` and report the accepted socket's
+        /// effective `SO_RCVBUF`.
+        fn accepted_recv_buffer(listener: &TcpListener) -> usize {
+            let port = listener.local_addr().expect("local addr").port();
+            let _client =
+                std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to listener");
+            let (accepted, _peer) = listener.accept().expect("accept");
+            effective_recv_buffer_size(&accepted).expect("query SO_RCVBUF")
+        }
+
+        let clamped = accepted_recv_buffer(
+            &bind_clamped_rcvbuf_listener(0, BACKPRESSURE_RCVBUF_BYTES)
+                .expect("bind clamped loopback listener"),
+        );
+        assert!(
+            clamped <= BACKPRESSURE_RCVBUF_CEILING_BYTES,
+            "accepted socket must inherit the listener's clamped receive buffer (requested \
+             {BACKPRESSURE_RCVBUF_BYTES}, ceiling {BACKPRESSURE_RCVBUF_CEILING_BYTES}); got \
+             {clamped}"
+        );
+
+        let plain = accepted_recv_buffer(
+            &TcpListener::bind(("127.0.0.1", 0)).expect("bind plain loopback listener"),
+        );
+        if plain > BACKPRESSURE_RCVBUF_CEILING_BYTES {
+            assert!(
+                clamped < plain,
+                "the clamp, not the host default, must produce the small buffer: clamped \
+                 {clamped} must be strictly below this host's unclamped default {plain}"
+            );
+        } else {
+            eprintln!(
+                "NOTE: this host's default accepted SO_RCVBUF is {plain}, already at or below \
+                 the {BACKPRESSURE_RCVBUF_CEILING_BYTES} ceiling — the clamp-vs-default \
+                 comparison proves nothing here and was skipped; only the ceiling bound \
+                 ({clamped}) was checked. Raise net.ipv4.tcp_rmem to exercise it."
+            );
+        }
+    }
+
     // ── read_trigger_byte ──────────────────────────────────────────────────────
 
     /// A caller (device) that writes the selector byte before the timeout gets it back
     /// verbatim — pins the `Some(byte)` side of the inbound-frames-source flood dispatch
-    /// (`selector == Some(b'F')`) that `run_tcp_inbound_backpressure`'s selector write
+    /// (`selector == Some(b'F')`) that `run_tls_inbound_backpressure`'s selector write
     /// depends on.
     #[test]
     fn read_trigger_byte_returns_byte_when_written() {
         use std::io::Write as _;
-        use std::net::{TcpListener, TcpStream};
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let addr = listener.local_addr().expect("local_addr");
-        let mut client = TcpStream::connect(addr).expect("connect loopback");
-        let (mut server, peer) = listener.accept().expect("accept");
+        let (mut server, mut client) = tls_loopback_pair();
+        let peer = server.get_ref().peer_addr().expect("peer addr");
 
         client.write_all(b"F").expect("write selector byte");
         client.flush().expect("flush");
@@ -9933,20 +10382,14 @@ mod tests {
         assert_eq!(got, Some(b'F'), "selector byte must round-trip verbatim");
     }
 
-    /// A caller that never writes the selector byte (a straggler firmware build that
-    /// omits it, or `run_tcp_inbound_frames`'s own `b'N'`-then-nothing-else stream after
-    /// the byte is consumed) gets `None` back once the timeout elapses — this is the
-    /// documented compat guarantee (design §3, "Selector regression on the happy path")
-    /// that the inbound-frames-source flood dispatch falls back to the happy-path
-    /// profile on. A short timeout keeps the test fast without asserting exact timing.
+    /// A caller that never writes the selector byte (a straggler firmware build that omits it,
+    /// or the inbound-frames stream after the byte is consumed) gets `None` back once the
+    /// timeout elapses — the documented compat guarantee the inbound-frames-source flood
+    /// dispatch falls back to the happy-path profile on. A short timeout keeps the test fast.
     #[test]
     fn read_trigger_byte_returns_none_on_timeout() {
-        use std::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let addr = listener.local_addr().expect("local_addr");
-        let _client = TcpStream::connect(addr).expect("connect loopback"); // held open, no write
-        let (mut server, peer) = listener.accept().expect("accept");
+        let (mut server, _client) = tls_loopback_pair(); // client held open, no write
+        let peer = server.get_ref().peer_addr().expect("peer addr");
 
         let got = read_trigger_byte(
             &mut server,
@@ -9961,18 +10404,13 @@ mod tests {
         );
     }
 
-    /// A caller that closes the connection before writing anything (clean EOF) also gets
-    /// `None` — the other branch of the same fallback contract, reached without waiting
-    /// out a timeout.
+    /// A caller that closes the connection before writing anything also gets `None` — the
+    /// other branch of the same fallback contract, reached without waiting out a timeout.
     #[test]
     fn read_trigger_byte_returns_none_on_eof() {
-        use std::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let addr = listener.local_addr().expect("local_addr");
-        let client = TcpStream::connect(addr).expect("connect loopback");
-        let (mut server, peer) = listener.accept().expect("accept");
-        drop(client); // clean close before any write
+        let (mut server, client) = tls_loopback_pair();
+        let peer = server.get_ref().peer_addr().expect("peer addr");
+        drop(client); // close before any write
 
         let got = read_trigger_byte(
             &mut server,
@@ -10120,24 +10558,12 @@ mod tests {
     #[test]
     fn hil_port_defaults_satisfy_ac2() {
         assert_ne!(
-            DEFAULT_HIL_UDP_PORT, DEFAULT_HIL_TCP_PORT,
-            "UDP and TCP default ports must be distinct"
-        );
-        assert_ne!(
             DEFAULT_HIL_UDP_PORT, DEFAULT_HIL_INBOUND_FRAMES_PORT,
             "UDP and inbound-frames default ports must be distinct"
         );
         assert_ne!(
-            DEFAULT_HIL_TCP_PORT, DEFAULT_HIL_INBOUND_FRAMES_PORT,
-            "TCP and inbound-frames default ports must be distinct"
-        );
-        assert_ne!(
             DEFAULT_HIL_UDP_PORT, 7380,
             "UDP default must not equal audio port 7380"
-        );
-        assert_ne!(
-            DEFAULT_HIL_TCP_PORT, 7380,
-            "TCP default must not equal audio port 7380"
         );
         assert_ne!(
             DEFAULT_HIL_INBOUND_FRAMES_PORT, 7380,
@@ -10149,21 +10575,12 @@ mod tests {
                 "UDP default must be in 5-digit range (≥10000)"
             );
             assert!(
-                DEFAULT_HIL_TCP_PORT >= 10000,
-                "TCP default must be in 5-digit range (≥10000)"
-            );
-            assert!(
                 DEFAULT_HIL_INBOUND_FRAMES_PORT >= 10000,
                 "inbound-frames default must be in 5-digit range (≥10000)"
             );
-            // Soft constraint: below OS ephemeral range (AC2 / design §2.1).
             assert!(
                 DEFAULT_HIL_UDP_PORT < 32768,
                 "default UDP port should be below OS ephemeral range (AC2 soft constraint)"
-            );
-            assert!(
-                DEFAULT_HIL_TCP_PORT < 32768,
-                "default TCP port should be below OS ephemeral range (AC2 soft constraint)"
             );
             assert!(
                 DEFAULT_HIL_INBOUND_FRAMES_PORT < 32768,
@@ -10184,10 +10601,6 @@ mod tests {
         assert_eq!(
             s.udp_echo_port, DEFAULT_HIL_UDP_PORT,
             "absent RESPEAKER_HIL_UDP_PORT → default"
-        );
-        assert_eq!(
-            s.tcp_echo_port, DEFAULT_HIL_TCP_PORT,
-            "absent RESPEAKER_HIL_TCP_PORT → default"
         );
         assert_eq!(
             s.inbound_frames_port, DEFAULT_HIL_INBOUND_FRAMES_PORT,
@@ -10244,14 +10657,12 @@ mod tests {
     fn resolve_secrets_valid_port_override_is_used() {
         let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         map.insert("RESPEAKER_HIL_UDP_PORT".to_string(), "19000".to_string());
-        map.insert("RESPEAKER_HIL_TCP_PORT".to_string(), "19001".to_string());
         map.insert(
             "RESPEAKER_HIL_INBOUND_FRAMES_PORT".to_string(),
             "19002".to_string(),
         );
         let s = resolve_secrets(|key| map.get(key).cloned(), "<test>");
         assert_eq!(s.udp_echo_port, 19000, "overridden UDP port must be used");
-        assert_eq!(s.tcp_echo_port, 19001, "overridden TCP port must be used");
         assert_eq!(
             s.inbound_frames_port, 19002,
             "overridden inbound frames port must be used"
@@ -10281,30 +10692,6 @@ mod tests {
         let s = resolve_secrets(|key| map.get(key).cloned(), "<test>");
         assert_eq!(
             s.udp_echo_port, DEFAULT_HIL_UDP_PORT,
-            "port 0 (ephemeral) must be rejected → default"
-        );
-    }
-
-    /// Unparseable TCP port override → falls back to default.
-    #[test]
-    fn resolve_secrets_unparseable_tcp_port_falls_back_to_default() {
-        let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        map.insert("RESPEAKER_HIL_TCP_PORT".to_string(), "65536".to_string()); // out of u16 range
-        let s = resolve_secrets(|key| map.get(key).cloned(), "<test>");
-        assert_eq!(
-            s.tcp_echo_port, DEFAULT_HIL_TCP_PORT,
-            "out-of-range TCP port → default"
-        );
-    }
-
-    /// Zero TCP port override → falls back to default.
-    #[test]
-    fn resolve_secrets_zero_tcp_port_falls_back_to_default() {
-        let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        map.insert("RESPEAKER_HIL_TCP_PORT".to_string(), "0".to_string());
-        let s = resolve_secrets(|key| map.get(key).cloned(), "<test>");
-        assert_eq!(
-            s.tcp_echo_port, DEFAULT_HIL_TCP_PORT,
             "port 0 (ephemeral) must be rejected → default"
         );
     }
@@ -10341,20 +10728,13 @@ mod tests {
 
     /// Env-over-file precedence: env value wins when the resolver returns it first.
     ///
-    /// Note: this test exercises `resolve_secrets` (which has no precedence logic of
-    /// its own — it takes a single `get` closure).  The actual env-over-file ordering
-    /// lives in `load_hil_secrets`'s two-layer lookup and is not separately unit-tested
-    /// at that layer; a regression there would require a temp-file + env-var integration
-    /// test to catch.  The two-layer logic is a single `env.or(file)` expression and has
-    /// not changed with this diff.
+    /// Scope: exercises `resolve_secrets` only; the env-over-file ordering in
+    /// `load_hil_secrets` is not separately unit-tested.
     #[test]
     fn resolve_secrets_env_wins_over_file_for_ports() {
-        // Simulate: env overrides to 18000/18001/18002.
-        // Verifies resolve_secrets uses the value the resolver supplies for all three ports.
         let get = |key: &str| -> Option<String> {
             match key {
                 "RESPEAKER_HIL_UDP_PORT" => Some("18000".to_string()),
-                "RESPEAKER_HIL_TCP_PORT" => Some("18001".to_string()),
                 "RESPEAKER_HIL_INBOUND_FRAMES_PORT" => Some("18002".to_string()),
                 _ => None,
             }
@@ -10363,10 +10743,6 @@ mod tests {
         assert_eq!(
             s.udp_echo_port, 18000,
             "resolver-returned value must be used for UDP port"
-        );
-        assert_eq!(
-            s.tcp_echo_port, 18001,
-            "resolver-returned value must be used for TCP port"
         );
         assert_eq!(
             s.inbound_frames_port, 18002,
@@ -10427,30 +10803,6 @@ mod tests {
         }
     }
 
-    /// Binding the default TCP echo port on loopback succeeds.
-    #[test]
-    fn tcp_echo_default_port_binds_on_loopback() {
-        // Known limitation: when the port is already in use the test exits
-        // without asserting anything; `fixed_port_second_bind_fails` covers
-        // the no-fallback property using an isolated test-only port.
-        let listener = TcpListener::bind(("127.0.0.1", DEFAULT_HIL_TCP_PORT));
-        match listener {
-            Ok(l) => {
-                assert_eq!(
-                    l.local_addr().unwrap().port(),
-                    DEFAULT_HIL_TCP_PORT,
-                    "bound port must equal the requested fixed port (no :0 fallback)"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                eprintln!(
-                    "SKIP tcp_echo_default_port_binds_on_loopback: port {DEFAULT_HIL_TCP_PORT} already in use"
-                );
-            }
-            Err(e) => panic!("unexpected bind error: {e}"),
-        }
-    }
-
     /// A second bind on the same fixed port fails (proves "no :0 fallback", AC7).
     ///
     /// Uses OS-assigned ephemeral port for the first bind so there is no
@@ -10495,7 +10847,6 @@ mod tests {
     fn print_ports_defaults_produce_correct_output() {
         let output = super::format_port_lines(
             DEFAULT_HIL_UDP_PORT,
-            DEFAULT_HIL_TCP_PORT,
             DEFAULT_HIL_INBOUND_FRAMES_PORT,
             DEFAULT_HIL_BACKPRESSURE_PORT,
             DEFAULT_HIL_POLL_READINESS_PORT,
@@ -10506,18 +10857,14 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "udp_port={DEFAULT_HIL_UDP_PORT}/udp\ntcp_port={DEFAULT_HIL_TCP_PORT}/tcp\ninbound_frames_port={DEFAULT_HIL_INBOUND_FRAMES_PORT}/tcp\nbackpressure_port={DEFAULT_HIL_BACKPRESSURE_PORT}/tcp\npoll_readiness_port={DEFAULT_HIL_POLL_READINESS_PORT}/tcp\nrtd_port={DEFAULT_HIL_RTD_PORT}/tcp\ntls_psk_port={DEFAULT_HIL_TLS_PSK_PORT}/tcp\ntls_psk_bad_port={DEFAULT_HIL_TLS_PSK_BAD_PORT}/tcp\n"
+                "udp_port={DEFAULT_HIL_UDP_PORT}/udp\ninbound_frames_port={DEFAULT_HIL_INBOUND_FRAMES_PORT}/tcp\nbackpressure_port={DEFAULT_HIL_BACKPRESSURE_PORT}/tcp\npoll_readiness_port={DEFAULT_HIL_POLL_READINESS_PORT}/tcp\nrtd_port={DEFAULT_HIL_RTD_PORT}/tcp\ntls_psk_port={DEFAULT_HIL_TLS_PSK_PORT}/tcp\ntls_psk_bad_port={DEFAULT_HIL_TLS_PSK_BAD_PORT}/tcp\n"
             ),
-            "--print-ports default output must be `udp_port=17380/udp\\ntcp_port=17381/tcp\\ninbound_frames_port=17382/tcp\\nbackpressure_port=17383/tcp\\npoll_readiness_port=17384/tcp\\nrtd_port=17385/tcp\\ntls_psk_port=17386/tcp\\ntls_psk_bad_port=17387/tcp\\n`"
+            "--print-ports default output must be `udp_port=17380/udp\\ninbound_frames_port=17382/tcp\\nbackpressure_port=17383/tcp\\npoll_readiness_port=17384/tcp\\nrtd_port=17385/tcp\\ntls_psk_port=17386/tcp\\ntls_psk_bad_port=17387/tcp\\n`"
         );
         // Verify the exact documented defaults.
         assert!(
             output.contains("udp_port=17380"),
             "default UDP port line must be `udp_port=17380`"
-        );
-        assert!(
-            output.contains("tcp_port=17381"),
-            "default TCP port line must be `tcp_port=17381`"
         );
         assert!(
             output.contains("inbound_frames_port=17382"),
@@ -10560,8 +10907,8 @@ mod tests {
         );
         assert_eq!(
             output.matches("/tcp").count(),
-            7,
-            "all seven non-echo-UDP ports must be emitted as `/tcp`"
+            6,
+            "all six non-echo-UDP ports must be emitted as `/tcp`"
         );
     }
 
@@ -10572,15 +10919,10 @@ mod tests {
     /// helper opens the overridden port (not the default).
     #[test]
     fn print_ports_overrides_produce_correct_output() {
-        let output =
-            super::format_port_lines(18000, 18001, 18002, 18003, 18004, 18005, 18006, 18007);
+        let output = super::format_port_lines(18000, 18002, 18003, 18004, 18005, 18006, 18007);
         assert!(
             output.contains("udp_port=18000"),
             "overridden UDP port must appear verbatim in --print-ports output"
-        );
-        assert!(
-            output.contains("tcp_port=18001"),
-            "overridden TCP port must appear verbatim in --print-ports output"
         );
         assert!(
             output.contains("inbound_frames_port=18002"),
@@ -10622,7 +10964,6 @@ mod tests {
         let secrets = resolve_secrets(get, "<test>");
         let output = super::format_port_lines(
             secrets.udp_echo_port,
-            secrets.tcp_echo_port,
             secrets.inbound_frames_port,
             secrets.backpressure_port,
             secrets.poll_readiness_port,
@@ -10633,10 +10974,6 @@ mod tests {
         assert!(
             output.contains("udp_port=19000"),
             "--print-ports must reflect UDP override resolved via resolve_secrets"
-        );
-        assert!(
-            output.contains(&format!("tcp_port={DEFAULT_HIL_TCP_PORT}")),
-            "--print-ports must use default TCP port when only UDP is overridden"
         );
         assert!(
             output.contains(&format!(
@@ -11723,13 +12060,63 @@ mod tests {
     // `RtdObservation` literals; this covers the publish closure and the terminal
     // final store that those literals bypass.
 
+    /// Build a client-side TLS-PSK context presenting `identity`/`key`, matching the server
+    /// context every fixture builds. Used by the loopback unit tests to drive a real handshake.
+    fn psk_client_context(identity: &str, key: [u8; AUDIO_PSK_LEN]) -> openssl::ssl::SslContext {
+        use openssl::ssl::{SslContext, SslMethod, SslVersion};
+        let identity = identity.to_string();
+        let mut b = SslContext::builder(SslMethod::tls_client()).expect("client ctx builder");
+        b.set_min_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+        b.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+        b.set_cipher_list(PSK_CIPHERSUITE).unwrap();
+        b.set_psk_client_callback(move |_ssl, _hint, id_buf, key_buf| {
+            let id = identity.as_bytes();
+            if id_buf.len() < id.len() + 1 || key_buf.len() < key.len() {
+                return Ok(0);
+            }
+            id_buf[..id.len()].copy_from_slice(id);
+            id_buf[id.len()] = 0; // NUL-terminated identity
+            key_buf[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        });
+        b.build()
+    }
+
+    /// Connected server/client TLS-PSK pair over loopback. The server side is already through
+    /// [`tls_accept`]; the client side has completed its handshake. Both share one identity+key.
+    fn tls_loopback_pair() -> (
+        TlsServerStream,
+        openssl::ssl::SslStream<std::net::TcpStream>,
+    ) {
+        use std::net::{TcpListener, TcpStream};
+        let identity = "test-pod";
+        let key = [0x5au8; AUDIO_PSK_LEN];
+        let psk = PodPsk {
+            identity: identity.to_string(),
+            key,
+        };
+        let server_ctx = psk_server_context(&psk).expect("server ctx");
+        let client_ctx = psk_client_context(identity, key);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let server_jh = thread::spawn(move || {
+            let (tcp, peer) = listener.accept().expect("accept loopback");
+            tls_accept(&server_ctx, tcp, &peer, "test-server").expect("server handshake")
+        });
+        let tcp = TcpStream::connect(addr).expect("connect loopback");
+        let ssl = openssl::ssl::Ssl::new(&client_ctx).expect("client Ssl");
+        let mut client = openssl::ssl::SslStream::new(ssl, tcp).expect("client SslStream");
+        client.connect().expect("client handshake");
+        let server = server_jh.join().expect("server thread");
+        (server, client)
+    }
+
     /// Encode one `StreamFrame` and write it whole to `stream` (test client side).
     fn rtd_test_write_frame(
-        stream: &mut std::net::TcpStream,
+        stream: &mut impl std::io::Write,
         frame: &audio_pipeline::wire::StreamFrame,
     ) {
         use audio_pipeline::wire::{encode_frame, MAX_FRAME_BYTES};
-        use std::io::Write as _;
         let mut buf = vec![0u8; MAX_FRAME_BYTES + 2];
         let n = encode_frame(frame, &mut buf).expect("test frame encodes");
         stream
@@ -11779,17 +12166,32 @@ mod tests {
     fn rtd_spawn_serve(
         slot: &Arc<Mutex<RtdObservation>>,
         conn: u32,
-    ) -> (std::net::TcpStream, thread::JoinHandle<()>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    ) -> (
+        openssl::ssl::SslStream<std::net::TcpStream>,
+        thread::JoinHandle<()>,
+    ) {
+        use std::net::{TcpListener, TcpStream};
+        let identity = "test-pod";
+        let key = [0x5au8; AUDIO_PSK_LEN];
+        let psk = PodPsk {
+            identity: identity.to_string(),
+            key,
+        };
+        let server_ctx = psk_server_context(&psk).expect("server ctx");
+        let client_ctx = psk_client_context(identity, key);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local_addr");
-        let client = std::net::TcpStream::connect(addr).expect("connect loopback");
-        let (accepted, peer) = listener.accept().expect("accept loopback");
         let slot_c = Arc::clone(slot);
         let handle = thread::spawn(move || {
-            let mut s = accepted;
+            let (tcp, peer) = listener.accept().expect("accept loopback");
+            let mut s = tls_accept(&server_ctx, tcp, &peer, "test-server").expect("handshake");
             let stop = Arc::new(Mutex::new(false));
             rtd_serve(&mut s, &peer, &slot_c, false, &stop, conn);
         });
+        let tcp = TcpStream::connect(addr).expect("connect loopback");
+        let ssl = openssl::ssl::Ssl::new(&client_ctx).expect("client Ssl");
+        let mut client = openssl::ssl::SslStream::new(ssl, tcp).expect("client SslStream");
+        client.connect().expect("client handshake");
         (client, handle)
     }
 

@@ -18,7 +18,7 @@ use crate::netpoll::{
     OUTBOUND_FRAMES_PER_WAKE,
 };
 #[cfg(target_os = "espidf")]
-use crate::nvs::{nvs_get_blob32, nvs_get_blob4, open_wifi_nvs};
+use crate::nvs::{nvs_get_blob4, open_wifi_nvs};
 #[cfg(target_os = "espidf")]
 use crate::tls_link::{tls_connect_psk, LinkStream, TlsConnectParams, TlsStream, PSK_LEN};
 #[cfg(target_os = "espidf")]
@@ -180,9 +180,10 @@ pub(crate) fn send_frame_bp(
     send_frame_bp_counted(stream, frame, buf).0
 }
 
-/// Like [`send_frame_bp`] but also returns the resume-cycle count (number of
-/// forward-progress budget resets). Used by HIL self-tests to distinguish
-/// resumed partial writes from immediate sends.
+/// Like [`send_frame_bp`] but also returns the resume-cycle count (completed
+/// writability waits that were followed by forward progress). Used by HIL
+/// self-tests to distinguish a frame that blocked and resumed from one the
+/// transport accepted outright.
 #[cfg(target_os = "espidf")]
 pub(crate) fn send_frame_bp_counted(
     stream: &mut dyn LinkStream,
@@ -482,7 +483,7 @@ fn read_audio_provisioning() -> Result<([u8; 4], u16, [u8; PSK_LEN]), device_pro
             )));
         }
     };
-    let psk = nvs_get_blob32(&nvs, "audio_psk")
+    let psk = crate::hil_session::effective_audio_psk(&nvs)
         .map_err(|msg| fmt_msg(format_args!("audio_psk unavailable: {}", msg.as_str())))?;
     Ok((ip, port, psk))
 }
@@ -564,6 +565,11 @@ pub(crate) fn spawn_streamer_thread() {
             };
 
             // ── Read provisioning, polling until it appears ──────────────────
+            // These values are captured for the life of this thread on the first
+            // success, so a HIL audio-PSK override is observed only if it lands
+            // before then — a not-yet-provisioned streamer can pick it up mid-run,
+            // a boot-provisioned one keeps its boot-time key until reboot.
+            // TODO(hil-streamer-psk-quiesce): observe overrides after this point.
             let (audio_ip, audio_port, audio_psk): ([u8; 4], u16, [u8; PSK_LEN]) = {
                 let mut last_err: Option<device_protocol::TestResultMsg> = None;
                 loop {

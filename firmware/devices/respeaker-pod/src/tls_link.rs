@@ -91,8 +91,12 @@ pub(crate) const PSK_LEN: usize = 32;
 /// The ECDHE-PSK exchange costs on the order of 100–300 ms on this silicon; a
 /// 3 s ceiling absorbs a retransmit or two on a bad radio while still failing
 /// fast enough that the caller's reconnect backoff, not this wait, dominates.
+///
+/// Sourced from `device_protocol` because the host's HIL timeout-budget
+/// invariants charge the same ceiling as a term.
 #[cfg(target_os = "espidf")]
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(3000);
+const HANDSHAKE_TIMEOUT: Duration =
+    Duration::from_secs(device_protocol::TLS_HANDSHAKE_TIMEOUT_SECS);
 
 /// Which direction TLS last said it was waiting on, for one operation
 /// (a read's outstanding request and a write's are tracked separately).
@@ -432,6 +436,56 @@ pub(crate) struct TlsConnectParams<'a> {
     pub(crate) write_timeout: Duration,
 }
 
+/// Stage of [`tls_connect_psk_staged`] a failure came from.
+///
+/// Only [`TlsConnectStage::Handshake`] means TLS was actually spoken; the
+/// negative self-test keys its verdict on that distinction.
+#[cfg(target_os = "espidf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TlsConnectStage {
+    /// TCP connect, before any TLS byte crosses.
+    TcpConnect,
+    /// esp-tls session construction and fd adoption.
+    Setup,
+    /// The handshake exchange itself, including a peer's refusal alert.
+    Handshake,
+}
+
+#[cfg(target_os = "espidf")]
+impl TlsConnectStage {
+    /// Short name for diagnostics.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TlsConnectStage::TcpConnect => "tcp connect",
+            TlsConnectStage::Setup => "tls setup",
+            TlsConnectStage::Handshake => "tls handshake",
+        }
+    }
+}
+
+/// A ready TLS-PSK session plus the per-stage timings measured opening it.
+#[cfg(target_os = "espidf")]
+pub(crate) struct TlsConnected {
+    /// The established session.
+    pub(crate) stream: TlsStream,
+    /// Time spent in `connect_timeout`, before any TLS byte.
+    pub(crate) connect: Duration,
+    /// Time spent driving the handshake to completion.
+    pub(crate) handshake: Duration,
+}
+
+/// A failed TLS-PSK connect: which stage produced it, how long that stage ran,
+/// and the error itself (original `ErrorKind` preserved).
+#[cfg(target_os = "espidf")]
+pub(crate) struct TlsConnectFailed {
+    /// Stage that failed.
+    pub(crate) stage: TlsConnectStage,
+    /// Wall-clock time spent inside that stage.
+    pub(crate) elapsed: Duration,
+    /// The underlying error.
+    pub(crate) error: io::Error,
+}
+
 /// Open a TCP connection to `params.peer` and complete a TLS-PSK handshake over
 /// it, returning the ready session.
 ///
@@ -439,11 +493,55 @@ pub(crate) struct TlsConnectParams<'a> {
 /// (esp-tls owns it from that point on) and the handshake is driven by
 /// `poll()`, so the caller's event loop is never blocked for longer than
 /// [`HANDSHAKE_TIMEOUT`]. On any failure the fd is closed and nothing leaks.
+///
+/// Errors name the stage that produced them and preserve the original
+/// `ErrorKind`, so callers that classify by kind are unaffected. Callers that
+/// need the stage as data, or the connect/handshake split as a measurement, use
+/// [`tls_connect_psk_staged`].
 #[cfg(target_os = "espidf")]
 pub(crate) fn tls_connect_psk(params: &TlsConnectParams) -> io::Result<TlsStream> {
+    tls_connect_psk_staged(params)
+        .map(|c| c.stream)
+        .map_err(|f| f.error)
+}
+
+/// [`tls_connect_psk`] with the failing stage and the per-stage elapsed times
+/// returned as data rather than encoded in prose.
+#[cfg(target_os = "espidf")]
+pub(crate) fn tls_connect_psk_staged(
+    params: &TlsConnectParams,
+) -> Result<TlsConnected, TlsConnectFailed> {
     use std::os::fd::IntoRawFd as _;
 
-    let sock = std::net::TcpStream::connect_timeout(params.peer, params.connect_timeout)?;
+    let connect_started = Instant::now();
+    let sock =
+        std::net::TcpStream::connect_timeout(params.peer, params.connect_timeout).map_err(|e| {
+            let elapsed = connect_started.elapsed();
+            TlsConnectFailed {
+                stage: TlsConnectStage::TcpConnect,
+                elapsed,
+                error: io::Error::new(
+                    e.kind(),
+                    format!(
+                        "tcp connect to {} after {} ms: {e}",
+                        params.peer,
+                        elapsed.as_millis()
+                    ),
+                ),
+            }
+        })?;
+    let connect = connect_started.elapsed();
+    log::info!(
+        "tls-psk: tcp connect to {} took {} ms",
+        params.peer,
+        connect.as_millis()
+    );
+    let setup_started = Instant::now();
+    let setup_failed = |error: io::Error| TlsConnectFailed {
+        stage: TlsConnectStage::Setup,
+        elapsed: setup_started.elapsed(),
+        error,
+    };
     if let Err(e) = sock.set_nodelay(true) {
         log::warn!("tls_link: set_nodelay failed: {e:?}");
     }
@@ -452,9 +550,9 @@ pub(crate) fn tls_connect_psk(params: &TlsConnectParams) -> io::Result<TlsStream
     }
     // Must precede the handoff: esp-tls owns the fd afterwards, and a blocking
     // socket would stall the streamer's poll loop inside the handshake.
-    sock.set_nonblocking(true)?;
+    sock.set_nonblocking(true).map_err(setup_failed)?;
 
-    let cfg = TlsSessionCfg::new(params.pod_id, params.key)?;
+    let cfg = TlsSessionCfg::new(params.pod_id, params.key).map_err(setup_failed)?;
     let fd = sock.into_raw_fd();
 
     // SAFETY: no arguments; returns a heap handle or null.
@@ -463,7 +561,9 @@ pub(crate) fn tls_connect_psk(params: &TlsConnectParams) -> io::Result<TlsStream
         // SAFETY: `fd` is a live fd this function still owns — the adopt
         // sequence below has not run, so nothing else will close it.
         unsafe { sys::close(fd) };
-        return Err(io::Error::other("esp_tls_init failed (out of memory)"));
+        return Err(setup_failed(io::Error::other(
+            "esp_tls_init failed (out of memory)",
+        )));
     }
 
     // From here on `stream`'s `Drop` owns both the session and the fd.
@@ -480,26 +580,35 @@ pub(crate) fn tls_connect_psk(params: &TlsConnectParams) -> io::Result<TlsStream
     // SAFETY: `tls` is a live handle and `fd` is a connected socket.
     let rc = unsafe { sys::esp_tls_set_conn_sockfd(stream.tls, fd) };
     if rc != sys::ESP_OK {
-        return Err(io::Error::other(format!(
+        return Err(setup_failed(io::Error::other(format!(
             "esp_tls_set_conn_sockfd failed ({rc:#x})"
-        )));
+        ))));
     }
     // SAFETY: `tls` is a live handle; the state enum value is from the bindings.
     let rc = unsafe {
         sys::esp_tls_set_conn_state(stream.tls, sys::esp_tls_conn_state_ESP_TLS_CONNECTING)
     };
     if rc != sys::ESP_OK {
-        return Err(io::Error::other(format!(
+        return Err(setup_failed(io::Error::other(format!(
             "esp_tls_set_conn_state failed ({rc:#x})"
-        )));
+        ))));
     }
 
     // Hostname is irrelevant under PSK (no certificate, no SNI need); the peer
     // IP keeps esp-tls's logging meaningful.
     let host = params.peer.ip().to_string();
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    handshake(&mut stream, &host, deadline)?;
-    Ok(stream)
+    let handshake_started = Instant::now();
+    let deadline = handshake_started + HANDSHAKE_TIMEOUT;
+    handshake(&mut stream, &host, deadline).map_err(|error| TlsConnectFailed {
+        stage: TlsConnectStage::Handshake,
+        elapsed: handshake_started.elapsed(),
+        error,
+    })?;
+    Ok(TlsConnected {
+        stream,
+        connect,
+        handshake: handshake_started.elapsed(),
+    })
 }
 
 /// Drive `esp_tls_conn_new_async` to completion under `deadline`.
