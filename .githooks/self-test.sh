@@ -125,13 +125,15 @@ else
     done
 fi
 
-# The root `check` target claims to be the union of every lane CI runs, but it
-# hardcodes its steps while the router derives lanes from staged paths. Add a
-# lane to the router and CI silently stops covering it — the exact drift this
-# repo's gate exists to prevent, one level up. Both sides are derived here.
+# The root `check` target claims to be the union of every lane CI's check job
+# runs, but it hardcodes its steps while the router derives lanes from staged
+# paths. Add a lane to the router and CI silently stops covering it — the exact
+# drift this repo's gate exists to prevent, one level up. Both sides are derived
+# here. Lanes CI runs as their own workflow job are checked the same way against
+# the workflow file instead.
 #
-# A token with no step and no exemption is a hard fail: the map below must be
-# extended deliberately, which is the point.
+# A token with no step, no workflow step and no exemption is a hard fail: the
+# maps below must be extended deliberately, which is the point.
 gate_step_for_token() {
     case "$1" in
         # host/ is reached transitively: firmware's check-host runs it via
@@ -145,11 +147,30 @@ gate_step_for_token() {
     esac
 }
 
+# Lanes public CI runs as dedicated workflow jobs, outside the root check target,
+# mapped to the command that job must execute and to the job that must execute it.
+# Both halves are needed: the command alone says nothing about whether the job
+# carrying it actually runs or whether its verdict counts.
+gate_workflow_step_for_token() {
+    case "$1" in
+        firmware-device) echo 'make -C firmware check-device' ;;
+        *)               return 1 ;;
+    esac
+}
+
+gate_workflow_job_for_token() {
+    case "$1" in
+        firmware-device) echo 'device-clippy' ;;
+        *)               return 1 ;;
+    esac
+}
+
 # Deliberate gaps in the public gate, each named with the slug that closes it.
+# Kept as the documented extension point, so a future gap has to be declared here
+# rather than appearing by omission.
 gate_exempt_token() {
     case "$1" in
-        firmware-device) echo 'TODO(ci-esp-clippy) — device clippy needs the esp toolchain' ;;
-        *)               return 1 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -158,15 +179,42 @@ mapfile -t PLAN_TOKENS < <(
         | grep -oE '\becho [a-z-]+' | awk '{print $2}' | sort -u
 )
 CHECK_RECIPE="$(sed -n '/^check:$/,/^$/p' "$REPO_ROOT/Makefile")"
+CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 
-if [ "${#PLAN_TOKENS[@]}" -eq 0 ] || [ -z "$CHECK_RECIPE" ]; then
-    fail "gate union: could not derive plan tokens or the root check recipe — extraction is broken"
+if [ "${#PLAN_TOKENS[@]}" -eq 0 ] || [ -z "$CHECK_RECIPE" ] || [ ! -r "$CI_WORKFLOW" ]; then
+    fail "gate union: could not derive plan tokens or the root check recipe, or the CI workflow is unreadable — extraction is broken"
 else
     for tok in "${PLAN_TOKENS[@]}"; do
-        if exemption="$(gate_exempt_token "$tok")"; then
+        if wstep="$(gate_workflow_step_for_token "$tok")"; then
+            wjob="$(gate_workflow_job_for_token "$tok" || true)"
+            # One job's block: its `  <id>:` header through the line before the next
+            # job header at the same indent, or EOF.
+            job_block="$(
+                sed -n "/^  ${wjob}:\$/,\$p" "$CI_WORKFLOW" \
+                    | awk 'NR > 1 && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit } { print }'
+            )"
+            # `run:` lines only, never the whole block: ci.yml's comments quote
+            # commands freely (this job's header comment among them), so a plain
+            # substring match would stay green the moment the executable step was
+            # deleted.
+            job_runs="$(printf '%s\n' "$job_block" | grep -E '^[[:space:]]*(- )?run:' || true)"
+            # Job-level `if:`/`continue-on-error:` sit at four spaces and would make
+            # the lane skippable or its red harmless; step-level ones (the footprint
+            # step's `if: always()`) sit at eight and must not trip this.
+            job_masks="$(printf '%s\n' "$job_block" | grep -E '^    (if|continue-on-error):' || true)"
+            if [ -z "$wjob" ] || [ -z "$job_block" ]; then
+                fail "gate union: '$tok' expects a workflow job '$wjob', which .github/workflows/ci.yml does not define — public CI would not run this lane"
+            elif ! printf '%s\n' "$job_runs" | grep -qF -- "$wstep"; then
+                fail "gate union: '$tok' expects workflow job '$wjob' to run '$wstep', which it has no run: line for — public CI would not run this lane"
+            elif [ -n "$job_masks" ]; then
+                fail "gate union: workflow job '$wjob' carries a job-level condition ($(printf '%s' "$job_masks" | tr '\n' ';' | tr -s ' ')) — the lane would be skipped or its verdict masked, so '$tok' is not really gated"
+            else
+                pass "gate union: '$tok' -> '$wstep' runs unmasked in workflow job '$wjob'"
+            fi
+        elif exemption="$(gate_exempt_token "$tok")"; then
             pass "gate union: '$tok' deliberately exempt — $exemption"
         elif ! step="$(gate_step_for_token "$tok")"; then
-            fail "gate union: plan token '$tok' maps to no step in the root check target — add the step to Makefile's check, or declare an exemption naming its TODO slug"
+            fail "gate union: plan token '$tok' maps to no step in the root check target — add the step to Makefile's check, map it to a workflow run step, or declare an exemption naming its TODO slug"
         elif [ -z "$step" ]; then
             pass "gate union: '$tok' needs no step of its own"
         elif printf '%s\n' "$CHECK_RECIPE" | grep -qF -- "$step"; then
@@ -175,6 +223,32 @@ else
             fail "gate union: '$tok' expects '$step' in the root check recipe, which is missing it — public CI would not run this lane"
         fi
     done
+fi
+
+# The device-clippy job keys its ~/.espressif cache on an ESP-IDF version that the
+# device crate's cargo config is what actually decides. actions/cache does not
+# re-save on a primary-key hit, so a config bump left unmirrored in the workflow
+# restores the superseded ESP-IDF and pays a full cold install on every subsequent
+# run — a permanent tax that reads as "the cache is slow" rather than as breakage.
+#
+# Both extractions end in `|| true`: under `set -e` with `pipefail` a no-match
+# grep would otherwise abort the whole script at the assignment, skipping every
+# later tier and printing no diagnostic. Empty falls through to the fail below.
+IDF_CONFIG_TAG="$(
+    grep -oE '^ESP_IDF_VERSION[[:space:]]*=[[:space:]]*"[^"]+"' \
+        "$REPO_ROOT/firmware/devices/respeaker-pod/.cargo/config.toml" \
+        | sed 's/.*"\(.*\)"$/\1/' || true
+)"
+IDF_WORKFLOW_TAG="$(
+    grep -oE '^[[:space:]]*ESP_IDF_VERSION_TAG:[[:space:]]*[^[:space:]]+' \
+        "$REPO_ROOT/.github/workflows/ci.yml" | awk '{print $2}' || true
+)"
+if [ -z "$IDF_CONFIG_TAG" ] || [ -z "$IDF_WORKFLOW_TAG" ]; then
+    fail "esp-idf pin: could not read ESP_IDF_VERSION from the device crate's .cargo/config.toml or ESP_IDF_VERSION_TAG from .github/workflows/ci.yml — extraction is broken"
+elif [ "$IDF_CONFIG_TAG" = "$IDF_WORKFLOW_TAG" ]; then
+    pass "esp-idf pin: ci.yml's cache key tag matches the device crate's ESP_IDF_VERSION ($IDF_CONFIG_TAG)"
+else
+    fail "esp-idf pin: ci.yml has ESP_IDF_VERSION_TAG=$IDF_WORKFLOW_TAG but the device crate's .cargo/config.toml has ESP_IDF_VERSION=$IDF_CONFIG_TAG — the device-clippy job would restore a stale ~/.espressif on every run"
 fi
 
 # ---------------------------------------------------------------------------

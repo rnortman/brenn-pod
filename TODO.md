@@ -4,24 +4,60 @@
 
 This is a placeholder entry. Leave it here so the file is never empty. It is not a real TODO. You would reference it in code with `// TODO(example-placeholder)` comments. This is the basic TODO system design: An entry here with a slug used to join to code comments. Add real TODOs below this one in this format.
 
-## `ci-esp-clippy`
+## `ci-device-clippy-first-run` — BLOCKED as of 2026-07-25 (needs a real GitHub-hosted runner)
 
-Public CI runs the espup-free lane (`make -C firmware check-host`, via the root `make check`),
-so the device crate `firmware/devices/respeaker-pod/` gets no clippy coverage in CI — only the
-maintainer's local `make -C firmware check` lints it under the esp toolchain. Closing the gap
-means installing espup on the runner and switching the `check` job's delegation to
-`make -C firmware check` (whose final step is the device-crate clippy pass,
-`firmware/Makefile:38`).
+The `device-clippy` job in `.github/workflows/ci.yml` has never executed. Everything below
+its `actions/checkout` step is unexercised by any in-tree test and unverifiable off a
+runner: the pinned espup release-asset URL and its sha256, `espup install --targets esp32s3
+--toolchain-version 1.96.0.0` accepting that version string, `~/export-esp.sh` landing where
+the toolchain cache expects it, `python3-venv` being enough for ESP-IDF's tools installer,
+`build-std` finding `rust-src` in espup's toolchain, the assumption that clippy never needs
+`ldproxy`, and the `!~/.espressif/dist` cache exclusion not provoking a re-download on a warm
+restore. Two of the cheap failure modes were already retired against the maintainer's local
+toolchain (`espup --version` prints `espup 0.17.1`; `rustc +esp --version` reports
+`1.96.0.0`); the rest are runner-only. Until it runs, the repo carries an advisory job whose
+green/red signal is unknown, and the cold wall time and disk footprint — the numbers that
+decide whether the job is worth keeping — do not exist.
 
-Deferred at CI bring-up because espup's installability and download cost on a public GitHub
-runner are unverified, and the payoff is one additional clippy view of one crate with zero
-additional tests — a poor trade for the first CI iteration, and heavy enough to risk either
-bloating the `check` job or breaking the two-job house shape shared with the sibling repos.
+Blocked purely on pushing the branch, which is the maintainer's action. The job is
+self-measuring: its `Footprint` step prints `du`/`df` on every run, including failed ones.
 
-Done = the device crate's esp-toolchain clippy view runs in CI, green, with the two job names
-(`check (fmt, clippy, test)` and `scrub`) unchanged, since branch protection joins on them.
+Done = a real run with all three jobs green, and the cold wall time, the warm wall time, the
+`Footprint` step's `du`/`df` output, and the compressed cache sizes from the repo's Actions
+caches page recorded in the ADR. If the cold run exceeds the 60-minute timeout, or warm runs
+routinely exceed ~10 min, the numbers go to the maintainer with a keep/drop/restructure
+recommendation rather than a silently raised timeout.
 
-See `TODO(ci-esp-clippy)` at the `make check` step in `.github/workflows/ci.yml`.
+See `TODO(ci-device-clippy-first-run)` at the `device-clippy` job header in
+`.github/workflows/ci.yml`.
+
+## `ci-pinned-tool-extract` — BLOCKED as of 2026-07-25 (needs a factoring decision, and touching the two protected jobs)
+
+`.github/workflows/ci.yml` now carries three near-copies of the pinned-binary install
+skeleton — shellcheck (`check` job), gitleaks (`scrub` job), espup (`device-clippy` job):
+`cd "$RUNNER_TEMP"` → curl a release asset → `sha256sum -c` → place/chmod → `--version`
+self-check → PATH. The variation between them is real (raw binary vs tar.xz vs tar.gz,
+PATH vs absolute invocation) but the part carrying the security discipline is identical, so
+hardening it — `curl --retry`, a stricter version check, moving to published checksum files
+— is three synchronized edits, and the copies have already drifted cosmetically. Three is
+the conventional extraction threshold.
+
+Deferred, not dismissed. Two reasons. First, the factoring is a decision, not a mechanical
+move: a local composite action (`.github/actions/pinned-tool`) and a `scripts/` helper taking
+url/sha/asset-type trade differently (the composite keeps it inside the workflow vocabulary
+and can be reused by other workflows; the script is testable from a developer's shell and by
+`scripts/check.sh`), and the asset-type variation has to be absorbed somewhere. Second, the
+extraction necessarily rewrites the install steps of the two jobs whose behavior the current
+CI work was explicitly constrained not to touch, and it would land before `device-clippy`
+has had its first real green run — so the change would be made against an install path not
+yet proven to work.
+
+Done = the three call sites share one pinned-download implementation, each still naming its
+own version + sha256, with the shellcheck and gitleaks jobs verified green afterward. Do it
+no later than the arrival of a fourth pinned tool.
+
+See `TODO(ci-pinned-tool-extract)` at the `Install espup` step in
+`.github/workflows/ci.yml`.
 
 ## `podctl-dfu-serial` — BLOCKED as of 2026-07-18 (hardware observation: DFU-mode USB serial-number exposure unverified)
 

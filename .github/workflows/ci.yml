@@ -6,7 +6,7 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Both jobs only read the tree. Pinned here so a permissive repo-level default
+# All jobs only read the tree. Pinned here so a permissive repo-level default
 # cannot silently hand a write-capable token to cached actions, the downloaded
 # scanner, or anything `make check` executes.
 permissions:
@@ -58,8 +58,6 @@ jobs:
 
       # The gate's contents live in the root `check` target, not here, so the
       # whole thing is reproducible locally on a fresh clone.
-      # TODO(ci-esp-clippy): the device crate's esp-toolchain clippy view would
-      # slot in here (espup install + `make -C firmware check`).
       - run: make check
 
   scrub:
@@ -112,3 +110,155 @@ jobs:
             exit 1
           fi
           echo "clean (shared rules)"
+
+  # Lints the `cfg(target_os = "espidf")` half of firmware/devices/respeaker-pod —
+  # whole modules gated out at their `mod` declaration plus a few hundred per-item gate
+  # sites, none of which the check job's host-triple clippy ever compiles. Additive to
+  # the pre-commit hook (.githooks/pre-commit); this job covers contributor PRs and
+  # hook-bypassing commits.
+  #
+  # Deliberately NOT a required status check: it installs a heavy toolchain over the
+  # network, so a slow or flaky install degrades an advisory job instead of blocking
+  # merges. No continue-on-error though — it reports red honestly.
+  #
+  # TODO(ci-device-clippy-first-run): nothing below the checkout has ever executed on a
+  # runner; the pinned asset, the espup install and the C-side build are unverifiable
+  # off one.
+  device-clippy:
+    name: device-clippy (esp)
+    runs-on: ubuntu-latest
+    # Cold cost is dominated by the espup download and the ESP-IDF checkout + tools
+    # install; 60 min bounds a pathological cold run without strangling a plausible one.
+    timeout-minutes: 60
+    env:
+      ESPUP_VERSION: 0.17.1
+      ESPUP_SHA256: dbe54e9907b687809dbe1b955731569ed6df2b525362710d676256c5c8cf9ccd
+      # The Xtensa Rust toolchain espup installs under the name `esp`. Local dev runs a
+      # plain unpinned `espup install` and rust-toolchain.toml names only the channel, so
+      # pinning here changes nothing outside CI — it just keeps the lint verdict tied to
+      # a version a developer can install rather than to whatever shipped that morning.
+      ESP_TOOLCHAIN_VERSION: 1.96.0.0
+      # Must match ESP_IDF_VERSION in the device crate's .cargo/config.toml, which
+      # decides the installed ESP-IDF. Used here only to key the ~/.espressif cache;
+      # .githooks/self-test.sh enforces the match.
+      ESP_IDF_VERSION_TAG: v5.5.4
+    steps:
+      - uses: actions/checkout@v7
+
+      # restore/save split rather than plain actions/cache: that action's post step is
+      # post-if: success(), so a red or timed-out run would throw away everything it just
+      # installed and the next push would be cold again — exactly the runs that can least
+      # afford it. The paired save steps below bank the install regardless of the verdict.
+      #
+      # One cache for the toolchain and its export file: export-esp.sh carries
+      # LIBCLANG_PATH pointing inside the toolchain dir, so restoring one without the
+      # other would aim it at a different install. A corrupt restore is cured by bumping
+      # the key.
+      - name: Restore esp toolchain
+        id: cache-esp-toolchain
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.rustup/toolchains/esp
+            ~/export-esp.sh
+          key: esp-toolchain-${{ env.ESP_TOOLCHAIN_VERSION }}-${{ env.ESPUP_VERSION }}
+
+      # ESP_IDF_TOOLS_INSTALL_DIR = "global" puts the ESP-IDF checkout, xtensa-gcc,
+      # cmake, ninja and the Python venv all under ~/.espressif, so one cache covers the
+      # whole C-side footprint. The venv's absolute-path shebangs survive because $HOME
+      # is /home/runner on every ubuntu-latest runner.
+      #
+      # dist/ is excluded: it holds the tool archives idf_tools.py has already unpacked
+      # into tools/, ~720 MB of a ~6 GB tree that nothing reads afterwards. The whole
+      # repo shares a 10 GB cache quota with LRU eviction, so weight here evicts the
+      # required check job's caches too.
+      - name: Restore ESP-IDF and tools
+        id: cache-espressif
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.espressif
+            !~/.espressif/dist
+          key: espressif-${{ env.ESP_IDF_VERSION_TAG }}-${{ env.ESP_TOOLCHAIN_VERSION }}
+
+      # The device crate is a workspace member with no target-dir override, so its
+      # xtensa artifacts land in firmware/target and this covers them. rust-cache keys
+      # on the job id, so this does not collide with the check job's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware
+
+      # Pinned binary + sha256, the same pattern as the check job's shellcheck: release
+      # assets are mutable, so the hash is the real gate and the version self-check is a
+      # secondary sanity line. Not `cargo install espup` — compiling it costs minutes.
+      # TODO(ci-pinned-tool-extract): third copy of the pinned-download skeleton.
+      - name: Install espup
+        if: steps.cache-esp-toolchain.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o espup \
+            "https://github.com/esp-rs/espup/releases/download/v${ESPUP_VERSION}/espup-x86_64-unknown-linux-gnu"
+          echo "${ESPUP_SHA256}  espup" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          mv espup "$RUNNER_TEMP/bin/espup"
+          chmod +x "$RUNNER_TEMP/bin/espup"
+          "$RUNNER_TEMP/bin/espup" --version | grep -qx "espup ${ESPUP_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # --targets esp32s3 trims the download to the one chip this repo builds for.
+      # Writes ~/export-esp.sh, which the cache step above stores with the toolchain.
+      - name: Install esp Rust toolchain
+        if: steps.cache-esp-toolchain.outputs.cache-hit != 'true'
+        run: espup install --targets esp32s3 --toolchain-version "$ESP_TOOLCHAIN_VERSION"
+
+      # Saved here, not after the gate: a step with no `if:` runs only when everything
+      # before it succeeded, so this banks the toolchain exactly when espup finished and
+      # never banks a half-written one — which would be worse than no cache, since the
+      # two install steps above skip themselves on a hit.
+      - name: Save esp toolchain
+        if: steps.cache-esp-toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.rustup/toolchains/esp
+            ~/export-esp.sh
+          key: ${{ steps.cache-esp-toolchain.outputs.cache-primary-key }}
+
+      # ESP-IDF's tools installer builds a Python venv under ~/.espressif, which fails
+      # without python3-venv. dfu-util, ldproxy and cargo-espflash are deliberately
+      # absent: they exist for flashing and linking, and clippy does neither.
+      - name: Install OS prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv
+
+      # The gate — contents live in the firmware Makefile, so it is reproducible
+      # locally on a fresh clone.
+      - name: Device-crate clippy
+        run: . ~/export-esp.sh && make -C firmware check-device
+
+      # ~/.espressif is written by esp-idf-sys's build script during the gate above, so
+      # unlike the toolchain this can only be saved afterwards — hence always(), which
+      # keeps a red clippy verdict from costing the next push a full C-side reinstall.
+      # An install interrupted mid-way therefore can be banked; that is cured the same
+      # way any corrupt cache is, by bumping the key.
+      - name: Save ESP-IDF and tools
+        if: always() && steps.cache-espressif.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.espressif
+            !~/.espressif/dist
+          key: ${{ steps.cache-espressif.outputs.cache-primary-key }}
+
+      # Makes every run self-measuring: install cost and cache growth against the 10 GB
+      # per-repo cache quota, plus runner disk headroom. Runs even when the gate fails,
+      # since a run that dies early is exactly when the disk number matters — and those
+      # paths may not exist yet, hence the failure tolerance. These are uncompressed
+      # sizes; the quota is charged on the compressed entries the Actions caches page
+      # lists, so read both together.
+      - name: Footprint
+        if: always()
+        run: |
+          du -sh ~/.espressif ~/.rustup/toolchains/esp firmware/target 2>/dev/null || true
+          df -h /

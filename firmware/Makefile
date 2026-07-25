@@ -13,28 +13,21 @@
 # the audit and the flash examine the same file — a path change stays in one place.
 ELF := target/xtensa-esp32s3-espidf/release/respeaker-pod
 
-# Default inner loop — full workspace lint + tests (stable, no espup) + device lint
-# (esp channel, ~1s warm).  Device clippy runs from the device crate dir so crate-scoped
-# rust-toolchain.toml and .cargo/config.toml take effect.  Requires espup but NOT an
-# attached board.  Use check-host if espup is not installed.
+# Default inner loop — the host lane plus the device-crate lint (esp channel, ~1s warm).
+# Requires espup but NOT an attached board.  Use check-host if espup is not installed.
 #
-# --workspace covers every crate (podctl, pod-transport, hil-host, audio-receiver,
-# device-protocol, build-id) so cross-crate API breaks are caught here instead of hiding
-# until hil-test or a manual build.  respeaker-pod is included: run from the workspace root
-# it builds under its host cfg (esp-idf items gated `cfg(target_os = "espidf")`), so its
-# unit tests execute here.  The two clippy runs therefore cover both halves of every cfg
-# split — root clippy the host view, the device-dir run below the device view.
+# The two lanes' clippy runs cover both halves of every cfg split — check-host the host
+# view of every crate, check-device the `cfg(target_os = "espidf")` view of the device
+# crate.
 .PHONY: check
-check: check-host-arch
-	cargo fmt --all --check
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace
-# This lane runs only the awk-parser fixture self-test, NOT `check-realign` against a
-# freshly-built device ELF. That is deliberate: pre-commit stays fast and toolchain-optional
-# (the host lane needs no espup). The real-ELF audit runs manually before flash via
-# `make check-realign` (a prerequisite of `make flash`); allowlist drift is caught there as a
-# ship-gate finding, not at commit time. This is the accepted arrangement.
-	tools/check-realign-args.test.sh
+check: check-host check-device
+
+# Device-crate clippy under the esp toolchain — the one step in `check` that check-host
+# lacks.  Runs from the device crate dir so its crate-scoped rust-toolchain.toml
+# (channel = esp) and .cargo/config.toml (xtensa-esp32s3-espidf target) take effect.
+# Requires espup; no attached board.  Public CI runs this in its device-clippy job.
+.PHONY: check-device
+check-device:
 	cd devices/respeaker-pod && cargo clippy --all-targets -- -D warnings
 
 # Auto-fix — fmt (all members) + clippy fix (full host workspace) + device clippy fix.
@@ -54,14 +47,24 @@ build-firmware:
 	cd devices/respeaker-pod && cargo build --release
 
 # Host-only lane — no espup required. Use in environments without the esp toolchain.
-# Covers fmt, full workspace clippy, and host tests — including the device crate's host cfg
-# view, so respeaker-pod's device-logic unit tests run in this lane too (no espup needed).
-# It does NOT cover the device cfg view; that is the device-dir clippy in `check`.
+# Covers fmt, full workspace clippy, and host tests.
+#
+# --workspace covers every crate (podctl, pod-transport, hil-host, audio-receiver,
+# device-protocol, build-id) so cross-crate API breaks are caught here instead of hiding
+# until hil-test or a manual build.  respeaker-pod is included: run from the workspace root
+# it builds under its host cfg (esp-idf items gated `cfg(target_os = "espidf")`), so its
+# device-logic unit tests execute in this lane too (no espup needed).  It does NOT cover
+# the device cfg view; that is check-device.
 .PHONY: check-host
 check-host: check-host-arch
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
+# This lane runs only the awk-parser fixture self-test, NOT `check-realign` against a
+# freshly-built device ELF. That is deliberate: pre-commit stays fast and toolchain-optional
+# (the host lane needs no espup). The real-ELF audit runs manually before flash via
+# `make check-realign` (a prerequisite of `make flash`); allowlist drift is caught there as a
+# ship-gate finding, not at commit time. This is the accepted arrangement.
 	tools/check-realign-args.test.sh
 
 # Host-architecture workspace (host/) — stable toolchain, no espup.

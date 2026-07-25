@@ -9,7 +9,8 @@
 # content and knows nothing about workspaces, and `check` — the union of every
 # lane CI's check job runs. `check` is not a new inner loop; it exists so the CI
 # workflow stays dumb and that job is reproducible on a fresh clone. CI's other
-# job, scrub, is not part of `check` — see scrub-tree.
+# jobs are not part of `check`: scrub — see scrub-tree — and device-clippy, whose
+# gate is `make -C firmware check-device` (needs espup).
 
 .DEFAULT_GOAL := help
 
@@ -37,7 +38,8 @@ help:
 # scripts lanes invoke — one definition each, shared rather than copied, so the
 # local hook and the public gate cannot drift apart.
 #
-# Not covered: CI's other job, scrub. `make scrub-tree` is that half.
+# Not covered: CI's other two jobs. `make scrub-tree` is the scrub half;
+# `make -C firmware check-device` is the device-clippy half (needs espup).
 .PHONY: check
 check:
 	$(MAKE) -C firmware check-host
