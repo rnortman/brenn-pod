@@ -568,8 +568,8 @@ pub(crate) fn spawn_streamer_thread() {
             // These values are captured for the life of this thread on the first
             // success, so a HIL audio-PSK override is observed only if it lands
             // before then — a not-yet-provisioned streamer can pick it up mid-run,
-            // a boot-provisioned one keeps its boot-time key until reboot.
-            // TODO(hil-streamer-psk-quiesce): observe overrides after this point.
+            // a boot-provisioned one keeps its boot-time key until reboot. Reconnects
+            // reuse these values too, so a connection loss does not re-read provisioning.
             let (audio_ip, audio_port, audio_psk): ([u8; 4], u16, [u8; PSK_LEN]) = {
                 let mut last_err: Option<device_protocol::TestResultMsg> = None;
                 loop {

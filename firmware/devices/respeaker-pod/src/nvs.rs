@@ -259,7 +259,10 @@ pub(crate) fn handle_provision_audio_psk(key: [u8; 32]) -> (Status, Payload) {
         return test_report_fail_detail("nvs set_blob audio_psk failed", &e);
     }
     log::info!(
-        "provisioned audio_psk (32 bytes) pod_id={} (applies on next streamer connect)",
+        // Not "next connect": the streamer captures the key once, on its first successful
+        // provisioning read, and reuses it across reconnects for the life of the thread.
+        "provisioned audio_psk (32 bytes) pod_id={} (a streamer already running with a key \
+         keeps it until reboot)",
         pod_id.as_str()
     );
     (Status::Ok, Payload::PodId(pod_id))

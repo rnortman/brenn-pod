@@ -31,7 +31,6 @@
 //! holds a pointer to; the handshake driver below expresses (2) directly.
 //! If upstream fixes them this module can be re-hosted on `EspTls` without
 //! touching callers.
-//! TODO(esp-idf-svc-psk-wrapper-upstream): report both to `esp-rs/esp-idf-svc`.
 //!
 //! The esp-tls surface used here is `esp_tls_init`, `esp_tls_set_conn_sockfd`,
 //! `esp_tls_set_conn_state`, `esp_tls_conn_new_async`, `esp_tls_conn_read`,

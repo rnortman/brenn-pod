@@ -2422,9 +2422,9 @@ const fn test_meta(t: &TestName) -> TestMeta {
         },
         TestName::TlsPskHandshake => TestMeta {
             phase: TestPhase::Network,
-            // Device worst case: TCP connect (TLS_PSK_CONNECT_TIMEOUT_SECS 10 s) +
+            // Device worst case: TCP connect (TLS_PSK_CONNECT_TIMEOUT_SECS 3 s) +
             // handshake deadline (TLS_HANDSHAKE_TIMEOUT_SECS 3 s) + echo round-trip
-            // (TLS_PSK_ECHO_TIMEOUT_SECS 5 s) = 18 s, plus serial-round-trip margin,
+            // (TLS_PSK_ECHO_TIMEOUT_SECS 5 s) = 11 s, plus serial-round-trip margin,
             // so the host always sees the typed TestReport rather than a hang. See
             // the budget-invariant test for the exact accounting.
             timeout: Duration::from_secs(25),
@@ -2432,8 +2432,8 @@ const fn test_meta(t: &TestName) -> TestMeta {
         TestName::TlsPskWrongKeyRejected => TestMeta {
             phase: TestPhase::Network,
             // Device worst case: reachability pre-probe connect + the TLS connect
-            // (2 × TLS_PSK_CONNECT_TIMEOUT_SECS = 20 s) + handshake deadline
-            // (TLS_HANDSHAKE_TIMEOUT_SECS 3 s) = 23 s, plus serial-round-trip margin.
+            // (2 × TLS_PSK_CONNECT_TIMEOUT_SECS = 6 s) + handshake deadline
+            // (TLS_HANDSHAKE_TIMEOUT_SECS 3 s) = 9 s, plus serial-round-trip margin.
             // See the budget-invariant test for the exact accounting.
             timeout: Duration::from_secs(30),
         },

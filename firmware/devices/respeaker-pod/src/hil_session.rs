@@ -171,8 +171,9 @@ pub(crate) fn handle_set_temporary_peer_config(
 /// response carries the identity (authoritative only on-device), so there is
 /// nothing useful to do without it. Never echoes the key.
 ///
-/// The override takes effect for every audio-PSK read made after this call.
-// TODO(hil-streamer-psk-quiesce): make a running streamer observe the override.
+/// The override takes effect for every audio-PSK read made after this call. A streamer
+/// thread that already captured its key at boot makes no such read, so it keeps streaming
+/// with its boot-time key for the rest of the run.
 #[cfg(target_os = "espidf")]
 pub(crate) fn handle_set_temporary_audio_psk(
     key: [u8; 32],

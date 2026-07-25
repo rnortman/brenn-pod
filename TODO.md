@@ -203,32 +203,7 @@ next measurement session; the boot-path-offset question itself is unchanged.
 See `TODO(heap-floor-post-flash-boot-path-offset)` at `HEAP_MIN_EVER_FLOOR` in
 `firmware/crates/device-protocol/src/lib.rs`.
 
-## `post-feed-heap-durable-guard`
-
-`heap-gate-measure` (`docs/adr/2026/07/19-heap-gate-measure/`) discharged the pre-deploy
-heap gate with a one-time manual measurement: a full-suite `make hil-test` run followed by
-a second, separate `RESPEAKER_HIL_ONLY=DeviceHealthCheck make hil-test` invocation on the
-same boot. That two-invocation procedure is not part of the permanent `REGISTERED_TESTS`
-registry — `DeviceHealthCheck` runs once, at position 4, *before* `FullDuplexRxIntegrity`
-(position 24), so no routine suite run ever samples heap after the saturated-playback feed.
-A future change that regresses inbound-path allocation (ring geometry, lwIP window, PSRAM
-fallback to internal RAM) would drop the post-feed trough toward the floor with the routine
-suite still green.
-
-`heap-gate-measure`'s design explicitly scoped this out (design.md §5: "No new automated
-tests... this is a one-time gate discharge and not a new durable test"), so closing this gap
-means overriding that design decision, not a code-review action item. Candidate fix: register
-`DeviceHealthCheck` a second time at a registry position after `FullDuplexRxIntegrity` (or a
-dedicated test name dispatching the same handler) so every suite run re-asserts the post-feed
-trough.
-
-Deferred: needs a human/design decision on whether a durable regression guard is worth the
-extra registered-test slot and per-run time cost, not just an obvious fix.
-
-See `TODO(post-feed-heap-durable-guard)` at `REGISTERED_TESTS` in
-`firmware/crates/device-protocol/src/lib.rs`.
-
-## `tls-link-bench-measure`
+## `tls-link-bench-measure` — BLOCKED as of 2026-07-25 (needs a bench session with the pod)
 
 The TLS-PSK audio link (`docs/adr/2026/07/22-pod--tls-and-auth/`) landed with the
 mbedTLS record buffers at their IDF defaults — 16 KB in + 4 KB out, roughly 20.5 KB
@@ -271,32 +246,18 @@ after the observed `min_heap_after` came in at 30_512 with the TLS link live. Th
 predate it and need re-derivation against the new floor at the bench session; the
 buffer/stack measurement this entry calls for is otherwise unchanged.
 
+Note (2026-07-25 triage, `docs/adr/2026/07/25-pod--todo-burndown/`): validation confirmed
+the instrumentation this entry needs already exists — the health report carries
+`streamer_hwm` (`health.rs:123-133`), so no new code is required before the bench run. The
+heap half is also partly discharged: the 30_512 `min_heap_after` reading was taken with the
+TLS link live. What remains unmeasured is the **stack** half — no `streamer_hwm` reading
+appears anywhere in the record, so the 28672 stack size has never been checked against an
+actual watermark and may be several KB of waste. Blocked purely on bench time; collect the
+`heap-floor-post-flash-boot-path-offset` samples in the same session.
+
 See `TODO(tls-link-bench-measure)` at the streamer thread's `.stack_size` in
 `firmware/devices/respeaker-pod/src/streamer.rs` and in the TLS-PSK block of
 `firmware/devices/respeaker-pod/sdkconfig.defaults`.
-
-## `esp-idf-svc-psk-wrapper-upstream`
-
-`firmware/devices/respeaker-pod/src/tls_link.rs` drops below the safe
-`esp_idf_svc::tls::EspTls` wrapper to raw `esp-tls` `sys` calls because of two
-defects in `esp-idf-svc-0.52.1/src/tls.rs`, both characterized in that module's doc
-comment: `Config::try_into_raw` (tls.rs:245-263) leaves `rcfg.psk_hint_key` pointing
-into a dead stack frame, and `EspTls::negotiate` (tls.rs:620) passes `cfg.non_block`
-as both the `asynch` selector and `rcfg.non_block`, which an adopted socket cannot
-survive. Neither is reported upstream, so every downstream user of PSK or of an
-adopted non-blocking socket hits them fresh, and this tree carries a local
-workaround with no path to deleting it.
-
-Deferred: filing on the `esp-rs/esp-idf-svc` tracker is an action against a
-third-party project taken in the maintainer's name, not a change to this repo.
-
-Done = both defects reported upstream with their reproductions, the issue numbers
-recorded in `tls_link.rs`'s doc comment. If upstream fixes them, `tls_link.rs` can
-be re-hosted on `EspTls` without touching callers.
-
-See `TODO(esp-idf-svc-psk-wrapper-upstream)` in the module doc comment of
-`firmware/devices/respeaker-pod/src/tls_link.rs`.
-
 
 ## `tls-link-run-segment-hil-coverage`
 
@@ -329,55 +290,3 @@ it.
 See `TODO(tls-link-run-segment-hil-coverage)` at the idle readiness wait in
 `firmware/devices/respeaker-pod/src/streamer.rs`.
 
-## `hil-streamer-psk-quiesce`
-
-A HIL run installs a RAM-only audio-PSK override (`SetTemporaryAudioPsk`) that shadows
-the NVS `audio_psk` for every key read that happens afterwards. A streamer thread that
-was already running does not make such a read: `spawn_streamer_thread` polls
-`read_audio_provisioning` only until it first succeeds and captures
-`audio_ip`/`audio_port`/`audio_psk` into its `ConnectInputs` for the life of the
-thread. So a pod that was provisioned at boot keeps streaming to its production host
-with its production key for the whole HIL run, and the clear-on-exit is equally
-invisible to it. Only a pod that is still unprovisioned when the override lands picks
-it up. A fresh boot always ends the divergence in either direction.
-
-Deferred because nothing needs it yet: bench pods are not paired with a production
-host, the session key and the production key never collide (the HIL fixtures check
-only the session table), and the connect-stage failure that first prompted a look at
-this turned out to have nothing to do with streamer contention. The cost of the gap is
-bounded to RF/CPU contention from a co-resident stream, and a connect failure now
-names its stage, so contention is diagnosable rather than confusing.
-
-Done = if a production-paired pod is ever HIL'd: the streamer observes override
-changes — e.g. a session generation counter in `hil_session` bumped by set and clear,
-sampled once per streamer loop tick, and on change the socket is dropped via
-`note_socket_lost`, provisioning re-read, and the link reconnected — so that setting
-the override actually quiesces production streaming and clearing it actually resumes.
-
-See `TODO(hil-streamer-psk-quiesce)` at the provisioning poll in
-`firmware/devices/respeaker-pod/src/streamer.rs` and at
-`handle_set_temporary_audio_psk` in
-`firmware/devices/respeaker-pod/src/hil_session.rs`.
-
-## `tls-psk-connect-budget-attribution`
-
-The TLS-PSK self-tests' TCP connect budget (`TLS_PSK_CONNECT_TIMEOUT_SECS`) was raised
-from 2 s to 10 s after a bench run in which `TlsPskHandshake` failed with a connect
-timeout. The raise is justified by lwIP retransmission arithmetic — a 2 s budget affords
-exactly one SYN-retransmit recovery attempt, where every other converted test rides out
-several — but the attribution of that specific failure to a correlated packet-loss burst
-is inference, not measurement. No log from the failing run carries a connect duration,
-because the timing instrumentation was added in the same change as the raise.
-
-Deferred because settling it needs a hardware run, not code: the device now logs the TCP
-connect duration on success and carries it in the failure detail on every stage, so the
-next full-suite bench run produces the reading directly.
-
-Done = a bench run's log for `TlsPskHandshake` / `TlsPskWrongKeyRejected` either shows a
-connect at ~1.0-1.5 s or more (retransmission demonstrably occurred, attribution
-confirmed, budget stands), or shows a clean ~ms connect on every run — in which case the
-raise is unjustified by evidence and goes to human review before it is kept, per the
-bring-up guardrail.
-
-See `TODO(tls-psk-connect-budget-attribution)` at `TLS_PSK_CONNECT_TIMEOUT_SECS` in
-`firmware/crates/device-protocol/src/lib.rs`.

@@ -43,14 +43,12 @@ pub const MAX_TESTS: usize = 30;
 /// Adding a `TestName` variant without adding it here is caught at `cargo test` time
 /// by `registered_tests_covers_all_variants` in `device-protocol`'s test suite.
 ///
-/// TODO(post-feed-heap-durable-guard): `DeviceHealthCheck` runs once, at position 4 —
-/// before `FullDuplexRxIntegrity` (position 24) — so no routine suite run samples heap
-/// after the saturated-playback feed. The post-feed trough that discharged
-/// `heap-gate-measure` (`docs/adr/2026/07/19-heap-gate-measure/implementation-log.md`) is
-/// a one-time human-asserted number with no regression guard. `heap-gate-measure`'s design
-/// deliberately scoped out a new durable test (design.md §5: "No new automated tests");
-/// adding a second post-feed health sample to close this gap is a design decision for a
-/// future item, not a call to make here.
+/// `DeviceHealthCheck` runs early (position 4), before the saturated-playback feed, so its
+/// `min_heap` cannot carry the post-feed trough. That trough is guarded anyway:
+/// `StreamRealtimeDuplex` runs after the feed and gates the same boot-wide
+/// `heap_caps_get_minimum_free_size` low-water mark against `HEAP_MIN_EVER_FLOOR`. A
+/// since-boot minimum sampled later subsumes every earlier dip, so no second health sample
+/// is needed to cover the feed.
 pub const REGISTERED_TESTS: &[TestName] = &[
     TestName::Ping,
     TestName::Identify,
@@ -143,11 +141,17 @@ pub const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 3;
 /// TCP connect budget (seconds) for the TLS-PSK self-tests, charged before any TLS is
 /// spoken.
 ///
-/// Sized against lwIP's SYN retransmission, not against a healthy LAN RTT: the initial
-/// RTO is 1500 ms on a 500 ms slow timer, so the first retransmit of a lost SYN fires
-/// 1.0-1.5 s after the connect, and `SYN_SENT` does not double the RTO, so later ones
-/// follow at ~1.5 s. A 2 s budget therefore covers exactly one recovery attempt, which a
-/// single correlated loss burst exhausts; 10 s covers about six.
+/// Sized for a LAN, which is the only environment this device is designed to run in. A
+/// healthy LAN connect completes in single-digit milliseconds; the observed population is
+/// 3-8 ms. 3 s leaves room for a lost SYN and its retransmit (lwIP's initial RTO is
+/// ~1.5 s) while still failing fast, because past that point the realistic explanations
+/// are that the host is absent or the port is firewalled — neither of which a longer
+/// budget recovers from, it only delays the report.
+///
+/// History: this was briefly raised to 10 s after a bench failure attributed to a
+/// correlated packet-loss burst. The instrumented rerun refuted that: four connects
+/// landed at 3-8 ms and the failing one burned the full budget and timed out, which is
+/// the signature of an unreachable port, not of retransmission recovery.
 ///
 /// Scope: `TlsPskHandshake`, `TlsPskWrongKeyRejected` (both its reachability pre-probe
 /// and its connect), `TlsSendBackpressure`, `PollReadinessBidir`, and
@@ -159,9 +163,8 @@ pub const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 3;
 /// deadlines are separate. It lives here, not in the device crate, so the host-side
 /// budget-invariant tests can charge it against `test_timeout(...)`.
 ///
-/// TODO(tls-psk-connect-budget-attribution): the raise from 2 s rests on inference.
 /// Tuning constant, no wire/serde role.
-pub const TLS_PSK_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const TLS_PSK_CONNECT_TIMEOUT_SECS: u64 = 3;
 
 /// Wall-clock budget (seconds) for the `TlsPskHandshake` echo round-trip through the
 /// tunnel, charged from after the handshake completes so a slow connect cannot eat it.
