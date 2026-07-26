@@ -46,6 +46,7 @@ mod inbound;
 mod net_tests;
 mod netpoll;
 mod nvs;
+mod protocol_rx;
 mod speaker;
 mod streamer;
 mod tls_link;
@@ -76,7 +77,7 @@ use esp_idf_svc::wifi::{BlockingWifi, EspWifi, WifiDeviceId};
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::wifi::{ClientConfiguration, Configuration, WifiEvent};
 #[cfg(target_os = "espidf")]
-use postcard::accumulator::{CobsAccumulator, FeedResult};
+use protocol_rx::ProtocolRx;
 #[cfg(target_os = "espidf")]
 use std::io::Read;
 #[cfg(target_os = "espidf")]
@@ -662,20 +663,22 @@ fn main() {
 
     let mut stdin = std::io::stdin();
     let mut read_buf = [0u8; 256];
-    let mut acc: CobsAccumulator<512> = CobsAccumulator::new();
-    // Rate-limit error logs (every 64th) to avoid livelock under corrupt-byte storms.
-    let mut deser_error_count: u32 = 0;
-    let mut over_full_count: u32 = 0;
+    let mut rx = ProtocolRx::new();
+    let epoch = std::time::Instant::now();
 
     loop {
-        match stdin.read(&mut read_buf) {
+        let read = stdin.read(&mut read_buf);
+        let now_ms = epoch.elapsed().as_millis() as u64;
+        match read {
             Ok(0) => {
+                rx.poll_idle(now_ms);
                 FreeRtos::delay_ms(10);
                 continue;
             }
             Err(e) => {
                 match e.kind() {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                        rx.poll_idle(now_ms);
                         FreeRtos::delay_ms(10);
                     }
                     kind => {
@@ -685,44 +688,7 @@ fn main() {
                 }
                 continue;
             }
-            Ok(n) => {
-                let mut chunk = &read_buf[..n];
-                loop {
-                    match acc.feed::<Request>(chunk) {
-                        FeedResult::Success { data, remaining } => {
-                            chunk = remaining;
-                            dispatch_request(data);
-                        }
-                        FeedResult::Consumed => break,
-                        FeedResult::OverFull(r) => {
-                            acc = CobsAccumulator::new();
-                            if over_full_count.is_multiple_of(64) {
-                                log::warn!(
-                                    target: "protocol",
-                                    "OverFull: accumulator reset (count={})",
-                                    over_full_count
-                                );
-                            }
-                            over_full_count = over_full_count.saturating_add(1);
-                            chunk = r;
-                        }
-                        FeedResult::DeserError(r) => {
-                            if deser_error_count.is_multiple_of(64) {
-                                log::warn!(
-                                    target: "protocol",
-                                    "COBS DeserError: corrupt or unknown-discriminant frame skipped (count={})",
-                                    deser_error_count
-                                );
-                            }
-                            deser_error_count = deser_error_count.saturating_add(1);
-                            chunk = r;
-                        }
-                    }
-                    if chunk.is_empty() {
-                        break;
-                    }
-                }
-            }
+            Ok(n) => rx.feed(now_ms, &read_buf[..n], &mut |req| dispatch_request(req)),
         }
     }
 }

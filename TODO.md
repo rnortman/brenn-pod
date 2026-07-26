@@ -138,30 +138,6 @@ See `TODO(xtensa-realign-stack-args)` in `firmware/tools/check-realign-args.sh` 
 matching `RtdSegmentIo` constraint comment in
 `firmware/devices/respeaker-pod/src/net_tests.rs`.
 
-## `hil-first-attempt-after-boot-ac9`
-
-The first `make hil-test` invocation immediately after a physical power-cycle
-reliably fails at the serial `Identify` handshake with `ERROR [AC9]: device present
-but not responding with protocol frames` — boot console output accumulates in a
-buffer that confuses the fixture on the very first attempt. A second/third
-invocation against the *same* boot (no further power cycle) succeeds normally.
-Observed and characterized during the RTD heap-floor rebake session
-(`docs/adr/2026/07/19-rtd-heap-floor-rebake/run-record.md`): six of six power-cycles
-in that session hit it on the first attempt (two on run 1), costing six aborted
-`hil-test` invocations. It was investigated in-session and could plausibly be
-mistaken for a recurrence of the `dd254e8e`-class serial-corruption bug, which is
-the expensive failure mode this TODO exists to prevent — a future operator wasting
-time re-diagnosing a known, benign fixture artifact as a regression, or the reverse.
-
-Likely fix: drain and discard any pending serial input before sending the first
-`Identify` command, so accumulated boot-console bytes don't desync the frame parser.
-
-Done = the first `make hil-test` invocation after a physical power-cycle succeeds
-(no AC9 error) across several power-cycles.
-
-See `TODO(hil-first-attempt-after-boot-ac9)` at the `Identify` command send in
-`firmware/crates/hil-host/src/main.rs`.
-
 ## `heap-floor-post-flash-boot-path-offset`
 
 The RTD heap-floor rebake (`docs/adr/2026/07/19-rtd-heap-floor-rebake/`) baked

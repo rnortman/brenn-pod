@@ -470,6 +470,60 @@ impl std::fmt::Display for HarnessError {
     }
 }
 
+// ── Re-send scheduling ────────────────────────────────────────────────────────
+
+/// Floor on the re-send interval used by
+/// [`Harness::send_command_retry`](Harness::send_command_retry).
+///
+/// Anything shorter would re-write the request on nearly every poll of the wait
+/// loop and bury the device's small RX ring under copies of one frame — the
+/// corruption class the retry exists to recover from. Shorter intervals are
+/// clamped up to this value.
+pub const MIN_RESEND_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Decides when the wait loop re-writes an unanswered request.
+///
+/// Re-sends fall on fixed `interval` steps measured from the opening send, so a
+/// late poll never pushes the following steps out. A step at or after
+/// `deadline` is skipped: the loop's own deadline check owns that instant and
+/// ends the wait on its next pass regardless, so writing it would only race the
+/// two clock reads at the boundary.
+struct ResendSchedule {
+    interval: Duration,
+    deadline: Instant,
+    /// When the next re-send comes due.
+    next: Instant,
+    /// Opening send plus every re-send the window holds. Used for the operator
+    /// message only — the deadline check is what stops the loop.
+    total_sends: u32,
+}
+
+impl ResendSchedule {
+    /// Re-send every `interval` (clamped to [`MIN_RESEND_INTERVAL`]) from
+    /// `start` until `deadline`.
+    fn new(start: Instant, deadline: Instant, interval: Duration) -> Self {
+        let interval = interval.max(MIN_RESEND_INTERVAL);
+        let window = deadline.saturating_duration_since(start).as_micros();
+        let total_sends = window.div_ceil(interval.as_micros()).max(1) as u32;
+        Self {
+            interval,
+            deadline,
+            next: start + interval,
+            total_sends,
+        }
+    }
+
+    /// Whether a re-send is due at `now`, consuming that step when it is.
+    fn poll(&mut self, now: Instant) -> bool {
+        if self.next < self.deadline && now >= self.next {
+            self.next += self.interval;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Harness {
     /// Create a harness over an already-open transport.
     pub fn new(port: Box<dyn Transport>) -> Self {
@@ -539,6 +593,50 @@ impl Harness {
         timeout: Duration,
         logs_out: &mut Vec<String>,
     ) -> Result<Response, HarnessError> {
+        self.send_command_impl(command, timeout, None, logs_out)
+    }
+
+    /// Send `command` and wait for the correlated response, re-writing the SAME
+    /// encoded request (same id) every `resend_interval` until `overall_timeout`.
+    ///
+    /// Only for idempotent commands: the device may execute the command once per
+    /// delivered copy and respond to each. One id is consumed for the logical
+    /// command, so any copy's response matches.
+    ///
+    /// Timeout semantics are identical to
+    /// [`send_command_timeout`](Self::send_command_timeout): one overall deadline,
+    /// `Err(Timeout)` iff `overall_timeout` elapses with no matching response.
+    /// A re-send that fails to write is reported and the wait continues; only
+    /// the opening send's write failure is fatal.
+    /// Each re-send prints a line to stdout so a recovered run is visibly distinct
+    /// from a clean one.
+    ///
+    /// `resend_interval` is clamped to [`MIN_RESEND_INTERVAL`].
+    pub fn send_command_retry(
+        &mut self,
+        command: device_protocol::Command,
+        overall_timeout: Duration,
+        resend_interval: Duration,
+    ) -> Result<Response, HarnessError> {
+        self.send_command_impl(
+            command,
+            overall_timeout,
+            Some(resend_interval),
+            &mut Vec::new(),
+        )
+    }
+
+    /// Shared wait loop for every `send_command*` variant.
+    ///
+    /// `resend_interval` = `Some(iv)` re-writes the already-encoded request (same
+    /// id) every `iv` while no matching response has arrived; `None` writes once.
+    fn send_command_impl(
+        &mut self,
+        command: device_protocol::Command,
+        timeout: Duration,
+        resend_interval: Option<Duration>,
+        logs_out: &mut Vec<String>,
+    ) -> Result<Response, HarnessError> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -550,17 +648,42 @@ impl Harness {
             .write_all(&req_buf[..req_len])
             .map_err(HarnessError::Write)?;
 
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
         let mut matched_response: Option<Response> = None;
+        let mut schedule = resend_interval.map(|iv| ResendSchedule::new(start, deadline, iv));
+        let mut sends: u32 = 1;
+        let total_sends = schedule.as_ref().map_or(1, |s| s.total_sends);
         // `pump` returns Ok(false) when the serial port read times out (no data yet).
-        // The loop then re-checks the deadline and calls `pump` again.  This relies on the
-        // transport always being opened with a non-zero read timeout (which the FakePort
-        // simulates by returning TimedOut from an empty rx buffer) so that Ok(false) incurs
-        // at least one OS-level sleep rather than a tight CPU spin.
+        // The loop then re-checks the deadline and calls `pump` again.  This relies on
+        // the transport always being opened with a non-zero read timeout so that
+        // Ok(false) incurs at least one OS-level sleep rather than a tight CPU spin.
 
         loop {
             if Instant::now() >= deadline {
                 return Err(HarnessError::Timeout);
+            }
+
+            if let Some(schedule) = schedule.as_mut()
+                && schedule.poll(Instant::now())
+            {
+                sends += 1;
+                println!(
+                    "{:?} unanswered after {:.0?}; re-sending (attempt {sends}/{total_sends})",
+                    req.command,
+                    start.elapsed(),
+                );
+                // A re-send that fails to write is not fatal. This wait spans
+                // exactly the window in which the host→device path misbehaves,
+                // an earlier copy may already be answered with the response
+                // sitting unread, and aborting would replace the timeout
+                // operators know with a novel signature. Give up at the deadline.
+                if let Err(e) = self.reader.write_all(&req_buf[..req_len]) {
+                    eprintln!(
+                        "WARN [transport]: re-send {sends}/{total_sends} failed to write: {e}; \
+                         still waiting for a response"
+                    );
+                }
             }
 
             self.reader
@@ -693,6 +816,7 @@ mod tests {
     use device_protocol::{
         Command, DeviceFrame, LogFrame, LogLevel, Payload, Response, Status, TestName, log_tokens,
     };
+    use std::sync::{Arc, Mutex};
 
     /// A `FakePort` that returns a hard I/O error on any read.
     struct ErrorPort;
@@ -829,6 +953,265 @@ mod tests {
             .unwrap();
         assert_eq!(resp.id, 1);
         assert_eq!(resp.status, Status::Ok);
+    }
+
+    // ── send_command_retry tests ──────────────────────────────────────────────
+
+    /// A `FakePort` whose write hook answers the `answer_on`-th write with an
+    /// `id=1` Ok response (1 = the first write). Returns the port plus a shared
+    /// record of every written frame, so tests can count sends and compare bytes.
+    fn retry_port(answer_on: Option<usize>) -> (FakePort, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let writes: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&writes);
+        let mut port = FakePort::new();
+        port.on_write = Some(Box::new(move |bytes, rx| {
+            let mut w = recorder.lock().expect("writes mutex poisoned");
+            w.push(bytes.to_vec());
+            if Some(w.len()) == answer_on {
+                crate::test_support::queue_frame_into(
+                    rx,
+                    &DeviceFrame::Response(Response {
+                        id: 1,
+                        status: Status::Ok,
+                        payload: Payload::Empty,
+                    }),
+                );
+            }
+        }));
+        (port, writes)
+    }
+
+    /// The device ignores the first request and answers the re-send: the retry
+    /// path recovers, having written the identical frame twice.
+    #[test]
+    fn retry_second_send_matches_response() {
+        let (port, writes) = retry_port(Some(2));
+        let mut harness = make_harness(port);
+        let resp = harness
+            .send_command_retry(
+                Command::RunTest(TestName::Identify),
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+            )
+            .expect("retry should recover when the second send is answered");
+        assert_eq!(resp.id, 1);
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2, "expected exactly two sends");
+        assert_eq!(
+            writes[0], writes[1],
+            "re-send must be the same encoded request (same id), not a fresh one"
+        );
+    }
+
+    /// Happy path: the first request is answered, so no re-send is emitted.
+    #[test]
+    fn retry_first_response_means_single_write() {
+        let (port, writes) = retry_port(Some(1));
+        let mut harness = make_harness(port);
+        harness
+            .send_command_retry(
+                Command::RunTest(TestName::Identify),
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+            )
+            .expect("first send is answered");
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "answered first send must not be re-sent"
+        );
+    }
+
+    /// Nothing ever answers: the overall deadline still governs, and the window
+    /// is filled with `overall / interval` sends.
+    #[test]
+    fn retry_exhaustion_times_out() {
+        let (port, writes) = retry_port(None);
+        let mut harness = make_harness(port);
+        let result = harness.send_command_retry(
+            Command::RunTest(TestName::Identify),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        );
+        assert!(
+            matches!(result, Err(HarnessError::Timeout)),
+            "expected Timeout; got {:?}",
+            result
+        );
+        // Sends at t=0, 100, 200. Both bounds are loose because this test runs on
+        // the wall clock: a scheduler stall spanning a due time swallows a
+        // re-send. Which instants carry a send is pinned exactly, off the wall
+        // clock, by the `ResendSchedule` tests below.
+        let sends = writes.lock().unwrap().len();
+        assert!(
+            (2..=3).contains(&sends),
+            "expected 3 sends in 300ms (2 tolerated under scheduler jitter); got {sends}"
+        );
+    }
+
+    /// A re-send whose write fails must not abort the wait: an answer already on
+    /// the wire still resolves the command.
+    #[test]
+    fn retry_resend_write_failure_is_not_fatal() {
+        let (mut port, writes) = retry_port(Some(2));
+        // The opening send succeeds; every re-send reports a broken pipe, but the
+        // device still receives the second copy and answers it.
+        port.fail_writes_after = Some(1);
+        let mut harness = make_harness(port);
+        let resp = harness
+            .send_command_retry(
+                Command::RunTest(TestName::Identify),
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+            )
+            .expect("a failed re-send write must not abandon the wait window");
+        assert_eq!(resp.id, 1);
+        assert_eq!(writes.lock().unwrap().len(), 2);
+    }
+
+    /// Every re-send failing to write still ends in the timeout operators know,
+    /// not a novel write-error signature.
+    #[test]
+    fn retry_write_failures_still_end_in_timeout() {
+        let (mut port, writes) = retry_port(None);
+        port.fail_writes_after = Some(1);
+        let mut harness = make_harness(port);
+        let result = harness.send_command_retry(
+            Command::RunTest(TestName::Identify),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        );
+        assert!(
+            matches!(result, Err(HarnessError::Timeout)),
+            "expected Timeout; got {result:?}"
+        );
+        assert!(
+            writes.lock().unwrap().len() >= 2,
+            "the loop must keep re-sending after a write failure"
+        );
+    }
+
+    /// The opening send is the exception: nothing was ever delivered, so its
+    /// write failure is fatal.
+    #[test]
+    fn retry_opening_send_write_failure_is_fatal() {
+        let (mut port, _writes) = retry_port(None);
+        port.fail_writes_after = Some(0);
+        let mut harness = make_harness(port);
+        let result = harness.send_command_retry(
+            Command::RunTest(TestName::Identify),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        );
+        assert!(
+            matches!(result, Err(HarnessError::Write(_))),
+            "expected Write; got {result:?}"
+        );
+    }
+
+    // ── ResendSchedule (synthetic timeline, no wall clock) ────────────────────
+
+    /// Drive a schedule over a synthetic timeline: `polls_ms` are the instants
+    /// the wait loop observes; the result is the subset that carries a re-send,
+    /// as ms offsets from the opening send.
+    fn resend_offsets(window_ms: u64, interval_ms: u64, polls_ms: &[u64]) -> Vec<u64> {
+        let start = Instant::now();
+        let mut schedule = ResendSchedule::new(
+            start,
+            start + Duration::from_millis(window_ms),
+            Duration::from_millis(interval_ms),
+        );
+        polls_ms
+            .iter()
+            .copied()
+            .filter(|ms| schedule.poll(start + Duration::from_millis(*ms)))
+            .collect()
+    }
+
+    /// A re-send due exactly at the overall deadline is skipped — the deadline
+    /// check owns that instant.
+    #[test]
+    fn resend_due_at_deadline_is_skipped() {
+        let polls: Vec<u64> = (0..=310).step_by(10).collect();
+        assert_eq!(resend_offsets(300, 100, &polls), vec![100, 200]);
+    }
+
+    /// A window that is not a whole number of intervals carries no re-send in
+    /// its trailing partial interval.
+    #[test]
+    fn resend_partial_final_interval_carries_no_send() {
+        let polls: Vec<u64> = (0..=260).step_by(10).collect();
+        assert_eq!(resend_offsets(250, 100, &polls), vec![100, 200]);
+    }
+
+    /// Steps stay anchored to the opening send: a late poll pays the steps it
+    /// owes without pushing the following ones out.
+    #[test]
+    fn late_poll_does_not_shift_later_steps() {
+        assert_eq!(
+            resend_offsets(1000, 100, &[250, 251, 252, 299, 300]),
+            vec![250, 251, 300],
+            "the t=100 and t=200 steps are owed one per poll, and the next is t=300"
+        );
+    }
+
+    /// A degenerate interval is clamped, so the window holds a bounded number of
+    /// sends instead of one per poll.
+    #[test]
+    fn degenerate_resend_interval_is_clamped() {
+        let polls: Vec<u64> = (0..=110).collect();
+        let expected: Vec<u64> = (1..10).map(|n| n * 10).collect();
+        assert_eq!(
+            resend_offsets(100, 0, &polls),
+            expected,
+            "a zero interval must be clamped to MIN_RESEND_INTERVAL"
+        );
+    }
+
+    /// `total_sends` (the `attempt n/total` denominator) counts the opening send
+    /// plus every step the window holds.
+    #[test]
+    fn total_sends_counts_opening_send_plus_steps() {
+        let start = Instant::now();
+        for (window_ms, interval_ms, expected) in [
+            (30_000u64, 5_000u64, 6u32),
+            (300, 100, 3),
+            (250, 100, 3),
+            (100, 100, 1),
+            (100, 300, 1),
+            // Clamped to MIN_RESEND_INTERVAL (10ms).
+            (100, 0, 10),
+        ] {
+            let schedule = ResendSchedule::new(
+                start,
+                start + Duration::from_millis(window_ms),
+                Duration::from_millis(interval_ms),
+            );
+            assert_eq!(
+                schedule.total_sends, expected,
+                "window {window_ms}ms / interval {interval_ms}ms"
+            );
+        }
+    }
+
+    /// Boot-console junk ahead of the response — the retry path resyncs like the
+    /// single-send path does, and needs no re-send to do it.
+    #[test]
+    fn retry_junk_prefix_then_response() {
+        let (mut port, writes) = retry_port(Some(1));
+        // Partial/garbled frame bytes of the kind a cold boot leaves on the wire.
+        port.rx.extend(&[0x03u8, 0xff, 0x7f, 0x11, 0x00]);
+        let mut harness = make_harness(port);
+        let resp = harness
+            .send_command_retry(
+                Command::RunTest(TestName::Identify),
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+            )
+            .expect("harness must resync past the junk prefix and match the response");
+        assert_eq!(resp.id, 1);
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(writes.lock().unwrap().len(), 1);
     }
 
     // ── send_command_timeout_collect_logs tests ───────────────────────────────

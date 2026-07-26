@@ -278,17 +278,18 @@ fn run_suite(
 
     // ── Step 3: four independent checks ──────────────────────────────────────
 
-    // Send Identify command to gather info for checks 1–3.
     // Use a longer timeout (30 s) to accommodate boot-time WiFi association, which
     // can take up to ~10 s before the protocol loop is reached.
-    // TODO(hil-first-attempt-after-boot-ac9): the first invocation after a physical
-    // power-cycle reliably fails here (AC9) because accumulated boot-console bytes
-    // on the serial port desync the frame parser. A drain-and-discard of pending
-    // input before this send would likely fix it.
+    //
+    // Re-send every 5 s within that window: the first Identify after a physical
+    // power-cycle arrives at the device corrupted (host→device), so a single send
+    // turns a recoverable condition into a 30 s abort. Identify is read-only, so
+    // re-delivering it is harmless.
     println!("Sending Identify...");
-    let identify_response = match harness.send_command_timeout(
+    let identify_response = match harness.send_command_retry(
         Command::RunTest(TestName::Identify),
         Duration::from_secs(30),
+        Duration::from_secs(5),
     ) {
         Ok(r) => r,
         Err(HarnessError::Timeout) => {
