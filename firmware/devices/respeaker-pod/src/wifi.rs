@@ -3,7 +3,7 @@
 //! Holds the process-lifetime WiFi stack (`WIFI_STACK`) + event subscriptions,
 //! the reconnect supervisor thread, and the HIL WiFi handlers
 //! (`run_wifi_scan`/`run_wifi_associate`/`run_wifi_reassociation`/
-//! `run_gateway_probe_gate`). Extracted from `main.rs` per design.md §2.1.
+//! `run_gateway_probe_gate`).
 
 use crate::hil::test_report_fail_msg;
 use crate::nvs::{nvs_get_str, open_wifi_nvs};
@@ -21,7 +21,10 @@ use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configura
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wifi_diag::{WifiSnapshot, fmt_ipv4};
-use wifi_reconnect::{Backoff, GW_UNREACHABLE_THRESHOLD, TICK_INTERVAL_SECS, compute_wait_secs};
+use wifi_reconnect::{
+    Backoff, GW_UNREACHABLE_THRESHOLD, TICK_INTERVAL_SECS, compute_wait_secs,
+    compute_wake_deadline_secs, should_absorb_wake,
+};
 
 /// Process-lifetime sender half of the WiFi supervisor doorbell channel.
 ///
@@ -83,51 +86,35 @@ pub(crate) struct WifiEventSubs {
 /// the `WifiEventSubs` is never accessed after the initial store.
 pub(crate) static WIFI_EVENT_SUBS: Mutex<Option<WifiEventSubs>> = Mutex::new(None);
 
-/// True while the supervisor thread is blocked inside `associate_from_active_config()`
-/// for an attempt it initiated itself; false otherwise. Written only by the supervisor
-/// thread (around its own attempt); read by `ring_wifi_wake_on_disconnect`, which runs
-/// on the event-loop callback task.
+/// True when a pending doorbell ring came from a caller that needs prompt action — a
+/// credential provision or clear, a temporary-config change, a forced disconnect, or the
+/// boot kick — rather than from the `StaDisconnected` event callback.
 ///
-/// Exists because a failed association attempt against an unreachable AP/bogus SSID can
-/// itself drive the driver through a `StaDisconnected` transition — the *attempt's own*
-/// teardown, not news about a previously-up link. Ringing the doorbell for that event
-/// would let the pending ring bypass the backoff wait the supervisor is about to compute
-/// on its next loop iteration (`recv_timeout` returns immediately on any pending ring),
-/// collapsing "wait ~30s+" to "back-to-back with the attempt that just failed". The flag
-/// scopes the ring-suppression to exactly the attempt's own blocking window, so a
-/// `StaDisconnected` for a link that was genuinely up (the doorbell-while-up path) is
-/// unaffected and still rings.
+/// Set by [`ring_wifi_wake`] before the ring; consumed (swapped to false) by the
+/// supervisor on a doorbell wake, and only then: clearing it on a timeout wake could
+/// steal the urgency of a ring not yet received.
 ///
-/// TODO(wifi-assoc-inflight-flag-generation-race): this suppression window is timing-
-/// based, not state-based, and has a residual race the store/clear pair does not close.
-/// `store(true)`/`store(false)` bracket the *call* to `associate_from_active_config()`,
-/// but the failing attempt's `StaDisconnected` event is delivered asynchronously on the
-/// event-loop task; nothing here guarantees the callback (`main.rs`'s
-/// `WifiEvent::StaDisconnected` handler) has actually run by the time `store(false)`
-/// executes — `BlockingWifi::connect()`/`stop()` wait on driver *state*, not on every
-/// other event subscriber having been dispatched. If the callback runs after
-/// `store(false)`, it sees the flag false and rings anyway, bypassing the backoff wait
-/// that was just computed for the next attempt (reintroducing the ~17.4s flake this flag
-/// exists to prevent, at low probability). A state-based fix (e.g. an attempt-generation
-/// counter stamped by the supervisor and checked by the callback, so a ring is only
-/// suppressed for the exact attempt that produced it) would close this properly; not
-/// done here — see TODO.md.
-static WIFI_ASSOC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// It is a separate flag rather than a channel payload because the doorbell is a
+/// capacity-1 channel that drops sends when full (rings coalesce by design), so urgency
+/// carried in the message would be lost whenever an urgent send coalesced into a pending
+/// non-urgent ring. A flag ORs urgency across coalesced rings instead.
+///
+/// The store precedes the send, so whenever the urgent send itself lands in the channel the
+/// supervisor sees the urgency on the wake that receives it. When the send instead coalesces
+/// into a ring another thread already queued, the two threads race: the supervisor can
+/// consume that ring and read the flag an instant before the store lands. The supervisor
+/// re-reads the flag on its absorb path to narrow that window; urgency missed even there
+/// stays set for the next doorbell wake, and the wake deadline bounds the delay.
+static WIFI_WAKE_URGENT: AtomicBool = AtomicBool::new(false);
 
-/// Ring the doorbell for a `StaDisconnected` event, unless the disconnect is an artifact
-/// of an association attempt the supervisor itself currently has in flight (see
-/// [`WIFI_ASSOC_IN_FLIGHT`]) — in which case the ring is suppressed. The supervisor is
-/// already awake inside the attempt and will re-evaluate state on its own the moment the
-/// attempt returns; honoring a self-inflicted ring here would only let that attempt
-/// cancel the backoff wait it is about to compute for the *next* attempt.
+/// Ring the doorbell for a `StaDisconnected` event: a non-urgent ring.
+///
+/// A failed association attempt drives the radio through a disconnect transition of its
+/// own, and this callback cannot tell that apart from news about a link that was up. It
+/// therefore reports without demanding promptness; the supervisor decides from its own
+/// state (see `should_absorb_wake`) whether the ring warrants acting before the deadline.
 pub(crate) fn ring_wifi_wake_on_disconnect() {
-    if WIFI_ASSOC_IN_FLIGHT.load(Ordering::Acquire) {
-        log::debug!(
-            "wifi-supervisor: StaDisconnected during in-flight attempt — doorbell ring suppressed"
-        );
-        return;
-    }
-    ring_wifi_wake();
+    ring_doorbell();
 }
 
 // ── WiFi supervisor thread ────────────────────────────────────────────────────
@@ -218,12 +205,23 @@ pub(crate) fn spawn_wifi_supervisor_thread() {
             let mut attempt_counter: u32 = 0;
 
             loop {
-                // ── Compute wait and block ───────────────────────────────────────
+                // ── Compute deadline, wait, and block ────────────────────────────
+                // The deadline is a pure function of state that this iteration does not
+                // change, so an absorbed wake re-derives the identical instant and the
+                // recomputed wait is exactly the remainder.
                 let jittered_backoff =
                     backoff.next_wait_secs(jitter_seed_base ^ attempt_counter);
-                let wait_secs =
-                    compute_wait_secs(now_secs(), last_attempt_secs, jittered_backoff, TICK_INTERVAL_SECS);
-                let wait = std::time::Duration::from_secs(wait_secs);
+                let wake_deadline = compute_wake_deadline_secs(
+                    last_attempt_secs,
+                    jittered_backoff,
+                    TICK_INTERVAL_SECS,
+                );
+                let wait = std::time::Duration::from_secs(compute_wait_secs(
+                    now_secs(),
+                    last_attempt_secs,
+                    jittered_backoff,
+                    TICK_INTERVAL_SECS,
+                ));
 
                 let doorbell_rang = match rx.recv_timeout(wait) {
                     Ok(()) => true,
@@ -237,6 +235,10 @@ pub(crate) fn spawn_wifi_supervisor_thread() {
                     }
                 };
 
+                // Consume urgency only on a doorbell wake: a timeout wake could
+                // otherwise clear the urgency of a ring still in flight.
+                let urgent = doorbell_rang && WIFI_WAKE_URGENT.swap(false, Ordering::AcqRel);
+
                 // ── State check ─────────────────────────────────────────────────
                 let is_up = wifi_is_up_nonblocking();
 
@@ -248,7 +250,7 @@ pub(crate) fn spawn_wifi_supervisor_thread() {
                             GatewayProbe::Reachable | GatewayProbe::Indeterminate => {
                                 backoff.record_success();
                                 consecutive_gw_unreachable = 0;
-                                // Advance tick clock so compute_wait_secs derives a fresh deadline.
+                                // Advance tick clock so the next iteration derives a fresh deadline.
                                 last_attempt_secs = now_secs();
                                 continue;
                             }
@@ -340,7 +342,38 @@ pub(crate) fn spawn_wifi_supervisor_thread() {
                     }
                     (Some(false), _) | (None, _) => {
                         // Link is down (or lock was busy — treat conservatively as down).
-                        // Fall through to associate.
+                        //
+                        // A failed attempt's own StaDisconnected event rings the doorbell
+                        // asynchronously, typically after the attempt has returned, and a
+                        // pending ring makes recv_timeout return immediately. Absorbing
+                        // such a ring is what keeps consecutive attempt starts spaced by
+                        // the interval instead of collapsing them back-to-back. Only
+                        // non-urgent rings in a failure regime are absorbed: an urgent
+                        // ring, a first disconnect of a healthy link, and every timeout
+                        // tick stay prompt.
+                        //
+                        // The second urgency read covers the caller whose ring coalesced
+                        // into this one and whose flag store had not landed when `urgent`
+                        // was read above; reading true here means act now, not wait. It
+                        // runs only on a doorbell wake (`should_absorb_wake` short-circuits
+                        // on `doorbell_rang`), so it cannot consume the urgency of a ring
+                        // still in flight.
+                        if should_absorb_wake(
+                            doorbell_rang,
+                            urgent,
+                            backoff.consecutive_failures(),
+                            now_secs(),
+                            wake_deadline,
+                        ) && !WIFI_WAKE_URGENT.swap(false, Ordering::AcqRel)
+                        {
+                            log::info!(
+                                "wifi-supervisor: absorbing premature doorbell ring ({}s to deadline, consecutive_failures={})",
+                                wake_deadline.saturating_sub(now_secs()),
+                                backoff.consecutive_failures()
+                            );
+                            continue;
+                        }
+                        // Otherwise fall through to associate.
                     }
                 }
 
@@ -353,11 +386,7 @@ pub(crate) fn spawn_wifi_supervisor_thread() {
                     attempt_counter
                 );
 
-                WIFI_ASSOC_IN_FLIGHT.store(true, Ordering::Release);
-                let attempt_result = associate_from_active_config();
-                WIFI_ASSOC_IN_FLIGHT.store(false, Ordering::Release);
-
-                match attempt_result {
+                match associate_from_active_config() {
                     Ok((ip, gw, rssi)) => {
                         log::info!(
                             "{} ip={} gw={} rssi={}",
@@ -675,16 +704,28 @@ fn probe_gateway_reachable() -> GatewayProbe {
     ping_reachable(gateway, netif_index)
 }
 
-/// Ring the WiFi supervisor doorbell (fire-and-forget).
+/// Send the doorbell wake signal itself, without touching urgency (fire-and-forget).
 ///
 /// Coalescing is safe: the supervisor re-reads actual state on each wake.
-pub(crate) fn ring_wifi_wake() {
+fn ring_doorbell() {
     let guard = WIFI_WAKE_TX.lock().unwrap_or_else(|_| {
         panic!("WIFI_WAKE_TX mutex poisoned — another thread panicked holding it")
     });
     if let Some(ref tx) = *guard {
         let _ = tx.try_send(()); // Full → already pending; None → before spawn; both OK.
     }
+}
+
+/// Ring the WiFi supervisor doorbell as urgent: the supervisor acts on this wake
+/// immediately rather than waiting out the backoff interval.
+///
+/// This is the ring for callers that changed state the supervisor must pick up now
+/// (credentials, temporary config, a forced disconnect, the boot kick). Each such caller
+/// stores its new state before ringing, so the supervisor sees that state on the wake it
+/// acts upon. For reporting a driver disconnect, use [`ring_wifi_wake_on_disconnect`].
+pub(crate) fn ring_wifi_wake() {
+    WIFI_WAKE_URGENT.store(true, Ordering::Release);
+    ring_doorbell();
 }
 
 /// Whether an active WiFi credential source exists: a RAM-only temporary override,

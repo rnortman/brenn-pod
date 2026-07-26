@@ -14,8 +14,12 @@
 //! seconds), folded into the supervisor's single `recv_timeout` call so backoff is
 //! doorbell-interruptible.
 //!
-//! [`compute_wait_secs`] computes the composed supervisor `recv_timeout` duration from
-//! the backoff state and the periodic-tick interval.
+//! [`compute_wake_deadline_secs`] gives the absolute time the supervisor intends to act,
+//! and [`compute_wait_secs`] is that deadline minus now — the `recv_timeout` duration.
+//!
+//! [`should_absorb_wake`] decides whether a doorbell wake that arrived before the
+//! deadline should be resumed-from rather than acted on, which is what keeps attempt
+//! spacing intact when a failing association rings its own doorbell.
 
 #![no_std]
 
@@ -160,22 +164,21 @@ fn jittered(base_secs: u64, seed: u32) -> u64 {
     jittered.max(1)
 }
 
-/// Compute the supervisor's `recv_timeout` duration (seconds) for one iteration.
+/// Compute the absolute time (seconds since the epoch) at which the supervisor
+/// intends to act on this iteration.
 ///
-/// Combines the backoff deadline and the periodic-tick interval:
+/// Combines the backoff deadline and the periodic-tick deadline, both anchored at
+/// `last_attempt_secs`:
 ///
 /// ```text
-/// wait = max(backoff_deadline, last_attempt + tick_interval) - now
+/// deadline = max(last_attempt + jittered_backoff, last_attempt + tick_interval)
 /// ```
 ///
-/// where `backoff_deadline = last_attempt + jittered_backoff`.
-///
 /// All times are relative to an arbitrary epoch (e.g. `esp_timer_get_time()` µs
-/// converted to seconds); only the differences matter.
+/// converted to seconds); only the differences matter.  Arithmetic saturates.
 ///
 /// # Parameters
 ///
-/// - `now_secs` — current time in whole seconds since the epoch.
 /// - `last_attempt_secs` — time of the most recent association attempt (or boot if
 ///   no attempt yet).
 /// - `jittered_backoff_secs` — output of [`Backoff::next_wait_secs`] for this
@@ -183,9 +186,10 @@ fn jittered(base_secs: u64, seed: u32) -> u64 {
 /// - `tick_interval_secs` — [`TICK_INTERVAL_SECS`] in normal use; injectable for
 ///   testing.
 ///
-/// Returns the wait duration (seconds, ≥ 0).  A return of 0 means "act immediately."
-pub fn compute_wait_secs(
-    now_secs: u64,
+/// The result is a pure function of its inputs, so a supervisor that re-enters its
+/// loop with the same inputs re-derives the same deadline: the remaining wait shrinks
+/// but the instant it targets does not move.
+pub fn compute_wake_deadline_secs(
     last_attempt_secs: u64,
     jittered_backoff_secs: u64,
     tick_interval_secs: u64,
@@ -193,8 +197,55 @@ pub fn compute_wait_secs(
     let backoff_deadline = last_attempt_secs.saturating_add(jittered_backoff_secs);
     let tick_deadline = last_attempt_secs.saturating_add(tick_interval_secs);
     // Wake at whichever deadline comes later.
-    let wake_at = backoff_deadline.max(tick_deadline);
-    wake_at.saturating_sub(now_secs)
+    backoff_deadline.max(tick_deadline)
+}
+
+/// Compute the supervisor's `recv_timeout` duration (seconds) for one iteration:
+/// [`compute_wake_deadline_secs`] minus `now_secs`, saturating at 0.
+///
+/// Returns the wait duration (seconds, ≥ 0).  A return of 0 means "act immediately."
+/// See [`compute_wake_deadline_secs`] for the parameter meanings.
+pub fn compute_wait_secs(
+    now_secs: u64,
+    last_attempt_secs: u64,
+    jittered_backoff_secs: u64,
+    tick_interval_secs: u64,
+) -> u64 {
+    compute_wake_deadline_secs(last_attempt_secs, jittered_backoff_secs, tick_interval_secs)
+        .saturating_sub(now_secs)
+}
+
+/// Whether a supervisor wake should be absorbed — i.e. the loop should resume waiting
+/// for the remainder of the interval instead of acting on the wake.
+///
+/// A failing association attempt drives the radio through a disconnect transition of
+/// its own, and that event's callback rings the doorbell asynchronously, often after
+/// the attempt has already returned.  Acting on such a ring restarts the radio
+/// immediately and collapses the attempt spacing the backoff just computed.  Absorbing
+/// it costs one loop iteration and leaves the deadline where it was.
+///
+/// Absorb iff all four hold:
+///
+/// - `doorbell_rang` — a timeout wake is *never* absorbed, so the periodic tick stays
+///   an unconditional backstop and no path can wait forever.
+/// - `!urgent` — the ringer did not declare that it needs prompt action (a config
+///   change, a forced disconnect, or the boot kick always does).
+/// - `consecutive_failures > 0` — the link has not been up since the last failed
+///   attempt, as far as this [`Backoff`] has been told.  Only in that regime is attempt
+///   spacing at stake, and only then does a disconnect ring carry no information the
+///   supervisor does not already have; the first disconnect of a healthy link is acted
+///   on promptly.  A link brought up by some path that never reports its success to this
+///   [`Backoff`] leaves the count positive on an up link, so that link's next disconnect
+///   is deferred to the deadline instead of being acted on at once.
+/// - `now_secs < wake_deadline_secs` — the interval has not yet elapsed.
+pub fn should_absorb_wake(
+    doorbell_rang: bool,
+    urgent: bool,
+    consecutive_failures: u32,
+    now_secs: u64,
+    wake_deadline_secs: u64,
+) -> bool {
+    doorbell_rang && !urgent && consecutive_failures > 0 && now_secs < wake_deadline_secs
 }
 
 #[cfg(test)]
@@ -341,7 +392,7 @@ mod tests {
     /// Pin GW_UNREACHABLE_THRESHOLD at 3.  A lower value (e.g. 1) would bounce the
     /// radio on a single unlucky probe window; a higher value extends stuck-link
     /// detection time beyond the intended ~90 s.  Change requires a conscious update
-    /// to this test and the design doc.
+    /// to this test.
     #[test]
     fn gw_unreachable_threshold_is_three() {
         assert_eq!(GW_UNREACHABLE_THRESHOLD, 3);
@@ -396,6 +447,180 @@ mod tests {
         let w = compute_wait_secs(now, last_attempt, BACKOFF_FLOOR_SECS, TICK_INTERVAL_SECS);
         // backoff_deadline=2 (past); tick_deadline=30 → max=30 → wait=20
         assert_eq!(w, 20);
+    }
+
+    // ── compute_wake_deadline_secs ────────────────────────────────────────────
+
+    #[test]
+    fn wake_deadline_governed_by_tick_at_floor_backoff() {
+        // backoff_deadline = 100 + 2 = 102; tick_deadline = 100 + 30 = 130.
+        let d = compute_wake_deadline_secs(100, BACKOFF_FLOOR_SECS, TICK_INTERVAL_SECS);
+        assert_eq!(d, 130);
+    }
+
+    #[test]
+    fn wake_deadline_governed_by_backoff_at_cap() {
+        // backoff_deadline = 100 + 60 = 160; tick_deadline = 130.
+        let d = compute_wake_deadline_secs(100, BACKOFF_CAP_SECS, TICK_INTERVAL_SECS);
+        assert_eq!(d, 160);
+    }
+
+    #[test]
+    fn wake_deadline_saturates_near_max() {
+        // Both addends overflow; saturation pins the deadline at u64::MAX rather
+        // than wrapping to a deadline in the past.
+        let d = compute_wake_deadline_secs(u64::MAX - 1, BACKOFF_CAP_SECS, TICK_INTERVAL_SECS);
+        assert_eq!(d, u64::MAX);
+        // With `now` at the clock's top too, the saturated deadline still leaves the 1 s
+        // that genuinely remains — it does not wrap to an instant already past (which
+        // would return 0 and retry immediately).
+        assert_eq!(
+            compute_wait_secs(
+                u64::MAX - 1,
+                u64::MAX - 1,
+                BACKOFF_CAP_SECS,
+                TICK_INTERVAL_SECS
+            ),
+            1
+        );
+        // From an early `now` the same saturated deadline yields the whole clock range.
+        assert_eq!(
+            compute_wait_secs(0, u64::MAX - 1, BACKOFF_CAP_SECS, TICK_INTERVAL_SECS),
+            u64::MAX
+        );
+    }
+
+    // ── should_absorb_wake ────────────────────────────────────────────────────
+
+    #[test]
+    fn absorbs_non_urgent_premature_ring_in_failure_regime() {
+        // All four conditions hold: doorbell ring, not urgent, cf > 0, before deadline.
+        assert!(should_absorb_wake(true, false, 1, 117, 130));
+    }
+
+    #[test]
+    fn each_condition_independently_prevents_absorption() {
+        // Timeout wake: the tick backstop is never deferred.
+        assert!(!should_absorb_wake(false, false, 1, 117, 130));
+        // Urgent ring (config change, forced disconnect, boot kick): act promptly.
+        assert!(!should_absorb_wake(true, true, 1, 117, 130));
+        // Healthy regime: the first disconnect of an up link is real news.
+        assert!(!should_absorb_wake(true, false, 0, 117, 130));
+        // Deadline reached: the wait is over, so proceed.
+        assert!(!should_absorb_wake(true, false, 1, 130, 130));
+        assert!(!should_absorb_wake(true, false, 1, 131, 130));
+    }
+
+    #[test]
+    fn absorption_holds_across_the_failure_regime() {
+        for cf in [1u32, 2, 9, 10, u32::MAX] {
+            assert!(
+                should_absorb_wake(true, false, cf, 117, 130),
+                "cf={cf} should still absorb a premature non-urgent ring"
+            );
+        }
+    }
+
+    /// The absorption loop terminates only because `next_wait_secs` is a pure function of
+    /// `(backoff state, seed)`: an absorbed wake re-derives its deadline from unchanged
+    /// inputs, so that instant must not move.  A jitter source that consulted a call
+    /// counter, the clock, or a hardware RNG would satisfy the bounds tests above while
+    /// re-rolling the deadline on every absorbed ring, and rolls that land later defer the
+    /// retry indefinitely — the timeout backstop never fires because the wait restarts.
+    #[test]
+    fn next_wait_secs_is_deterministic_in_state_and_seed() {
+        let mut b = Backoff::new();
+        b.record_failure();
+        b.record_failure();
+        for seed in [0u32, 0x1234, u32::MAX] {
+            let first = b.next_wait_secs(seed);
+            for _ in 0..8 {
+                assert_eq!(
+                    b.next_wait_secs(seed),
+                    first,
+                    "seed={seed}: jitter re-rolled across repeated calls"
+                );
+            }
+            assert_eq!(
+                b.clone().next_wait_secs(seed),
+                first,
+                "seed={seed}: jitter differs between identical Backoff states"
+            );
+        }
+    }
+
+    /// The bug this guard exists to close: an attempt starting at T fails ~17 s later
+    /// and its own disconnect event rings the doorbell.  Before the fix that ring made
+    /// the next attempt start at T+17; now it is absorbed and the retry lands on the
+    /// deadline the backoff already chose.
+    #[test]
+    fn premature_wake_after_failed_attempt_does_not_collapse_spacing() {
+        let attempt_start = 1_000u64;
+        let mut backoff = Backoff::new();
+        // The attempt failed, so the supervisor is in the failure regime.
+        backoff.record_failure();
+        let jittered = backoff.next_wait_secs(0);
+        let deadline = compute_wake_deadline_secs(attempt_start, jittered, TICK_INTERVAL_SECS);
+        // Backoff is 4 s here, so the 30 s tick governs the deadline.
+        assert_eq!(deadline, attempt_start + TICK_INTERVAL_SECS);
+
+        // Stray ring at T+17: absorbed, 13 s of the interval remain.
+        let stray = attempt_start + 17;
+        assert!(should_absorb_wake(
+            true,
+            false,
+            backoff.consecutive_failures(),
+            stray,
+            deadline
+        ));
+        assert_eq!(
+            compute_wait_secs(stray, attempt_start, jittered, TICK_INTERVAL_SECS),
+            13
+        );
+
+        // A second stray at T+22, re-deriving the jitter as the loop does on an absorbed
+        // iteration: same deadline instant, strictly smaller remainder — repeated strays
+        // cannot push the retry out.
+        let stray2 = attempt_start + 22;
+        let rederived = backoff.next_wait_secs(0);
+        assert_eq!(
+            compute_wake_deadline_secs(attempt_start, rederived, TICK_INTERVAL_SECS),
+            deadline
+        );
+        assert!(should_absorb_wake(
+            true,
+            false,
+            backoff.consecutive_failures(),
+            stray2,
+            deadline
+        ));
+        assert_eq!(
+            compute_wait_secs(stray2, attempt_start, rederived, TICK_INTERVAL_SECS),
+            8
+        );
+
+        // At the deadline the wait expires; the timeout wake proceeds to associate,
+        // so consecutive attempt starts are 30 s apart, not 17.
+        let timeout_wake = attempt_start + TICK_INTERVAL_SECS;
+        assert_eq!(
+            compute_wait_secs(timeout_wake, attempt_start, jittered, TICK_INTERVAL_SECS),
+            0
+        );
+        assert!(!should_absorb_wake(
+            false,
+            false,
+            backoff.consecutive_failures(),
+            timeout_wake,
+            deadline
+        ));
+        // Even a ring landing exactly then is not absorbed.
+        assert!(!should_absorb_wake(
+            true,
+            false,
+            backoff.consecutive_failures(),
+            timeout_wake,
+            deadline
+        ));
     }
 
     #[test]

@@ -1347,6 +1347,14 @@ fn run_suite(
 
                     // 5. Observe recovery without reboot, up to 45 s — exits as soon as
                     // WIFI_REASSOCIATED is seen rather than always burning the full window.
+                    //
+                    // The 45 s is an assertion, not just a timeout budget: the clear lands
+                    // in a deep failure regime, where a ring the supervisor treated as
+                    // non-urgent would be absorbed until its wake deadline — up to
+                    // BACKOFF_CAP_SECS + 25% jitter ≈ 75 s. A window strictly below that is
+                    // the only thing proving the clear's ring is honored as urgent, i.e.
+                    // that a user fixing bad credentials is not ignored for a minute-plus.
+                    // Do not raise it past ~60 s to de-flake a run.
                     let mut recovery_logs: Vec<(Instant, String)> = Vec::new();
                     if let Err(e) = harness.drain_logs_until(
                         WIFI_REASSOCIATED,
@@ -4665,8 +4673,14 @@ fn check_strictly_increasing(
 /// Assert the `BootAssociationRetry` retry-with-backoff window: at least two failed
 /// re-association attempts with strictly increasing attempt counters (proves genuine
 /// RF/AP failures occurred, backoff charged), each pair of consecutive attempt-*start*
-/// lines spaced at least 20 s apart (the jitter-immune lower bound derived from the 30 s
-/// supervisor tick), and no reboot in the window.
+/// lines spaced at least 25 s apart, and no reboot in the window.
+///
+/// The 25 s comes from the supervisor's wake deadline in a failure regime,
+/// `last_attempt + max(jittered_backoff, 30 s)`: consecutive attempt starts are ≥ 30 s
+/// apart (further still when an attempt outlasts its own deadline), and no urgent ring
+/// occurs inside the observation window. 25 s leaves margin for whole-second clock
+/// granularity and harness-side receipt jitter while still rejecting the collapsed
+/// spacing a broken premature-wake guard produces.
 ///
 /// The spacing check is deliberately measured on `WIFI_REASSOC_ATTEMPT_START` lines, not
 /// `WIFI_REASSOC_ATTEMPT_FAILED` lines: the supervisor's wait-spacing guarantee is anchored
@@ -4692,10 +4706,10 @@ fn eval_boot_association_retry_failures(logs: &[(Instant, String)]) -> Result<()
         let (t0, n0) = pair[0];
         let (t1, n1) = pair[1];
         let gap = t1.duration_since(t0);
-        if gap < Duration::from_secs(20) {
+        if gap < Duration::from_secs(25) {
             return Err(format!(
                 "consecutive {:?} lines only {:.1}s apart (attempts {n0} -> {n1}), expected \
-                 >= 20s — backoff not honored (busy-spin?)",
+                 >= 25s — backoff not honored (busy-spin?)",
                 WIFI_REASSOC_ATTEMPT_START,
                 gap.as_secs_f64()
             ));
@@ -8072,7 +8086,7 @@ mod tests {
         (instant, format!("{WIFI_REASSOC_ATTEMPT_START} ({attempt})"))
     }
 
-    /// Two strictly-increasing failures, two strictly-increasing starts spaced >= 20s
+    /// Two strictly-increasing failures, two strictly-increasing starts spaced >= 25s
     /// apart, no reboot line — the passing shape.
     #[test]
     fn eval_boot_association_retry_failures_passes() {
@@ -8134,7 +8148,7 @@ mod tests {
         );
     }
 
-    /// Consecutive attempt-start lines spaced < 20s apart means backoff was not honored,
+    /// Consecutive attempt-start lines spaced < 25s apart means backoff was not honored,
     /// even though the (attempt-end) failure lines here are spaced exactly 30s apart —
     /// the spacing check must key off starts, not ends.
     #[test]
@@ -8150,6 +8164,25 @@ mod tests {
         assert!(
             err.contains("backoff not honored"),
             "error must name the spacing problem: {err}"
+        );
+    }
+
+    /// 22 s spacing: a partial collapse — one stray ring honored instead of absorbed —
+    /// that the interval must reject, since the supervisor's failure-regime deadline is
+    /// never shorter than the 30 s tick.
+    #[test]
+    fn eval_boot_association_retry_failures_partially_collapsed_spacing_fails() {
+        let t0 = Instant::now();
+        let logs = vec![
+            start_line(t0, 1),
+            failure_line(t0 + Duration::from_secs(17), 1),
+            start_line(t0 + Duration::from_secs(22), 2),
+            failure_line(t0 + Duration::from_secs(39), 2),
+        ];
+        let err = eval_boot_association_retry_failures(&logs).unwrap_err();
+        assert!(
+            err.contains("backoff not honored"),
+            "22s spacing must fail the >= 25s interval: {err}"
         );
     }
 

@@ -138,39 +138,6 @@ See `TODO(xtensa-realign-stack-args)` in `firmware/tools/check-realign-args.sh` 
 matching `RtdSegmentIo` constraint comment in
 `firmware/devices/respeaker-pod/src/net_tests.rs`.
 
-## `wifi-assoc-inflight-flag-generation-race`
-
-`WIFI_ASSOC_IN_FLIGHT` (`firmware/devices/respeaker-pod/src/wifi.rs`) suppresses a
-self-inflicted `StaDisconnected` ring while the supervisor is blocked inside its own
-`associate_from_active_config()` call, closing the ~17.4s backoff-bypass bug
-(`design-delta-1.md`, Hole B). The suppression window is timing-based
-(`store(true)`/`store(false)` bracket the *call*), not state-based: the failing
-attempt's `StaDisconnected` event is delivered asynchronously on the event-loop task,
-and `BlockingWifi::connect()`/`stop()` wait on driver state, not on that callback
-having actually run. If the callback runs after `store(false)`, it rings anyway,
-bypassing the backoff wait just computed for the next attempt — reintroducing the
-fixed bug as a low-probability heisenbug — or, in the reversed edge, wrongly suppresses
-a genuine external disconnect landing in the same window (bounded degradation:
-recovery waits for the next ~30s tick instead of being prompt). Found in deep review
-(`notes-deep-tracer-r1.md`,
-`correctness-inflight-flag-clear-vs-async-disconnect`,
-`docs/adr/2026/07/19-wifi-temporary-config/`).
-
-Deferred: a proper fix needs state-based suppression, e.g. an attempt-generation
-counter stamped by the supervisor at attempt start and checked by the callback, so a
-ring is only suppressed for the exact attempt that produced it — a firmware-behavior
-design decision (algorithm choice, plus a fresh empirical HIL validation cycle like the
-one that found Hole A/B), not a mechanical fix. Reproducing it to confirm a fix
-requires a low-probability hardware race, so the residual is a design decision the
-project can pick up deliberately rather than a code review action item.
-
-Done = suppression scoped to the exact attempt that produced a given disconnect event,
-confirmed by extended real-hardware runs of `BootAssociationRetry` showing no
-recurrence of sub-20s attempt-start spacing.
-
-See `TODO(wifi-assoc-inflight-flag-generation-race)` at `WIFI_ASSOC_IN_FLIGHT` in
-`firmware/devices/respeaker-pod/src/wifi.rs`.
-
 ## `hil-first-attempt-after-boot-ac9`
 
 The first `make hil-test` invocation immediately after a physical power-cycle
