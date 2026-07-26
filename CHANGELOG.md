@@ -9,17 +9,11 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
-- **Boot-path labels on every reported heap sample.** The heap floors are since-boot low
-  watermarks baked on `POWERON` boots alone, and nothing joined a heap figure to the boot
-  that produced it. The raw `esp_reset_reason_t` code now rides with the samples:
-  `TestData::DeviceHealth` gains a `reset_reason` field (a wire-schema change),
-  `DeviceHealthCheck` fail details end in `rr=<code>`, and the `StreamRealtimeDuplex` detail
-  line carries `rr=` beside `mh_post`. `device_protocol::reset_reason_label` decodes the
-  code and now also backs the boot log line, which gained the raw code alongside the label.
-- **`wsub=` on the `StreamRealtimeDuplex` report** — how many times the TLS session polled
-  the direction esp-tls asked for instead of the one the caller armed. That branch is
-  data-dependent and nothing recorded whether it ever fired. The decision is factored into
-  a host-tested pure function, so poll behavior is pinned by an exhaustive truth table.
+- **Boot-path labels on reported heap samples**, so a heap figure can be attributed to the
+  boot that produced it. `TestData::DeviceHealth` gains a `reset_reason` field — a
+  wire-schema change — surfacing as `rr=` in report details.
+- **`wsub=` on the `StreamRealtimeDuplex` report**, counting TLS poll-direction
+  substitutions.
 
 ### Changed
 
@@ -27,6 +21,15 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   `[workspace.package]`. Resolves a drift where the editor format hook ran
   `rustfmt --edition 2024` against edition-2021 manifests. `scripts/check-edition.sh`
   guards against recurrence.
+- **TLS-PSK connect timeout cut from 10s to 3s.** These devices are LAN-only; a longer
+  wait only delays an inevitable failure.
+
+### Fixed
+
+- **Doorbell rings arriving during WiFi backoff are no longer dropped**, so the wake one
+  asks for actually happens.
+- **First HIL attempt after a cold boot could fail (AC9).** The host now retries Identify,
+  and a re-send write error no longer aborts the whole wait.
 
 ## [0.1.0] - 2026-07-23
 
