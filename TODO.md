@@ -189,19 +189,34 @@ single post-flash observation) — not a code-review action item, a data-gatheri
 one for a future measurement session.
 
 Done = at least five post-flash-reset `mh_post` samples recorded (matching the
-POWERON bake's sample count). If any sample lands below ~71 KB (i.e. realized
-headroom against `HEAP_MIN_EVER_FLOOR` drops under the design's 25% target), or
-the post-flash population otherwise clusters measurably below the POWERON
-population, re-bake `HEAP_MIN_EVER_FLOOR` against `min()` of both populations
-combined, not against POWERON alone. Otherwise document why the single low
-sample was an outlier.
+POWERON bake's sample count). If the post-flash population clusters measurably below
+the POWERON population, re-bake `HEAP_MIN_EVER_FLOOR` against `min()` of both
+populations combined, not against POWERON alone. Otherwise document why the single
+low sample was an outlier.
+
+The re-bake threshold is deliberately left unstated: the pre-re-bake arithmetic in
+this entry (53_248, ~71 KB, the design's 25% headroom target) is obsolete and must be
+re-derived at the measurement session against the floor as it stands — 24_576 against
+an observed worst case of 30_512, i.e. ~5_936 B, ~19.5%, already under the original
+bake rule's 25%. Note what that leaves: an 8.1 KB systematic boot-path offset of the
+kind this entry hypothesizes would exceed the entire present margin.
 
 Note (2026-07-23 ship-gate re-bake): `HEAP_MIN_EVER_FLOOR` was lowered
 53_248 → 24_576 under the ship-gate directive, after this cycle's TLS-PSK +
 heap-instrumentation additions drove the observed `min_heap_after` to 30_512.
-The 53_248 figures and the 25%-headroom / ~71 KB / ~76–78 KB `mh_post` analysis
-above predate that re-bake and need re-derivation against the new floor at the
-next measurement session; the boot-path-offset question itself is unchanged.
+The 53_248 figures above predate that re-bake; the boot-path-offset question itself
+is unchanged.
+
+Note (2026-07-25, `docs/adr/2026/07/25-pod--hil-report-observability/`): the labelling
+half of this entry now exists — every reported heap sample carries its boot path. The
+`StreamRealtimeDuplex` detail line carries `rr=<code>` beside `mh_post`, the
+`DeviceHealth` typed report carries a `reset_reason` field beside `min_heap`, and every
+`DeviceHealthCheck` fail detail ends in `rr=<code>`
+(`device_protocol::reset_reason_label` decodes the code; a post-flash reset reports 0,
+labelled `unknown`). So the five post-flash-reset samples this entry needs now
+accumulate for free from ordinary `make hil-test` runs — no dedicated measurement
+session to schedule, just transcripts to read. What remains is the reading and the
+re-derivation above.
 
 See `TODO(heap-floor-post-flash-boot-path-offset)` at `HEAP_MIN_EVER_FLOOR` in
 `firmware/crates/device-protocol/src/lib.rs`.
@@ -261,35 +276,4 @@ actual watermark and may be several KB of waste. Blocked purely on bench time; c
 See `TODO(tls-link-bench-measure)` at the streamer thread's `.stack_size` in
 `firmware/devices/respeaker-pod/src/streamer.rs` and in the TLS-PSK block of
 `firmware/devices/respeaker-pod/sdkconfig.defaults`.
-
-## `tls-link-run-segment-hil-coverage`
-
-The streamer's `poll` loop over a `TlsStream` — production's only transport since the
-TLS-PSK audio link landed (`docs/adr/2026/07/22-pod--tls-and-auth/`) — is the one
-combination nothing tests. `LinkStream` exists to carry two TLS-specific rules into
-that loop: read on every wake because decrypted plaintext can sit in the session
-buffer with no `POLLIN` (`buffers_plaintext`), and poll the direction esp-tls asked
-for rather than the one the caller armed (`poll_events`). Both branches take their
-trivial arm in every existing test: `run_stream_realtime_duplex` (the only test that
-drives `run_segment`) connects with a plain `TcpStream`, the two TLS self-tests
-(`TlsPskHandshake`, `TlsPskWrongKeyRejected`) use hand-written read/write helpers and
-never reach `run_segment`, and `tls_link.rs` is entirely `cfg(target_os = "espidf")`
-so no host unit test can reach it. A mishandled poll direction or a missed buffered
-read stalls the real audio link and surfaces only as a hang on the bench.
-
-Deferred because closing it needs a decision this ADR deliberately did not make. The
-obvious route — running the RTD fixture over TLS — converts an HIL fixture link the
-design named an explicit non-goal (§10: bench traffic under physical trust, not
-production surface), so whether the RTD listener gains a PSK context or a separate
-TLS-speaking fixture is added is a design question, not an implementation detail. The
-result is also a hardware assertion either way: a new HIL self-test whose first
-readings get human review before they are baked in, per the bring-up doctrine.
-
-Done = at least one registered HIL self-test pushes a segment through `run_segment`
-over a `TlsStream`, with the buffered-plaintext read and the direction-substitution
-paths actually taken, and the fixture question above settled in the ADR that decides
-it.
-
-See `TODO(tls-link-run-segment-hil-coverage)` at the idle readiness wait in
-`firmware/devices/respeaker-pod/src/streamer.rs`.
 

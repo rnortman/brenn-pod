@@ -6,7 +6,8 @@
 //! split out so it is host-testable without ESP-IDF FFI.
 
 use device_protocol::{
-    MallocProbe, Payload, Status, TestData, evaluate_health, test_report_fail_fmt, test_report_ok,
+    HealthSample, MallocProbe, Payload, Status, TestData, evaluate_health, test_report_fail_fmt,
+    test_report_ok,
 };
 
 use crate::console::{ENCODE_FAILURES, TX_WRITE_FAILURES, WRITER_STATE_ANOMALIES};
@@ -62,6 +63,40 @@ pub(crate) fn heap_free_min() -> (u32, u32) {
     }
 }
 
+/// Read the raw `esp_reset_reason_t` code of this boot, clamped into a `u8`.
+///
+/// The boot path is a property of every heap sample: `heap_free_min`'s minimum-ever
+/// figure is a since-boot low watermark, and the floors it is checked against were baked
+/// on `POWERON` boots alone, so the code travels with the samples in the test report
+/// (`device_protocol::reset_reason_label` resolves it). Callable at any point in the
+/// boot — the value is fixed before `app_main` runs.
+///
+/// Codes outside `u8` range clamp to `u8::MAX`, which
+/// `device_protocol::reset_reason_label` reports as `"unknown"`. Real codes are ≤ 10
+/// today; the asserts below fail the firmware build if the SDK renumbers them.
+///
+/// SAFETY: a pure read of a boot-time-determined ESP-IDF value, no side effects.
+pub(crate) fn reset_reason_code() -> u8 {
+    let code = unsafe { esp_idf_svc::sys::esp_reset_reason() };
+    u8::try_from(code).unwrap_or(u8::MAX)
+}
+
+// The numeric ABI `device_protocol::reset_reason_label` decodes, pinned against the SDK.
+// A renumbering breaks the firmware build here rather than silently mislabelling samples.
+// `ESP_RST_UNKNOWN == 0` is pinned too: the label table routes it through its unmapped
+// arm on purpose, which only stays correct while 0 is the code a post-flash reset reports.
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_UNKNOWN == 0);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_POWERON == 1);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_EXT == 2);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_SW == 3);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_PANIC == 4);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_INT_WDT == 5);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_TASK_WDT == 6);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_WDT == 7);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_DEEPSLEEP == 8);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_BROWNOUT == 9);
+const _: () = assert!(esp_idf_svc::sys::esp_reset_reason_t_ESP_RST_SDIO == 10);
+
 /// Read a heap waypoint triple: current free, boot-wide minimum-ever free, and the
 /// largest contiguous free block (bytes), all scoped to **internal** RAM
 /// (`MALLOC_CAP_INTERNAL`).
@@ -97,12 +132,30 @@ pub(crate) fn run_device_health_check() -> (Status, Payload) {
     let tx_write_failures = TX_WRITE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
     let writer_anomalies = WRITER_STATE_ANOMALIES.load(std::sync::atomic::Ordering::Relaxed);
     let encode_failures = ENCODE_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    // Boot path of this sample. Every detail below already reports min_heap, and min_heap
+    // is a since-boot watermark, so each of them is a heap sample that needs its label.
+    let reset_reason = reset_reason_code();
 
     // Check the main-task metrics first; return early on failure.
-    if let Some(fail) = evaluate_health(free_heap, min_heap, stack_hwm, tx_write_failures) {
+    if let Some(fail) = evaluate_health(HealthSample {
+        free_heap,
+        min_heap,
+        stack_hwm,
+        tx_write_failures,
+        reset_reason,
+    }) {
         return fail;
     }
 
+    // Detail-width budget for the four fail details below. They are device-gated, so unlike
+    // `evaluate_health`'s three, no host test reaches them and the arithmetic lives here:
+    // under the per-field caps `TEST_RESULT_MSG_CAP` documents (heap counts 6 digits, stack
+    // HWMs 5, `rr` 3, and the event counters at their full 10-digit `u32` width, since
+    // nothing bounds them below the type), the widest two — `writer_anomalies` and
+    // `encode_failures` — bound at 184 bytes against the 192-byte cap: 8 bytes of headroom.
+    // Overflow truncates from the tail, dropping `rr` first, so re-derive this before adding
+    // a token, and bump the cap rather than spend the headroom.
+    //
     // Also check the wifi-supervisor thread's stack HWM.  The supervisor is always
     // running by the time DeviceHealthCheck executes; a NULL handle here would mean
     // the thread hasn't started or its name changed — both are bugs, not transients.
@@ -116,7 +169,7 @@ pub(crate) fn run_device_health_check() -> (Status, Payload) {
 
     if supervisor_hwm < SUPERVISOR_STACK_HWM_FLOOR {
         return test_report_fail_fmt(format_args!(
-            "FAIL supervisor_hwm={supervisor_hwm}<{SUPERVISOR_STACK_HWM_FLOOR} heap_free={free_heap} min_heap={min_heap} stack_hwm={stack_hwm} tx_write_failures={tx_write_failures}"
+            "FAIL supervisor_hwm={supervisor_hwm}<{SUPERVISOR_STACK_HWM_FLOOR} heap_free={free_heap} min_heap={min_heap} stack_hwm={stack_hwm} tx_write_failures={tx_write_failures} rr={reset_reason}"
         ));
     }
 
@@ -134,7 +187,7 @@ pub(crate) fn run_device_health_check() -> (Status, Payload) {
 
     if streamer_hwm < STREAMER_STACK_HWM_FLOOR {
         return test_report_fail_fmt(format_args!(
-            "FAIL streamer_hwm={streamer_hwm}<{STREAMER_STACK_HWM_FLOOR} heap_free={free_heap} min_heap={min_heap} stack_hwm={stack_hwm} supervisor_hwm={supervisor_hwm} tx_write_failures={tx_write_failures}"
+            "FAIL streamer_hwm={streamer_hwm}<{STREAMER_STACK_HWM_FLOOR} heap_free={free_heap} min_heap={min_heap} stack_hwm={stack_hwm} supervisor_hwm={supervisor_hwm} tx_write_failures={tx_write_failures} rr={reset_reason}"
         ));
     }
 
@@ -144,7 +197,7 @@ pub(crate) fn run_device_health_check() -> (Status, Payload) {
     // loudly with full logs instead of the device aborting inside the fault-reporting channel.
     if writer_anomalies != 0 {
         return test_report_fail_fmt(format_args!(
-            "FAIL writer_anomalies={writer_anomalies} heap_free={free_heap} min_heap={min_heap} stack_hwm={stack_hwm} supervisor_hwm={supervisor_hwm} streamer_hwm={streamer_hwm} encode_failures={encode_failures} tx_write_failures={tx_write_failures}"
+            "FAIL writer_anomalies={writer_anomalies} heap_free={free_heap} min_heap={min_heap} stack_hwm={stack_hwm} supervisor_hwm={supervisor_hwm} streamer_hwm={streamer_hwm} encode_failures={encode_failures} tx_write_failures={tx_write_failures} rr={reset_reason}"
         ));
     }
 
@@ -153,7 +206,7 @@ pub(crate) fn run_device_health_check() -> (Status, Payload) {
     // environmental condition — fail loudly rather than surface it format-only.
     if encode_failures != 0 {
         return test_report_fail_fmt(format_args!(
-            "FAIL encode_failures={encode_failures} heap_free={free_heap} min_heap={min_heap} stack_hwm={stack_hwm} supervisor_hwm={supervisor_hwm} streamer_hwm={streamer_hwm} writer_anomalies={writer_anomalies} tx_write_failures={tx_write_failures}"
+            "FAIL encode_failures={encode_failures} heap_free={free_heap} min_heap={min_heap} stack_hwm={stack_hwm} supervisor_hwm={supervisor_hwm} streamer_hwm={streamer_hwm} writer_anomalies={writer_anomalies} tx_write_failures={tx_write_failures} rr={reset_reason}"
         ));
     }
 
@@ -166,6 +219,7 @@ pub(crate) fn run_device_health_check() -> (Status, Payload) {
         writer_anomalies,
         encode_failures,
         tx_write_failures,
+        reset_reason,
     })
 }
 

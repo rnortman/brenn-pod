@@ -145,27 +145,6 @@ fn main() {}
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-/// Map an ESP reset reason to a human-readable label for the boot log line.
-///
-/// Unrecognized codes fall through to `"unknown"`.
-#[cfg(target_os = "espidf")]
-fn decode_reset_reason(reason: esp_idf_svc::sys::esp_reset_reason_t) -> &'static str {
-    use esp_idf_svc::sys;
-    match reason {
-        sys::esp_reset_reason_t_ESP_RST_POWERON => "POWERON",
-        sys::esp_reset_reason_t_ESP_RST_SW => "SW",
-        sys::esp_reset_reason_t_ESP_RST_DEEPSLEEP => "DEEPSLEEP",
-        sys::esp_reset_reason_t_ESP_RST_SDIO => "SDIO",
-        sys::esp_reset_reason_t_ESP_RST_PANIC => "PANIC",
-        sys::esp_reset_reason_t_ESP_RST_INT_WDT => "INT_WDT",
-        sys::esp_reset_reason_t_ESP_RST_TASK_WDT => "TASK_WDT",
-        sys::esp_reset_reason_t_ESP_RST_WDT => "WDT",
-        sys::esp_reset_reason_t_ESP_RST_BROWNOUT => "BROWNOUT",
-        sys::esp_reset_reason_t_ESP_RST_EXT => "EXT",
-        _ => "unknown",
-    }
-}
-
 /// Argument + result shuttle for the cross-core watchpoint-arm IPC callback.
 #[cfg(target_os = "espidf")]
 #[repr(C)]
@@ -335,11 +314,14 @@ fn main() {
 
     log::info!("respeaker-pod firmware starting");
 
-    // Log the previous reset reason so crash causes are visible on the next boot.
-    let reset_reason = unsafe { esp_idf_svc::sys::esp_reset_reason() };
+    // Log the previous reset reason so crash causes are visible on the next boot. The raw
+    // code accompanies the label so an unmapped code is distinguishable from ESP_RST_UNKNOWN,
+    // which also labels "unknown"; the same code labels the heap samples in the test report.
+    let reset_reason = health::reset_reason_code();
     log::info!(
-        "respeaker_pod: boot: reset reason = {}",
-        decode_reset_reason(reset_reason)
+        "respeaker_pod: boot: reset reason = {} ({})",
+        device_protocol::reset_reason_label(reset_reason),
+        reset_reason
     );
 
     let peripherals = Peripherals::take()

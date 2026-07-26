@@ -943,13 +943,20 @@ struct SegMeas {
     /// before it exits. Observability for re-deriving `RTD_PRODUCER_STACK_BYTES` if a
     /// producer-thread overflow is ever implicated.
     producer_hwm: u32,
+    /// Poll directions the segment's TLS session had substituted for the one esp-tls asked
+    /// for (`TlsStream::want_substitutions`), read once the segment is done. The scope
+    /// exceptions are documented on that accessor.
+    want_subs: u32,
 }
 
 /// Handler-wide resource measurements, accumulated across both scenarios. Every RTD result
 /// line — PASS and every FAIL variant — carries the fields collected so far, so the
 /// (expected-to-fail) measurement run still yields the numbers it exists to produce.
+///
+/// The type and its pure rendering methods are ungated so the detail-width budget test
+/// measures `suffix()` itself rather than a hand-copied token list; only the FFI samplers
+/// and the report constructor are device-gated.
 #[derive(Clone, Copy)]
-#[cfg(target_os = "espidf")]
 struct RtdMeasure {
     min_heap_after: u32,
     rtd_stack_hwm: u32,
@@ -957,11 +964,15 @@ struct RtdMeasure {
     heap_low_b: u32,
     producer_tcb: u32,
     producer_hwm: u32,
+    /// Raw `esp_reset_reason_t` code of this boot, labelling the heap figures above —
+    /// they are since-boot watermarks, and their floors were baked on `POWERON` boots.
+    reset_reason: u8,
+    /// Poll-direction substitutions summed across both scenarios' TLS sessions.
+    want_subs: u32,
 }
 
 /// Map the `u32::MAX` "never sampled" sentinel (used by the stack-HWM and heap-low fields)
 /// to 0 for reporting.
-#[cfg(target_os = "espidf")]
 fn sampled_or_zero(v: u32) -> u32 {
     if v == u32::MAX { 0 } else { v }
 }
@@ -984,6 +995,8 @@ impl RtdMeasure {
             heap_low_b: 0,
             producer_tcb: 0,
             producer_hwm: u32::MAX,
+            reset_reason: crate::health::reset_reason_code(),
+            want_subs: 0,
         }
     }
 
@@ -1001,6 +1014,13 @@ impl RtdMeasure {
         self.rtd_stack_hwm = self.rtd_stack_hwm.min(hwm);
     }
 
+    /// Build a `FAIL src=rtd <detail> <fields>` result carrying all fields collected so far.
+    fn fail(&self, detail: core::fmt::Arguments) -> (Status, Payload) {
+        test_report_fail_fmt(format_args!("FAIL src=rtd {detail} {}", self.suffix()))
+    }
+}
+
+impl RtdMeasure {
     /// The sampled stack HWM, mapping the unsampled sentinel to 0.
     fn stack_hwm(&self) -> u32 {
         sampled_or_zero(self.rtd_stack_hwm)
@@ -1015,25 +1035,31 @@ impl RtdMeasure {
     /// keep the whole line under the `TestReport` detail (`TestResultMsg`) budget: `mh_post` =
     /// min-heap-ever after the run (the boot-wide-minimum assertion), `hla`/`hlb` =
     /// per-scenario free-heap low, `shwm` = rtd-test stack HWM, `ptcb` = rtd-producer
-    /// TCB/pthread overhead, `phwm` = rtd-producer stack HWM. Assertion-critical fields lead so
-    /// a graceful truncation on a FAIL line drops observability, not a floor check's value;
-    /// `phwm` (pure observability) is last so it is the first token dropped. Per-scenario wall
-    /// times are host-observed (obs.catch_up_ms) and are not repeated here.
+    /// TCB/pthread overhead, `phwm` = rtd-producer stack HWM, `rr` = raw reset-reason code
+    /// of this boot (`device_protocol::reset_reason_label`), `wsub` = TLS poll-direction
+    /// substitutions. Assertion-critical fields lead so a graceful truncation on a FAIL line
+    /// drops observability, not a floor check's value; the pure-observability tail
+    /// (`phwm`/`rr`/`wsub`) is dropped first. Per-scenario wall times are host-observed
+    /// (obs.catch_up_ms) and are not repeated here.
+    ///
+    /// This line rides on every RTD result, PASS and FAIL alike, so it is the accumulation
+    /// channel for the boot-path-labelled heap population. `mh_post` and `rr` land together
+    /// on PASS and on the short-infix assertion FAILs, the floor breach `rr` exists to
+    /// explain among them. A FAIL whose free-text reason is long — a handshake error's
+    /// `Debug` runs to ~100 bytes — can push the tail past the `TestResultMsg` cap and drop
+    /// `rr`/`wsub`, which is the ordering rule working as intended, not an accident.
     fn suffix(&self) -> String {
         format!(
-            "mh_post={} hla={} hlb={} shwm={} ptcb={} phwm={}",
+            "mh_post={} hla={} hlb={} shwm={} ptcb={} phwm={} rr={} wsub={}",
             self.min_heap_after,
             self.heap_low_a,
             self.heap_low_b,
             self.stack_hwm(),
             self.producer_tcb,
             self.producer_hwm(),
+            self.reset_reason,
+            self.want_subs,
         )
-    }
-
-    /// Build a `FAIL src=rtd <detail> <fields>` result carrying all fields collected so far.
-    fn fail(&self, detail: core::fmt::Arguments) -> (Status, Payload) {
-        test_report_fail_fmt(format_args!("FAIL src=rtd {detail} {}", self.suffix()))
     }
 }
 
@@ -1176,6 +1202,7 @@ fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
     meas.heap_low_a = a_meas.heap_low;
     meas.producer_tcb = a_meas.producer_tcb;
     meas.producer_hwm = meas.producer_hwm.min(a_meas.producer_hwm);
+    meas.want_subs = meas.want_subs.saturating_add(a_meas.want_subs);
     if !matches!(a_exit, SegmentExit::Completed) {
         return meas.fail(format_args!("scenario=A exit={a_exit:?} wall_ms={a_wall}"));
     }
@@ -1217,6 +1244,7 @@ fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
     };
     meas.heap_low_b = b_meas.heap_low;
     meas.producer_hwm = meas.producer_hwm.min(b_meas.producer_hwm);
+    meas.want_subs = meas.want_subs.saturating_add(b_meas.want_subs);
     if !matches!(b_exit, SegmentExit::Completed) {
         return meas.fail(format_args!("scenario=B exit={b_exit:?} wall_ms={b_wall}"));
     }
@@ -1514,6 +1542,7 @@ fn rtd_run_one_segment(
             heap_low,
             producer_tcb,
             producer_hwm,
+            want_subs: socket.want_substitutions(),
         },
     ))
 }
@@ -1856,7 +1885,7 @@ pub(crate) fn run_tls_psk_wrong_key_rejected() -> (Status, Payload) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PostEofTick, post_eof_tick};
+    use super::{PostEofTick, RtdMeasure, post_eof_tick};
 
     const LIMIT: u32 = 50;
 
@@ -1921,23 +1950,59 @@ mod tests {
         }
     }
 
+    /// Every field at its cap, rendered by `RtdMeasure::suffix` itself so a token added
+    /// there without re-deriving the budget fails here rather than overrunning on the bench.
+    fn worst_case_measure() -> RtdMeasure {
+        RtdMeasure {
+            min_heap_after: 999_999,
+            heap_low_a: 999_999,
+            heap_low_b: 999_999,
+            rtd_stack_hwm: 99_999,
+            producer_tcb: 99_999,
+            producer_hwm: 99_999,
+            reset_reason: u8::MAX,
+            want_subs: u32::MAX,
+        }
+    }
+
     /// The RTD measurement suffix rides in `TestReport::detail`, which truncates on
     /// overflow; truncation would drop the trailing observability tokens, so its worst-case
     /// width stays budgeted. Per-field caps are upper bounds tied to device
     /// characteristics: heap free-byte fields fit 6 digits on the internal-RAM heap; the
-    /// stack fields are bounded by the KB-scale RTD/producer stacks (`shwm`/`ptcb`/`phwm`).
+    /// stack fields are bounded by the KB-scale RTD/producer stacks (`shwm`/`ptcb`/`phwm`);
+    /// `rr` is a `u8` reset-reason code, so 3 digits is its ceiling; `wsub` is a `u32` that
+    /// saturates rather than wrapping, so `u32::MAX` is its exact worst case.
     #[test]
     fn rtd_detail_length_budget() {
-        let worst_case = format!(
-            "src=rtd mh_post={} hla={} hlb={} shwm={} ptcb={} phwm={}",
-            999_999u32, 999_999u32, 999_999u32, 99_999u32, 99_999u32, 99_999u32,
-        );
+        let worst_case = format!("src=rtd {}", worst_case_measure().suffix());
         assert!(
             worst_case.len() <= 127,
             "worst-case RTD detail ({} bytes) exceeds 127-byte budget \
              (conservative, well under TestResultMsg cap): {:?}",
             worst_case.len(),
             worst_case
+        );
+    }
+
+    /// The suffix's token names and order are the grep contract for the bench transcripts
+    /// the heap population is read out of, and the observability tail (`phwm`/`rr`/`wsub`)
+    /// trails so truncation drops it before an assertion's value. Unsampled stack HWMs
+    /// report 0, not the `u32::MAX` sentinel.
+    #[test]
+    fn rtd_suffix_renders_every_token_and_maps_unsampled_hwms() {
+        let measure = RtdMeasure {
+            min_heap_after: 30_512,
+            heap_low_a: 41_000,
+            heap_low_b: 42_000,
+            rtd_stack_hwm: u32::MAX,
+            producer_tcb: 3_200,
+            producer_hwm: u32::MAX,
+            reset_reason: 9,
+            want_subs: 4,
+        };
+        assert_eq!(
+            measure.suffix(),
+            "mh_post=30512 hla=41000 hlb=42000 shwm=0 ptcb=3200 phwm=0 rr=9 wsub=4"
         );
     }
 }

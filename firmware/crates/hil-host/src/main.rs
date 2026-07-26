@@ -6564,6 +6564,7 @@ mod tests {
             writer_anomalies: 0,
             encode_failures: 0,
             tx_write_failures: 0,
+            reset_reason: 1,
         }
     }
 

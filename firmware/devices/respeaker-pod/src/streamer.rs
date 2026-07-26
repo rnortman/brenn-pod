@@ -666,9 +666,9 @@ pub(crate) fn spawn_streamer_thread() {
 
                 // ── Idle readiness wait ──────────────────────────────────────
                 // POLLIN de-armed while accumulator is full (backpressure) to avoid spinning.
-                // TODO(tls-link-run-segment-hil-coverage): no test drives this loop over a
-                // `TlsStream` — the direction-substitution and buffered-plaintext branches
-                // are only exercised against a plain `TcpStream`.
+                // `poll_events` may substitute the direction esp-tls asked for here; whether
+                // that branch fires on hardware is read off the `StreamRealtimeDuplex`
+                // report's `wsub` token, which counts substitutions on the RTD session.
                 let inbound_armed = held_socket.is_some() && inbound_has_room(&inbound_accum);
 
                 let mut readable = false;

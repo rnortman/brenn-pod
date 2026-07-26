@@ -815,11 +815,26 @@ pub enum Status {
     Unsupported,
 }
 
-/// Capacity in bytes of [`TestResultMsg`]. Sized to hold the widest failure detail
-/// (worst-case field-by-field bound: 154 bytes) plus headroom. This const is the single
-/// lever for future field additions: the alias derives from it, and the device-side
-/// `format_truncating_marked` call sites take it as their const-generic width, so a bump
-/// here propagates everywhere with no `192` literals to chase.
+/// Capacity in bytes of [`TestResultMsg`]. Sized to hold the widest failure detail plus
+/// headroom. This const is the single lever for future field additions: the alias derives
+/// from it, and the device-side `format_truncating_marked` call sites take it as their
+/// const-generic width, so a bump here propagates everywhere with no `192` literals to
+/// chase.
+///
+/// Worst-case field-by-field bound: **184 of 192 bytes — 8 bytes of headroom**. The widest
+/// lines are the health check's `writer_anomalies` and `encode_failures` details (tied: 124
+/// bytes of static text plus the same nine fields), under per-field caps of 6 digits for
+/// heap byte counts, 5 for stack high-water marks (bounded by the configured stack sizes),
+/// 3 for the `u8` reset-reason code, and 10 — the full `u32` width — for the three event
+/// counters `writer_anomalies`, `encode_failures`, and `tx_write_failures`, which nothing
+/// bounds below their type. Those three counters are half the 60-byte field budget.
+/// [`evaluate_health`]'s three details bound at 94 under the same caps and are pinned by
+/// `evaluate_health_fail_detail_width_budget`; the device-gated details that reach 184 carry
+/// the same arithmetic in a comment beside them, since no host test can reach them.
+///
+/// Redo the budget arithmetic whenever a detail line grows, and bump this const rather
+/// than spending the headroom. Overflow does not fail loudly — it silently truncates
+/// trailing tokens.
 pub const TEST_RESULT_MSG_CAP: usize = 192;
 
 /// Message string carried by [`TestReport`]'s `detail`. Every carrier that flows into
@@ -917,6 +932,10 @@ pub enum TestData {
         writer_anomalies: u32,
         encode_failures: u32,
         tx_write_failures: u32,
+        /// Raw `esp_reset_reason_t` code of the boot these metrics were sampled on
+        /// ([`reset_reason_label`]). The heap fields are since-boot low watermarks, so
+        /// the boot path is part of the sample.
+        reset_reason: u8,
     },
     I2cScan {
         found: HVec<u8, I2C_SCAN_MAX_ADDRS>,
@@ -1278,6 +1297,61 @@ pub const HEAP_MIN_EVER_FLOOR: u32 = 24_576;
 /// `CONFIG_ESP_MAIN_TASK_STACK_SIZE` rather than lowering the floor.
 pub const STACK_HWM_FLOOR: u32 = 1_024;
 
+/// Label for a raw ESP-IDF `esp_reset_reason_t` code — the boot path a heap sample
+/// was taken on.
+///
+/// Heap floors are since-boot low watermarks, and the two boot paths (a true power
+/// cycle vs. a post-flash reset) are not known to be equivalent, so every reported
+/// heap sample carries its reset-reason code and this label resolves it.
+///
+/// The numeric values are ESP-IDF ABI. The device pins them against the real SDK
+/// constants with compile-time asserts beside its capture helper, so this table cannot
+/// drift from the SDK silently. Unmapped codes — including 0 (`ESP_RST_UNKNOWN`), what a
+/// post-flash reset reports — return `"unknown"`; callers print the raw code alongside
+/// the label, which is what distinguishes `ESP_RST_UNKNOWN` from a code this table has
+/// never heard of.
+pub fn reset_reason_label(code: u8) -> &'static str {
+    match code {
+        1 => "POWERON",
+        2 => "EXT",
+        3 => "SW",
+        4 => "PANIC",
+        5 => "INT_WDT",
+        6 => "TASK_WDT",
+        7 => "WDT",
+        8 => "DEEPSLEEP",
+        9 => "BROWNOUT",
+        10 => "SDIO",
+        _ => "unknown",
+    }
+}
+
+/// One main-task health sample: the metrics [`evaluate_health`] gates on, plus the
+/// context every fail detail reports alongside them.
+///
+/// A struct rather than a parameter list because four of the five fields are `u32` with
+/// no distinguishing type, so a transposed argument at any call site would produce a
+/// plausible-looking wrong fail line instead of a compile error. Named fields also mean
+/// the next sample-context field is an added field, not a sixth positional parameter.
+///
+/// `tx_write_failures` counts whole-frame TX drops (ring full, all-or-nothing write
+/// returned 0). A non-zero value is environmental — ring fills while host port is
+/// closed — not a device fault. It is surfaced for observability only; it does not
+/// affect pass/fail.
+///
+/// `reset_reason` is the raw `esp_reset_reason_t` code of the boot being measured
+/// ([`reset_reason_label`]). It never affects pass/fail; it rides on every fail detail as
+/// `rr=` because the heap floors are boot-path-sensitive and the breach line is where that
+/// attribution matters most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthSample {
+    pub free_heap: u32,
+    pub min_heap: u32,
+    pub stack_hwm: u32,
+    pub tx_write_failures: u32,
+    pub reset_reason: u8,
+}
+
 /// Pure health evaluation: checks three metrics against their floors.
 ///
 /// Returns `Some(fail_report)` for the first metric below its floor, `None` when all
@@ -1285,20 +1359,16 @@ pub const STACK_HWM_FLOOR: u32 = 1_024;
 /// [`TestData::DeviceHealth`] report, which holds these metrics plus the per-thread
 /// ones this function cannot see.
 ///
-/// Extracted from `run_device_health_check` so threshold logic is unit-testable
-/// on the host without ESP-IDF FFI. Field names are consistent across fail details
-/// (heap_free / min_heap / stack_hwm / tx_write_failures everywhere).
-///
-/// `tx_write_failures` counts whole-frame TX drops (ring full, all-or-nothing write
-/// returned 0). A non-zero value is environmental — ring fills while host port is
-/// closed — not a device fault. The field is surfaced for observability only; it
-/// does not affect pass/fail.
-pub fn evaluate_health(
-    free_heap: u32,
-    min_heap: u32,
-    stack_hwm: u32,
-    tx_write_failures: u32,
-) -> Option<(Status, Payload)> {
+/// Field names are consistent across fail details
+/// (heap_free / min_heap / stack_hwm / tx_write_failures / rr everywhere).
+pub fn evaluate_health(sample: HealthSample) -> Option<(Status, Payload)> {
+    let HealthSample {
+        free_heap,
+        min_heap,
+        stack_hwm,
+        tx_write_failures,
+        reset_reason,
+    } = sample;
     // min_heap is checked before free_heap: since min_heap <= free_heap always
     // (min_heap is a since-boot low watermark of free_heap), when both floors
     // trip min_heap is the deeper ratchet breach, so checking it first surfaces
@@ -1306,17 +1376,17 @@ pub fn evaluate_health(
     // since HEAP_MIN_EVER_FLOOR sits below HEAP_FREE_FLOOR.
     if min_heap < HEAP_MIN_EVER_FLOOR {
         return Some(test_report_fail_fmt(format_args!(
-            "FAIL min_heap={min_heap}<{HEAP_MIN_EVER_FLOOR} heap_free={free_heap} stack_hwm={stack_hwm} tx_write_failures={tx_write_failures}"
+            "FAIL min_heap={min_heap}<{HEAP_MIN_EVER_FLOOR} heap_free={free_heap} stack_hwm={stack_hwm} tx_write_failures={tx_write_failures} rr={reset_reason}"
         )));
     }
     if free_heap < HEAP_FREE_FLOOR {
         return Some(test_report_fail_fmt(format_args!(
-            "FAIL heap_free={free_heap}<{HEAP_FREE_FLOOR} min_heap={min_heap} stack_hwm={stack_hwm} tx_write_failures={tx_write_failures}"
+            "FAIL heap_free={free_heap}<{HEAP_FREE_FLOOR} min_heap={min_heap} stack_hwm={stack_hwm} tx_write_failures={tx_write_failures} rr={reset_reason}"
         )));
     }
     if stack_hwm < STACK_HWM_FLOOR {
         return Some(test_report_fail_fmt(format_args!(
-            "FAIL stack_hwm={stack_hwm}<{STACK_HWM_FLOOR} heap_free={free_heap} min_heap={min_heap} tx_write_failures={tx_write_failures}"
+            "FAIL stack_hwm={stack_hwm}<{STACK_HWM_FLOOR} heap_free={free_heap} min_heap={min_heap} tx_write_failures={tx_write_failures} rr={reset_reason}"
         )));
     }
     None
@@ -1675,22 +1745,32 @@ mod tests {
         }
     }
 
+    /// Every metric exactly at its floor: the passing baseline the tests below perturb
+    /// one field at a time, so each case names only what it is testing.
+    fn at_floor() -> HealthSample {
+        HealthSample {
+            free_heap: HEAP_FREE_FLOOR,
+            min_heap: HEAP_MIN_EVER_FLOOR,
+            stack_hwm: STACK_HWM_FLOOR,
+            tx_write_failures: 0,
+            reset_reason: 1,
+        }
+    }
+
     #[test]
     fn evaluate_health_all_at_floor_pass() {
         assert!(
-            evaluate_health(HEAP_FREE_FLOOR, HEAP_MIN_EVER_FLOOR, STACK_HWM_FLOOR, 0).is_none(),
+            evaluate_health(at_floor()).is_none(),
             "all metrics at floor must pass"
         );
     }
 
     #[test]
     fn evaluate_health_heap_free_below_floor_fails() {
-        let (status, msg) = health_fail(evaluate_health(
-            HEAP_FREE_FLOOR - 1,
-            HEAP_MIN_EVER_FLOOR,
-            STACK_HWM_FLOOR,
-            0,
-        ));
+        let (status, msg) = health_fail(evaluate_health(HealthSample {
+            free_heap: HEAP_FREE_FLOOR - 1,
+            ..at_floor()
+        }));
         assert_eq!(status, Status::Fail);
         assert!(
             msg.starts_with(&format!(
@@ -1703,12 +1783,10 @@ mod tests {
 
     #[test]
     fn evaluate_health_min_heap_below_floor_fails() {
-        let (status, msg) = health_fail(evaluate_health(
-            HEAP_FREE_FLOOR,
-            HEAP_MIN_EVER_FLOOR - 1,
-            STACK_HWM_FLOOR,
-            0,
-        ));
+        let (status, msg) = health_fail(evaluate_health(HealthSample {
+            min_heap: HEAP_MIN_EVER_FLOOR - 1,
+            ..at_floor()
+        }));
         assert_eq!(status, Status::Fail);
         // Hardcoded literal (not built from the constants `evaluate_health` itself
         // interpolates): witnesses both the baked number and the message format
@@ -1721,12 +1799,10 @@ mod tests {
 
     #[test]
     fn evaluate_health_stack_hwm_below_floor_fails() {
-        let (status, msg) = health_fail(evaluate_health(
-            HEAP_FREE_FLOOR,
-            HEAP_MIN_EVER_FLOOR,
-            STACK_HWM_FLOOR - 1,
-            0,
-        ));
+        let (status, msg) = health_fail(evaluate_health(HealthSample {
+            stack_hwm: STACK_HWM_FLOOR - 1,
+            ..at_floor()
+        }));
         assert_eq!(status, Status::Fail);
         assert!(
             msg.starts_with(&format!(
@@ -1741,7 +1817,12 @@ mod tests {
     /// binding constraint whenever both are breached, since min_heap <= free_heap.
     #[test]
     fn evaluate_health_min_heap_fails_first() {
-        let (status, msg) = health_fail(evaluate_health(0, 0, 0, 0));
+        let (status, msg) = health_fail(evaluate_health(HealthSample {
+            free_heap: 0,
+            min_heap: 0,
+            stack_hwm: 0,
+            ..at_floor()
+        }));
         assert_eq!(status, Status::Fail);
         assert!(
             msg.starts_with("FAIL min_heap="),
@@ -1754,9 +1835,143 @@ mod tests {
     #[test]
     fn evaluate_health_tx_failures_do_not_fail() {
         assert!(
-            evaluate_health(HEAP_FREE_FLOOR, HEAP_MIN_EVER_FLOOR, STACK_HWM_FLOOR, 7).is_none(),
+            evaluate_health(HealthSample {
+                tx_write_failures: 7,
+                ..at_floor()
+            })
+            .is_none(),
             "non-zero tx_write_failures must not fail"
         );
+    }
+
+    /// The boot path never decides pass/fail — a floor-clearing sample passes whatever
+    /// reset reason produced it.
+    #[test]
+    fn evaluate_health_reset_reason_does_not_fail() {
+        assert!(
+            evaluate_health(HealthSample {
+                reset_reason: 0,
+                ..at_floor()
+            })
+            .is_none(),
+            "reset reason must not affect pass/fail"
+        );
+    }
+
+    /// Every fail detail carries the boot path: the predicted failure mode is a heap
+    /// floor breach on a non-POWERON boot, so the breach line must say which boot it was.
+    #[test]
+    fn evaluate_health_fail_details_carry_reset_reason() {
+        let breached = HealthSample {
+            reset_reason: 9,
+            ..at_floor()
+        };
+        let cases = [
+            evaluate_health(HealthSample {
+                min_heap: HEAP_MIN_EVER_FLOOR - 1,
+                ..breached
+            }),
+            evaluate_health(HealthSample {
+                free_heap: HEAP_FREE_FLOOR - 1,
+                ..breached
+            }),
+            evaluate_health(HealthSample {
+                stack_hwm: STACK_HWM_FLOOR - 1,
+                ..breached
+            }),
+        ];
+        for case in cases {
+            let (_, msg) = health_fail(case);
+            assert!(
+                msg.ends_with(" rr=9"),
+                "every fail detail must carry the boot path; got: {msg}"
+            );
+        }
+    }
+
+    /// Health fail details flow into a [`TestResultMsg`], which truncates from the tail on
+    /// overflow — where `rr=` sits — and marks it with a sentinel instead of failing.
+    /// Nothing at build time catches a detail that outgrows [`TEST_RESULT_MSG_CAP`], so the
+    /// worst case is asserted here.
+    ///
+    /// Heap byte counts fit 6 digits on the internal-RAM heap and stack high-water marks fit
+    /// 5 — upper bounds tied to device characteristics — while `reset_reason` is a `u8`.
+    /// `tx_write_failures` has no such bound, so it runs at `u32::MAX` here, as `wsub` does
+    /// in `rtd_detail_length_budget`. Each breaching field is capped tighter still — the
+    /// branch only fires below its floor — so each case sets the breach to `floor - 1` and
+    /// every other field to its cap.
+    #[test]
+    fn evaluate_health_fail_detail_width_budget() {
+        let capped = HealthSample {
+            free_heap: 999_999,
+            min_heap: 999_999,
+            stack_hwm: 99_999,
+            tx_write_failures: u32::MAX,
+            reset_reason: u8::MAX,
+        };
+        let cases = [
+            evaluate_health(HealthSample {
+                min_heap: HEAP_MIN_EVER_FLOOR - 1,
+                ..capped
+            }),
+            evaluate_health(HealthSample {
+                free_heap: HEAP_FREE_FLOOR - 1,
+                ..capped
+            }),
+            evaluate_health(HealthSample {
+                stack_hwm: STACK_HWM_FLOOR - 1,
+                ..capped
+            }),
+        ];
+        for case in cases {
+            let (_, msg) = health_fail(case);
+            assert!(
+                msg.len() <= TEST_RESULT_MSG_CAP,
+                "worst-case health detail ({} bytes) exceeds the {TEST_RESULT_MSG_CAP}-byte \
+                 cap: {msg:?}",
+                msg.len()
+            );
+            assert!(
+                !msg.contains(TRUNCATION_SENTINEL),
+                "worst-case health detail was truncated: {msg:?}"
+            );
+            assert!(
+                msg.ends_with(" rr=255"),
+                "the boot path is the trailing token truncation drops first: {msg:?}"
+            );
+        }
+    }
+
+    // ── reset_reason_label ─────────────────────────────────────────────────────
+
+    /// Every code the device's SDK asserts pin maps to its ESP-IDF name.
+    #[test]
+    fn reset_reason_label_maps_every_pinned_code() {
+        for (code, label) in [
+            (1u8, "POWERON"),
+            (2, "EXT"),
+            (3, "SW"),
+            (4, "PANIC"),
+            (5, "INT_WDT"),
+            (6, "TASK_WDT"),
+            (7, "WDT"),
+            (8, "DEEPSLEEP"),
+            (9, "BROWNOUT"),
+            (10, "SDIO"),
+        ] {
+            assert_eq!(reset_reason_label(code), label, "code {code}");
+        }
+    }
+
+    /// `ESP_RST_UNKNOWN` (0) is a deliberate fallthrough, not an omission: it is what a
+    /// post-flash reset reports, and `"unknown"` keeps the boot line matching the
+    /// historical logs the heap-sample population was read out of. Codes above the table
+    /// (a future IDF variant) and the out-of-range sentinel land in the same arm.
+    #[test]
+    fn reset_reason_label_unmapped_codes_are_unknown() {
+        for code in [0u8, 11, 254, u8::MAX] {
+            assert_eq!(reset_reason_label(code), "unknown", "code {code}");
+        }
     }
 
     /// Guard: these floors are hardware-baked, not free to edit in passing. A move
@@ -2786,6 +3001,7 @@ mod typed_report_tests {
                 writer_anomalies: 0,
                 encode_failures: 0,
                 tx_write_failures: 0,
+                reset_reason: 1,
             },
             TestData::I2cScan {
                 found,

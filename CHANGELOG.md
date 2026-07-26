@@ -7,6 +7,20 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ## [Unreleased]
 
+### Added
+
+- **Boot-path labels on every reported heap sample.** The heap floors are since-boot low
+  watermarks baked on `POWERON` boots alone, and nothing joined a heap figure to the boot
+  that produced it. The raw `esp_reset_reason_t` code now rides with the samples:
+  `TestData::DeviceHealth` gains a `reset_reason` field (a wire-schema change),
+  `DeviceHealthCheck` fail details end in `rr=<code>`, and the `StreamRealtimeDuplex` detail
+  line carries `rr=` beside `mh_post`. `device_protocol::reset_reason_label` decodes the
+  code and now also backs the boot log line, which gained the raw code alongside the label.
+- **`wsub=` on the `StreamRealtimeDuplex` report** — how many times the TLS session polled
+  the direction esp-tls asked for instead of the one the caller armed. That branch is
+  data-dependent and nothing recorded whether it ever fired. The decision is factored into
+  a host-tested pure function, so poll behavior is pinned by an exhaustive truth table.
+
 ### Changed
 
 - **Rust edition 2024 pinned across both workspaces**, inherited per crate from
