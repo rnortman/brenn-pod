@@ -1,0 +1,24 @@
+[package]
+name = "pod-streamer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The transport-independent half of the pod audio streamer: the link/poll seams and
+# the event-loop pacing arithmetic, shared by the ESP32 firmware and the Linux pod.
+# std-only with no system dependencies, so it stays in default-members and plain
+# `cargo test` covers it. Depends on no platform crate — in particular, never on
+# esp-idf-svc.
+
+[dependencies]
+audio-pipeline = { path = "../audio-pipeline", features = ["std"] }
+# The segment engine builds `AudioFrame`s, whose PCM payload is a `heapless::Vec`.
+heapless = { version = "0.9" }
+# Segment-loop diagnostics (poll faults, encode failures, backpressure) are identical
+# on every pod, so the messages live with the engine rather than in each platform.
+log = { workspace = true }
+# The telemetry poll core speaks the XVF3800 control protocol over whichever
+# transport the platform supplies.
+xvf3800-ctrl = { path = "../xvf3800-ctrl" }
+# Reconnect pacing: the idle loop's jittered-exponential backoff ladder.
+wifi-reconnect = { path = "../wifi-reconnect" }

@@ -308,6 +308,117 @@ pub fn next_preroll_target(current: usize) -> usize {
         .min(PLAYBACK_PREROLL_MAX_TARGET_BYTES)
 }
 
+/// How much audio a pod banks before playing, and when that answer changes.
+///
+/// The four pieces of state are held together rather than left as loose flags because
+/// every arming site must set all of them: a re-arm that forgets the fallback clock
+/// times the next window from the previous stream's first bytes and clears at once, and
+/// one that forgets the audio-seen edge treats the next idle gap as an underrun.
+///
+/// One owner for both pods. The escalation rule here is bench-tuned, so a retune must
+/// not be able to land on one platform only; what stays platform-side is the drain loop
+/// around it and the fallback wait each pod passes to [`admit`](Self::admit).
+pub struct PrerollGate {
+    pending: bool,
+    /// Starts at the first banked bytes of a window, so the fallback times from audio
+    /// arriving rather than from the window opening. Cleared by every re-arm.
+    first_bytes_at: Option<std::time::Instant>,
+    target: usize,
+    /// Whether audio has been seen since the ring last ran dry — the edge that tells a
+    /// mid-stream underrun from an idle pod.
+    saw_audio: bool,
+}
+
+impl Default for PrerollGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PrerollGate {
+    /// A gate armed at the base target, with no clock and no stream seen yet.
+    pub fn new() -> Self {
+        Self {
+            pending: true,
+            first_bytes_at: None,
+            target: PLAYBACK_PREROLL_TARGET_BYTES,
+            saw_audio: false,
+        }
+    }
+
+    /// Whether audio is being held rather than played.
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// The depth currently being waited for.
+    pub fn target(&self) -> usize {
+        self.target
+    }
+
+    /// Whether audio has arrived since the ring last read empty.
+    pub fn saw_audio(&self) -> bool {
+        self.saw_audio
+    }
+
+    /// Record that audio is present, for a caller whose non-empty edge is observed
+    /// somewhere other than [`admit`](Self::admit).
+    pub fn note_audio_seen(&mut self) {
+        self.saw_audio = true;
+    }
+
+    /// Drop the audio-seen edge without re-arming — an empty ring that is not an
+    /// underrun, so the next non-empty poll starts a fresh streak.
+    pub fn clear_audio_seen(&mut self) {
+        self.saw_audio = false;
+    }
+
+    /// Re-arm at the base target: a fresh stream, whose predecessor's difficulties say
+    /// nothing about it.
+    pub fn arm_base(&mut self) {
+        self.pending = true;
+        self.first_bytes_at = None;
+        self.saw_audio = false;
+        self.target = PLAYBACK_PREROLL_TARGET_BYTES;
+    }
+
+    /// Re-arm with a deeper target after an underrun, returning the new target.
+    ///
+    /// Rebuilding at the depth that just failed would underrun again on the next dip, so
+    /// the depth climbs with what the link is doing ([`next_preroll_target`]). Returned
+    /// rather than left to be re-read so the caller can name the transition in its log
+    /// line without recomputing it.
+    pub fn rearm_escalated(&mut self) -> usize {
+        self.pending = true;
+        self.first_bytes_at = None;
+        self.saw_audio = false;
+        self.target = next_preroll_target(self.target);
+        self.target
+    }
+
+    /// May the drain play, given `available` banked bytes at `now`?
+    ///
+    /// Also runs the fallback clock, which is why it takes `&mut self` and a time rather
+    /// than being a predicate over the depth alone. `max_wait_ms` is the pod's own
+    /// fallback bound — the ceiling on how long a short stream is held.
+    pub fn admit(&mut self, available: usize, now: std::time::Instant, max_wait_ms: u64) -> bool {
+        if available > 0 && self.first_bytes_at.is_none() {
+            self.first_bytes_at = Some(now);
+        }
+        if !self.pending {
+            return true;
+        }
+        let waited = self
+            .first_bytes_at
+            .map(|since| now.duration_since(since).as_millis() as u64);
+        if preroll_gate_ready(available, self.target, waited, max_wait_ms) {
+            self.pending = false;
+            return true;
+        }
+        false
+    }
+}
+
 /// One drain write-unit / wire frame in **raw** bytes: 320 samples × 2 B = 640 (20 ms at 16 kHz)
 /// (design §3.1). The consumer drains the ring in runs capped at
 /// this size; each raw run is then expanded to `640 / 2 × I2S_TX_FRAME_BYTES = 2 560` I2S-frame bytes
@@ -1044,6 +1155,13 @@ pub trait PlaybackSink {
     /// everything banked and go silent immediately (barge-in mechanism). Default no-op;
     /// `I2sStreamSink` overrides it to reset the ring and mark end-of-audio.
     fn flush_playback(&mut self) {}
+
+    /// Mark a (re)connection boundary: everything banked belongs to the previous
+    /// connection's stream and must not play out under the new one. Called when a
+    /// socket is installed, so it lands after the teardown's
+    /// [`end_of_audio`](PlaybackSink::end_of_audio) and supersedes it. Default
+    /// no-op so non-playback sinks (counting/test) need not react.
+    fn stream_reset(&mut self) {}
 }
 
 /// Real speaker-output playback sink (Seam C, design §2.3).
@@ -1297,28 +1415,23 @@ impl PlaybackSink for I2sStreamSink {
             producer.mark_end_of_audio();
         }
     }
-}
 
-impl I2sStreamSink {
-    /// Mark a (re)connection boundary on the ring (design §2.8), replacing the prior
-    /// channel `StreamReset` enqueue.
+    /// Mark a (re)connection boundary on the ring.
     ///
-    /// The reset is now an **infallible** producer operation: [`InboundRingProducer::reset`]
-    /// locks the ring and bumps `generation` + records `head_at_reset` under that lock. Because
-    /// the producer is the sole `head` writer, the reset is ordered after all prior writes and
-    /// before all subsequent writes by single-writer construction — the FIFO "boundary, then
-    /// fresh audio" ordering the old `StreamReset` channel message provided, without a separate
-    /// ordered marker and **without a `Full` failure mode**: there is always room for a
-    /// generation bump (it writes no audio bytes). The prior channel-based `Full`/`pending_reset`
-    /// retry dance therefore disappears (design §2.8).
+    /// [`InboundRingProducer::reset`] locks the ring and bumps `generation` + records
+    /// `head_at_reset` under that lock. Because the producer is the sole `head` writer, the
+    /// reset is ordered after all prior writes and before all subsequent writes by
+    /// single-writer construction — the FIFO "boundary, then fresh audio" ordering — and
+    /// **without a `Full` failure mode**: there is always room for a generation bump (it
+    /// writes no audio bytes).
     ///
-    /// Infallible: a generation bump always has room (it writes no audio bytes), so there is no
-    /// result to return. The two arms differ only in their side effect:
+    /// Infallible: a generation bump always has room, so there is no result to return. The
+    /// two arms differ only in their side effect:
     /// - **producer wired** → the reset is applied.
     /// - **no producer wired** (should-never-happen ordering bug) → dead-channel discard (counted
     ///   in `dead_channel_discards`, exactly as `accept`'s no-producer arm); there is no ring to
     ///   reset.
-    pub fn send_stream_reset(&mut self) {
+    fn stream_reset(&mut self) {
         match self.producer.as_ref() {
             Some(producer) => producer.reset(),
             // No producer wired (should-never-happen ordering bug) — discard-and-count like the
@@ -1328,8 +1441,10 @@ impl I2sStreamSink {
             }
         }
     }
+}
 
-    /// Consumer-stall watchdog (design §6.2(b)) — run on every ring-full `accept` stall.
+impl I2sStreamSink {
+    /// Consumer-stall watchdog — run on every ring-full `accept` stall.
     ///
     /// A ring has no `Disconnected` state, so a vanished/wedged consumer (capture/DAC thread) does
     /// not surface as data loss the way the channel's `dead_channel_discards` did; it surfaces as a
@@ -1408,7 +1523,7 @@ mod tests {
     use super::{
         Accepted, I2S_TX_FRAME_BYTES, I2sStreamSink, InboundPcmRing, InboundRingConsumer,
         LogCountdown, PLAYBACK_CONSUMER_STALL_WARN_STALLS, PLAYBACK_LOG_CADENCE_FRAMES,
-        PLAYBACK_PREROLL_MAX_TARGET_BYTES, PlaybackSink, WIRE_BYTES_PER_SAMPLE,
+        PLAYBACK_PREROLL_MAX_TARGET_BYTES, PlaybackSink, PrerollGate, WIRE_BYTES_PER_SAMPLE,
         expand_run_in_place, expand_run_into, expand_sample_to_frame, is_drop_burst,
         next_preroll_target, preroll_gate_ready,
     };
@@ -1796,30 +1911,21 @@ mod tests {
         );
     }
 
-    // ── send_stream_reset (ring reset) unit tests (design §2.8, §4) ─────────────────
-    //
-    // `send_stream_reset` now calls `InboundRingProducer::reset` instead of enqueuing a
-    // channel `StreamReset` message. The reset is **infallible** — it bumps the ring's
-    // `generation` under the lock, writing no audio bytes, so it cannot fail and returns unit; the
-    // prior channel `Full`/`pending_reset` retry path and the `Disconnected` arm are gone (a ring
-    // cannot hang up — design §6.2). The no-producer arm remains (dead-channel discard). The
-    // load-bearing FIFO ordering — "boundary, then fresh audio", which the consumer observes via
-    // the generation bump — is preserved by single-writer construction (design §2.8) and pinned
-    // by `stream_reset_is_ordered_before_a_following_chunk` below.
+    // ── stream_reset (ring reset) unit tests ──────────────────────────────────
 
-    /// `send_stream_reset` bumps the ring `generation` exactly once and does not touch the
+    /// `stream_reset` bumps the ring `generation` exactly once and does not touch the
     /// audio-frame or backpressure counters (a reset is a boundary marker, not audio).
     #[test]
-    fn send_stream_reset_bumps_generation_once() {
+    fn stream_reset_bumps_generation_once() {
         let (producer, consumer) = InboundPcmRing::new(1024).split();
         let mut sink = I2sStreamSink::with_producer(Some(producer));
         let gen0 = consumer.generation();
 
-        sink.send_stream_reset();
+        sink.stream_reset();
         let gen1 = consumer.generation();
         assert_ne!(
             gen1, gen0,
-            "send_stream_reset must bump the ring generation exactly once"
+            "stream_reset must bump the ring generation exactly once"
         );
 
         // A reset moves no audio-frame counters and is neither a stall nor a discard.
@@ -1833,13 +1939,12 @@ mod tests {
     }
 
     /// A reset against a **full** ring still succeeds (it writes no audio bytes, so fullness
-    /// cannot block it) — the prior channel `Full` reset path is gone (design §2.8). The ring's
-    /// buffered audio is untouched: the generation bump records `head_at_reset = head` but does
-    /// not drop any bytes until the consumer applies the reset.
+    /// cannot block it). The ring's buffered audio is untouched: the generation bump records
+    /// `head_at_reset = head` but does not drop any bytes until the consumer applies the reset.
     #[test]
-    fn send_stream_reset_succeeds_on_full_ring() {
+    fn stream_reset_succeeds_on_full_ring() {
         const N: usize = 8;
-        const FRAME_RAW_BYTES: usize = WIRE_BYTES_PER_SAMPLE; // one S16 sample, stored raw (design §3.1)
+        const FRAME_RAW_BYTES: usize = WIRE_BYTES_PER_SAMPLE; // one S16 sample, stored raw
         let (producer, consumer) = InboundPcmRing::new(N * FRAME_RAW_BYTES).split();
         let mut sink = I2sStreamSink::with_producer(Some(producer));
 
@@ -1852,7 +1957,7 @@ mod tests {
         let gen0 = consumer.generation();
 
         // A reset against a full ring must still succeed (it buffers no audio).
-        sink.send_stream_reset();
+        sink.stream_reset();
         assert_ne!(
             consumer.generation(),
             gen0,
@@ -1868,14 +1973,12 @@ mod tests {
         );
     }
 
-    /// A sink built with no producer wired (`with_producer(None)`) discards + counts the reset and
-    /// reports `Enqueued` (forward progress) — the same no-producer data-loss contract `accept`
-    /// uses. (There is no `Disconnected` arm: a ring cannot hang up, design §6.2, so the prior
-    /// `send_stream_reset_discards_on_disconnected_channel` test is removed with its condition.)
+    /// A sink with no producer wired (`with_producer(None)`) counts the no-op reset as a
+    /// dead-channel discard — the same loss contract as `accept`'s no-producer arm.
     #[test]
-    fn send_stream_reset_discards_with_no_producer() {
+    fn stream_reset_discards_with_no_producer() {
         let mut sink = I2sStreamSink::with_producer(None);
-        sink.send_stream_reset();
+        sink.stream_reset();
         assert_eq!(
             sink.dead_channel_discards, 1,
             "no-producer reset must count as a dead-channel discard"
@@ -1902,7 +2005,7 @@ mod tests {
         let a: [u8; 2] = [0x11, 0x11];
         assert_eq!(sink.accept(&a), Accepted::Enqueued);
         // Establishment order: reset the boundary, then write the new stream's first frame B.
-        sink.send_stream_reset();
+        sink.stream_reset();
         let b: [u8; 2] = [0x22, 0x22];
         assert_eq!(sink.accept(&b), Accepted::Enqueued);
 
@@ -3288,6 +3391,104 @@ mod tests {
             PLAYBACK_PREROLL_TARGET_BYTES < next_preroll_target(PLAYBACK_PREROLL_TARGET_BYTES),
             "reset-to-base must land below the first escalation step, or reconnect reset is a no-op"
         );
+    }
+
+    // ── PrerollGate ────────────────────────────────────────────────────────────
+    //
+    // The gate is the state machine both pods arm; these pin the transitions each of
+    // them depends on, so a retune cannot land on one platform only.
+
+    #[test]
+    fn preroll_gate_new_is_armed_at_base() {
+        let g = PrerollGate::new();
+        assert!(g.pending(), "a new gate holds audio");
+        assert_eq!(g.target(), PLAYBACK_PREROLL_TARGET_BYTES);
+        assert!(!g.saw_audio(), "no stream has been seen yet");
+    }
+
+    #[test]
+    fn preroll_gate_arm_base_rebases_and_clears_the_clock() {
+        let mut g = PrerollGate::new();
+        // A live, escalated, mid-stream gate: opened, clocked, and past one underrun.
+        let now = std::time::Instant::now();
+        assert!(g.admit(PLAYBACK_PREROLL_TARGET_BYTES, now, 500));
+        g.rearm_escalated();
+        g.note_audio_seen();
+
+        g.arm_base();
+        assert!(g.pending());
+        assert_eq!(
+            g.target(),
+            PLAYBACK_PREROLL_TARGET_BYTES,
+            "a fresh stream re-bases the target"
+        );
+        assert!(!g.saw_audio());
+        // The clock was cleared with it: a poll long after the previous window's first
+        // bytes does not open the gate, because this window has seen none.
+        assert!(!g.admit(0, now + std::time::Duration::from_secs(60), 500));
+    }
+
+    #[test]
+    fn preroll_gate_rearm_escalates_and_clears_the_clock() {
+        let mut g = PrerollGate::new();
+        let now = std::time::Instant::now();
+        assert!(g.admit(PLAYBACK_PREROLL_TARGET_BYTES, now, 500));
+        g.note_audio_seen();
+        let expected = next_preroll_target(g.target());
+
+        assert_eq!(
+            g.rearm_escalated(),
+            expected,
+            "the returned target is the one adopted"
+        );
+        assert!(g.pending());
+        assert_eq!(g.target(), expected);
+        assert!(!g.saw_audio());
+        assert!(
+            !g.admit(0, now + std::time::Duration::from_secs(60), 500),
+            "the fallback clock restarts with the window, not with the previous stream"
+        );
+    }
+
+    #[test]
+    fn preroll_gate_opens_on_depth_and_on_the_fallback() {
+        let start = std::time::Instant::now();
+        let mut by_depth = PrerollGate::new();
+        assert!(
+            !by_depth.admit(PLAYBACK_PREROLL_TARGET_BYTES - 1, start, 500),
+            "a byte short of the target still fills"
+        );
+        assert!(by_depth.admit(PLAYBACK_PREROLL_TARGET_BYTES, start, 500));
+        assert!(!by_depth.pending(), "an opened gate stays open");
+
+        let mut by_wait = PrerollGate::new();
+        assert!(!by_wait.admit(0, start, 500), "no audio, no clock");
+        assert!(
+            !by_wait.admit(1, start + std::time::Duration::from_secs(10), 500),
+            "the clock starts at the first bytes, not at the window"
+        );
+        assert!(
+            by_wait.admit(1, start + std::time::Duration::from_millis(10_500), 500),
+            "the fallback plays whatever is banked once the bound is reached"
+        );
+    }
+
+    #[test]
+    fn preroll_gate_audio_edge_is_settable_and_clearable() {
+        let mut g = PrerollGate::new();
+        assert!(!g.saw_audio());
+        g.note_audio_seen();
+        assert!(
+            g.saw_audio(),
+            "the non-empty edge is observable by both pods"
+        );
+        g.clear_audio_seen();
+        assert!(
+            !g.saw_audio(),
+            "an idle empty ring drops the edge without re-arming"
+        );
+        assert!(g.pending(), "clearing the edge is not an arming site");
+        assert_eq!(g.target(), PLAYBACK_PREROLL_TARGET_BYTES);
     }
 
     /// Pin the escalating-preroll cap so a silent retune of the §3.3 ceiling is visible in test

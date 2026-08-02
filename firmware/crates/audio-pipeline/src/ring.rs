@@ -34,6 +34,244 @@ pub const RING_CAPACITY_SAMPLES: usize = (RING_SECONDS * SAMPLE_RATE_HZ) as usiz
 /// pre-roll sample as a whole frame, leaving no steady-state tail.
 pub const PREROLL_SAMPLES: u64 = SAMPLE_RATE_HZ as u64;
 
+// ── CaptureRing ───────────────────────────────────────────────────────────────
+
+/// The capture ring's sample storage plus the head/anchor bookkeeping that dates it,
+/// held together so a reader under one lock gets a consistent snapshot.
+///
+/// Generic over the backing buffer so each platform supplies its own allocation:
+/// `B` is expected to deref to `[i16]` of `RING_CAPACITY_SAMPLES` samples (the ESP pod
+/// passes a PSRAM buffer, a Linux pod a `Box<[i16]>`). No bound is declared here — the
+/// struct is plain state with no methods of its own, and the consumers that index
+/// `samples` carry the `Deref`/`DerefMut` bounds they need.
+///
+/// Typical callers:
+/// - Capture thread: locks, writes samples, advances `write_head`, updates the anchor.
+///   Hold time is one chunk write (≤ 320 samples × 2 B ≈ negligible).
+/// - Streamer / self-tests: lock, read samples and/or head and anchor, unlock.
+pub struct CaptureRing<B> {
+    /// Sample storage, capacity = [`RING_CAPACITY_SAMPLES`].
+    pub samples: B,
+    /// Absolute sample index of the next slot to be written (monotonically increasing).
+    pub write_head: u64,
+    /// Sample index at the moment `anchor_ts_us` was recorded.
+    pub anchor_sample: u64,
+    /// Platform monotonic µs at the moment `anchor_sample` was captured. Only offsets
+    /// within a segment are wire-visible, so the epoch is the platform's own.
+    pub anchor_ts_us: u64,
+}
+
+// ── Signal sanity ─────────────────────────────────────────────────────────────
+
+/// Normalized lag-1 autocorrelation from pre-accumulated sums.
+///
+/// Returns r1 in [-1, 1] (0.0 when `sq_sum == 0`). The i64→f32 cast loses ≲0.01
+/// relative — safe against the autocorrelation floors the capture sanity tests use
+/// (0.2 vs expected ~0.68).
+pub fn autocorr_lag1_from_sums(lag1_sum: i64, sq_sum: i64) -> f32 {
+    if sq_sum == 0 {
+        0.0
+    } else {
+        (lag1_sum as f32) / (sq_sum as f32)
+    }
+}
+
+/// Dead-line guard: the smallest absolute peak (`max(|min|, |max|)`) a live channel may
+/// show. A window at or below it is treated as a dead / all-zero line.
+///
+/// This is NOT a loudness floor — a healthy mic in a quiet room produces a quiet but
+/// correlated signal that must PASS. Confirmed quiet-room audio reaches `max_abs` as low
+/// as 38; this sits well below that and above a truly dead line (≈0 plus a few LSB of
+/// interference). The real broken-versus-working discriminator is [`AUTOCORR_FLOOR`].
+pub const ZERO_ABS_THRESHOLD: i32 = 16;
+
+/// Frozen-line guard: the smallest spread (`max − min`) a live channel may show.
+///
+/// Autocorrelation cannot catch a frozen line on its own — a constant value has
+/// `ac1 ≈ 1.0` and sails through the autocorr gate — so this small spread floor is the
+/// dedicated anti-frozen guard. A frozen / 1-bit line has spread ≈ 0–2, while confirmed
+/// quiet-room audio has spread ≥ 76; 32 separates the two with margin on both sides.
+pub const STUCK_SPREAD_FLOOR: i32 = 32;
+
+/// Near-full-scale magnitude counted as clipped. Below `i16::MAX` by enough margin to
+/// catch sustained clipping while allowing occasional transients.
+pub const SATURATION_ABS: i32 = 32_700;
+
+/// The fraction of clipped samples at which a channel is called saturated.
+pub const SATURATION_FRAC_MAX: f32 = 0.95;
+
+/// Normalized lag-1 autocorrelation floor — the primary health gate.
+///
+/// This is the real broken-versus-working discriminator: full-scale random noise (the
+/// two-master clock-contention failure mode) has ac1 ≈ 0, while real acoustic audio is
+/// strongly correlated (confirmed across 60 quiet-room windows, ac1 0.41–0.97 every
+/// window). 0.2 sits with margin below the observed acoustic minimum and well above RNG
+/// noise.
+///
+/// These five thresholds were calibrated on the ESP pod's hardware and are shared by
+/// every liveness check in the tree. A reading that fails one on a different board is a
+/// value for a human to review, not a threshold to lower quietly — and when one is
+/// retuned it must move for every check at once, which is why they live here.
+pub const AUTOCORR_FLOOR: f32 = 0.2;
+
+/// What one channel's capture window looks like.
+///
+/// Summary only: the judgement is [`defect`](Self::defect), so a caller that reports the
+/// reading and a caller that gates on it cannot disagree about what "live" means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveformStats {
+    /// Samples the window was accumulated from.
+    pub samples: usize,
+    /// Smallest sample value seen (0 for an empty window).
+    pub min: i32,
+    /// Largest sample value seen (0 for an empty window).
+    pub max: i32,
+    /// Mean of the squared samples — `rms²`. The square root is left to
+    /// [`rms`](Self::rms) so the accumulation stays free of `std`'s float math.
+    pub mean_square: f32,
+    /// Fraction of samples at or beyond [`SATURATION_ABS`].
+    pub saturated_fraction: f32,
+    /// Normalized lag-1 autocorrelation over the window.
+    pub autocorr_lag1: f32,
+}
+
+impl WaveformStats {
+    /// Summarize one contiguous window.
+    pub fn of(samples: &[i16]) -> Self {
+        let mut accum = WaveformAccum::new();
+        for sample in samples {
+            accum.push(*sample);
+        }
+        accum.finish()
+    }
+
+    /// Absolute peak of the window.
+    pub fn max_abs(&self) -> i32 {
+        self.max.abs().max(self.min.abs())
+    }
+
+    /// Distance between the extremes of the window.
+    pub fn spread(&self) -> i32 {
+        self.max - self.min
+    }
+
+    /// Root mean square of the window — reported, never gated on: a quiet room must
+    /// pass, so there is deliberately no loudness floor.
+    #[cfg(feature = "std")]
+    pub fn rms(&self) -> f32 {
+        self.mean_square.sqrt()
+    }
+
+    /// Why this window is not live audio, or `None` if it is.
+    ///
+    /// Ordered so the most specific diagnosis wins: a dead line is also uncorrelated,
+    /// and reporting it as low autocorrelation would send someone looking at the wrong
+    /// thing.
+    pub fn defect(&self) -> Option<&'static str> {
+        if self.samples == 0 {
+            Some("no samples")
+        } else if self.max_abs() <= ZERO_ABS_THRESHOLD {
+            Some("all-zero")
+        } else if self.spread() <= STUCK_SPREAD_FLOOR {
+            Some("stuck-constant")
+        } else if self.saturated_fraction >= SATURATION_FRAC_MAX {
+            Some("saturated")
+        } else if self.autocorr_lag1 <= AUTOCORR_FLOOR {
+            Some("low-autocorr")
+        } else {
+            None
+        }
+    }
+}
+
+/// The reading as a human reviewing it wants to see it — every statistic, including the
+/// ones nothing gates on, because an unexpected value is reviewed before it is accepted.
+#[cfg(feature = "std")]
+impl core::fmt::Display for WaveformStats {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "min={} max={} rms={:.0} sat={:.0}% ac1={:.3} samples={}",
+            self.min,
+            self.max,
+            self.rms(),
+            self.saturated_fraction * 100.0,
+            self.autocorr_lag1,
+            self.samples
+        )
+    }
+}
+
+/// Accumulates [`WaveformStats`] one sample at a time.
+///
+/// Sample-at-a-time rather than slice-at-a-time because a window read straight out of a
+/// wrapping capture ring is not contiguous; a caller with a slice uses
+/// [`WaveformStats::of`].
+pub struct WaveformAccum {
+    samples: usize,
+    min: i32,
+    max: i32,
+    sq_sum: i64,
+    lag1_sum: i64,
+    saturated: usize,
+    prev: i64,
+}
+
+impl Default for WaveformAccum {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WaveformAccum {
+    /// An empty window.
+    pub fn new() -> Self {
+        Self {
+            samples: 0,
+            min: i32::MAX,
+            max: i32::MIN,
+            sq_sum: 0,
+            lag1_sum: 0,
+            saturated: 0,
+            prev: 0,
+        }
+    }
+
+    /// Fold one sample in, in capture order — the lag-1 term pairs it with the previous
+    /// one, so out-of-order pushes report a correlation that is not the signal's.
+    pub fn push(&mut self, sample: i16) {
+        let value = sample as i32;
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+        let value64 = value as i64;
+        self.sq_sum += value64 * value64;
+        if value.abs() >= SATURATION_ABS {
+            self.saturated += 1;
+        }
+        if self.samples > 0 {
+            self.lag1_sum += value64 * self.prev;
+        }
+        self.prev = value64;
+        self.samples += 1;
+    }
+
+    /// The window's summary. The accumulator is left intact, so a caller polling a
+    /// filling window can read it more than once.
+    pub fn finish(&self) -> WaveformStats {
+        // The denominator floors at 1 so an empty window reports zeros rather than NaN;
+        // `samples == 0` is what `defect` keys the "no samples" diagnosis on.
+        let n = self.samples.max(1) as f32;
+        WaveformStats {
+            samples: self.samples,
+            min: if self.samples == 0 { 0 } else { self.min },
+            max: if self.samples == 0 { 0 } else { self.max },
+            mean_square: (self.sq_sum as f32) / n,
+            saturated_fraction: self.saturated as f32 / n,
+            autocorr_lag1: autocorr_lag1_from_sums(self.lag1_sum, self.sq_sum),
+        }
+    }
+}
+
 // ── RingIndex ─────────────────────────────────────────────────────────────────
 
 /// Stateless ring-index helper.  All operations are pure functions of the
@@ -294,5 +532,246 @@ mod tests {
     #[test]
     fn preroll_samples_constant() {
         assert_eq!(PREROLL_SAMPLES, 16_000);
+    }
+
+    // ── autocorr_lag1_from_sums ────────────────────────────────────────────────
+
+    #[test]
+    fn autocorr_all_zero() {
+        let r1 = autocorr_lag1_from_sums(0, 0);
+        assert_eq!(r1, 0.0, "all-zero: r1 must be 0.0");
+    }
+
+    #[test]
+    fn autocorr_constant_signal() {
+        let n = 10_i64;
+        let v: i64 = 1000;
+        let sq_sum = n * v * v;
+        let lag1_sum = (n - 1) * v * v;
+        let r1 = autocorr_lag1_from_sums(lag1_sum, sq_sum);
+        // r1 ≈ (n-1)/n = 0.9 (denominator has one extra x[0]² term)
+        assert!(
+            r1 > 0.85,
+            "constant signal: r1 must be close to 1.0, got {r1}"
+        );
+    }
+
+    #[test]
+    fn autocorr_alternating_signal() {
+        let n = 10_i64;
+        let v: i64 = 1000;
+        let sq_sum = n * v * v;
+        let lag1_sum = -(n - 1) * v * v;
+        let r1 = autocorr_lag1_from_sums(lag1_sum, sq_sum);
+        assert!(
+            r1 < -0.85,
+            "alternating signal: r1 must be close to -1.0, got {r1}"
+        );
+    }
+
+    /// Near-zero lag1_sum relative to sq_sum → r1 ≈ 0 (uncorrelated noise).
+    #[test]
+    fn autocorr_random_noise_near_zero() {
+        let lag1_sum: i64 = 10;
+        let sq_sum: i64 = 10_000;
+        let r1 = autocorr_lag1_from_sums(lag1_sum, sq_sum);
+        assert!(
+            r1.abs() < 0.3,
+            "RNG-like inputs (tiny lag1_sum vs sq_sum) must yield r1 near zero, got {r1}"
+        );
+        assert!(r1 > -1.0 && r1 < 1.0, "r1 must be in [-1, 1], got {r1}");
+    }
+
+    // ── CaptureRing ────────────────────────────────────────────────────────────
+
+    /// The backing buffer the real pods use is a heap allocation reached through
+    /// `Deref`/`DerefMut` (`PsramBuf<i16>` on the ESP, `Box<[i16]>` on Linux), so the
+    /// generic is exercised here through a boxed slice. `alloc` is linked under
+    /// `cfg(test)`, so this runs in the `no_std` lane too.
+    #[test]
+    fn capture_ring_works_over_a_deref_backing_buffer() {
+        let mut ring = CaptureRing {
+            samples: alloc::vec![0i16; 8].into_boxed_slice(),
+            write_head: 0,
+            anchor_sample: 0,
+            anchor_ts_us: 0,
+        };
+        let r = RingIndex::new(ring.samples.len());
+
+        for i in 0..10u64 {
+            ring.samples[r.slot(i)] = (i as i16) - 5;
+            ring.write_head = i + 1;
+        }
+        ring.anchor_sample = 10;
+        ring.anchor_ts_us = 4_242;
+
+        assert_eq!(
+            ring.samples[r.slot(9)],
+            4,
+            "last sample readable at its slot"
+        );
+        assert_eq!(
+            ring.samples[r.slot(8)],
+            3,
+            "the wrapped sample overwrote slot 0"
+        );
+        assert_eq!(r.oldest(ring.write_head), 2, "the first two are lapped");
+
+        // Same shape a drain uses to copy out.
+        let view: &[i16] = &ring.samples[..];
+        assert_eq!(view.len(), 8);
+        assert_eq!(&view[..3], &[3i16, 4, -3]);
+        assert_eq!(ring.anchor_ts_us, 4_242);
+    }
+
+    /// The struct declares no bound on `B`, so a bare array is a legal backing buffer
+    /// too: it is plain state, and the consumers that index `samples` carry the bounds.
+    #[test]
+    fn capture_ring_holds_samples_and_anchor() {
+        let mut ring = CaptureRing {
+            samples: [0i16; 8],
+            write_head: 0,
+            anchor_sample: 0,
+            anchor_ts_us: 0,
+        };
+        ring.samples[3] = -1234;
+        ring.write_head = 4;
+        ring.anchor_sample = 4;
+        ring.anchor_ts_us = 987_654;
+
+        let r = RingIndex::new(ring.samples.len());
+        assert_eq!(
+            ring.samples[r.slot(3)],
+            -1234,
+            "sample readable at its slot"
+        );
+        assert_eq!(r.available(ring.write_head, 0), 4);
+        assert_eq!(ring.anchor_ts_us, 987_654);
+    }
+
+    // ── Waveform sanity ────────────────────────────────────────────────────────
+
+    /// A correlated, quiet-room-shaped window: a slow sine at a level a real quiet room
+    /// reaches, so it must pass every gate without a loudness floor helping it.
+    fn quiet_speech(out: &mut [i16]) {
+        // A 40-sample period triangle: correlated, and integer-only so the fixture is
+        // the same on every target.
+        for (i, sample) in out.iter_mut().enumerate() {
+            let phase = (i % 40) as i32;
+            let value = if phase < 20 { phase - 10 } else { 30 - phase };
+            *sample = (value * 12) as i16;
+        }
+    }
+
+    /// Uncorrelated full-scale noise — the shape a contended clock produces.
+    fn noise(out: &mut [i16]) {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for sample in out.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *sample = (state >> 48) as i16;
+        }
+    }
+
+    #[test]
+    fn the_calibration_constants_are_the_bench_values() {
+        // Pinned so a retune is visible in test output rather than only in a diff, and
+        // so it has to be made once here instead of in each pod's registry.
+        assert_eq!(ZERO_ABS_THRESHOLD, 16);
+        assert_eq!(STUCK_SPREAD_FLOOR, 32);
+        assert_eq!(SATURATION_ABS, 32_700);
+        assert_eq!(SATURATION_FRAC_MAX, 0.95);
+        assert_eq!(AUTOCORR_FLOOR, 0.2);
+    }
+
+    #[test]
+    fn a_quiet_but_correlated_window_passes_with_no_loudness_floor() {
+        let mut window = [0i16; 4_000];
+        quiet_speech(&mut window);
+        let stats = WaveformStats::of(&window);
+        assert_eq!(stats.defect(), None, "{stats:?}");
+        assert!(stats.autocorr_lag1 > AUTOCORR_FLOOR, "{stats:?}");
+        // Genuinely quiet: a loudness floor anywhere in this path would have to sit
+        // below this to let a real room through.
+        assert!(stats.mean_square < 100.0 * 100.0, "{stats:?}");
+    }
+
+    #[test]
+    fn each_broken_shape_is_named_by_its_own_defect() {
+        assert_eq!(WaveformStats::of(&[0i16; 1_000]).defect(), Some("all-zero"));
+        assert_eq!(
+            WaveformStats::of(&[1_000i16; 1_000]).defect(),
+            Some("stuck-constant"),
+            "a constant line is perfectly correlated, so only the spread guard catches it"
+        );
+
+        // A square wave at the rails: correlated, loud, and clipped.
+        let mut clipped = [0i16; 1_000];
+        for (i, sample) in clipped.iter_mut().enumerate() {
+            *sample = if i % 500 < 499 { 32_760 } else { -32_760 };
+        }
+        assert_eq!(WaveformStats::of(&clipped).defect(), Some("saturated"));
+
+        let mut uncorrelated = [0i16; 4_000];
+        noise(&mut uncorrelated);
+        assert_eq!(
+            WaveformStats::of(&uncorrelated).defect(),
+            Some("low-autocorr")
+        );
+
+        assert_eq!(WaveformStats::of(&[]).defect(), Some("no samples"));
+    }
+
+    #[test]
+    fn the_most_specific_diagnosis_wins() {
+        // A dead line is also uncorrelated and also has no spread; reporting either of
+        // those would send someone looking at the wrong thing.
+        let dead = WaveformStats::of(&[0i16; 100]);
+        assert!(dead.spread() <= STUCK_SPREAD_FLOOR && dead.autocorr_lag1 <= AUTOCORR_FLOOR);
+        assert_eq!(dead.defect(), Some("all-zero"));
+    }
+
+    #[test]
+    fn an_accumulated_window_reads_the_same_as_a_contiguous_one() {
+        let mut window = [0i16; 512];
+        quiet_speech(&mut window);
+        let mut accum = WaveformAccum::new();
+        for sample in &window {
+            accum.push(*sample);
+        }
+        assert_eq!(accum.finish(), WaveformStats::of(&window));
+        // Reading it does not consume it: a caller polling a filling window reads twice.
+        assert_eq!(accum.finish(), WaveformStats::of(&window));
+    }
+
+    #[test]
+    fn an_empty_window_reports_zeros_rather_than_extremes() {
+        let empty = WaveformAccum::new().finish();
+        assert_eq!(empty.samples, 0);
+        assert_eq!((empty.min, empty.max), (0, 0));
+        assert_eq!(empty.mean_square, 0.0);
+        assert_eq!(empty.saturated_fraction, 0.0);
+        assert_eq!(empty.autocorr_lag1, 0.0);
+    }
+
+    #[test]
+    fn saturation_counts_both_rails() {
+        let mut accum = WaveformAccum::new();
+        accum.push(SATURATION_ABS as i16);
+        accum.push(-(SATURATION_ABS as i16));
+        accum.push(0);
+        accum.push(0);
+        let stats = accum.finish();
+        assert_eq!(stats.saturated_fraction, 0.5, "both rails count as clipped");
+        assert_eq!(stats.max_abs(), SATURATION_ABS);
+        assert_eq!(stats.spread(), 2 * SATURATION_ABS);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn rms_is_the_root_of_the_mean_square() {
+        let stats = WaveformStats::of(&[300i16; 64]);
+        assert!((stats.rms() - 300.0).abs() < 0.01, "{stats:?}");
     }
 }

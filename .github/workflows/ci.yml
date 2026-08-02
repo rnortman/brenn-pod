@@ -25,6 +25,17 @@ jobs:
       - name: Install Rust
         run: rustup component add rustfmt clippy
 
+      # psk-link links openssl and reachy-pod links libusb and libasound, and
+      # `make check`'s workspace-wide clippy/test builds all of them whether or not
+      # they are default members. The runner image ships libssl-dev today, so that
+      # one is a pin against image drift; the other two sets of headers it does not,
+      # so those are fixes.
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev libusb-1.0-0-dev libasound2-dev
+
       # Neither workspace lives at repo root; without this the action caches a
       # nonexistent root workspace and every run is cold.
       - uses: Swatinem/rust-cache@v2

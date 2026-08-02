@@ -1,15 +1,19 @@
 [workspace]
 members = [
+    "devices/reachy-pod",
     "devices/respeaker-pod",
     "crates/audio-pipeline",
     "crates/device-protocol",
     "crates/build-id",
     "crates/hil-host",
+    "crates/pod-streamer",
     "crates/pod-transport",
     "crates/podctl",
+    "crates/psk-link",
     "crates/truncfmt",
     "crates/wifi-diag",
     "crates/wifi-reconnect",
+    "crates/xvf3800-ctrl",
 ]
 # default-members lists only host-buildable crates so no-flag `cargo build`/`cargo test`
 # runs host builds/tests without building the device crate or requiring espup.
@@ -17,8 +21,11 @@ members = [
 # directory (`cd devices/respeaker-pod && cargo build --release`) where the crate-scoped
 # rust-toolchain.toml and .cargo/config.toml select the esp channel and Xtensa target.
 # hil-host is a workspace member but NOT a default member (pulls serialport; keep it
-# out of the default lane so `make check-host` stays light).
-default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect"]
+# out of the default lane so `make check-host` stays light). psk-link is out for the same
+# reason (openssl, which needs libssl-dev); `make check-host` covers it via --workspace.
+# reachy-pod is out for the same reason too (rusb → libusb-1.0); it is a Linux binary
+# built for the Pi in a container, and its host-triple unit tests run under --workspace.
+default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/pod-streamer", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
 resolver = "2"
 
 [workspace.package]

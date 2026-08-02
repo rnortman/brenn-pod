@@ -9,6 +9,11 @@ pod-ingest = { path = "../pod-ingest" }
 speech-pipeline = { path = "../speech-pipeline" }
 # Wire decode (`decode_frame`) for replaying recorded frame logs offline.
 audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std"] }
+# The link's TLS-PSK parameters, shared with the device clients; re-exported as
+# `speech_surface::psk`. Parameters only: `default-features = false` drops the
+# crate's Linux client transport, so the daemon does not compile the firmware
+# streamer engine it never runs.
+psk-link = { path = "../../../firmware/crates/psk-link", default-features = false }
 # The brain response channel: `ResponseSink` wraps a `futures::channel::mpsc`
 # sender, so the pipeline holds the matching sender type in `BrainWiring`.
 futures = "0.3"
@@ -46,6 +51,16 @@ tempfile = "3"
 heapless = "0.9"
 # Shared frame-log/wire-frame test fixtures (`test_fixtures`).
 pod-ingest = { path = "../pod-ingest", features = ["test-util"] }
+# The shared streamer engine — test-only; the daemon never runs a streamer.
+pod-streamer = { path = "../../../firmware/crates/pod-streamer" }
+# Test-only too: `client-transport` is the Linux pod's transport (the integration
+# test drives the code the pod ships) and `test-util` is the shared pinned
+# PSK-server peer. Feature-unified with the normal dep in test builds only, so
+# the daemon's own build still takes the parameters alone.
+psk-link = { path = "../../../firmware/crates/psk-link", features = [
+    "client-transport",
+    "test-util",
+] }
 # SIGTERM (via `process`) for the replay round-trip test's graceful-shutdown
 # assertion. Feature-unified with the normal-dep `rustix` (`fs`) in test builds.
 rustix = { version = "1", features = ["process"] }

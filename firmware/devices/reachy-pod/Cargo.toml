@@ -1,0 +1,44 @@
+[package]
+name = "reachy-pod"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The Linux voice node: an aarch64 binary that captures from the XVF3800 mic array
+# over USB and streams to the audio host, sharing the policy crates with the ESP32
+# pod. Built natively in a Debian trixie arm64 container, so the crate carries no
+# cross-linker configuration and no toolchain pin of its own.
+#
+# A library plus a thin binary: the modules are the crate's public surface, which
+# is what lets `cargo test -p reachy-pod` exercise them on the workstation while the
+# transports themselves are only assertable against hardware.
+#
+# Not in default-members — `rusb` links libusb-1.0 and `alsa` links libasound2, so a
+# plain `cargo build` stays free of system dependencies; `make check-host`'s
+# `--workspace` clippy and tests cover it.
+
+[dependencies]
+# The transport-independent XVF3800 control protocol: resids, commands, status
+# semantics and the shared retry driver. This crate supplies the USB transport.
+xvf3800-ctrl = { path = "../../crates/xvf3800-ctrl" }
+# Telemetry plausibility predicates, shared with the ESP pod's HIL self-tests.
+device-protocol = { path = "../../crates/device-protocol" }
+# The wire format, the capture ring and the VAD bounds — the same code the ESP pod
+# runs, which is what keeps the two pods' audio identical above the transport.
+audio-pipeline = { path = "../../crates/audio-pipeline", features = ["std"] }
+# The segment engine, the idle loop and the telemetry core, plus the gate default
+# both pods fall back to.
+pod-streamer = { path = "../../crates/pod-streamer" }
+# The TLS-PSK parameters, the key encoding, and the Linux client transport this pod
+# connects through.
+psk-link = { path = "../../crates/psk-link" }
+# USB vendor control transfers (libusb-1.0). The audio interfaces stay with the
+# kernel's snd_usb_audio; only EP0 is ours.
+rusb = "0.9"
+# The board's audio, through ALSA's own library (libasound2). Direct `hw:` access:
+# this application is the card's only user, so there is no sound server in the path.
+alsa = "0.12"
+# gethostname (the pod id and PSK identity), geteuid (which account a self-test run
+# is actually observing the device as) and CLOCK_MONOTONIC (the capture clock).
+libc = "0.2"
+log = { workspace = true }

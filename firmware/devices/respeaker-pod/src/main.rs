@@ -32,11 +32,17 @@ mod health;
 #[cfg(target_os = "espidf")]
 mod i2c;
 #[cfg(target_os = "espidf")]
+mod netpoll;
+#[cfg(target_os = "espidf")]
 mod psram;
+#[cfg(target_os = "espidf")]
+mod streamer;
 #[cfg(target_os = "espidf")]
 mod telemetry;
 #[cfg(target_os = "espidf")]
 mod wifi;
+#[cfg(target_os = "espidf")]
+mod xvf3800;
 
 mod aic3104;
 mod capture;
@@ -44,13 +50,10 @@ mod hil;
 mod hil_session;
 mod inbound;
 mod net_tests;
-mod netpoll;
 mod nvs;
 mod protocol_rx;
 mod speaker;
-mod streamer;
 mod tls_link;
-mod xvf3800;
 
 #[cfg(target_os = "espidf")]
 use audio_pipeline::playback::{INBOUND_PCM_RING_BYTES, InboundPcmRing};
@@ -85,9 +88,11 @@ use wifi_diag::fmt_ipv4;
 
 #[cfg(target_os = "espidf")]
 use aic3104::AIC3104_ADDR;
-use capture::DEVICE_PLAYBACK_FORMAT;
 #[cfg(target_os = "espidf")]
-use capture::{CAPTURE_RING, CaptureRing, run_i2s_waveform_sanity, spawn_capture_thread};
+use capture::{
+    CAPTURE_RING, CaptureRing, DEVICE_PLAYBACK_FORMAT, run_i2s_waveform_sanity,
+    spawn_capture_thread,
+};
 #[cfg(target_os = "espidf")]
 use console::{LOGGER, UsbSerialTxSink, WRITER, write_frame};
 #[cfg(target_os = "espidf")]

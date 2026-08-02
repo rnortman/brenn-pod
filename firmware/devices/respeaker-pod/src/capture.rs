@@ -10,15 +10,15 @@
 // Host view: these items exist for the tests and for the device-gated call sites.
 #![cfg_attr(not(target_os = "espidf"), allow(dead_code))]
 
-use audio_pipeline::playback::{PLAYBACK_PREROLL_TARGET_BYTES, next_preroll_target};
+use audio_pipeline::playback::PrerollGate;
 
 #[cfg(target_os = "espidf")]
 use audio_pipeline::playback::{
     I2S_TX_FRAME_BYTES, INBOUND_PCM_WRITE_UNIT_BYTES, InboundRingConsumer, WIRE_BYTES_PER_SAMPLE,
-    expand_run_in_place, preroll_gate_ready,
+    expand_run_in_place,
 };
 #[cfg(target_os = "espidf")]
-use audio_pipeline::ring::{RING_CAPACITY_SAMPLES, RingIndex};
+use audio_pipeline::ring::{RING_CAPACITY_SAMPLES, RingIndex, WaveformAccum};
 #[cfg(target_os = "espidf")]
 use device_protocol::{Payload, Status, log_tokens};
 #[cfg(target_os = "espidf")]
@@ -53,27 +53,12 @@ use device_protocol::{TestData, test_report_fail, test_report_fail_fmt, test_rep
 
 // ── Audio capture ring (process-lifetime, boot-initialized) ──────────────────
 
-/// State held inside `CAPTURE_RING` under a single mutex.
-///
-/// Callers:
-/// - Capture thread: locks, writes samples, advances `write_head`, updates anchor.
-///   Hold time ≤ one chunk write (≤320 samples × 2 B = 640 B memcpy ≈ negligible).
-/// - Test handler / streamer: locks, reads samples and/or head/anchor, unlocks.
-///
-/// All fields are in the same lock so readers get a consistent snapshot.
+/// The pod's capture ring: the shared [`audio_pipeline::ring::CaptureRing`] state
+/// backed by PSRAM. The samples are indexed by the capture thread, streamer, and
+/// self-tests through `Deref`; the buffer is never a DMA target (the I2S DMA lands in
+/// `dma_buf` and is CPU-copied in). `anchor_ts_us` is `esp_timer_get_time()` µs here.
 #[cfg(target_os = "espidf")]
-pub(crate) struct CaptureRing {
-    /// PSRAM-allocated sample storage, capacity = `RING_CAPACITY_SAMPLES`.
-    /// Indexed by the capture thread, streamer, and self-tests through `Deref`;
-    /// never a DMA target (the I2S DMA lands in `dma_buf` and is CPU-copied in).
-    pub(crate) samples: crate::psram::PsramBuf<i16>,
-    /// Absolute sample index of the next slot to be written (monotonically increasing).
-    pub(crate) write_head: u64,
-    /// Sample index at the moment `anchor_ts_us` was recorded.
-    pub(crate) anchor_sample: u64,
-    /// `esp_timer_get_time()` µs at the moment `anchor_sample` was captured.
-    pub(crate) anchor_ts_us: u64,
-}
+pub(crate) type CaptureRing = audio_pipeline::ring::CaptureRing<crate::psram::PsramBuf<i16>>;
 
 /// Process-lifetime audio capture ring. Initialized at boot before the capture
 /// thread is spawned; `None` means capture has not yet been initialized (firmware
@@ -131,38 +116,6 @@ pub(crate) use audio_pipeline::wire::DEVICE_PLAYBACK_FORMAT;
 /// Compile-time lock: the shared format's sample rate must equal the device's own I2S
 /// clock. A drift in either fails the device build instead of a live HIL round-trip.
 const _: () = assert!(DEVICE_PLAYBACK_FORMAT.sample_rate_hz == I2S_SAMPLE_RATE_HZ);
-
-/// Dead-line guard: minimum absolute peak (`max(|min|, |max|)`) below which the
-/// window is treated as a dead / all-zero line.
-///
-/// This is NOT a loudness floor — a healthy mic in a quiet room produces a quiet
-/// but correlated signal that must PASS. Confirmed quiet-room audio reaches
-/// `max_abs` as low as 38; this floor sits well below that and above a truly dead
-/// line (≈0 ± a few EMI LSB). The real broken-vs-working discriminator is
-/// `AUTOCORR_FLOOR`, not this guard.
-#[cfg(target_os = "espidf")]
-const ZERO_ABS_THRESHOLD: i16 = 16;
-
-/// Frozen-line guard: minimum spread (`max − min`) below which the window is
-/// treated as a stuck / constant / 1-bit-toggle line.
-///
-/// Autocorrelation cannot catch a frozen line on its own — a constant value has
-/// `ac1 ≈ 1.0` and would sail through the autocorr gate — so this small spread floor
-/// is the dedicated anti-frozen guard, decoupled from `ZERO_ABS_THRESHOLD`. A frozen
-/// / 1-bit line has spread ≈ 0–2, while confirmed quiet-room audio has spread ≥ 76;
-/// 32 separates the two with margin on both sides.
-#[cfg(target_os = "espidf")]
-const STUCK_SPREAD_FLOOR: i32 = 32;
-
-/// Saturation fraction threshold: if more than this fraction of frames are at or beyond
-/// ±I2S_SATURATION_ABS the signal is clipped/saturated.
-#[cfg(target_os = "espidf")]
-const SATURATION_FRAC_MAX: f32 = 0.95;
-
-/// Near-full-scale threshold for saturation counting (margin below i16::MAX=32767).
-/// Chosen to catch sustained clipping while allowing occasional transients.
-#[cfg(target_os = "espidf")]
-const I2S_SATURATION_ABS: i32 = 32700;
 
 /// Poll sleep between NON_BLOCK I2S read attempts (milliseconds).
 /// At 16 kHz stereo 32-bit, one DMA buffer of 240 frames fills in ~15 ms (8 B/frame).
@@ -279,18 +232,6 @@ const _: () = assert!(
     "I2S_WAVEFORM_SANITY_RING_FILL_TIMEOUT_US must exceed CAPTURE_WARMUP_US \
      + ring-fill time; update it if CAPTURE_WARMUP_US changes"
 );
-
-/// Normalized lag-1 autocorrelation floor — the PRIMARY health gate for the
-/// I2sWaveformSanity test.
-///
-/// This is the real broken-vs-working discriminator: full-scale random noise (the
-/// two-master clock-contention failure mode) has ac1 ≈ 0, while real acoustic audio
-/// is strongly correlated (confirmed across 60 quiet-room windows, ac1 0.41–0.97
-/// every window). The floor 0.2 (200 milli) sits with margin below the observed
-/// acoustic minimum and well above RNG noise. Keep in sync with
-/// `I2S_HOST_AUTOCORR_FLOOR` in `hil-host/src/main.rs`.
-#[cfg(target_os = "espidf")]
-const AUTOCORR_FLOOR: f32 = 0.2;
 
 /// Push as much of the staged expanded-PCM residue (`staged[*cursor..]`) as the TX DMA will
 /// accept in **one NON_BLOCK write** (design §3.6). Advances `*cursor` by the bytes the DMA
@@ -453,67 +394,12 @@ impl TxStager {
     }
 }
 
-/// Speaker pre-roll / minimum-fill arming state (design §3.3). Groups the arm invariants that
-/// otherwise live as loose locals mutated as a unit at divergent sites, so a new arm site cannot
-/// forget to clear the fallback clock or pick the wrong target rule.
-struct PrerollGate {
-    /// While set, the consumer does not advance `tail` — the ring itself is the hold buffer.
-    pending: bool,
-    /// Fallback clock: starts when the first bytes arrive in the ring; None until first bytes,
-    /// and reset on each re-arm so each window times from its own first bytes.
-    first_chunk_at: Option<std::time::Instant>,
-    /// Adaptive pre-roll target: base at boot / generation change, escalated on underrun.
-    target: usize,
-    /// Underrun-edge detection: true once a non-empty first-poll is seen, cleared at the
-    /// non-empty→empty edge that `should_rearm_preroll` gates the warn/re-arm on. This is the
-    /// live suppression (the vestigial `underrun_proxy_warned` latch is gone).
-    saw_nonempty_since_empty: bool,
-}
-
-impl PrerollGate {
-    /// Boot state: armed, no clock, base target, no non-empty poll seen yet.
-    fn new() -> Self {
-        PrerollGate {
-            pending: true,
-            first_chunk_at: None,
-            target: PLAYBACK_PREROLL_TARGET_BYTES,
-            saw_nonempty_since_empty: false,
-        }
-    }
-
-    /// Generation-change re-base (reconnect): the previous generation's escalation does not
-    /// carry across a fresh stream, so reset the target to base and clear the fallback clock.
-    fn arm_base(&mut self) {
-        self.pending = true;
-        self.first_chunk_at = None;
-        self.saw_nonempty_since_empty = false;
-        self.target = PLAYBACK_PREROLL_TARGET_BYTES;
-    }
-
-    /// Mid-stream underrun escalate (design §3.3): rebuild lead on the next bytes and escalate
-    /// the target — one underrun with this ring means the transient regime is severe, so a
-    /// base-target rebuild would immediately re-underrun. Clears the fallback clock and the
-    /// non-empty-edge flag (the first statement of the re-arm block); the target escalates via
-    /// `next_preroll_target` and encodes underrun severity within one stream. Returns the new
-    /// escalated target so the caller can log the transition without recomputing it.
-    fn rearm_escalated(&mut self) -> usize {
-        self.pending = true;
-        self.first_chunk_at = None;
-        self.saw_nonempty_since_empty = false;
-        self.target = next_preroll_target(self.target);
-        self.target
-    }
-
-    /// End-of-audio boundary transition (design §3.4): arm the delayed mute and full-re-base the
-    /// gate so the next stream starts fresh. Routes the whole six-field transition through one
-    /// method; the `break` vs fall-through control flow stays at the two call sites.
-    fn on_end_of_audio_boundary(&mut self, mute_armed: &mut bool) {
-        *mute_armed = true;
-        self.pending = true;
-        self.first_chunk_at = None;
-        self.saw_nonempty_since_empty = false;
-        self.target = PLAYBACK_PREROLL_TARGET_BYTES;
-    }
+/// End-of-audio boundary transition: arm the delayed mute and re-base the gate so the next
+/// stream starts fresh. Routes both side effects through one call; the `break` vs
+/// fall-through control flow stays at the two call sites.
+fn on_end_of_audio_boundary(gate: &mut PrerollGate, mute_armed: &mut bool) {
+    *mute_armed = true;
+    gate.arm_base();
 }
 
 // ── Capture thread ─────────────────────────────────────────────────────────────
@@ -727,7 +613,7 @@ pub(crate) fn spawn_capture_thread(
             // escalation cannot outrun that regime; sustained sub-real-time delivery at these
             // depths is an unexpected reading for human review, not a knob to nudge.
             //
-            // `gate.saw_nonempty_since_empty` detects mid-stream ring starvation
+            // The gate's audio-seen edge (`gate.saw_audio()`) detects mid-stream ring starvation
             // (non-empty→empty while dac_active): it requires a prior non-empty first-poll to
             // distinguish real starvation from the normal end-of-stream window (under the design
             // §3.4 mute policy dac_active stays true through starvation — it drops only when an
@@ -904,7 +790,7 @@ pub(crate) fn spawn_capture_thread(
                     // tail *lands on* via `advance` is reported by `advance` in the stage arm
                     // below instead.
                     if inbound_consumer.take_mark_at_tail() {
-                        gate.on_end_of_audio_boundary(&mut mute_armed);
+                        on_end_of_audio_boundary(&mut gate, &mut mute_armed);
                         break;
                     }
 
@@ -914,7 +800,7 @@ pub(crate) fn spawn_capture_thread(
                         if available > 0 {
                             tx_nonempty_polls = tx_nonempty_polls.wrapping_add(1);
                             first_poll = false;
-                            gate.saw_nonempty_since_empty = true;
+                            gate.note_audio_seen();
                         } else if residue_pending {
                             // Ring empty but committed audio is still draining from staging —
                             // the DAC is being fed, so this is NOT starvation and NOT a
@@ -924,7 +810,7 @@ pub(crate) fn spawn_capture_thread(
                         } else {
                             // During pre-roll, empties are expected fill waits, not
                             // starvation — route to preroll_waits to keep empty_polls clean.
-                            if gate.pending {
+                            if gate.pending() {
                                 tx_preroll_waits = tx_preroll_waits.wrapping_add(1);
                             } else {
                                 tx_empty_polls = tx_empty_polls.wrapping_add(1);
@@ -933,20 +819,16 @@ pub(crate) fn spawn_capture_thread(
                             // Underrun-proxy edge: warn on non-empty→empty transition while
                             // DAC is active and not in pre-roll (excludes the normal
                             // end-of-stream idle window). `should_rearm_preroll` is the live
-                            // edge suppression: it gates on `saw_nonempty_since_empty`, which
+                            // edge suppression: it gates on the gate's audio-seen edge, which
                             // `rearm_escalated` clears here, so the warn fires exactly once per
                             // non-empty→empty streak (no separate warn latch needed).
-                            if should_rearm_preroll(
-                                gate.saw_nonempty_since_empty,
-                                dac_active,
-                                gate.pending,
-                            ) {
+                            if should_rearm_preroll(gate.saw_audio(), dac_active, gate.pending()) {
                                 // Name the escalation the re-arm drives (base / 5 120 / capped)
                                 // — the target and re-arm frequency are the field evidence
                                 // design-delta-1 D4 keys the OQ2 depth decision on, so it must
                                 // be legible in the log. Read the pre-escalation target before
                                 // re-arm advances it, and log the exact target the gate adopts.
-                                let before = gate.target;
+                                let before = gate.target();
                                 // Re-arm pre-roll (design §3.3): rebuild lead on the next bytes
                                 // instead of playing every subsequent gap at zero lead.
                                 // Escalate the target — one underrun with this ring means the
@@ -969,22 +851,14 @@ pub(crate) fn spawn_capture_thread(
 
                     // Step 1: pre-roll gate. Hold PCM in the ring (don't advance tail) until
                     // fill target or fallback timeout is reached.
-                    if gate.pending {
-                        if available > 0 && gate.first_chunk_at.is_none() {
-                            gate.first_chunk_at = Some(std::time::Instant::now());
-                        }
-                        let elapsed_ms =
-                            gate.first_chunk_at.map(|t| t.elapsed().as_millis() as u64);
-                        if preroll_gate_ready(
+                    if gate.pending()
+                        && !gate.admit(
                             available,
-                            gate.target,
-                            elapsed_ms,
+                            std::time::Instant::now(),
                             PLAYBACK_PREROLL_MAX_WAIT_MS,
-                        ) {
-                            gate.pending = false;
-                        } else {
-                            break; // still filling
-                        }
+                        )
+                    {
+                        break; // still filling
                     }
 
                     // Cannot stage a new run while committed residue is still in flight —
@@ -1144,7 +1018,7 @@ pub(crate) fn spawn_capture_thread(
                         // This run drained the banked tail up to an explicit end-of-audio
                         // boundary (design §3.4). Arm the mute and re-arm pre-roll + reset the
                         // underrun-edge state and adaptive target so the next stream starts fresh.
-                        gate.on_end_of_audio_boundary(&mut mute_armed);
+                        on_end_of_audio_boundary(&mut gate, &mut mute_armed);
                     } else {
                         // New PCM committed that is NOT a boundary: cancel any pending EOA mute
                         // (design §3.4 / edge case B — host ended one stream and immediately
@@ -1393,18 +1267,6 @@ pub(crate) fn spawn_capture_thread(
     }
 }
 
-/// Normalized lag-1 autocorrelation from pre-accumulated sums.
-///
-/// Returns r1 in [-1, 1] (0.0 when `sq_sum == 0`). The i64→f32 cast loses ≲0.01
-/// relative — safe given the `AUTOCORR_FLOOR` margin (0.2 vs expected ~0.68).
-fn autocorr_lag1_from_sums(lag1_sum: i64, sq_sum: i64) -> f32 {
-    if sq_sum == 0 {
-        0.0
-    } else {
-        (lag1_sum as f32) / (sq_sum as f32)
-    }
-}
-
 /// I2S waveform sanity test.
 ///
 /// Waits for the capture ring to fill, then checks that the audio is correlated
@@ -1442,15 +1304,10 @@ pub(crate) fn run_i2s_waveform_sanity() -> (Status, Payload) {
     }
 
     // ── Compute waveform stats under the lock ──────────────────────────────────
-    let mut s_min: i32 = i32::MAX;
-    let mut s_max: i32 = i32::MIN;
-    let mut sq_sum: i64 = 0;
-    let mut sat: u32 = 0;
-    // Lag-1 autocorrelation (i64 avoids overflow). sq_sum doubles as the denominator;
-    // the off-by-one vs the lag1 index set is negligible at n=4000.
-    let mut lag1_sum: i64 = 0;
-    let mut prev_sv: i64 = 0;
-    let samples_captured;
+    // The accumulation, the five thresholds and the defect precedence all belong to
+    // `audio_pipeline::ring`; the window is fed to it a sample at a time because a
+    // window read out of the wrapping ring is not contiguous.
+    let mut accum = WaveformAccum::new();
 
     {
         let guard = CAPTURE_RING
@@ -1471,151 +1328,76 @@ pub(crate) fn run_i2s_waveform_sanity() -> (Status, Payload) {
         if n_samples == 0 {
             return test_report_fail("FAIL src=ring samples=0 capture not yet started");
         }
-        samples_captured = n_samples;
         let start = ring.write_head - n_samples as u64;
         for i in 0..n_samples {
             let slot = ridx.slot(start + i as u64);
-            let sv = ring.samples[slot] as i32;
-            if sv < s_min {
-                s_min = sv;
-            }
-            if sv > s_max {
-                s_max = sv;
-            }
-            sq_sum += (sv as i64) * (sv as i64);
-            if sv >= I2S_SATURATION_ABS || sv <= -I2S_SATURATION_ABS {
-                sat += 1;
-            }
-            if i > 0 {
-                let sv64 = sv as i64;
-                lag1_sum += sv64 * prev_sv;
-            }
-            prev_sv = sv as i64;
+            accum.push(ring.samples[slot]);
         }
     }
 
-    let n = samples_captured as f32;
-    let rms = ((sq_sum as f32) / n).sqrt();
-    let sat_pct = ((sat as f32 / n) * 100.0) as u32;
-    let max_abs = s_max.abs().max(s_min.abs());
-    let spread = s_max - s_min;
-    let sat_frac = sat as f32 / n;
-
-    let r1 = autocorr_lag1_from_sums(lag1_sum, sq_sum);
+    let stats = accum.finish();
+    let sat_pct = (stats.saturated_fraction * 100.0) as u32;
     // Milli-units integer. Round to match the host's strict-greater-than gate.
-    let ac1_milli = (r1 * 1000.0 + 0.5) as i32;
+    let ac1_milli = (stats.autocorr_lag1 * 1000.0 + 0.5) as i32;
 
     // No minimum-loudness (rms) floor — a quiet room must pass. rms reported for observability.
-    let live = (max_abs > ZERO_ABS_THRESHOLD as i32)
-        && (spread > STUCK_SPREAD_FLOOR)
-        && (sat_frac < SATURATION_FRAC_MAX)
-        && (r1 > AUTOCORR_FLOOR);
-
-    if live {
-        test_report_ok(TestData::I2sWaveform {
-            min: s_min,
-            max: s_max,
-            rms: rms as i32,
+    match stats.defect() {
+        None => test_report_ok(TestData::I2sWaveform {
+            min: stats.min,
+            max: stats.max,
+            rms: stats.rms() as i32,
             sat_pct,
-            samples: samples_captured as u32,
+            samples: stats.samples as u32,
             ac1: ac1_milli,
-        })
-    } else {
-        let reason = if max_abs <= ZERO_ABS_THRESHOLD as i32 {
-            "all-zero"
-        } else if spread <= STUCK_SPREAD_FLOOR {
-            "stuck-constant"
-        } else if sat_frac >= SATURATION_FRAC_MAX {
-            "saturated"
-        } else {
-            "low-autocorr"
-        };
-        test_report_fail_fmt(format_args!(
+        }),
+        Some(reason) => test_report_fail_fmt(format_args!(
             "FAIL src=ring reason={} ch min={} max={} rms={} sat={}% samples={} ac1={}",
-            reason, s_min, s_max, rms as i32, sat_pct, samples_captured, ac1_milli,
-        ))
+            reason,
+            stats.min,
+            stats.max,
+            stats.rms() as i32,
+            sat_pct,
+            stats.samples,
+            ac1_milli,
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PLAYBACK_PREROLL_TARGET_BYTES, PrerollGate, TxStager, autocorr_lag1_from_sums,
-        next_preroll_target,
-    };
+    use audio_pipeline::playback::PLAYBACK_PREROLL_TARGET_BYTES;
 
-    // ── PrerollGate ────────────────────────────────────────────────────────────
+    use super::{PrerollGate, TxStager, on_end_of_audio_boundary};
 
-    #[test]
-    fn preroll_gate_new_is_armed_at_base() {
-        let g = PrerollGate::new();
-        assert!(g.pending, "new gate is armed");
-        assert!(g.first_chunk_at.is_none(), "new gate has no fallback clock");
-        assert_eq!(g.target, PLAYBACK_PREROLL_TARGET_BYTES);
-        assert!(!g.saw_nonempty_since_empty);
-    }
-
-    #[test]
-    fn preroll_gate_arm_base_rebases_and_clears_clock() {
-        let mut g = PrerollGate::new();
-        // Simulate a live, escalated, mid-stream state.
-        g.pending = false;
-        g.first_chunk_at = Some(std::time::Instant::now());
-        g.target = next_preroll_target(PLAYBACK_PREROLL_TARGET_BYTES);
-        g.saw_nonempty_since_empty = true;
-
-        g.arm_base();
-        assert!(g.pending);
-        assert!(
-            g.first_chunk_at.is_none(),
-            "arm_base clears the fallback clock"
-        );
-        assert_eq!(
-            g.target, PLAYBACK_PREROLL_TARGET_BYTES,
-            "arm_base re-bases to base"
-        );
-        assert!(!g.saw_nonempty_since_empty);
-    }
-
-    #[test]
-    fn preroll_gate_rearm_escalated_escalates_and_clears_clock() {
-        let mut g = PrerollGate::new();
-        g.pending = false;
-        g.first_chunk_at = Some(std::time::Instant::now());
-        g.saw_nonempty_since_empty = true;
-        let expected = next_preroll_target(g.target);
-
-        g.rearm_escalated();
-        assert!(g.pending);
-        assert!(
-            g.first_chunk_at.is_none(),
-            "rearm_escalated clears the fallback clock"
-        );
-        assert_eq!(
-            g.target, expected,
-            "rearm_escalated escalates via next_preroll_target"
-        );
-        assert!(!g.saw_nonempty_since_empty);
-    }
+    // ── on_end_of_audio_boundary ───────────────────────────────────────────────
+    //
+    // The gate's own transitions are pinned in `audio_pipeline::playback`, which owns
+    // them for both pods. What is this pod's is the pairing of the mute with the
+    // re-base: a boundary that armed the mute without re-basing would start the next
+    // stream at the dead stream's escalated depth.
 
     #[test]
     fn preroll_gate_on_end_of_audio_boundary_sets_mute_and_rebases() {
         let mut g = PrerollGate::new();
-        g.pending = false;
-        g.first_chunk_at = Some(std::time::Instant::now());
-        g.target = next_preroll_target(PLAYBACK_PREROLL_TARGET_BYTES);
-        g.saw_nonempty_since_empty = true;
+        // A live, escalated, mid-stream gate.
+        assert!(g.admit(
+            PLAYBACK_PREROLL_TARGET_BYTES,
+            std::time::Instant::now(),
+            500
+        ));
+        g.rearm_escalated();
+        g.note_audio_seen();
         let mut mute_armed = false;
 
-        g.on_end_of_audio_boundary(&mut mute_armed);
+        on_end_of_audio_boundary(&mut g, &mut mute_armed);
         assert!(mute_armed, "boundary arms the mute");
-        assert!(g.pending);
-        assert!(g.first_chunk_at.is_none());
+        assert!(g.pending(), "boundary holds the next stream's first bytes");
         assert_eq!(
-            g.target, PLAYBACK_PREROLL_TARGET_BYTES,
+            g.target(),
+            PLAYBACK_PREROLL_TARGET_BYTES,
             "boundary re-bases to base"
         );
-        assert!(!g.saw_nonempty_since_empty);
+        assert!(!g.saw_audio());
     }
 
     // ── TxStager ───────────────────────────────────────────────────────────────
@@ -1652,54 +1434,6 @@ mod tests {
         assert!(!s.has_residue(), "reset discards staged residue");
         assert!(s.wedge_since.is_none(), "reset clears the wedge clock");
         assert!(!s.wedge_warned, "reset clears the wedge warn latch");
-    }
-
-    // ── autocorr_lag1_from_sums ────────────────────────────────────────────────
-
-    #[test]
-    fn autocorr_all_zero() {
-        let r1 = autocorr_lag1_from_sums(0, 0);
-        assert_eq!(r1, 0.0, "all-zero: r1 must be 0.0");
-    }
-
-    #[test]
-    fn autocorr_constant_signal() {
-        let n = 10_i64;
-        let v: i64 = 1000;
-        let sq_sum = n * v * v;
-        let lag1_sum = (n - 1) * v * v;
-        let r1 = autocorr_lag1_from_sums(lag1_sum, sq_sum);
-        // r1 ≈ (n-1)/n = 0.9 (denominator has one extra x[0]² term)
-        assert!(
-            r1 > 0.85,
-            "constant signal: r1 must be close to 1.0, got {r1}"
-        );
-    }
-
-    #[test]
-    fn autocorr_alternating_signal() {
-        let n = 10_i64;
-        let v: i64 = 1000;
-        let sq_sum = n * v * v;
-        let lag1_sum = -(n - 1) * v * v;
-        let r1 = autocorr_lag1_from_sums(lag1_sum, sq_sum);
-        assert!(
-            r1 < -0.85,
-            "alternating signal: r1 must be close to -1.0, got {r1}"
-        );
-    }
-
-    /// Near-zero lag1_sum relative to sq_sum → r1 ≈ 0 (uncorrelated noise).
-    #[test]
-    fn autocorr_random_noise_near_zero() {
-        let lag1_sum: i64 = 10;
-        let sq_sum: i64 = 10_000;
-        let r1 = autocorr_lag1_from_sums(lag1_sum, sq_sum);
-        assert!(
-            r1.abs() < 0.3,
-            "RNG-like inputs (tiny lag1_sum vs sq_sum) must yield r1 near zero, got {r1}"
-        );
-        assert!(r1 > -1.0 && r1 < 1.0, "r1 must be in [-1, 1], got {r1}");
     }
 
     // ── detail length budget ───────────────────────────────────────────────────

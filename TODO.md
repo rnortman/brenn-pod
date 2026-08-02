@@ -253,3 +253,37 @@ See `TODO(tls-link-bench-measure)` at the streamer thread's `.stack_size` in
 `firmware/devices/respeaker-pod/src/streamer.rs` and in the TLS-PSK block of
 `firmware/devices/respeaker-pod/sdkconfig.defaults`.
 
+
+## `reachy-beam-mapping` — BLOCKED as of 2026-08-02 (needs a bench session with the reachy pod)
+
+The XVF3800 hands the reachy pod two processed outputs on one stereo capture stream.
+They are not two beams: both render the chip's one auto-selected look direction, and
+the four telemetry indices are the beamformer's internal beams (two fixed, one
+free-running, one auto-select that mirrors whichever fixed beam it has settled on).
+So there is no channel↔beam pairing to bake. What is unknown is what each channel
+actually carries on this firmware: on the reSpeaker Flex the two are the Conference
+beam (AGC-pinned) and the ASR beam (~15 dB more headroom), r=0.91 between them, but
+the first bench run of the reachy read the two channels as identical at the printed
+precision, which would mean one source routed to both.
+
+The bench case — `beam_energy_speech`, `firmware/devices/reachy-pod/src/beam.rs` —
+takes the readings that settle it: the ch0↔ch1 power correlation, whether the two
+sample streams are byte-identical, and the chip's own `AUDIO_MGR_OP_L`/`OP_R`
+routing registers. It asserts what the pipeline depends on (every channel's level
+follows the telemetry the gate is driven by) and fails on one contradiction
+(sample-identical channels while the registers say the outputs differ), but it
+concludes nothing about the channel identity itself.
+
+Deferred because it is an observation, not a code change: the reading has to come off
+the board with someone speaking into it, and per the bring-up doctrine it gets human
+review before anything is baked in.
+
+Done = a bench run of `make reachy-bench` recorded in the ADR directory, then baked
+into the case as expectations: the ch0/ch1 relationship (one source duplicated versus
+the Conference/ASR pair), the reviewed `OP_L`/`OP_R` values as identity assertions,
+and the `CHANNEL=` default the reviewed characterization implies — inert if both
+channels carry one source, otherwise a choice (the ASR flavor's extra headroom and
+ASR tuning is the expected pick for a host-side wake-word/STT consumer).
+
+See `TODO(reachy-beam-mapping)` at `beam_energy_speech` in
+`firmware/devices/reachy-pod/src/beam.rs`.

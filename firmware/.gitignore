@@ -1,2 +1,6 @@
 # Cargo build artifacts — not committed (Cargo.lock IS committed for reproducibility)
 /target/
+
+# Per-workstation device targeting for the reachy lanes (REACHY_HOST). Names one
+# developer's unit, so it is local to the clone.
+/.local/

@@ -1,0 +1,99 @@
+# The build host for the Reachy pod's payload binary.
+#
+# The payload is a native aarch64 binary that links the device image's own
+# shared libraries — libasound2, libusb-1.0, libssl3 and glibc itself — so it is
+# built against the same dated view of Debian the device image is bootstrapped
+# from (brenn-os, image/layer/brenn/debian-snapshot.yaml). A binary built
+# against a newer glibc than the image carries links fine here and dies on the
+# device with a symbol-version error, which is exactly the failure a pinned
+# builder removes.
+#
+# arm64 throughout, so the compiler runs on the target's own architecture and
+# the crate needs no cross-linker configuration. On an x86_64 workstation every
+# instruction in here executes through the host's binfmt_misc registration; the
+# wrapper preflights that and refuses rather than letting a build die deep in a
+# dependency.
+#
+# Rust does not come from the archive: trixie carries 1.85, and this workspace
+# needs newer. rustup does come from the archive, and the toolchain it installs
+# is pinned below.
+
+FROM --platform=linux/arm64 docker.io/library/debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+
+# The archive at a timestamp rather than at a suite — the same timestamp the
+# device image is bootstrapped from, which is the whole point of this image.
+#
+# A snapshot Release file expires about a week after it is made, and apt spells
+# the waiver for that `Check-Valid-Until: no` in a deb822 file. Without it this
+# image stops building a week after the pin is set.
+#
+# Over http for the first fetch only, and it has to be: the base image carries
+# no CA certificates, so an https archive cannot be reached until
+# ca-certificates is installed. The archive signature is what protects that
+# fetch, and the step after it moves the sources to https before anything else
+# is installed.
+RUN set -eu; \
+	rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; \
+	printf '%s\n' \
+		'Types: deb' \
+		'URIs: http://snapshot.debian.org/archive/debian/20260720T000000Z' \
+		'Suites: trixie' \
+		'Components: main contrib non-free non-free-firmware' \
+		'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
+		'Check-Valid-Until: no' \
+		'' \
+		'Types: deb' \
+		'URIs: http://snapshot.debian.org/archive/debian-security/20260720T000000Z' \
+		'Suites: trixie-security' \
+		'Components: main contrib non-free non-free-firmware' \
+		'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
+		'Check-Valid-Until: no' \
+		> /etc/apt/sources.list.d/snapshot.sources
+
+# The one package the http sources exist to fetch, and the switch to https that
+# follows it. The rewrite is asserted rather than assumed: a sed that matched
+# nothing would leave every later fetch on the weaker footing without failing.
+RUN set -eu; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends ca-certificates; \
+	sed -i 's|http://snapshot\.debian\.org|https://snapshot.debian.org|' \
+		/etc/apt/sources.list.d/snapshot.sources; \
+	grep -q 'https://snapshot' /etc/apt/sources.list.d/snapshot.sources; \
+	! grep -q 'http://snapshot' /etc/apt/sources.list.d/snapshot.sources; \
+	apt-get update
+
+# The compiler's own dependencies, and the development packages of every
+# system library the crate links. Each -dev package here has a runtime
+# counterpart on the device image; a link failure in this container is the
+# early form of a missing library there.
+RUN set -eu; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends \
+		ca-certificates \
+		gcc \
+		libasound2-dev \
+		libc6-dev \
+		libssl-dev \
+		libusb-1.0-0-dev \
+		pkgconf \
+		rustup; \
+	rm -rf /var/lib/apt/lists/*
+
+# The toolchain, pinned. rustup itself came from the pinned archive; the
+# toolchain comes from upstream because Debian's is too old for this
+# workspace's edition and standard-library use.
+#
+# RUSTUP_TOOLCHAIN is set for the same reason the version is pinned at all: the
+# workspace's rust-toolchain.toml says `stable`, which would resolve to
+# whatever is current on the day of the build and download it mid-build. The
+# environment variable outranks that file, so what compiles the payload is the
+# version named here and nothing else.
+# The toolchain lands in RUSTUP_HOME; the archive's rustup provides /usr/bin/cargo
+# and /usr/bin/rustc as symlinks to itself, so nothing else has to be on PATH.
+ENV RUSTUP_HOME=/usr/local/rustup \
+	RUSTUP_TOOLCHAIN=1.97.1
+
+RUN set -eu; \
+	rustup toolchain install --profile minimal "$RUSTUP_TOOLCHAIN"; \
+	rustc --version | grep -qw "$RUSTUP_TOOLCHAIN"
+CMD ["bash"]

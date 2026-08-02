@@ -1,0 +1,33 @@
+[package]
+name = "psk-link"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# Std-only library shared by both ends of the pod↔host audio link: the
+# `speech-surface` server re-exports it as `speech_surface::psk`, and the Linux
+# pod client builds its TLS context from the same functions. Not in
+# default-members — openssl stays out of the minimal `cargo build`/`cargo test`
+# lane; `make check-host`'s `--workspace` clippy and tests still cover it.
+
+[features]
+# On by default so `--workspace` clippy and tests cover the transport: the pod
+# clients and every test peer want it. The `speech-surface` daemon takes the
+# crate with `default-features = false` — it needs the link's parameters only,
+# and the streamer engine is code it never runs.
+default = ["client-transport"]
+# The Linux client transport (`link`): openssl over a non-blocking socket,
+# `libc::poll`, and the streamer platform seam.
+client-transport = ["dep:pod-streamer", "dep:libc", "dep:log"]
+# Exposes `test_server_context`, the pinned single-identity PSK server peer, to
+# downstream crates' test modules. Never enabled in a production build.
+test-util = []
+
+[dependencies]
+openssl = "0.10"
+pod-streamer = { path = "../pod-streamer", optional = true }
+libc = { version = "0.2", optional = true }
+log = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

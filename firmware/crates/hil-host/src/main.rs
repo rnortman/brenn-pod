@@ -2185,20 +2185,19 @@ fn eval_sp_energy_pass(data: &TestData) -> bool {
 
 // ── I2S waveform sanity pass-criterion mirror ─────────────────────────────────
 
-/// Host-side mirror of the dead-line guard (mirrors device `ZERO_ABS_THRESHOLD`).
-/// Minimum absolute peak `max(|min|, |max|)`; NOT a loudness floor. Keep in sync.
-const I2S_HOST_ZERO_ABS_THRESHOLD: i32 = 16;
+/// Dead-line guard: minimum absolute peak `max(|min|, |max|)`; NOT a loudness floor.
+/// Taken from the shared calibration rather than mirrored, so a retune reaches the host
+/// gate and the device's own classifier together.
+const I2S_HOST_ZERO_ABS_THRESHOLD: i32 = audio_pipeline::ring::ZERO_ABS_THRESHOLD;
 
-/// Host-side mirror of the frozen-line guard (mirrors device `STUCK_SPREAD_FLOOR`).
-/// Minimum spread (`max − min`) separating quiet-real audio (≥ 76) from a frozen /
-/// 1-bit line (≈ 0). Keep in sync with the device constant.
-const I2S_HOST_SPREAD_FLOOR: i32 = 32;
+/// Frozen-line guard: minimum spread (`max − min`) separating quiet-real audio (≥ 76)
+/// from a frozen / 1-bit line (≈ 0).
+const I2S_HOST_SPREAD_FLOOR: i32 = audio_pipeline::ring::STUCK_SPREAD_FLOOR;
 
-/// Host-side mirror of the lag-1 autocorrelation floor (mirrors device `AUTOCORR_FLOOR` × 1000)
-/// — the PRIMARY health gate. The device emits `ac1=` as r1 × 1000 (integer milli-units);
-/// this threshold is 200 (= 0.2). RNG noise has ac1 ≈ 0; confirmed quiet-room acoustic audio
-/// has ac1 0.41–0.97 (ADR 2026-06-17). Keep in sync.
-const I2S_HOST_AUTOCORR_FLOOR: i32 = 200;
+/// Lag-1 autocorrelation floor — the PRIMARY health gate — in the milli-units the device
+/// reports `ac1=` in (r1 × 1000, rounded the same way the device rounds it). RNG noise has
+/// ac1 ≈ 0; confirmed quiet-room acoustic audio has ac1 0.41–0.97.
+const I2S_HOST_AUTOCORR_FLOOR: i32 = (audio_pipeline::ring::AUTOCORR_FLOOR * 1000.0 + 0.5) as i32;
 
 /// Mirror of the device-side I2S waveform PASS criterion, evaluated from the typed report.
 ///
@@ -7637,6 +7636,16 @@ mod tests {
             !eval_i2s_waveform_pass(&waveform_data(-200, 200, I2S_HOST_AUTOCORR_FLOOR)),
             "ac1 at floor (200) must be rejected — predicate is strict greater-than"
         );
+    }
+
+    /// The host gates in the milli-units the device reports; the floor it derives from
+    /// the shared calibration must be exactly the device's own floor scaled by 1000, or
+    /// the two ends of the same test disagree about what "live" means.
+    #[test]
+    fn i2s_host_floors_are_the_shared_calibration() {
+        assert_eq!(I2S_HOST_AUTOCORR_FLOOR, 200);
+        assert_eq!(I2S_HOST_ZERO_ABS_THRESHOLD, 16);
+        assert_eq!(I2S_HOST_SPREAD_FLOOR, 32);
     }
 
     /// `ac1` one unit above the floor (201) → true.

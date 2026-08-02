@@ -894,6 +894,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pod-streamer"
+version = "0.1.0"
+dependencies = [
+ "audio-pipeline",
+ "heapless",
+ "log",
+ "wifi-reconnect",
+ "xvf3800-ctrl",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -946,6 +957,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psk-link"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "openssl",
+ "pod-streamer",
 ]
 
 [[package]]
@@ -1213,6 +1234,8 @@ dependencies = [
  "hound",
  "openssl",
  "pod-ingest",
+ "pod-streamer",
+ "psk-link",
  "rustix",
  "serde",
  "serde_json",
@@ -1642,6 +1665,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wifi-reconnect"
+version = "0.1.0"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1692,6 +1719,10 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xvf3800-ctrl"
+version = "0.1.0"
 
 [[package]]
 name = "yoke"

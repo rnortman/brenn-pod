@@ -12,7 +12,6 @@ pub mod jsonl;
 pub mod pipeline;
 pub mod playback_router;
 pub mod prune;
-pub mod psk;
 pub mod recorder;
 pub mod replay;
 pub mod server;
@@ -24,6 +23,8 @@ pub use config::{
 };
 pub use jsonl::{JsonlHandle, emit_line, format_line};
 pub use prune::{PruneFailure, PruneHalt, PruneOutcome, PruneRequest, PruneTier, PrunedLog, prune};
+/// The link's TLS-PSK parameters, shared with the device clients.
+pub use psk_link as psk;
 pub use recorder::{
     Sidecar, SidecarError, SidecarSegment, WakeClass, iso8601_ms, sanitize_filename, set_pinned,
     sidecar_path,

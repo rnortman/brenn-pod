@@ -1,10 +1,27 @@
 //! Shared TLS-PSK parameters for the pod↔host audio link.
 //!
 //! One source of truth for what this link speaks — protocol version,
-//! ciphersuite, identity encoding, key encoding — so the server, `replay-pod`,
-//! and every test peer cannot drift from each other. A drifted test peer is the
-//! worst case: it keeps passing against a configuration production no longer
-//! speaks.
+//! ciphersuite, identity encoding, key encoding — so the server, the device
+//! clients, `replay-pod`, and every test peer cannot drift from each other. A
+//! drifted test peer is the worst case: it keeps passing against a
+//! configuration production no longer speaks.
+//!
+//! Lives in the firmware workspace because both ends need it: `speech-surface`
+//! re-exports it as `speech_surface::psk`, and the Linux pod builds its client
+//! context here. The cross-workspace edge points one way only — host consumes
+//! firmware crates, never the reverse.
+//!
+//! The crate root is the parameters themselves; `link` is the Linux client
+//! transport built on them — openssl and `libc::poll` behind the streamer's
+//! seams. Both live here because both are Linux-generic rather than
+//! reachy-specific, and because the host-side integration test drives the same
+//! transport the pod ships. The transport sits behind the default-on
+//! `client-transport` feature so a consumer that wants the parameters alone
+//! (the `speech-surface` daemon) does not compile the streamer engine it never
+//! runs.
+
+#[cfg(feature = "client-transport")]
+pub mod link;
 
 use std::path::Path;
 
@@ -63,6 +80,32 @@ pub fn client_context(pod_id: &str, key: [u8; PSK_LEN]) -> Result<SslContext, St
     Ok(builder.build())
 }
 
+/// A server context accepting exactly `identity` with `key`, pinned to the same
+/// parameters every context on this wire is pinned to.
+///
+/// The canonical test server peer: a wrong identity or short secret buffer is
+/// refused with `Ok(0)` (which the peer reads as "no key for you" — a handshake
+/// failure, not a torn connection). Tests that roll their own callback risk
+/// passing against a configuration production does not speak.
+///
+/// Panics if openssl refuses the pinned parameters, which no test can recover
+/// from.
+#[cfg(any(test, feature = "test-util"))]
+pub fn test_server_context(identity: &str, key: [u8; PSK_LEN]) -> SslContext {
+    let identity = identity.to_string();
+    let mut builder = SslContext::builder(SslMethod::tls_server()).expect("server context builder");
+    pin_link_params(&mut builder).expect("tls parameters");
+    builder.set_psk_server_callback(move |_ssl, seen, secret| {
+        if seen == Some(identity.as_bytes()) && secret.len() >= key.len() {
+            secret[..key.len()].copy_from_slice(&key);
+            Ok(key.len())
+        } else {
+            Ok(0)
+        }
+    });
+    builder.build()
+}
+
 /// Decode one [`PSK_HEX_LEN`]-character key. `label` names the offending entry
 /// (a pod id, or a file path) in the error; key material never renders, so a
 /// message can be logged as-is.
@@ -96,9 +139,8 @@ pub fn psk_hex(key: &[u8; PSK_LEN]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Write a file holding key material with owner-only permissions — the writer
-/// counterpart of the startup mode check in [`crate::config`], which rejects any
-/// secrets file readable by another local account.
+/// Write a file holding key material with owner-only permissions. Wider modes
+/// would be rejected at load time.
 pub fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 

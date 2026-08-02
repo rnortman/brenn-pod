@@ -44,21 +44,22 @@
 //! 1. **Drain until `WouldBlock`.** TLS decrypts whole records into an internal
 //!    buffer, so the fd can show no `POLLIN` while plaintext is still pending.
 //!    A caller must keep reading until `WouldBlock` rather than trusting
-//!    readiness; [`LinkStream::buffers_plaintext`] is how the streamer's event
-//!    loop learns it must attempt a read every wake.
+//!    readiness; [`pod_streamer::link::LinkStream::buffers_plaintext`] is how
+//!    the streamer's event loop learns it must attempt a read every wake.
 //! 2. **Retry writes with the same bytes.** After `WANT_WRITE` mbedTLS requires
 //!    the next write to present the same buffer contents; partial-write
 //!    bookkeeping must not re-slice differently on retry.
 //! 3. **Poll the direction TLS asked for.** A read can want write and vice
-//!    versa — constant during the handshake, rare afterwards. [`Want`] is
-//!    tracked per direction (a read's outstanding request and a write's are
-//!    independent) and [`LinkStream::poll_events`] *substitutes* it for the
+//!    versa — constant during the handshake, rare afterwards.
+//!    [`pod_streamer::link::Want`] is tracked per direction (a read's
+//!    outstanding request and a write's are independent) and
+//!    [`pod_streamer::link::LinkStream::poll_interest`] *substitutes* it for the
 //!    direction the caller armed. Substitution, not addition: a caller that
 //!    de-armed `POLLOUT` (write backoff) or `POLLIN` (inbound backpressure) must
 //!    not have it reinstated by the other direction's outstanding request, or
 //!    the level-triggered fd wakes the loop immediately and the de-arm becomes a
-//!    busy spin. The one exception is the self-contained `POLLOUT` wait inside
-//!    `send_frame_bp`, which cannot consult [`Want`] while it holds the stream
+//!    busy spin. The one exception is the self-contained writability wait inside
+//!    `send_frame_bp`, which cannot consult the outstanding want while it holds the stream
 //!    mutably: a write blocked on `WANT_READ` there waits out its write budget
 //!    and the caller reconnects. That needs renegotiation to happen at all,
 //!    which this configuration never initiates.
@@ -74,6 +75,10 @@
 
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::sys;
+#[cfg(target_os = "espidf")]
+use pod_streamer::link::{LinkStream, PollInterest, Want, plan_poll_interest};
+#[cfg(target_os = "espidf")]
+use pod_streamer::netpoll::{NetPoll as _, Readiness};
 #[cfg(target_os = "espidf")]
 use std::io;
 #[cfg(target_os = "espidf")]
@@ -96,131 +101,6 @@ pub(crate) const PSK_LEN: usize = 32;
 #[cfg(target_os = "espidf")]
 const HANDSHAKE_TIMEOUT: Duration =
     Duration::from_secs(device_protocol::TLS_HANDSHAKE_TIMEOUT_SECS);
-
-/// Which direction TLS last said it was waiting on, for one operation
-/// (a read's outstanding request and a write's are tracked separately).
-///
-/// Ungated so [`plan_poll_events`] and its tests compile on the host; the values
-/// themselves are only ever produced by the device-gated `TlsStream::classify`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Want {
-    /// The last call returned `WANT_READ`: poll `POLLIN` before retrying.
-    Read,
-    /// The last call returned `WANT_WRITE`: poll `POLLOUT` before retrying.
-    Write,
-    /// The last call completed; no direction is outstanding.
-    None,
-}
-
-/// Poll directions for one wake under poll-discipline rule 3, plus how many of the
-/// armed directions were substituted (0..=2).
-pub(crate) struct PollPlan {
-    /// Whether the wake should wait on `POLLIN`.
-    pub poll_in: bool,
-    /// Whether the wake should wait on `POLLOUT`.
-    pub poll_out: bool,
-    /// Armed directions whose poll direction was replaced by the one TLS asked for.
-    pub substituted: u32,
-}
-
-/// Decide which directions to poll for a wake in which the caller armed reading
-/// (`readable`) and/or writing (`writable`), given each direction's outstanding [`Want`].
-///
-/// An armed read waits on `POLLOUT` when the last read wanted write, and an armed write
-/// waits on `POLLIN` when the last write wanted read — substitution, not addition, so a
-/// de-armed direction is never reinstated. Unarmed directions contribute nothing.
-///
-/// Split out of `TlsStream::poll_events` so the rule is reachable from a host unit test:
-/// the mask that impl returns is derived only from this plan, so the truth table pins the
-/// poll behavior of the real stream.
-pub(crate) fn plan_poll_events(
-    readable: bool,
-    writable: bool,
-    read_want: Want,
-    write_want: Want,
-) -> PollPlan {
-    let mut plan = PollPlan {
-        poll_in: false,
-        poll_out: false,
-        substituted: 0,
-    };
-    if readable {
-        if read_want == Want::Write {
-            plan.poll_out = true;
-            plan.substituted += 1;
-        } else {
-            plan.poll_in = true;
-        }
-    }
-    if writable {
-        if write_want == Want::Read {
-            plan.poll_in = true;
-            plan.substituted += 1;
-        } else {
-            plan.poll_out = true;
-        }
-    }
-    plan
-}
-
-/// A byte stream the streamer's `poll`-driven event loop can drive.
-///
-/// Bundles the pollable fd, event mask, and readiness-trust signal with
-/// `Read`/`Write` so TLS poll discipline lives in the impl rather than at
-/// every call site.
-#[cfg(target_os = "espidf")]
-pub(crate) trait LinkStream: io::Read + io::Write {
-    /// The fd to hand `poll()`.
-    fn link_fd(&self) -> RawFd;
-
-    /// `poll()` event mask for a wake in which the caller is interested in
-    /// reading (`readable`) and/or writing (`writable`). A direction the caller
-    /// did not arm contributes nothing; an armed one contributes whichever
-    /// event the transport needs to make that operation progress.
-    fn poll_events(&self, readable: bool, writable: bool) -> u32;
-
-    /// Whether decrypted bytes can sit in a transport-internal buffer that
-    /// `POLLIN` cannot reveal. `true` obliges the caller to attempt a read
-    /// every wake instead of only on readiness (poll discipline rule 1).
-    fn buffers_plaintext(&self) -> bool;
-
-    /// Reborrow as a plain reader, for helpers that need only `Read`.
-    fn as_read(&mut self) -> &mut dyn io::Read;
-
-    /// Reborrow as a plain writer, for helpers that need only `Write`.
-    fn as_write(&mut self) -> &mut dyn io::Write;
-}
-
-#[cfg(target_os = "espidf")]
-impl LinkStream for std::net::TcpStream {
-    fn link_fd(&self) -> RawFd {
-        use std::os::fd::AsRawFd as _;
-        self.as_raw_fd()
-    }
-
-    fn poll_events(&self, readable: bool, writable: bool) -> u32 {
-        let mut events = 0;
-        if readable {
-            events |= sys::POLLIN;
-        }
-        if writable {
-            events |= sys::POLLOUT;
-        }
-        events
-    }
-
-    fn buffers_plaintext(&self) -> bool {
-        false
-    }
-
-    fn as_read(&mut self) -> &mut dyn io::Read {
-        self
-    }
-
-    fn as_write(&mut self) -> &mut dyn io::Write {
-        self
-    }
-}
 
 /// Everything the C side holds a pointer to for the life of one session.
 ///
@@ -297,7 +177,7 @@ pub(crate) struct TlsStream {
     /// Direction the last `write` asked for.
     write_want: Want,
     /// Armed poll directions this session has had substituted (see
-    /// [`TlsStream::want_substitutions`]). `Cell` rather than an atomic: `poll_events`
+    /// [`TlsStream::want_substitutions`]). `Cell` rather than an atomic: `poll_interest`
     /// takes `&self` and the type is not `Send`, so there is no `Sync` obligation.
     want_substitutions: std::cell::Cell<u32>,
 }
@@ -310,10 +190,10 @@ impl TlsStream {
     /// The substitution is data-dependent, so this is the only way to tell whether the
     /// branch runs on the bench at all; the RTD self-test reports it as `wsub=`.
     ///
-    /// Coverage is exactly the [`LinkStream::poll_events`] calls made on this stream.
-    /// The `POLLOUT` wait inside `send_frame_bp` — the module docs' one documented
-    /// exception to consulting [`Want`] — does not go through `poll_events`, so a read of
-    /// 0 means "no substitution in the observed windows", not "no substitution".
+    /// Coverage is exactly the [`LinkStream::poll_interest`] calls made on this stream.
+    /// The writability wait inside `send_frame_bp` — the module docs' one documented
+    /// exception to consulting [`Want`] — does not go through `poll_interest`, so a read
+    /// of 0 means "no substitution in the observed windows", not "no substitution".
     pub(crate) fn want_substitutions(&self) -> u32 {
         self.want_substitutions.get()
     }
@@ -426,21 +306,14 @@ impl LinkStream for TlsStream {
         self.fd
     }
 
-    fn poll_events(&self, readable: bool, writable: bool) -> u32 {
-        let plan = plan_poll_events(readable, writable, self.read_want, self.write_want);
+    fn poll_interest(&self, readable: bool, writable: bool) -> PollInterest {
+        let plan = plan_poll_interest(readable, writable, self.read_want, self.write_want);
         self.want_substitutions.set(
             self.want_substitutions
                 .get()
                 .saturating_add(plan.substituted),
         );
-        let mut events = 0;
-        if plan.poll_in {
-            events |= sys::POLLIN;
-        }
-        if plan.poll_out {
-            events |= sys::POLLOUT;
-        }
-        events
+        plan.interest
     }
 
     fn buffers_plaintext(&self) -> bool {
@@ -481,13 +354,6 @@ unsafe fn cstr_or_empty<'a>(p: *const core::ffi::c_char) -> &'a str {
     unsafe { core::ffi::CStr::from_ptr(p) }
         .to_str()
         .unwrap_or("")
-}
-
-/// Milliseconds remaining until `deadline`, clamped to a non-negative `c_int`.
-#[cfg(target_os = "espidf")]
-fn poll_timeout_ms(deadline: Instant) -> std::os::raw::c_int {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    remaining.as_millis().min(std::os::raw::c_int::MAX as u128) as std::os::raw::c_int
 }
 
 /// Inputs for [`tls_connect_psk`], bundled to keep the argument-word count
@@ -723,122 +589,17 @@ fn handshake(stream: &mut TlsStream, host: &str, deadline: Instant) -> io::Resul
             ));
         }
         // Both directions, because the step's blocking direction is unobservable:
-        // a client flight blocked on a full send buffer produces no `POLLIN`, and
-        // waiting only on `POLLIN` would burn the whole deadline. A wake in the
+        // a client flight blocked on a full send buffer produces no readability, and
+        // waiting only on readability would burn the whole deadline. A wake in the
         // wrong direction just re-calls `esp_tls_conn_new_async`, which is cheap.
-        let events = sys::POLLIN | sys::POLLOUT;
-        match crate::netpoll::poll_readiness(stream.fd, events, poll_timeout_ms(deadline)) {
-            crate::netpoll::Readiness::Fault(e) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match crate::netpoll::EspPoll.readiness(stream.fd, PollInterest::BOTH, remaining) {
+            Readiness::Fault(e) => {
                 return Err(io::Error::other(format!(
                     "socket fault during TLS handshake: {e:?}"
                 )));
             }
-            crate::netpoll::Readiness::TimedOut | crate::netpoll::Readiness::Ready { .. } => {}
+            Readiness::TimedOut | Readiness::Ready { .. } => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{PollPlan, Want, plan_poll_events};
-
-    /// Expected plan for one truth-table row: an armed read polls out iff its last read
-    /// wanted write, an armed write polls in iff its last write wanted read, and each such
-    /// flip is one substitution.
-    ///
-    /// A second spelling of the rule, not an independent oracle — it can only show that the
-    /// implementation has not moved, which is what the truth table is for. The literal
-    /// expected values live in the single-case tests below.
-    fn expected(readable: bool, writable: bool, read_want: Want, write_want: Want) -> PollPlan {
-        let read_flipped = readable && read_want == Want::Write;
-        let write_flipped = writable && write_want == Want::Read;
-        PollPlan {
-            poll_in: (readable && !read_flipped) || write_flipped,
-            poll_out: (writable && !write_flipped) || read_flipped,
-            substituted: u32::from(read_flipped) + u32::from(write_flipped),
-        }
-    }
-
-    /// Exhaustive over the whole input space (2 x 2 x 3 x 3), as a refactor lock: it pins
-    /// every row, including that the substitution count is bookkeeping laid alongside a
-    /// mask decided by the arming flags and the `Want`s alone. It asserts against a
-    /// paraphrase of the rule, so the cases below are what say the rule itself is right.
-    #[test]
-    fn plan_poll_events_truth_table() {
-        let wants = [Want::Read, Want::Write, Want::None];
-        for readable in [false, true] {
-            for writable in [false, true] {
-                for read_want in wants {
-                    for write_want in wants {
-                        let got = plan_poll_events(readable, writable, read_want, write_want);
-                        let want = expected(readable, writable, read_want, write_want);
-                        assert_eq!(
-                            (got.poll_in, got.poll_out, got.substituted),
-                            (want.poll_in, want.poll_out, want.substituted),
-                            "readable={readable} writable={writable} \
-                             read_want={read_want:?} write_want={write_want:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// An unarmed direction contributes nothing, whatever it last wanted — substitution
-    /// replaces an armed direction's poll, it never reinstates a de-armed one (which would
-    /// turn a backpressure de-arm into a busy spin on the level-triggered fd).
-    #[test]
-    fn plan_poll_events_unarmed_directions_contribute_nothing() {
-        for read_want in [Want::Read, Want::Write, Want::None] {
-            for write_want in [Want::Read, Want::Write, Want::None] {
-                let plan = plan_poll_events(false, false, read_want, write_want);
-                assert!(!plan.poll_in && !plan.poll_out);
-                assert_eq!(plan.substituted, 0);
-            }
-        }
-    }
-
-    /// The production shape the `wsub` counter exists to detect: the drain loop arms the
-    /// read alone and esp-tls answered `WANT_WRITE`. `poll_in` must come out **false** —
-    /// the armed direction's poll is replaced, not joined, so a wake happens on the
-    /// handshake flight the read is really blocked behind instead of on arriving bytes.
-    #[test]
-    fn plan_poll_events_read_wanting_write_polls_out_alone() {
-        let plan = plan_poll_events(true, false, Want::Write, Want::None);
-        assert!(
-            !plan.poll_in,
-            "the armed read's POLLIN is replaced, not kept"
-        );
-        assert!(plan.poll_out);
-        assert_eq!(plan.substituted, 1);
-    }
-
-    /// The mirror: a lone armed write whose last write wanted read polls in, not out.
-    #[test]
-    fn plan_poll_events_write_wanting_read_polls_in_alone() {
-        let plan = plan_poll_events(false, true, Want::None, Want::Read);
-        assert!(plan.poll_in);
-        assert!(
-            !plan.poll_out,
-            "the armed write's POLLOUT is replaced, not kept"
-        );
-        assert_eq!(plan.substituted, 1);
-    }
-
-    /// Both directions armed and both cross-wanting is the only way to substitute twice —
-    /// the read waits on out, the write waits on in, and the mask is still both bits.
-    #[test]
-    fn plan_poll_events_counts_two_substitutions() {
-        let plan = plan_poll_events(true, true, Want::Write, Want::Read);
-        assert!(plan.poll_in && plan.poll_out);
-        assert_eq!(plan.substituted, 2);
-    }
-
-    /// The steady state: nothing outstanding, so each armed direction polls its own.
-    #[test]
-    fn plan_poll_events_no_want_polls_armed_directions() {
-        let plan = plan_poll_events(true, true, Want::None, Want::None);
-        assert!(plan.poll_in && plan.poll_out);
-        assert_eq!(plan.substituted, 0);
     }
 }

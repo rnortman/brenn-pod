@@ -3,9 +3,17 @@
 # Run from firmware/ (workspace root). The root rust-toolchain.toml pins stable,
 # so host targets run under stable Rust with no espup required.
 #
-# cargo's default-members = ["crates/device-protocol", "crates/build-id"] ensures
-# no-flag invocations build/test only host crates. See
-# docs/adr/2026/06/05-rust-toolchain-milestone0/ for the toolchain-scoping rationale.
+# cargo's default-members ensures no-flag invocations build/test only host crates.
+#
+# System prerequisites for the host lanes (check-host builds every workspace member,
+# default-member or not):
+#   libssl-dev         — psk-link links openssl (the audio link's TLS-PSK parameters).
+#   libusb-1.0-0-dev   — reachy-pod links libusb (the XVF3800 USB control transport).
+#   libasound2-dev     — reachy-pod links libasound (the board's ALSA capture and
+#                        playback ends).
+# The device lanes (check-device, build-firmware, flash) additionally need espup.
+# The reachy lanes (reachy-pod and the deploy targets below) need podman, an
+# aarch64 binfmt_misc registration on a non-arm64 workstation, and ssh + rsync.
 
 .DEFAULT_GOAL := check
 
@@ -149,6 +157,75 @@ check-fast:
 .PHONY: podctl
 podctl:
 	cargo build -p podctl --release
+
+# ── The Reachy pod: build, deploy, watch, self-test ──────────────────────────
+#
+# The Linux voice node is not flashed, it is deployed: a payload tree is pushed
+# into a tmpfs store on a running device and the application is restarted onto
+# it. No reboot, no flash write, and the same contract check a payload served by
+# an application server would get. `make reachy-pod` alone needs no device.
+#
+# Device targeting is REACHY_HOST, the unit's hostname or address. The
+# environment (or the make command line) is consulted first and the gitignored
+# .local/reachy.conf second, so a workstation that always talks to the same unit
+# says so once:
+#
+#     echo 'REACHY_HOST=reachy00' > .local/reachy.conf
+#
+# The file is only read when the variable is not already set, so an override for
+# one invocation stays an override for one invocation.
+ifeq ($(origin REACHY_HOST), undefined)
+-include .local/reachy.conf
+endif
+
+# Refuse before doing anything rather than ssh to nowhere. A prerequisite of
+# every target that talks to a device, listed first so the refusal comes before
+# a container build.
+.PHONY: reachy-host
+reachy-host:
+	@[ -n "$(REACHY_HOST)" ] || { \
+	    echo "REACHY_HOST is not set, so there is no device to talk to." >&2; \
+	    echo "Name the unit for this invocation:" >&2; \
+	    echo "    make $(MAKECMDGOALS) REACHY_HOST=<hostname>" >&2; \
+	    echo "or once, in the gitignored firmware/.local/reachy.conf:" >&2; \
+	    echo "    REACHY_HOST=<hostname>" >&2; \
+	    exit 1; \
+	}
+
+# The payload: an aarch64 binary built in the pinned container, plus the tree
+# and the tarball the device takes it as. Needs podman; needs no device.
+.PHONY: reachy-pod
+reachy-pod:
+	tools/build-reachy-pod.sh
+
+# Build, push into the payload store, and activate — which checks the contract,
+# switches the current symlink and restarts the application onto it.
+.PHONY: reachy-deploy
+reachy-deploy: reachy-host reachy-pod
+	tools/deploy-reachy-pod.sh $(REACHY_HOST) --activate
+
+# Build, push, and run the bring-up registry out of the pushed release as the
+# account the application runs as — without activating it, so a device with no
+# payload stays without one. Refuses while the application is running: it holds
+# the sound card and the USB control interface.
+.PHONY: reachy-selftest
+reachy-selftest: reachy-host reachy-pod
+	tools/deploy-reachy-pod.sh $(REACHY_HOST) --selftest
+
+# The same, for the registry's manual cases: the bench run that establishes
+# which capture channel carries which of the chip's beams. It prompts, and you
+# speak into the array when it does — so run this one from a terminal at the
+# bench, not from CI.
+.PHONY: reachy-bench
+reachy-bench: reachy-host reachy-pod
+	tools/deploy-reachy-pod.sh $(REACHY_HOST) --bench
+
+# Follow what the deployed payload is saying. The journal is volatile, so this
+# is where its output is read. Through the deploy script like everything else
+# that talks to a device, so the unit's name is spelled in one place.
+.PHONY: reachy-logs
+reachy-logs: reachy-host
+	tools/deploy-reachy-pod.sh $(REACHY_HOST) --logs
 
 # Wire the repo-local git hooks directory so the pre-commit hook travels with the repo.
 # Run once per clone: make install-hooks

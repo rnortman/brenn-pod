@@ -146,7 +146,7 @@ pub struct SegmentStart {
     /// Absolute sample index (since capture start) of this segment's first sample.
     /// Includes pre-roll samples.
     pub base_sample_index: u64,
-    /// `esp_timer_get_time()` µs at the moment `base_sample_index` was captured.
+    /// Device monotonic µs at the moment `base_sample_index` was captured.
     /// Clock-mapping anchor: telemetry timestamps resolve to sample offsets via
     /// `offset = (ts_us − base_device_ts_us) × sample_rate / 1_000_000`.
     pub base_device_ts_us: u64,
@@ -161,7 +161,7 @@ pub struct AudioFrame {
     pub segment_id: u32,
     /// Absolute sample index of `pcm[0]`.
     pub first_sample_index: u64,
-    /// `esp_timer_get_time()` µs when this frame's first sample was captured.
+    /// Device monotonic µs when this frame's first sample was captured.
     pub device_ts_us: u64,
     /// Raw PCM bytes.  S16_LE, little-endian.  Interleaved channels if `channels > 1`.
     /// Capacity `MAX_AUDIO_PAYLOAD` = 1280 bytes (320 samples × 2 ch × 2 B).
@@ -199,7 +199,7 @@ pub fn pack_pcm_s16le<const CAP: usize>(samples: &[i16]) -> HVec<u8, CAP> {
 /// One XVF3800 telemetry reading, in-band within a segment.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct Telemetry {
-    /// `esp_timer_get_time()` µs when the I2C read completed.
+    /// Device monotonic µs when the control read completed.
     pub device_ts_us: u64,
     /// The specific register values read.
     pub kind: TelemetryKind,
@@ -222,7 +222,7 @@ pub enum TelemetryKind {
 pub struct SegmentEnd {
     /// Must match the opened segment's `segment_id`.
     pub segment_id: u32,
-    /// `esp_timer_get_time()` µs at close.
+    /// Device monotonic µs at close.
     pub device_ts_us: u64,
     /// Total `AudioFrame`s sent in this segment.
     pub frames_sent: u32,

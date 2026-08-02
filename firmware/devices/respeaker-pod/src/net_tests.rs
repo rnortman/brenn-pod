@@ -10,18 +10,16 @@
 #[cfg(target_os = "espidf")]
 use crate::hil::test_report_fail_msg;
 #[cfg(target_os = "espidf")]
-use crate::inbound::{
-    CountingSink, FrameAccumulator, InboundConnectionState, StallCountingSink, consume_frames,
-    drain_inbound,
-};
-#[cfg(target_os = "espidf")]
 use crate::netpoll::poll_one;
 #[cfg(target_os = "espidf")]
 use crate::nvs::open_wifi_nvs;
 #[cfg(target_os = "espidf")]
-use crate::tls_link::LinkStream;
-#[cfg(target_os = "espidf")]
 use crate::{build_inbound_stream_sink, send_frame_bp, send_frame_bp_counted};
+#[cfg(target_os = "espidf")]
+use audio_pipeline::inbound::{
+    CountingSink, FrameAccumulator, InboundConnectionState, StallCountingSink, consume_frames,
+    drain_inbound,
+};
 #[cfg(target_os = "espidf")]
 use audio_pipeline::stream_send::SendOutcome;
 #[cfg(target_os = "espidf")]
@@ -32,6 +30,10 @@ use device_protocol::{
 };
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::tls::{self, EspTls};
+#[cfg(target_os = "espidf")]
+use pod_streamer::link::LinkStream;
+#[cfg(target_os = "espidf")]
+use pod_streamer::netpoll::{NetPoll as _, Readiness};
 #[cfg(target_os = "espidf")]
 use wifi_diag::fmt_ipv4;
 
@@ -226,7 +228,13 @@ pub(crate) fn run_tls_inbound_frames() -> (Status, Payload) {
     let mut idle_count: u32 = 0;
 
     loop {
-        match drain_inbound(&mut stream, &mut accum, &mut sink, &mut inbound_state) {
+        match drain_inbound(
+            &mut stream,
+            &mut accum,
+            &mut sink,
+            &mut inbound_state,
+            &mut crate::inbound::HeapWaypointObs,
+        ) {
             Ok(outcome) if outcome.frames_routed > 0 => {
                 total_frames += outcome.frames_routed;
                 idle_count = 0; // reset on progress
@@ -400,7 +408,12 @@ pub(crate) fn run_tls_inbound_backpressure() -> (Status, Payload) {
         }
 
         if eof {
-            match consume_frames(&mut accum, &mut sink, &mut inbound_state) {
+            match consume_frames(
+                &mut accum,
+                &mut sink,
+                &mut inbound_state,
+                &mut crate::inbound::HeapWaypointObs,
+            ) {
                 Ok(n) => {
                     if n > 0 {
                         total_frames += n;
@@ -434,7 +447,13 @@ pub(crate) fn run_tls_inbound_backpressure() -> (Status, Payload) {
             continue;
         }
 
-        match drain_inbound(&mut stream, &mut accum, &mut sink, &mut inbound_state) {
+        match drain_inbound(
+            &mut stream,
+            &mut accum,
+            &mut sink,
+            &mut inbound_state,
+            &mut crate::inbound::HeapWaypointObs,
+        ) {
             Ok(outcome) => {
                 total_frames += outcome.frames_routed;
                 if !outcome.made_progress() {
@@ -1107,8 +1126,9 @@ pub(crate) fn run_stream_realtime_duplex() -> (Status, Payload) {
 
 #[cfg(target_os = "espidf")]
 fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
-    use crate::inbound::CountingSink;
-    use crate::streamer::{SEGMENT_ACTIVE, SegmentExit};
+    use crate::streamer::SEGMENT_ACTIVE;
+    use audio_pipeline::inbound::CountingSink;
+    use pod_streamer::segment::SegmentExit;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
@@ -1220,7 +1240,7 @@ fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
     // pre-B heap headroom survives even if Scenario B panics before the assertion suffix.
     let (free, min) = crate::health::heap_free_min();
     log::info!("rtd: heap waypoint before-B heap_free={free} min_heap={min}");
-    let mut sink_b = crate::inbound::FakeDacSink::new();
+    let mut sink_b = audio_pipeline::inbound::FakeDacSink::new();
     let b_seg = rtd_run_one_segment(
         &RtdConnect {
             peer_ip,
@@ -1303,8 +1323,8 @@ fn run_stream_realtime_duplex_inner() -> (Status, Payload) {
 struct RtdSegmentIo<'a> {
     sink: &'a mut dyn audio_pipeline::playback::PlaybackSink,
     scratch: &'a mut Vec<u8>,
-    accum: &'a mut crate::inbound::FrameAccumulator,
-    state: &'a mut crate::inbound::InboundConnectionState,
+    accum: &'a mut audio_pipeline::inbound::FrameAccumulator,
+    state: &'a mut audio_pipeline::inbound::InboundConnectionState,
 }
 
 /// The per-connection TLS-PSK dial inputs for one RTD segment, bundled to stay
@@ -1338,14 +1358,15 @@ fn rtd_run_one_segment(
     conn: &RtdConnect<'_>,
     scenario: char,
     io: &mut RtdSegmentIo<'_>,
-) -> Result<(crate::streamer::SegmentExit, u128, SegMeas), String> {
+) -> Result<(pod_streamer::segment::SegmentExit, u128, SegMeas), String> {
     use crate::capture::CAPTURE_RING;
-    use crate::streamer::{SegmentDeps, StreamerMsg, run_segment};
+    use crate::netpoll::EspPoll;
     use audio_pipeline::ring::{PREROLL_SAMPLES, RING_CAPACITY_SAMPLES, RingIndex};
     use audio_pipeline::wire::{
         AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, ChannelSource, Hello, SegmentStart,
         StreamFrame,
     };
+    use pod_streamer::segment::{SegmentDeps, StreamerMsg, run_segment};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
@@ -1513,6 +1534,15 @@ fn rtd_run_one_segment(
 
     let started = Instant::now();
     let exit = {
+        // The engine's observability seams: both are the production observers, so
+        // this session executes the same waypoint bodies the pipeline does — the
+        // segment sampler's heap queries and log line included — with a `rtd:`
+        // marker line added ahead of each so the session's own trace is greppable.
+        let mut prod_obs = crate::streamer::segment_obs(0);
+        let mut obs = |event: pod_streamer::segment::ObsEvent| {
+            log::info!("rtd: segment obs {}", event.as_str());
+            prod_obs(event);
+        };
         let mut deps = SegmentDeps {
             socket: &mut socket,
             rx: &rx,
@@ -1523,6 +1553,11 @@ fn rtd_run_one_segment(
             inbound_sink: &mut *io.sink,
             inbound_state: &mut *io.state,
             outbound_buf: &mut *io.scratch,
+            poll: &EspPoll,
+            now_us: &now_us,
+            now_instant: &Instant::now,
+            obs: &mut obs,
+            inbound_obs: &mut crate::inbound::HeapWaypointObs,
         };
         run_segment(&mut deps, 0, read_cursor)
     };
@@ -1619,8 +1654,8 @@ fn tls_psk_inputs(
     })
 }
 
-/// Wait for the tunnel to be ready in `direction` (a `poll()` event mask), or
-/// report the fault/timeout as a failed report.
+/// Wait for the tunnel to be ready in the requested direction, or report the
+/// fault/timeout as a failed report.
 #[allow(clippy::result_large_err)]
 #[cfg(target_os = "espidf")]
 fn tls_psk_wait(
@@ -1629,14 +1664,10 @@ fn tls_psk_wait(
     deadline: std::time::Instant,
 ) -> Result<(), (Status, Payload)> {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let timeout_ms =
-        remaining.as_millis().min(std::os::raw::c_int::MAX as u128) as std::os::raw::c_int;
-    let events = stream.poll_events(readable, !readable);
-    match crate::netpoll::poll_readiness(stream.link_fd(), events, timeout_ms) {
-        crate::netpoll::Readiness::Fault(e) => {
-            Err(test_report_fail_detail("tls-psk socket fault", &e))
-        }
-        crate::netpoll::Readiness::TimedOut | crate::netpoll::Readiness::Ready { .. } => Ok(()),
+    let interest = stream.poll_interest(readable, !readable);
+    match crate::netpoll::EspPoll.readiness(stream.link_fd(), interest, remaining) {
+        Readiness::Fault(e) => Err(test_report_fail_detail("tls-psk socket fault", &e)),
+        Readiness::TimedOut | Readiness::Ready { .. } => Ok(()),
     }
 }
 
