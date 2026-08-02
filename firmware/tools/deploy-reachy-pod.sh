@@ -32,29 +32,15 @@
 
 set -euo pipefail
 
-prog=$(basename -- "$0")
-firmware_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=lib.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 payload_dir="${firmware_root}/target/reachy-pod/payload"
 
 # Where brenn-os keeps unpacked payloads, and the tool that makes one current.
-store=/run/brenn-app/releases
+store="${store_mount}/releases"
 activate=/usr/sbin/brenn-app-activate
 service=brenn-app.service
-
-# The account the application runs as. The self-test observes the hardware as
-# this account or it observes nothing worth knowing.
-app_user=app
-
-die() {
-	echo "${prog}: $1" >&2
-	shift
-	local line
-	for line in "$@"; do
-		echo "    ${line}" >&2
-	done
-	exit 1
-}
 
 usage() {
 	die "usage: ${prog} <host> --activate|--selftest|--bench|--logs"

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 const CONSOLE_INFO: &[&str] = &[
     "daemon_start",
     "listening",
-    "wake_bypassed",
+    "listener_absent",
     "brain_absent",
     "brain_clip_loaded",
     "brain_echo",
@@ -135,18 +135,19 @@ fn has_error_token(event: &str) -> bool {
 }
 
 /// Whether an event renders loud (`!!! ` prefix, red on a terminal). Error-token
-/// names are loud; `wake_bypassed` is a loud warning (the gate is open); a
+/// names are loud; `listener_absent` is a loud warning (the daemon mints no
+/// utterances — a legitimate state, but one that otherwise looks healthy); a
 /// `wake_decision` is loud unless its outcome is one of the known calm verdicts,
 /// so an `error` or any unrecognized future outcome surfaces loudly rather than
 /// as a calm line.
 fn is_loud(event: &str, fields: &Value) -> bool {
-    if event == "wake_bypassed" {
+    if event == "listener_absent" {
         return true;
     }
     if event == "wake_decision" {
         return !matches!(
             fields.get("outcome").and_then(Value::as_str),
-            Some("positive") | Some("negative") | Some("bypassed")
+            Some("positive") | Some("negative")
         );
     }
     has_error_token(event)
@@ -751,9 +752,8 @@ fn narrate_wake_command_absent(fields: &Value) -> String {
 }
 
 /// The wake verdict as prose: `✓ wake positive — score 0.874 ≥ 0.500 (infer
-/// 31 ms)`, `✗ wake negative — score 0.121 < 0.500`, or `✓ wake bypassed (no
-/// gate)`. The bypass gate applies no threshold, so none is shown. An `error`
-/// (or unknown) outcome returns `None` to render loud through the generic path.
+/// 31 ms)` or `✗ wake negative — score 0.121 < 0.500`. An `error` (or unknown)
+/// outcome returns `None` to render loud through the generic path.
 fn narrate_wake_decision(fields: &Value) -> Option<String> {
     let outcome = fields.get("outcome").and_then(Value::as_str)?;
     let score = fmt_score(fields.get("score"));
@@ -772,7 +772,6 @@ fn narrate_wake_decision(fields: &Value) -> Option<String> {
             ))
         }
         "negative" => Some(format!("✗ wake negative — score {score} < {threshold}")),
-        "bypassed" => Some("✓ wake bypassed (no gate)".to_string()),
         _ => None,
     }
 }
@@ -1577,18 +1576,24 @@ mod tests {
     }
 
     #[test]
-    fn wake_bypassed_renders_loud() {
+    fn listener_absent_is_wanted_and_renders_loud_with_its_reason() {
+        // The allowlist is what makes an error-token-free name render at all; a
+        // class row and a loud mapping alone would leave the line file-only.
+        assert!(wants("listener_absent"));
         let mut plain = Renderer::new(false);
-        assert!(
-            plain
-                .render(0, "wake_bypassed", &json!({}))
-                .unwrap()
-                .contains("!!!")
-        );
+        let line = plain
+            .render(
+                0,
+                "listener_absent",
+                &json!({ "reason": "no wake table configured" }),
+            )
+            .unwrap();
+        assert!(line.contains("!!! listener_absent"), "{line}");
+        assert!(line.contains("no wake table configured"), "{line}");
         let mut colored = Renderer::new(true);
         assert!(
             colored
-                .render(0, "wake_bypassed", &json!({}))
+                .render(0, "listener_absent", &json!({}))
                 .unwrap()
                 .contains('\x1b')
         );
@@ -1870,17 +1875,6 @@ mod tests {
             "{neg}"
         );
 
-        // Bypass applies no threshold; none is invented.
-        let byp = r
-            .render(
-                0,
-                "wake_decision",
-                &json!({ "outcome": "bypassed", "threshold": null }),
-            )
-            .unwrap();
-        assert!(byp.ends_with("✓ wake bypassed (no gate)"), "{byp}");
-        assert!(!byp.contains("!!!"), "{byp}");
-
         let err = r
             .render(
                 0,
@@ -1890,6 +1884,16 @@ mod tests {
             .unwrap();
         assert!(err.contains("!!! wake_decision"), "{err}");
         assert!(err.contains("error=sidecar timeout"), "{err}");
+
+        // `bypassed` is retired vocabulary: no gate can produce it, but it is in
+        // logs already written. Replayed, it renders loud through the same
+        // unknown-outcome path — a calm "✓ wake bypassed (no gate)" is exactly the
+        // healthy-looking deafness the mode's removal was for.
+        let retired = r
+            .render(0, "wake_decision", &json!({ "outcome": "bypassed" }))
+            .unwrap();
+        assert!(retired.contains("!!! wake_decision"), "{retired}");
+        assert!(!retired.contains("(no gate)"), "{retired}");
     }
 
     #[test]
@@ -2489,6 +2493,7 @@ mod tests {
         ("model_stats", Class::Calm),
         ("jsonl_encode_error", Class::Loud),
         ("latency_summary", Class::Calm),
+        ("listener_absent", Class::Loud),
         ("listener_event_dropped_overflow", Class::Loud),
         ("listener_thread_panicked", Class::Loud),
         ("listening", Class::Calm),
@@ -2529,7 +2534,6 @@ mod tests {
         ("utterance", Class::Calm),
         ("utterance_closed", Class::Calm),
         ("utterance_superseded", Class::Calm),
-        ("wake_bypassed", Class::Loud),
         ("wake_command_absent", Class::Calm),
         ("wake_decision", Class::Loud),
         ("wake_detected", Class::Calm),

@@ -408,14 +408,14 @@ pub const UNKNOWN_POD: &str = "UNKNOWN_POD";
 
 /// A segment's wake class. Serializes to the snake-case label stored in the
 /// sidecar `wake` field. The wake gate writes `Positive`/`Negative`; `Ungated`
-/// is written when the gate is bypassed or made no decision. `Unknown`
+/// is written when no wake decision was made. `Unknown`
 /// catches any label a newer binary might write, so one unrecognized value never
 /// makes a whole sidecar unparseable (which would demote a pinned log to
 /// prunable via the unreadable-sidecar path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WakeClass {
-    /// No wake decision was made (gate bypassed, or a log the gate never saw).
+    /// No wake decision was made (no listener wired, or a log the gate never saw).
     /// Retention tier-1, freely prunable — degrades tiering to oldest-first.
     Ungated,
     /// The gate accepted the segment. Retention tier-2 — pruned

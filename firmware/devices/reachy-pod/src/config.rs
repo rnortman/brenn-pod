@@ -1,10 +1,15 @@
 //! The pod's runtime configuration: where the audio host is, which key to present,
 //! and how the capture and gate are tuned.
 //!
-//! One file, `audio.conf`, in the writable directory the application service hands
-//! the payload. It is `KEY=VALUE` lines — the shape every other configuration file
-//! on the device takes — and it holds the pod's pre-shared key, so it is expected to
-//! be owner-only and is placed per unit rather than baked into a payload.
+//! One file, `audio.conf`, in [`CONF_DIR`] — RAM, beside the payload store, not the
+//! device's flash. It is `KEY=VALUE` lines — the shape every other configuration file
+//! on the device takes — and it holds the pod's pre-shared key, so it is owner-only
+//! and pushed per unit rather than baked into a payload.
+//!
+//! Configuration is pushed the way the payload is pushed, and a reboot clears both.
+//! That is what keeps normal operation off the eMMC, and it costs nothing: a pod that
+//! starts before its file is back parks and re-reads every [`RECHECK_INTERVAL`], so
+//! re-pushing after a reboot is the whole recovery.
 //!
 //! The pod id is not in the file. It is the host name, which provisioning sets per
 //! unit and which doubles as the TLS-PSK identity, exactly as the ESP pod uses its
@@ -14,7 +19,6 @@
 //! same shared defaults, so a pod that says nothing about the gate behaves the way
 //! both pods do out of the box.
 
-use std::ffi::OsString;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -24,15 +28,14 @@ use audio_pipeline::vad::{VAD_HANGOVER_MS, VAD_HANGOVER_MS_MAX, vad_threshold_ok
 use pod_streamer::telemetry::VAD_THRESHOLD_DEFAULT;
 use psk_link::{MAX_IDENTITY_LEN, PSK_LEN, parse_psk_hex};
 
-/// Where the application service says a payload may write, and where the pod's
-/// credentials are placed. Named by the service; the fallback is what that service
-/// sets it to, so a hand-run binary finds the same file.
-pub const DATA_DIR_VAR: &str = "BRENN_DATA_DIR";
+/// Where this pod's configuration is pushed: a directory in the same tmpfs the
+/// payload store lives in. Compiled in rather than named by the environment —
+/// where the pod reads its own configuration is the pod's knowledge, not something
+/// the platform hands it, and one constant is one place for the pushing tool and
+/// the reading pod to agree.
+pub const CONF_DIR: &str = "/run/brenn-app/conf";
 
-/// The fallback for [`DATA_DIR_VAR`].
-pub const DEFAULT_DATA_DIR: &str = "/data/app";
-
-/// The configuration file's name inside the data directory.
+/// The configuration file's name inside [`CONF_DIR`].
 pub const CONF_FILE_NAME: &str = "audio.conf";
 
 /// How long to wait before looking again when the file is missing or unusable.
@@ -115,28 +118,9 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The directory the application service gives the payload to write in.
-pub fn data_dir() -> PathBuf {
-    data_dir_from(std::env::var_os(DATA_DIR_VAR))
-}
-
-/// Which directory a given setting of [`DATA_DIR_VAR`] names.
-///
-/// Split from the reading of the variable so both branches are decidable without
-/// process-global state. An empty setting takes the fallback rather than being
-/// honoured: `BRENN_DATA_DIR=` would otherwise make [`conf_path`] a bare relative
-/// name, read out of whatever directory the service happened to start in, and the
-/// pod would report a missing file while pointing at a path nobody provisions.
-pub fn data_dir_from(var: Option<OsString>) -> PathBuf {
-    match var {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(DEFAULT_DATA_DIR),
-    }
-}
-
 /// The configuration file's path.
 pub fn conf_path() -> PathBuf {
-    data_dir().join(CONF_FILE_NAME)
+    Path::new(CONF_DIR).join(CONF_FILE_NAME)
 }
 
 impl Config {
@@ -537,25 +521,41 @@ mod tests {
     }
 
     #[test]
-    fn the_data_directory_is_the_services_or_the_documented_fallback() {
-        // Decided over the value rather than over the process's environment, so
-        // both branches are reachable in a lane that runs tests in parallel.
+    fn the_configuration_is_read_from_the_path_the_pushing_tool_writes() {
+        // The pod's configuration path is the one thing in this device that spans
+        // two languages with no compiler between them: the provisioning tool
+        // composes it out of shell constants and this pod compiles its own copy.
+        // Drift either way is a pod parked on a file nobody writes, re-reading it
+        // every RECHECK_INTERVAL forever, so read the tool's constants and
+        // compare rather than restating this side's.
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools");
+        let lib = std::fs::read_to_string(tools.join("lib.sh")).expect("read lib.sh");
+        let tool = std::fs::read_to_string(tools.join("provision-reachy-pod.sh"))
+            .expect("read provision-reachy-pod.sh");
+
+        // One `name=value` assignment at the start of a line, unquoted.
+        let assigned = |text: &str, name: &str| -> String {
+            let prefix = format!("{name}=");
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("no {prefix} line in the provisioning tool"));
+            line[prefix.len()..].trim().trim_matches('"').to_string()
+        };
+
+        let store_mount = assigned(&lib, "store_mount");
+        let conf_dir = assigned(&tool, "conf_dir").replace("${store_mount}", &store_mount);
+        let conf_file = assigned(&tool, "conf_file").replace("${conf_dir}", &conf_dir);
+
         assert_eq!(
-            data_dir_from(Some(OsString::from("/run/whatever"))),
-            PathBuf::from("/run/whatever"),
-            "the service's setting is honoured"
+            conf_dir, CONF_DIR,
+            "the provisioning tool pushes into a different directory than CONF_DIR"
         );
         assert_eq!(
-            data_dir_from(None),
-            PathBuf::from(DEFAULT_DATA_DIR),
-            "an unset variable takes the documented fallback"
+            PathBuf::from(conf_file),
+            conf_path(),
+            "the provisioning tool writes a different file than the pod reads"
         );
-        assert_eq!(
-            data_dir_from(Some(OsString::new())),
-            PathBuf::from(DEFAULT_DATA_DIR),
-            "an empty setting must not turn the configuration path into a relative name"
-        );
-        assert_eq!(conf_path(), data_dir().join(CONF_FILE_NAME));
     }
 
     #[test]

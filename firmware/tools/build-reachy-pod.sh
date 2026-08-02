@@ -30,9 +30,8 @@
 
 set -euo pipefail
 
-prog=$(basename -- "$0")
-firmware_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-repo_root=$(cd -- "${firmware_root}/.." && pwd)
+# shellcheck source=lib.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 podman=${REACHY_PODMAN:-podman}
 
@@ -58,16 +57,6 @@ binary="${target_dir}/release/${binary_name}"
 # flag produces an x86_64 binary that runs perfectly on the workstation and not
 # at all on the device.
 elf_machine_aarch64=183
-
-die() {
-	echo "${prog}: $1" >&2
-	shift
-	local line
-	for line in "$@"; do
-		echo "    ${line}" >&2
-	done
-	exit 1
-}
 
 # Whether an aarch64 binfmt_misc registration usable from inside a container is
 # present. The F flag is what makes it usable: it opens the interpreter at
@@ -178,7 +167,7 @@ assemble() {
 		#!/bin/sh
 		# The application payload's entry point. The working directory is the
 		# payload root, and the pipeline reads its configuration from
-		# ${BRENN_DATA_DIR}/audio.conf.
+		# /run/brenn-app/conf/audio.conf.
 		exec ./reachy-pod run
 	EOF
 	chmod 0755 -- "${payload_dir}/run"

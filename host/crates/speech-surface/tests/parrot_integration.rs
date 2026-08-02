@@ -1,5 +1,5 @@
-//! End-to-end parrot mode (the increment-5 done-when): a daemon with the wake
-//! gate in `bypass`, `[brain] mode = "echo"`, and `[stt]`/`[tts]` pointed at an
+//! End-to-end parrot mode: a daemon running the
+//! streaming listener, `[brain] mode = "echo"`, and `[stt]`/`[tts]` pointed at an
 //! in-process fake speaches container reads back what it "heard". `replay-pod
 //! --linger-until-eoa` streams a checked-in capture and stays connected through
 //! the daemon's synthesized readback, so the assertion is both JSONL-side (the
@@ -11,8 +11,8 @@ mod common;
 
 use std::path::Path;
 
-/// The single segment `wav-import` synthesizes for the replayed capture. Bypass
-/// passes it, so it mints exactly one utterance.
+/// The single segment `wav-import` synthesizes for the replayed capture. The
+/// listener wakes on it, so it mints exactly one utterance.
 const SEGMENT_ID: u32 = 1;
 
 /// The fake TTS clip length in S16 samples — a non-multiple of the 320-sample
@@ -24,7 +24,7 @@ const FRAME_SAMPLES: usize = 320;
 /// Frames the writer emits for the clip: ⌈TTS_SAMPLES / FRAME_SAMPLES⌉.
 const CLIP_FRAMES: u64 = TTS_SAMPLES.div_ceil(FRAME_SAMPLES) as u64;
 
-/// A capture replayed against a `bypass` + `echo`-brain daemon with STT/TTS
+/// A capture replayed against a listener + `echo`-brain daemon with STT/TTS
 /// pointed at a fake speaches container: the segment mints one utterance, STT
 /// transcribes it (to the fake's canned text), `EchoBrain` echoes that text back,
 /// TTS renders it to PCM, and the paced sender writes the clip back over the same

@@ -40,6 +40,8 @@ const PLAIN_ECHO_CHARS: u64 = common::FAKE_TRANSCRIPT.len() as u64;
 const AUDIO_DEADLINE: Duration = Duration::from_secs(20);
 const FLUSH_DEADLINE: Duration = Duration::from_secs(20);
 
+// TODO(barge-in-flake): this test failed once in ~21 runs and has not reproduced;
+// unresolved between a daemon race and host timing.
 #[test]
 fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
     let speaches_url = common::spawn_fake_speaches(TTS_SAMPLES);

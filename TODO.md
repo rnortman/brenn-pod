@@ -287,3 +287,32 @@ ASR tuning is the expected pick for a host-side wake-word/STT consumer).
 
 See `TODO(reachy-beam-mapping)` at `beam_energy_speech` in
 `firmware/devices/reachy-pod/src/beam.rs`.
+
+## `barge-in-flake` — BLOCKED as of 2026-08-02 (needs a stress campaign; not reproducible on demand)
+
+During unrelated firmware work in 2026-08,
+`barge_in_flushes_playback_and_chains_the_interrupted_turn`
+(`host/crates/speech-surface/tests/barge_integration.rs`) failed once and rejected a
+commit. It did not reproduce: 15 solo re-runs plus 6 full host-workspace runs were all
+green, roughly a one-in-21 event. The captured tail showed the barge firing and the
+second turn already minted before the panic, which leans toward a race in the daemon
+rather than test timing — but the evidence is not conclusive, and a slow-host timing
+flake is not ruled out.
+
+Both branches have stakes. A flaky test rejects commits at random in either workspace
+and trains everyone to re-run rather than read the failure. A daemon race means
+barge-in occasionally misbehaves on live hardware, where nothing re-runs it.
+
+Deferred because a one-in-21 irreproducible failure is a stress-campaign problem, not a
+read-the-code problem, and no work in flight touches the code it implicates.
+
+Next action: loop the test a few hundred times on a deliberately loaded host and capture
+the daemon JSONL plus the wire log on the first failure.
+
+Done = the root cause found and fixed with a pinning test, **or** a recorded stress
+campaign (≥ 500 iterations under load) with zero failures, at which point this entry
+closes as unreproducible with that evidence attached.
+
+See `TODO(barge-in-flake)` at
+`barge_in_flushes_playback_and_chains_the_interrupted_turn` in
+`host/crates/speech-surface/tests/barge_integration.rs`.

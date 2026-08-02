@@ -165,12 +165,14 @@ impl ReplayListener {
     /// Build from a daemon [`Config`]'s `[wake]` + `[endpointer]` tables, loading
     /// the models. Returns `None` unless both tables are present in the streaming
     /// listener's required form (`mode = "oww"` with its three model paths plus an
-    /// `[endpointer]` table) — the same gating the live daemon applies, so a
-    /// bypass/model-less/endpointer-less config replays nothing.
+    /// `[endpointer]` table) — the same gating the live daemon applies, so a config
+    /// missing either table replays nothing.
     pub fn from_config(config: &Config) -> Result<Option<ReplayListener>, WakeError> {
         let Some(wake) = config.wake.as_ref() else {
             return Ok(None);
         };
+        // `Oww` is the only mode today; the guard is what a future mode that does
+        // not stream OWW falls through, rather than loading models it has none of.
         if wake.mode != WakeMode::Oww {
             return Ok(None);
         }

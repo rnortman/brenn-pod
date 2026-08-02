@@ -57,14 +57,15 @@ pub struct Config {
     /// writers exist (every registered pod), brain or no brain.
     #[serde(default)]
     pub playback: PlaybackConfig,
-    /// Wake-gate configuration. `None` when the `[wake]` table is absent — the
-    /// server treats absence as bypass-with-warning, distinct from an explicit
-    /// quiet `mode = "bypass"`.
+    /// Wake-gate configuration. `None` when the `[wake]` table is absent — no
+    /// continuous listener is built, so the daemon records and tracks segments
+    /// but mints no utterances and no brain answer.
     #[serde(default)]
     pub wake: Option<WakeConfig>,
     /// Host-endpointer configuration. `None` when the `[endpointer]` table is
-    /// absent — the continuous listener's Silero endpointer is unwired and
-    /// utterance boundaries fall back to device VAD-release alone.
+    /// absent — no continuous listener is built (the listener carves utterances
+    /// with the Silero endpointer; there is no device-VAD-only fallback), with the
+    /// same recording-only consequence as an absent `[wake]`.
     #[serde(default)]
     pub endpointer: Option<EndpointerConfig>,
     /// Brain configuration. `None` when the `[brain]` table is absent — no brain
@@ -422,21 +423,20 @@ impl PlaybackConfig {
     }
 }
 
-/// Wake-gate configuration. A present `[wake]` table names an explicit `mode`;
-/// `mode = "oww"` additionally requires all three model paths.
+/// Wake-gate configuration. A present `[wake]` table names an explicit `mode`
+/// and all three model paths.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WakeConfig {
     /// Selects the gate implementation.
     pub mode: WakeMode,
-    /// openWakeWord mel-spectrogram model. Required for `oww`; ignored for
-    /// `bypass` (accepted so an operator can toggle mode without deleting paths).
+    /// openWakeWord mel-spectrogram model. Required.
     #[serde(default)]
     pub melspectrogram: Option<PathBuf>,
-    /// openWakeWord embedding model. Required for `oww`; ignored for `bypass`.
+    /// openWakeWord embedding model. Required.
     #[serde(default)]
     pub embedding: Option<PathBuf>,
-    /// openWakeWord wake-phrase model. Required for `oww`; ignored for `bypass`.
+    /// openWakeWord wake-phrase model. Required.
     #[serde(default)]
     pub model: Option<PathBuf>,
     /// Sigmoid score above which a segment wakes. Must be in `(0.0, 1.0)`.
@@ -445,8 +445,8 @@ pub struct WakeConfig {
 }
 
 impl WakeConfig {
-    /// Semantic checks: `oww` needs all three model paths, and `threshold` must
-    /// be a strict probability. Path presence/validity beyond "specified" is the
+    /// Semantic checks: all three model paths are present, and `threshold` is a
+    /// strict probability. Path presence/validity beyond "specified" is the
     /// gate's own load-time concern.
     pub fn validate(&self) -> Result<(), String> {
         if !(self.threshold > 0.0 && self.threshold < 1.0) {
@@ -455,15 +455,13 @@ impl WakeConfig {
                 self.threshold
             ));
         }
-        if self.mode == WakeMode::Oww {
-            for (field, path) in [
-                ("melspectrogram", &self.melspectrogram),
-                ("embedding", &self.embedding),
-                ("model", &self.model),
-            ] {
-                if path.is_none() {
-                    return Err(format!("wake.{field} is required when wake.mode = \"oww\""));
-                }
+        for (field, path) in [
+            ("melspectrogram", &self.melspectrogram),
+            ("embedding", &self.embedding),
+            ("model", &self.model),
+        ] {
+            if path.is_none() {
+                return Err(format!("wake.{field} is required when [wake] is present"));
             }
         }
         Ok(())
@@ -560,14 +558,14 @@ impl EndpointerConfig {
     }
 }
 
-/// Which wake-gate implementation the daemon builds at startup.
+/// Which wake-gate implementation the daemon builds at startup. One variant
+/// today; the enum is the seam a future gate lands on, and it keeps `mode` an
+/// explicit, parse-checked field rather than an implicit default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WakeMode {
     /// openWakeWord over `ort`.
     Oww,
-    /// Pass-through gate: every segment bypasses scoring.
-    Bypass,
 }
 
 /// Brain configuration. A present `[brain]` table names an explicit `mode`;
@@ -1094,17 +1092,16 @@ room = "kitchen"
     }
 
     #[test]
-    fn wake_bypass_ignores_model_paths() {
-        let config = Config::parse(
+    fn wake_rejects_bypass_mode() {
+        // A bypass gate would build no listener — recording and answering nothing
+        // while looking healthy — so the parser rejects it, like `[brain] mode = "llm"`.
+        let err = Config::parse(
             "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"bypass\"\nmodel = \"/m/wake.onnx\"",
         )
-        .expect("parse");
-        let wake = config.wake.as_ref().expect("wake table");
-        assert_eq!(wake.mode, WakeMode::Bypass);
-        assert_eq!(wake.threshold, 0.5);
-        assert_eq!(wake.model, Some(PathBuf::from("/m/wake.onnx")));
-        // Bypass accepts (and ignores) model paths — no missing-path rejection.
-        assert!(config.validate().is_ok());
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("bypass"), "message: {message}");
+        assert!(message.contains("oww"), "message: {message}");
     }
 
     #[test]
@@ -1158,7 +1155,7 @@ threshold = 0.7
     fn wake_threshold_bounds_rejected() {
         for bad in ["0.0", "1.0", "-0.1", "1.5"] {
             let config = Config::parse(&format!(
-                "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"bypass\"\nthreshold = {bad}"
+                "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\nthreshold = {bad}"
             ))
             .expect("parse");
             let err = config.validate().unwrap_err();
@@ -1178,7 +1175,7 @@ threshold = 0.7
     #[test]
     fn wake_rejects_unknown_key() {
         let err =
-            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"bypass\"\nbogus = 1")
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nbogus = 1")
                 .unwrap_err();
         assert!(err.to_string().contains("bogus"), "message: {err}");
     }

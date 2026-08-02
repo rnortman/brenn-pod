@@ -106,6 +106,21 @@ fn roundtrip_recording_off_asserts_jsonl_timings_and_doa() {
             .clone()
     };
 
+    // This config has neither `[wake]` nor `[endpointer]`, so the daemon carves no
+    // utterances — the recording-only state the runbook's fault-isolation section
+    // sends an operator into, announced by one loud startup line. Asserted on a
+    // daemon that actually started: the unit test around `build_listener` cannot
+    // see whether the line survives startup ordering, and a run that shows nothing
+    // makes the runbook document a line that does not exist.
+    let absent = named("listener_absent");
+    assert_eq!(absent.len(), 1, "{}", daemon.diagnostics());
+    assert_eq!(
+        absent[0]["reason"],
+        "neither the wake nor the endpointer table is configured",
+        "{}",
+        daemon.diagnostics()
+    );
+
     // conn_hello: the fixture pod, unmapped (no pod→room map in the config).
     let hello = named("conn_hello");
     assert_eq!(hello.len(), 1);

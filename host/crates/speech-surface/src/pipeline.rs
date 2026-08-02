@@ -841,7 +841,7 @@ async fn handle_stt_done(
     };
     // STT-confidence gate: a trigger whose text trips the gate is a likely
     // hallucination — declined as a no-command outcome, never echoed. Fail-open on a
-    // missing summary; a bypassed (no-wake, no-barge) or empty transcript is never
+    // missing summary; a no-wake, no-barge or empty transcript is never
     // gated. A scored wake accept is gated through its wake provenance; a barge-in
     // utterance has no wake word, so a second arm keyed on the barge mark declines
     // the barging speech that transcribed to nothing — the playback is already cut.

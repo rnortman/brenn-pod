@@ -9,6 +9,8 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- Reachy robot voice pipeline support! You can now run the speech in/out on a Reachy Mini
+  Wireless robot.
 - **Boot-path labels on reported heap samples**, so a heap figure can be attributed to the
   boot that produced it. `TestData::DeviceHealth` gains a `reset_reason` field — a
   wire-schema change — surfacing as `rr=` in report details.

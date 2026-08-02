@@ -84,6 +84,16 @@ pub trait StreamerPlatform {
     /// Whether the network link is up: `Some(false)` for down and `None` for
     /// "this platform cannot say cheaply". Both are treated as down, and neither
     /// charges a reconnect backoff — link recovery is not an audio-host failure.
+    ///
+    /// `None` must be *transient* — "cannot say cheaply right now", as with a
+    /// contended mutex or a radio stack mid-init. A platform with no cheap link
+    /// query at all answers `Some(true)` and lets a dead carrier surface as a
+    /// paced connect failure; `psk_link::LinkPlatform::link_up` is the exemplar.
+    /// Answering a permanent `None` compiles and passes every host test while
+    /// failing the idle-connect gate forever ([`ensure_connected`],
+    /// [`crate::idle::should_attempt_idle_connect`]): the pod never opens an idle
+    /// connection and never reconnects after one is lost, so it silently loses
+    /// the first utterance after every disconnect.
     fn link_up(&self) -> Option<bool>;
 
     /// One line of link diagnostics for a failed connect's log entry. Called only

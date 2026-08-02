@@ -481,25 +481,27 @@ impl Server {
         // failure is fatal at startup. A forwarder task moves each `ListenerEvent`
         // onto the pipeline queue as a `PipelineItem::Listener`, so segments and
         // listener events share one drop-oldest queue and one consumer.
-        let (listener_handle, listener_stats, listener_forwarder) = match build_listener(&config)
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-        {
-            Some((oww_models, silero_model, listener_config)) => {
-                let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<ListenerEvent>();
-                let handle = Listener::spawn(oww_models, silero_model, listener_config, ev_tx)?;
-                let stats = handle.stats_shared();
-                let fwd_tx = item_tx.clone();
-                let forwarder = tokio::spawn(async move {
-                    while let Some(ev) = ev_rx.recv().await {
-                        // A drop-oldest eviction here is the same failure class as a
-                        // segment eviction (flood territory); the drop is silent.
-                        let _ = fwd_tx.send(crate::pipeline::PipelineItem::Listener(ev));
-                    }
-                });
-                (Some(Arc::new(handle)), Some(stats), Some(forwarder))
-            }
-            None => (None, None, None),
-        };
+        let (listener_handle, listener_stats, listener_forwarder) =
+            match build_listener(&config, &jsonl)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+            {
+                Some((oww_models, silero_model, listener_config)) => {
+                    let (ev_tx, mut ev_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<ListenerEvent>();
+                    let handle = Listener::spawn(oww_models, silero_model, listener_config, ev_tx)?;
+                    let stats = handle.stats_shared();
+                    let fwd_tx = item_tx.clone();
+                    let forwarder = tokio::spawn(async move {
+                        while let Some(ev) = ev_rx.recv().await {
+                            // A drop-oldest eviction here is the same failure class as a
+                            // segment eviction (flood territory); the drop is silent.
+                            let _ = fwd_tx.send(crate::pipeline::PipelineItem::Listener(ev));
+                        }
+                    });
+                    (Some(Arc::new(handle)), Some(stats), Some(forwarder))
+                }
+                None => (None, None, None),
+            };
 
         // Barge-in bookkeeping, shared by the router (which evicts an interrupted
         // turn's responses), the playback adapter (which settles every job), and
@@ -879,16 +881,45 @@ impl Server {
 /// `[wake]` (openWakeWord models) and `[endpointer]` (Silero + timing) tables.
 /// Returns `None` unless both are present in the forms the streaming listener
 /// needs — `mode = "oww"` with its three model paths, plus an `[endpointer]` table
-/// naming the Silero model — so a bypass, model-less, or endpointer-less config
-/// runs with no listener and the batch wake path is untouched. A model-load
-/// failure is fatal at startup, never a silently-degraded listener. Shares its
-/// config gating and model loading with the offline replay harness.
+/// naming the Silero model. No listener means no utterances at all: segments are
+/// still recorded and tracked, but nothing is carved, scored, or answered — a
+/// legitimate configuration (fault isolation) that would otherwise look like a
+/// healthy daemon, so the `None` outcome emits a loud startup `listener_absent`
+/// line naming the missing table. A model-load failure is fatal at startup, never
+/// a silently-degraded listener. Shares its config gating and model loading with
+/// the offline replay harness.
 #[allow(clippy::type_complexity)]
 fn build_listener(
     config: &Config,
+    jsonl: &JsonlHandle,
 ) -> Result<Option<(OwwModels, SileroModel, ListenerConfig)>, WakeError> {
-    Ok(crate::replay::ReplayListener::from_config(config)?
-        .map(crate::replay::ReplayListener::into_parts))
+    let built = crate::replay::ReplayListener::from_config(config)?
+        .map(crate::replay::ReplayListener::into_parts);
+    if built.is_none() {
+        jsonl.emit(
+            "listener_absent",
+            &json!({
+                "reason": listener_absent_reason(config),
+                "effect": "recording and tracking only; no utterance is minted, no brain answers",
+            }),
+        );
+    }
+    Ok(built)
+}
+
+/// Which missing piece left the daemon listener-less, for the `listener_absent`
+/// line. Mirrors [`crate::replay::ReplayListener::from_config`]'s gating: both
+/// tables are required, and `[wake]` must name a mode the streaming listener
+/// implements — the last arm is the future-mode case, unreachable while `oww` is
+/// the only one. Table names carry no brackets: this line renders loud, and the
+/// console sanitizer replaces `[`/`]` (they frame its identity tag).
+fn listener_absent_reason(config: &Config) -> &'static str {
+    match (config.wake.is_some(), config.endpointer.is_some()) {
+        (false, false) => "neither the wake nor the endpointer table is configured",
+        (false, true) => "no wake table configured",
+        (true, false) => "no endpointer table configured",
+        (true, true) => "the configured wake mode builds no streaming listener",
+    }
 }
 
 /// A weak accessor for the listener's [`FeedSender`], for the playback fanout hooks.
@@ -942,7 +973,7 @@ type BuiltBrain = (Option<Arc<dyn Brain>>, BrainEventFn, Arc<BrainStats>);
 
 /// Build the brain from config. An absent `[brain]` table wires no brain — the
 /// mint-and-emit-utterance behavior with no dispatch and a null `brain_dispatched`
-/// stamp — plus a startup `brain_absent` info line (the `wake_bypassed` idiom).
+/// stamp — plus a startup `brain_absent` info line (the `listener_absent` idiom).
 /// `mode = "wav"` loads and format-validates the configured clip (a load failure
 /// is fatal at startup, naming the path and the offending property) and builds a
 /// `WavBrain` answering every utterance with it, emitting a `brain_clip_loaded`
@@ -4582,24 +4613,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_listener_requires_oww_and_endpointer() {
-        // No `[wake]` table: no streaming wake, so no listener (models never load).
+    /// Every listener-less config shape returns `None` *and* announces itself: a
+    /// deaf daemon that looks healthy is the failure this line exists to prevent,
+    /// so the emission is asserted alongside the outcome (the `brain_absent`
+    /// pattern), including which table the reason names.
+    #[tokio::test]
+    async fn build_listener_requires_oww_and_endpointer_and_announces_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        // No `[wake]`, no `[endpointer]`: nothing to stream and nothing to carve
+        // with, so no listener (models never load).
         let c = test_config("listen_addr = \"10.0.0.5:7380\"\n").unwrap();
         assert!(
-            build_listener(&c).unwrap().is_none(),
-            "no wake ⇒ no listener"
+            build_listener(&c, &handle).unwrap().is_none(),
+            "no wake, no endpointer ⇒ no listener"
         );
 
-        // Bypass wake + an endpointer: the batch bypass path has no OWW to stream,
-        // so the listener stays unwired even with Silero configured.
-        let c = test_config(
-            "listen_addr = \"10.0.0.5:7380\"\n[wake]\nmode = \"bypass\"\n[endpointer]\nmodel = \"/m/s.onnx\"",
-        )
-        .unwrap();
+        // An endpointer alone: the legal recording-only shape the runbook's
+        // fault-isolation step uses — segments recorded, no utterance minted.
+        let c = test_config("listen_addr = \"10.0.0.5:7380\"\n[endpointer]\nmodel = \"/m/s.onnx\"")
+            .unwrap();
         assert!(
-            build_listener(&c).unwrap().is_none(),
-            "bypass wake ⇒ no listener"
+            build_listener(&c, &handle).unwrap().is_none(),
+            "endpointer without wake ⇒ no listener"
         );
 
         // OWW wake but no `[endpointer]`: no Silero endpointer to carve utterances,
@@ -4609,9 +4646,29 @@ mod tests {
         )
         .unwrap();
         assert!(
-            build_listener(&c).unwrap().is_none(),
+            build_listener(&c, &handle).unwrap().is_none(),
             "oww without endpointer ⇒ no listener"
         );
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let absent = events_named(&lines, "listener_absent");
+        assert_eq!(absent.len(), 3, "one line per listener-less build");
+        assert_eq!(
+            absent[0]["reason"],
+            "neither the wake nor the endpointer table is configured"
+        );
+        assert_eq!(absent[1]["reason"], "no wake table configured");
+        assert_eq!(absent[2]["reason"], "no endpointer table configured");
+        for line in &absent {
+            assert!(
+                line["effect"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("no utterance is minted")),
+                "{line}"
+            );
+        }
     }
 
     #[test]

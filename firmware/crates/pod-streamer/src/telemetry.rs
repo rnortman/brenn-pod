@@ -147,11 +147,28 @@ pub trait TelemetryBus {
 
 // ── Poll core ─────────────────────────────────────────────────────────────────
 
+/// The non-blocking send half of the telemetry → streamer channel.
+///
+/// A seam rather than the concrete [`SyncSender`] so the ordering between a store
+/// to [`TelemetryCtx::vad_closed_flag`] and the send that follows it is observable
+/// from a test: production passes the sender itself, tests can pass a sink that
+/// snapshots the flag mid-send.
+pub trait StreamerSink {
+    /// Offer `msg` without blocking, exactly as [`SyncSender::try_send`] does.
+    fn try_send(&self, msg: StreamerMsg) -> Result<(), TrySendError<StreamerMsg>>;
+}
+
+impl StreamerSink for SyncSender<StreamerMsg> {
+    fn try_send(&self, msg: StreamerMsg) -> Result<(), TrySendError<StreamerMsg>> {
+        SyncSender::try_send(self, msg)
+    }
+}
+
 /// The per-tick platform seams, all borrowed for the life of the loop.
 pub struct TelemetryCtx<'a> {
     /// Telemetry → streamer channel. Bounded: audio has priority, so a full
     /// channel drops telemetry rather than blocking the poll.
-    pub tx: &'a SyncSender<StreamerMsg>,
+    pub tx: &'a dyn StreamerSink,
     /// Lossless VAD-closed flag, the streamer's backup for a dropped
     /// [`StreamerMsg::VadClosed`]. Cleared on onset, set on release.
     pub vad_closed_flag: &'a AtomicBool,
@@ -266,7 +283,13 @@ impl TelemetryCore {
     ///
     /// A dropped `VadOpened` re-closes the segment: forwarding telemetry for a
     /// segment the streamer never opened wastes channel slots and could cascade
-    /// into dropping the `VadClosed` that ends it.
+    /// into dropping the `VadClosed` that ends it. It also restores the closed
+    /// flag, so a failed open leaves the world exactly as the preceding close
+    /// left it — including that close's lossless signal, which this onset had
+    /// already cleared. Restoring is unconditional and safe even when no close
+    /// preceded: the streamer reads the flag only inside an open segment, and
+    /// every delivered onset clears it before the message that opens that
+    /// segment, so a stale `true` is never visible to a new segment.
     fn note_vad_opened(&mut self, ctx: &TelemetryCtx<'_>, max_energy: f32) {
         let write_head = (ctx.write_head)();
         log::info!(
@@ -289,6 +312,7 @@ impl TelemetryCore {
                 self.telemetry_drops
             );
             self.segment_open = false;
+            ctx.vad_closed_flag.store(true, Ordering::Release);
         }
     }
 
@@ -363,6 +387,7 @@ pub fn run_telemetry_loop<B: TelemetryBus>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::sync::mpsc::{Receiver, sync_channel};
 
     // ── Fakes ─────────────────────────────────────────────────────────────────
@@ -540,14 +565,56 @@ mod tests {
         }
     }
 
-    /// Borrow a [`Harness`] as a [`TelemetryCtx`].
+    /// A sink that records the closed flag as it stood at the moment each
+    /// `VadOpened` was offered, then forwards to the harness channel.
+    ///
+    /// The only way to observe the *order* of the flag store and the send from
+    /// outside `note_vad_opened`: after the tick, both are done, and end state
+    /// cannot tell which came first.
+    struct SnoopingSink<'a> {
+        inner: &'a SyncSender<StreamerMsg>,
+        flag: &'a AtomicBool,
+        flag_at_open: RefCell<Vec<bool>>,
+    }
+
+    impl<'a> SnoopingSink<'a> {
+        fn new(h: &'a Harness) -> Self {
+            Self {
+                inner: &h.tx,
+                flag: &h.flag,
+                flag_at_open: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// The flag as each offered `VadOpened` saw it, in order.
+        fn flag_at_open(&self) -> Vec<bool> {
+            self.flag_at_open.borrow().clone()
+        }
+    }
+
+    impl StreamerSink for SnoopingSink<'_> {
+        fn try_send(&self, msg: StreamerMsg) -> Result<(), TrySendError<StreamerMsg>> {
+            if matches!(msg, StreamerMsg::VadOpened { .. }) {
+                self.flag_at_open
+                    .borrow_mut()
+                    .push(self.flag.load(Ordering::Acquire));
+            }
+            self.inner.try_send(msg)
+        }
+    }
+
+    /// Borrow a [`Harness`] as a [`TelemetryCtx`], optionally through a different
+    /// [`StreamerSink`] than the harness channel itself.
     ///
     /// A macro rather than a method: the seams are `&dyn Fn`, and only a `let`
     /// initializer extends the borrowed closures' temporaries far enough to bind.
     macro_rules! harness_ctx {
         ($h:expr) => {
+            harness_ctx!($h, $h.tx)
+        };
+        ($h:expr, $sink:expr) => {
             TelemetryCtx {
-                tx: &$h.tx,
+                tx: &$sink,
                 vad_closed_flag: &$h.flag,
                 write_head: &|| $h.write_head,
                 now_us: &|| $h.now_us,
@@ -915,13 +982,93 @@ mod tests {
         );
         assert_eq!(core.telemetry_drops(), 1);
         assert!(
-            !h.flag.load(Ordering::Acquire),
-            "the flag is still cleared — the FSM really did open"
+            h.flag.load(Ordering::Acquire),
+            "a failed open restores the flag it cleared"
         );
 
         let msgs = h.drain();
         assert!(opened_heads(&msgs).is_empty());
         assert!(telemetry(&msgs).is_empty());
+    }
+
+    /// Close-then-reopen against a jammed channel: both messages drop, so the
+    /// flag is the only surviving signal that the first segment ended. The
+    /// dropped open must hand it back rather than swallow it — otherwise the
+    /// streamer holds a segment nothing will ever close and it terminates as a
+    /// buffer overrun instead of an utterance.
+    #[test]
+    fn a_dropped_open_hands_back_the_flag_a_dropped_close_left() {
+        // Capacity 1: the successful onset takes the slot and nothing drains it,
+        // so every later send bounces.
+        let h = Harness::with_capacity(1);
+        let mut bus = FakeBus::scripted(
+            vec![
+                Some(LOUD),
+                Some(LOUD),
+                Some(QUIET),
+                Some(QUIET),
+                Some(LOUD),
+                Some(LOUD),
+            ],
+            Some(AZ),
+        );
+        let mut core = TelemetryCore::new(THRESHOLD, HANGOVER_MS);
+        let ctx = harness_ctx!(h);
+
+        core.poll_tick(&mut bus, &ctx);
+        assert_eq!(core.poll_tick(&mut bus, &ctx), Some(VadTransition::Opened));
+        assert!(core.segment_open());
+
+        core.poll_tick(&mut bus, &ctx); // hangover
+        assert_eq!(core.poll_tick(&mut bus, &ctx), Some(VadTransition::Closed));
+        assert!(
+            h.flag.load(Ordering::Acquire),
+            "the dropped close leaves the flag as its lossless path"
+        );
+
+        core.poll_tick(&mut bus, &ctx);
+        assert_eq!(core.poll_tick(&mut bus, &ctx), Some(VadTransition::Opened));
+        assert!(!core.segment_open(), "the reopen bounced too");
+        assert!(
+            h.flag.load(Ordering::Acquire),
+            "the bounced reopen must not consume the close's signal"
+        );
+
+        assert_eq!(
+            opened_heads(&h.drain()),
+            vec![h.write_head],
+            "only the first onset was ever delivered"
+        );
+    }
+
+    /// The ordering the failed-open restore rests on: a delivered onset clears
+    /// the flag *before* the message that opens the segment. Were the store to
+    /// move after the send, the streamer could open the segment and read a
+    /// previous close's `true` on its first post-drain check, ending the new
+    /// segment on its first wake — with the end state after the tick identical.
+    /// So the sink snapshots the flag mid-send.
+    #[test]
+    fn a_delivered_open_clears_the_flag_before_the_message() {
+        let h = Harness::new();
+        h.flag.store(true, Ordering::Release);
+        let sink = SnoopingSink::new(&h);
+        let mut bus = FakeBus::constant(Some(LOUD), Some(AZ));
+        let mut core = TelemetryCore::new(THRESHOLD, HANGOVER_MS);
+        let ctx = harness_ctx!(h, sink);
+
+        core.poll_tick(&mut bus, &ctx);
+        assert_eq!(core.poll_tick(&mut bus, &ctx), Some(VadTransition::Opened));
+
+        assert_eq!(
+            sink.flag_at_open(),
+            vec![false],
+            "the onset must clear the flag before it offers VadOpened"
+        );
+        assert_eq!(
+            opened_heads(&h.drain()),
+            vec![h.write_head],
+            "the snapshot only means anything if the message really went out"
+        );
     }
 
     /// Telemetry that does not fit is counted and dropped, and the segment stays

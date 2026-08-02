@@ -39,12 +39,15 @@ use crate::playback::{AlsaOut, PlaybackFault, StereoOut, expand_mono_to_stereo, 
 use crate::run::PeriodSource;
 use crate::usb_ctrl::{Generation, UsbControl, find_boards, log_generation, select_board};
 
-/// The application-servicer `VERSION` a board running the reachy firmware is
-/// expected to report at least. The factory software's own floor, and the reading to
-/// expect from the `38fb:1001` id; a board still on the pre-update id reports older
-/// and that is not a failure. The exact triple observed on hardware is baked in here
-/// once a human has reviewed it.
-pub const REACHY_FIRMWARE_MIN_VERSION: (u8, u8, u8) = (2, 1, 0);
+/// The application-servicer `VERSION` a board carrying the `38fb:1001` id reports.
+///
+/// Not a floor and not a prediction: the triple `reachy00` reported at bring-up on
+/// 2026-08-02, human-reviewed and baked in. Any other reading — older *or* newer —
+/// fails the identity case, because a board whose firmware changed under us is
+/// exactly what this registry exists to surface. A deliberate reflash is re-baked
+/// here after the new reading is reviewed. Boards on the pre-update id are a
+/// different generation and are not held to this value.
+pub const REACHY_FIRMWARE_EXPECTED_VERSION: (u8, u8, u8) = (2, 1, 2);
 
 /// The control-plane cases, in the order they run. Named so a run that never opened
 /// the board can still account for each of them.
@@ -195,11 +198,13 @@ pub fn usb_presence() -> (Outcome, Option<UsbControl>) {
     }
 }
 
-/// Case 2 (identity) — the application servicer reports a plausible firmware
-/// version.
+/// Case 2 (identity) — the application servicer reports the firmware version this
+/// board is known to carry.
 ///
-/// Read, not guessed: the version is what says the command table this pipeline
-/// assumes is the table the board carries.
+/// The version is what says the command table this pipeline assumes is the table
+/// the board carries. On the reachy id it is asserted exactly against
+/// [`REACHY_FIRMWARE_EXPECTED_VERSION`]; on the pre-update id, where no reading has
+/// ever been taken, only "a version at all" can be asserted without guessing.
 pub fn ctrl_version<T: ControlTransport>(transport: &mut T, generation: Generation) -> Outcome
 where
     T::Error: fmt::Display,
@@ -228,13 +233,15 @@ where
             "VERSION read reported {rendered}, which is no version at all"
         ));
     }
-    if generation == Generation::ReachyFirmware && observed < REACHY_FIRMWARE_MIN_VERSION {
-        let (major, minor, patch) = REACHY_FIRMWARE_MIN_VERSION;
+    if generation == Generation::ReachyFirmware && observed != REACHY_FIRMWARE_EXPECTED_VERSION {
+        let (major, minor, patch) = REACHY_FIRMWARE_EXPECTED_VERSION;
         return Outcome::Fail(vec![
             format!(
-                "firmware {rendered} is below the {major}.{minor}.{patch} the reachy id implies"
+                "firmware {rendered} differs from the {major}.{minor}.{patch} this board reported \
+                 at bring-up"
             ),
-            "a board on this id running older firmware is a reading to review, not one to accept"
+            "an unexpected firmware triple is a reading to review, not one to accept: review it, \
+             then re-bake REACHY_FIRMWARE_EXPECTED_VERSION in selftest.rs"
                 .to_string(),
         ]);
     }
@@ -835,26 +842,70 @@ mod tests {
 
     // ── ctrl_version ──────────────────────────────────────────────────────────
 
+    /// The reading itself, pinned — the one assertion in this module that is
+    /// about the *value* rather than the comparison around it.
+    ///
+    /// Every other `ctrl_version` test derives its scripted payload from the
+    /// constant, so editing the constant leaves them green. That is what makes
+    /// this test load-bearing: after a deliberate reflash it fails on purpose,
+    /// and clearing it means reviewing the new reading and re-baking both the
+    /// constant and this expectation, which is a human act, not a make-it-green
+    /// edit.
     #[test]
-    fn a_current_firmware_version_passes_and_is_reported() {
-        let mut t = Scripted::answering(STATUS_DONE, vec![2, 1, 3]);
+    fn the_baked_reading_is_the_one_reviewed_on_the_bench() {
+        assert_eq!(REACHY_FIRMWARE_EXPECTED_VERSION, (2, 1, 2));
+    }
+
+    #[test]
+    fn the_baked_in_firmware_version_passes_and_is_reported() {
+        let (major, minor, patch) = REACHY_FIRMWARE_EXPECTED_VERSION;
+        let mut t = Scripted::answering(STATUS_DONE, vec![major, minor, patch]);
         let outcome = ctrl_version(&mut t, Generation::ReachyFirmware);
         assert!(outcome.passed(), "{}", detail(&outcome));
-        assert!(detail(&outcome).contains("2.1.3"), "{}", detail(&outcome));
+        assert!(
+            detail(&outcome).contains(&format!("{major}.{minor}.{patch}")),
+            "{}",
+            detail(&outcome)
+        );
     }
 
     #[test]
     fn old_firmware_fails_on_the_reachy_id_and_passes_on_the_pre_update_one() {
+        let (major, minor, patch) = REACHY_FIRMWARE_EXPECTED_VERSION;
         let mut t = Scripted::answering(STATUS_DONE, vec![1, 0, 4]);
         let reachy = ctrl_version(&mut t, Generation::ReachyFirmware);
         assert!(!reachy.passed());
         assert!(
-            detail(&reachy).contains("1.0.4") && detail(&reachy).contains("2.1.0"),
+            detail(&reachy).contains("1.0.4")
+                && detail(&reachy).contains(&format!("{major}.{minor}.{patch}")),
             "{}",
             detail(&reachy)
         );
         // The same reading under the pre-update id is expected, not a finding.
         let mut t = Scripted::answering(STATUS_DONE, vec![1, 0, 4]);
+        let legacy = ctrl_version(&mut t, Generation::LegacyModule);
+        assert!(legacy.passed(), "{}", detail(&legacy));
+    }
+
+    #[test]
+    fn newer_firmware_is_an_unexpected_reading_not_a_silent_pass() {
+        let (major, minor, patch) = REACHY_FIRMWARE_EXPECTED_VERSION;
+        let mut t = Scripted::answering(STATUS_DONE, vec![major, minor, patch + 1]);
+        let outcome = ctrl_version(&mut t, Generation::ReachyFirmware);
+        assert!(!outcome.passed(), "{}", detail(&outcome));
+        let text = detail(&outcome);
+        assert!(
+            text.contains(&format!("{major}.{minor}.{}", patch + 1)),
+            "{text}"
+        );
+        // The actionable half of the message: a reading to review, and the
+        // constant to re-bake once it has been. Reword the prose freely; losing
+        // this leaves the operator with a bare mismatch and no way forward.
+        assert!(text.contains("REACHY_FIRMWARE_EXPECTED_VERSION"), "{text}");
+
+        // The pre-update id keeps its plausible-non-zero rule: no reading has
+        // ever been taken from such a board, so identity there would be a guess.
+        let mut t = Scripted::answering(STATUS_DONE, vec![major, minor, patch + 1]);
         let legacy = ctrl_version(&mut t, Generation::LegacyModule);
         assert!(legacy.passed(), "{}", detail(&legacy));
     }
@@ -945,8 +996,9 @@ mod tests {
 
     #[test]
     fn the_control_plane_runs_every_case_in_order_against_its_own_register() {
+        let (major, minor, patch) = REACHY_FIRMWARE_EXPECTED_VERSION;
         let mut t = Scripted::sequenced(vec![
-            (STATUS_DONE, vec![2, 1, 0]),
+            (STATUS_DONE, vec![major, minor, patch]),
             (STATUS_DONE, f32x4_bytes([0.1, 0.2, 0.3, 0.4])),
             (STATUS_DONE, f32x4_bytes([0.0, 1.0, -1.0, f32::NAN])),
         ]);
@@ -976,7 +1028,7 @@ mod tests {
         assert!(report.all_passed(), "{}", report.summary());
         // Each case's detail is its own reading, so a swapped label shows up here.
         assert!(
-            detail(&report.cases[0].outcome).contains("2.1.0"),
+            detail(&report.cases[0].outcome).contains(&format!("{major}.{minor}.{patch}")),
             "{}",
             detail(&report.cases[0].outcome)
         );

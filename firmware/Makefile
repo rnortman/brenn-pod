@@ -74,6 +74,11 @@ check-host: check-host-arch
 # `make check-realign` (a prerequisite of `make flash`); allowlist drift is caught there as a
 # ship-gate finding, not at commit time. This is the accepted arrangement.
 	tools/check-realign-args.test.sh
+# The provisioning tool's host-only half — its TOML reader, its validation gates and its
+# reuse-or-generate-a-key branch — with the device stubbed. Everything it decides before it
+# touches a pod is text processing, and a wrong answer there mis-files or duplicates a key
+# that exists nowhere else. No toolchain, no device, no network.
+	tools/provision-reachy-pod.test.sh
 
 # Host-architecture workspace (host/) — stable toolchain, no espup.
 # Standalone workspace beside firmware/; check and check-host both depend on this
@@ -197,6 +202,14 @@ reachy-host:
 .PHONY: reachy-pod
 reachy-pod:
 	tools/build-reachy-pod.sh
+
+# Give the unit its configuration: the address it dials and the key it presents,
+# derived from the host daemon's config and pushed into the same tmpfs the payload
+# lands in. Needs no payload and no build, so it can run before or after a deploy;
+# idempotent, and the re-run after a reboot is the whole re-provisioning story.
+.PHONY: reachy-provision
+reachy-provision: reachy-host
+	tools/provision-reachy-pod.sh $(REACHY_HOST)
 
 # Build, push into the payload store, and activate — which checks the contract,
 # switches the current symlink and restarts the application onto it.

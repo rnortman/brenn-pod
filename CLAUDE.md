@@ -20,4 +20,4 @@ Two pieces that stay in sync:
 - `TODO.md` at the repo root — master list. Each entry has a slug, a description, and the deferral context.
 - `TODO(slug)` comments in code — mark the spot where the work needs to happen.
 
-Slugs are the join key. Adding a TODO requires both an entry in `TODO.md` and a `TODO(slug)` comment at the relevant location. Don't use TODOs for vague aspirations — every TODO should describe a concrete thing that needs to happen, in a place where "done" is obvious.
+Slugs are the join key. Adding a TODO requires both an entry in `TODO.md` and a `TODO(slug)` comment at the relevant location. Don't use TODOs for vague aspirations — every TODO should describe a concrete thing that needs to happen, in a place where "done" is obvious. `TODO.md` is for code and design work only — never for operational tasks (running a suite, performing a bench run, deploying something); those are asks made to the user directly, not entries in this file.
