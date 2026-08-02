@@ -1,0 +1,51 @@
+[package]
+name = "brenn-bridge"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The brenn bus attachment stack, consumed across the repo boundary. The edge
+# points one way — pod depends on brenn, never the reverse — so these are git
+# dependencies pinned to a published rev rather than path dependencies: a path
+# would resolve only on a machine that happens to have both checkouts side by
+# side, and CI checks out one repo. HTTPS rather than SSH because the public CI
+# job runs an unauthenticated checkout with no key.
+#
+# Bumping the pin is a deliberate act: the wire contract negotiates versions, so
+# a bridge built against an older rev keeps working against a newer server for
+# as long as the negotiated window allows. Move all three together — they are one
+# workspace upstream and their internal path deps must agree.
+brenn-attach-client = { git = "https://github.com/rnortman/brenn.git", rev = "5f7cd2cd01215e93584a93f5c1e9d044f66b4d66" }
+brenn-attach-proto = { git = "https://github.com/rnortman/brenn.git", rev = "5f7cd2cd01215e93584a93f5c1e9d044f66b4d66" }
+brenn-envelope = { git = "https://github.com/rnortman/brenn.git", rev = "5f7cd2cd01215e93584a93f5c1e9d044f66b4d66" }
+pod-secrets = { path = "../pod-secrets" }
+pod-jsonl = { path = "../pod-jsonl" }
+# TLS backend for the `wss://` dial. No code in this crate calls it; naming it
+# here enables TLS for the shared build through cargo's feature unification.
+#
+# native-tls rather than rustls: this workspace already links native-tls and
+# openssl, and it reads the platform trust store, so an operator-installed CA for
+# a LAN origin works. The rustls path would add a second TLS implementation plus
+# an explicit crypto-provider choice, since tokio-tungstenite takes rustls with
+# no provider feature and rustls 0.23 then panics on the first handshake.
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+# `time` is pulled transitively by the driver; named here because this crate's
+# own reconnect timings need it. `io-util`/`io-std` are the `bridge-probe` bin's
+# stdin reader, `signal` its interrupt handler.
+tokio = { version = "1", features = ["rt", "sync", "macros", "time", "io-util", "io-std", "signal"] }
+# `bridge-probe`: the JSONL event lines it writes and the publish lines it reads.
+# The library itself renders nothing — it hands its facts to the embedder typed.
+serde_json = "1"
+# `bridge-probe` argument parsing, the host workspace's convention for a bin.
+clap = { version = "4", features = ["derive"] }
+# `bridge-probe` only: without a tracing subscriber, diagnostic output from the
+# attachment stack's connection layer is lost. The library installs none.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
+tempfile = "3"

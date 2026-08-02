@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 pod-ingest = { path = "../pod-ingest" }
 speech-pipeline = { path = "../speech-pipeline" }
+pod-jsonl = { path = "../pod-jsonl" }
+pod-secrets = { path = "../pod-secrets" }
 # Wire decode (`decode_frame`) for replaying recorded frame logs offline.
 audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std"] }
 # The link's TLS-PSK parameters, shared with the device clients; re-exported as

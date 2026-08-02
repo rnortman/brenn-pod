@@ -97,39 +97,9 @@ impl SinkTasks {
     }
 }
 
-/// The wire envelope: `ts_ms` and `event` first, then the caller's fields
-/// flattened in. `fields` must serialize to a JSON object.
-#[derive(Serialize)]
-struct Envelope<'a, T: Serialize> {
-    ts_ms: u64,
-    event: &'a str,
-    #[serde(flatten)]
-    fields: T,
-}
-
 /// Serialize one event into the `{"ts_ms", "event", ...fields}` envelope at a
-/// caller-supplied `ts_ms`. The single owner of the wire envelope, split from
-/// [`format_line`] so a caller feeding two sinks can stamp once and hand the
-/// same `ts_ms` to both. A serialization failure yields a self-describing
-/// `jsonl_encode_error` line (built through serde, since interpolating a serde
-/// error into a hand-written literal could itself emit malformed JSON) so the
-/// miss is visible rather than silent.
-pub fn format_line_at<T: Serialize>(ts_ms: u64, event: &str, fields: &T) -> String {
-    match serde_json::to_string(&Envelope {
-        ts_ms,
-        event,
-        fields,
-    }) {
-        Ok(line) => line,
-        Err(err) => serde_json::json!({
-            "ts_ms": ts_ms,
-            "event": "jsonl_encode_error",
-            "target": event,
-            "detail": err.to_string(),
-        })
-        .to_string(),
-    }
-}
+/// caller-supplied `ts_ms`.
+pub use pod_jsonl::format_line_at;
 
 /// Serialize one event into the envelope, stamping `ts_ms` from the current host
 /// clock. The self-stamping entry point for callers that own one line: the

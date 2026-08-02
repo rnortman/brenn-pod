@@ -1,0 +1,10 @@
+[package]
+name = "pod-secrets"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"
