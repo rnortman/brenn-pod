@@ -7,7 +7,9 @@
 //!   marked turn — from its queue, from mid-synthesis, and once more after
 //!   synthesis returns. One id per pod suffices: pipeline dispatch awaits
 //!   `brain.handle()` inline, so at most one turn per pod streams responses at a
-//!   time (revisit with streaming brains).
+//!   time. That holds for a brain that streams several clips within one `handle`
+//!   call, which `BrennBrain`'s multi-part responses exercise: the mark is per turn,
+//!   and settlement counts each of the turn's commands.
 //! - **The response and transcript capture.** The sink tap records each turn's
 //!   outgoing response text and the pipeline records its transcript, so an
 //!   interrupt can mint a [`ContextSegment`] describing the turn it cut.

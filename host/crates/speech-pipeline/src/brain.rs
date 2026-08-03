@@ -55,6 +55,40 @@ pub enum BrainEvent {
         no_speech_prob: f32,
         avg_logprob: f32,
     },
+    /// A brain that answers over a link could not hand the utterance to its peer;
+    /// the turn is over with nothing said (beyond a configured spoken fallback).
+    /// `detail` is the transport's own rendering of the refusal.
+    LinkPublishFailed {
+        utterance: UtteranceId,
+        detail: String,
+    },
+    /// A brain that answers over a link waited out its response window. With
+    /// `continuation: false` no response arrived at all; with `continuation: true` a
+    /// promised follow-up segment never came after part of the response was already
+    /// spoken, so the user heard a truncated answer.
+    LinkResponseTimeout {
+        utterance: UtteranceId,
+        waited_ms: u64,
+        continuation: bool,
+    },
+    /// A response carried a tag-shaped island the codec does not know (an
+    /// unrecognized name, or one mangled past parsing). It was stripped rather than
+    /// spoken. Loud by contract: it means the peer's vocabulary and ours have
+    /// diverged. `tag` is the raw text as it appeared.
+    LinkTagStripped { utterance: UtteranceId, tag: String },
+    /// A response carried no turn-correlation marker and was accepted for the one
+    /// pending turn anyway. Benign — with a single pending slot there is only one
+    /// turn it could belong to — but worth seeing.
+    LinkReplyAssumed { utterance: UtteranceId },
+    /// A response asked to hold the mic open, which is in the wire vocabulary but
+    /// not implemented; the tag was stripped and the request ignored.
+    LinkListenUnsupported { utterance: UtteranceId },
+    /// A response chain kept promising continuations past the safety bound. The
+    /// capping segment was spoken and the turn ended as if it were terminal.
+    LinkContinuationCapped {
+        utterance: UtteranceId,
+        segments: u32,
+    },
 }
 
 impl BrainEvent {
@@ -112,6 +146,12 @@ pub struct BrainStats {
     no_transcript: AtomicU64,
     wake_command_absent: AtomicU64,
     barge_command_absent: AtomicU64,
+    link_publish_failures: AtomicU64,
+    link_response_timeouts: AtomicU64,
+    link_tags_stripped: AtomicU64,
+    link_replies_assumed: AtomicU64,
+    link_listen_unsupported: AtomicU64,
+    link_continuations_capped: AtomicU64,
 }
 
 /// A point-in-time copy of [`BrainStats`], for `stage_health` reporting.
@@ -129,6 +169,21 @@ pub struct BrainStatsSnapshot {
     /// speech as likely hallucination. Not a failure: the playback was already
     /// cut, and declining the phantom text is the honest outcome.
     pub barge_command_absent: u64,
+    /// Turns whose utterance the link refused to carry to the peer.
+    pub link_publish_failures: u64,
+    /// Turns that waited out a response window — initial or continuation.
+    pub link_response_timeouts: u64,
+    /// Tag-shaped islands stripped from a response because the codec did not know
+    /// them. A nonzero count means the peer's tag vocabulary has drifted from ours.
+    pub link_tags_stripped: u64,
+    /// Responses accepted for the pending turn despite carrying no correlation
+    /// marker. Not a failure counter — the reply policy is deliberately optimistic.
+    pub link_replies_assumed: u64,
+    /// Responses that asked to hold the mic open, a wire-vocabulary tag with no
+    /// implementation behind it yet.
+    pub link_listen_unsupported: u64,
+    /// Response chains cut off at the continuation safety bound.
+    pub link_continuations_capped: u64,
 }
 
 impl BrainStats {
@@ -152,6 +207,37 @@ impl BrainStats {
         self.barge_command_absent.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a turn whose utterance the link refused to carry.
+    pub fn record_link_publish_failure(&self) {
+        self.link_publish_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a turn that waited out a response window, initial or continuation.
+    pub fn record_link_response_timeout(&self) {
+        self.link_response_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a tag-shaped island stripped from a response as unknown or mangled.
+    pub fn record_link_tag_stripped(&self) {
+        self.link_tags_stripped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a response accepted for the pending turn with no correlation marker.
+    pub fn record_link_reply_assumed(&self) {
+        self.link_replies_assumed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a response that asked for the unimplemented hold-open behavior.
+    pub fn record_link_listen_unsupported(&self) {
+        self.link_listen_unsupported.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a response chain cut off at the continuation safety bound.
+    pub fn record_link_continuation_capped(&self) {
+        self.link_continuations_capped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A `Copy` snapshot of the counters, read for `stage_health`.
     pub fn snapshot(&self) -> BrainStatsSnapshot {
         BrainStatsSnapshot {
@@ -159,6 +245,12 @@ impl BrainStats {
             no_transcript: self.no_transcript.load(Ordering::Relaxed),
             wake_command_absent: self.wake_command_absent.load(Ordering::Relaxed),
             barge_command_absent: self.barge_command_absent.load(Ordering::Relaxed),
+            link_publish_failures: self.link_publish_failures.load(Ordering::Relaxed),
+            link_response_timeouts: self.link_response_timeouts.load(Ordering::Relaxed),
+            link_tags_stripped: self.link_tags_stripped.load(Ordering::Relaxed),
+            link_replies_assumed: self.link_replies_assumed.load(Ordering::Relaxed),
+            link_listen_unsupported: self.link_listen_unsupported.load(Ordering::Relaxed),
+            link_continuations_capped: self.link_continuations_capped.load(Ordering::Relaxed),
         }
     }
 }

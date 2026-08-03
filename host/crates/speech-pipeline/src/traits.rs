@@ -25,7 +25,9 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde::Serialize;
 
-use crate::types::{InterruptProgress, SpeakCmd, TranscriptConfidence, Utterance, UtteranceId};
+use crate::types::{
+    InterruptProgress, PodId, SpeakCmd, TranscriptConfidence, Utterance, UtteranceId,
+};
 
 /// The PCM handed to a `Transcriber`: the segment's samples plus their rate.
 #[derive(Debug, Clone)]
@@ -175,6 +177,25 @@ pub trait Brain: Send + Sync {
     /// out just as the flush is accepted, so `progress` may report a `heard_ms` at
     /// or near `total_ms` for a response that effectively finished.
     fn interrupt(&self, id: UtteranceId, progress: InterruptProgress);
+
+    /// Advisory nudge: a wake word was just confirmed on `pod`, so a command may
+    /// follow. A brain that pre-warms a remote peer uses this to start the round
+    /// trip early; one that does not ignores it. Invoked from the pipeline's select
+    /// loop, so it must be cheap and non-blocking — the same discipline as
+    /// [`Brain::interrupt`]. Default: no-op.
+    fn wake(&self, pod: &PodId) {
+        let _ = pod;
+    }
+
+    /// The confidence gate declined a barge-in utterance: playback was already cut,
+    /// but no usable command was captured, so [`Brain::handle`] will never be called
+    /// for it. A brain that mirrors the conversation elsewhere uses this to report
+    /// that its response was interrupted with nothing said in its place. Invoked from
+    /// the pipeline's select loop, so it must be cheap and non-blocking — the same
+    /// discipline as [`Brain::interrupt`]. Default: no-op.
+    fn barge_declined(&self, u: &Utterance) {
+        let _ = u;
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +228,16 @@ mod tests {
             futures::future::ready(()).boxed()
         }
         fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {}
+    }
+
+    #[test]
+    fn wake_and_barge_declined_default_to_no_ops() {
+        // `NullStages` implements neither, so this only compiles — and only stays
+        // silent — while both carry a default body. Every brain that has no use for
+        // the nudges relies on that.
+        let brain: Box<dyn Brain> = Box::new(NullStages);
+        brain.wake(&PodId("pod-x".into()));
+        brain.barge_declined(&crate::types::test_utterance());
     }
 
     #[test]

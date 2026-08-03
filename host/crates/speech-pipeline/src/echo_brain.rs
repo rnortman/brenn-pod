@@ -56,33 +56,17 @@ fn barge_readback(seg: &ContextSegment, transcript: &str) -> String {
     }
 }
 
-/// The last few words of the interrupted response the user actually heard: cut the
-/// response text at the heard fraction of its characters, drop a trailing partial
-/// word, and keep at most [`READBACK_TAIL_WORDS`]. `None` when there is nothing to
-/// quote: a segment with no response text (a Pcm reply), or a cut so early no whole
-/// word was heard.
+/// The last few words of the interrupted response the user actually heard: the
+/// segment's estimated heard prefix, keeping at most [`READBACK_TAIL_WORDS`] words.
+/// `None` when there is nothing to quote: a segment with no response text (a Pcm
+/// reply), or a cut so early no whole word was heard — degrade to the tail-less
+/// readback rather than speaking an empty quote.
 fn barge_tail(seg: &ContextSegment) -> Option<String> {
     let response = seg.response_text.as_deref()?;
-    let chars: Vec<char> = response.chars().collect();
-    let total = seg.interrupted.total_ms.max(1);
-    let heard = seg.interrupted.heard_ms.min(total);
-    let cut = (chars.len() as u128 * heard as u128 / total as u128) as usize;
-    // A cut that lands inside a word would quote half of it; drop that word.
-    let mid_word = cut > 0
-        && cut < chars.len()
-        && !chars[cut - 1].is_whitespace()
-        && !chars[cut].is_whitespace();
-    let heard_prefix: String = chars[..cut].iter().collect();
-    let mut words: Vec<&str> = heard_prefix.split_whitespace().collect();
-    if mid_word {
-        words.pop();
-    }
+    let heard = seg.interrupted.heard_prefix(response)?;
+    let words: Vec<&str> = heard.split_whitespace().collect();
     let start = words.len().saturating_sub(READBACK_TAIL_WORDS);
-    let tail = words[start..].join(" ");
-    // A cut landing before the first whole word (a barge at the very start of the
-    // response, or a near-zero heard estimate) leaves nothing to quote; degrade to
-    // the tail-less readback rather than speaking an empty quote.
-    (!tail.is_empty()).then_some(tail)
+    Some(words[start..].join(" "))
 }
 
 impl Brain for EchoBrain {

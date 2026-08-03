@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use audio_pipeline::wire::{MAX_FRAME_BYTES, decode_frame};
@@ -37,18 +37,20 @@ use pod_ingest::{
     CloseCause, CrossCheck, HostMicros, ResumeLedger, SegmentRef, SessionEvent, SessionFsm,
 };
 use speech_pipeline::{
-    AssemblerLimits, Brain, BrainEvent, BrainEventFn, BrainStats, BrainStatsSnapshot, BuildError,
-    ConfidenceGate, DropOldestQueue, EchoBrain, FeedSender, FlushRejected, HttpSynthesizer,
-    HttpTranscriber, InterruptProgress, Listener, ListenerConfig, ListenerEvent, ListenerHandle,
-    ListenerStats, ListenerStatsSnapshot, OwwModels, PacerConfig, PlayRejected, PlaybackEventFn,
-    PlaybackHandle, PlaybackJob, PlaybackStats, PlaybackStatsSnapshot, PlaybackWriter, PodId,
-    QueueStats, RoomId, SPINE_FORMAT, Segment, SegmentAssembler, SegmentEndCause, Sender,
-    SileroModel, SpeakCmd, StageTimings, StatsHandle, SttParams, SttStats, SttStatsSnapshot,
-    Synthesizer, Transcriber, TtsParams, TtsStats, TtsStatsSnapshot, UtteranceId,
+    AssemblerLimits, Brain, BrainEvent, BrainEventFn, BrainStats, BrainStatsSnapshot, BrennBrain,
+    BuildError, ConfidenceGate, DropOldestQueue, EchoBrain, FeedSender, FlushRejected,
+    HttpSynthesizer, HttpTranscriber, InterruptProgress, Listener, ListenerConfig, ListenerEvent,
+    ListenerHandle, ListenerStats, ListenerStatsSnapshot, OwwModels, PacerConfig, PlayRejected,
+    PlaybackEventFn, PlaybackHandle, PlaybackJob, PlaybackStats, PlaybackStatsSnapshot,
+    PlaybackWriter, PodId, QueueStats, RoomId, SPINE_FORMAT, Segment, SegmentAssembler,
+    SegmentEndCause, Sender, SileroModel, SpeakCmd, StageTimings, StatsHandle, SttParams, SttStats,
+    SttStatsSnapshot, Synthesizer, Transcriber, TtsParams, TtsStats, TtsStatsSnapshot, UtteranceId,
     WakeCommandReason, WakeError, WavBrain, stage_delta_us,
 };
 
 use crate::barge::TurnLedger;
+use crate::brenn::BridgeLink;
+use crate::brenn::driver::{BridgeDriver, DriverIo, DriverTokens};
 use crate::clip::{ClipError, load_clip};
 use crate::config::{BrainMode, Config, PskTable, SttBackend, SttConfig, TtsBackend};
 use crate::iso8601_ms;
@@ -341,6 +343,29 @@ pub struct Server {
     // `run` uses it instead of minting its own.
     #[cfg(test)]
     playback_registry_override: Option<PlaybackRegistry>,
+    // Test-supplied bridge so a scripted peer can drive bus-facing paths
+    // that a real socket otherwise gates.
+    #[cfg(test)]
+    brenn_override: Option<BrennBridge>,
+    // Test-supplied driver join handle so a mid-run death can be driven
+    // through the supervision arm.
+    #[cfg(test)]
+    driver_override: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// A running bridge: the spawned `Bridge::run`, the handle everything publishes
+/// and subscribes through, and the event stream the driver pumps.
+struct BrennBridge {
+    task: tokio::task::JoinHandle<brenn_bridge::BridgeOutcome>,
+    handle: brenn_bridge::BridgeHandle,
+    events: tokio::sync::mpsc::Receiver<brenn_bridge::BridgeEvent>,
+}
+
+/// Bridge lifecycle parts consumed by the driver task.
+struct BrennParts<'a> {
+    config: &'a crate::config::BrennConfig,
+    bridge: BrennBridge,
+    notices: tokio::sync::mpsc::Receiver<crate::brenn::Notice>,
 }
 
 impl Server {
@@ -372,6 +397,10 @@ impl Server {
             router_override: None,
             #[cfg(test)]
             playback_registry_override: None,
+            #[cfg(test)]
+            brenn_override: None,
+            #[cfg(test)]
+            driver_override: None,
         })
     }
 
@@ -386,6 +415,33 @@ impl Server {
     #[cfg(test)]
     fn with_router_override(mut self, router: tokio::task::JoinHandle<()>) -> Self {
         self.router_override = Some(router);
+        self
+    }
+
+    /// Run against a test-supplied bridge instead of dialling `[brenn.bridge]`,
+    /// so a scripted peer stands where the bus would be. Everything downstream —
+    /// the link, the brain, the driver, the teardown — is built exactly as it is
+    /// in production.
+    #[cfg(test)]
+    fn with_brenn_override(
+        mut self,
+        task: tokio::task::JoinHandle<brenn_bridge::BridgeOutcome>,
+        handle: brenn_bridge::BridgeHandle,
+        events: tokio::sync::mpsc::Receiver<brenn_bridge::BridgeEvent>,
+    ) -> Self {
+        self.brenn_override = Some(BrennBridge {
+            task,
+            handle,
+            events,
+        });
+        self
+    }
+
+    /// Replace the spawned bridge-driver task with a test-supplied join handle,
+    /// so a test can drive a mid-run driver death through the supervision arm.
+    #[cfg(test)]
+    fn with_driver_override(mut self, driver: tokio::task::JoinHandle<()>) -> Self {
+        self.driver_override = Some(driver);
         self
     }
 
@@ -414,6 +470,10 @@ impl Server {
         let router_override = self.router_override;
         #[cfg(test)]
         let playback_registry_override = self.playback_registry_override;
+        #[cfg(test)]
+        let brenn_override = self.brenn_override;
+        #[cfg(test)]
+        let driver_override = self.driver_override;
         let Server {
             listener,
             config,
@@ -540,12 +600,53 @@ impl Server {
             }),
         );
 
+        // Built before the brain because the brain publishes through its handle,
+        // and here rather than inside `build_brain` because what comes back is a
+        // lifecycle — a task to spawn, an event stream to pump, a shutdown to
+        // sequence — that outlives any constructor.
+        let (brenn_parts, brenn_link) = match (&config.brain, &config.brenn) {
+            (Some(brain), Some(brenn)) if brain.mode == BrainMode::Brenn => {
+                #[cfg(test)]
+                let supplied = brenn_override;
+                #[cfg(not(test))]
+                let supplied: Option<BrennBridge> = None;
+                let bridge = match supplied {
+                    Some(bridge) => bridge,
+                    None => {
+                        let (bridge, handle, events) = brenn_bridge::Bridge::new(&brenn.bridge)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        BrennBridge {
+                            task: tokio::spawn(bridge.run()),
+                            handle,
+                            events,
+                        }
+                    }
+                };
+                let (link, notices) = BridgeLink::new(
+                    bridge.handle.clone(),
+                    brenn.publish_channel.clone(),
+                    brenn.attribution.clone(),
+                    jsonl.clone(),
+                );
+                (
+                    Some(BrennParts {
+                        config: brenn,
+                        bridge,
+                        notices,
+                    }),
+                    Some(link),
+                )
+            }
+            _ => (None, None),
+        };
+
         // Build the brain from `[brain]` config; a clip-load failure is fatal at
         // startup, before anything is accepted. `brain_stats` exists in both cases
         // (zeros with no brain) so `stage_health` reports the dropped-reply count
         // (`speak_send_failures`) uniformly across configs.
-        let (brain, brain_events, brain_stats) =
-            build_brain(&config, &jsonl).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let (brain, brain_events, brain_stats, brenn_brain) =
+            build_brain(&config, &jsonl, brenn_link)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         // Build the transcriber from `[stt]`; a malformed endpoint or a client that
         // will not build is fatal at startup, before anything is accepted. No
         // transcriber wired (absent `[stt]`) mints utterances with a null
@@ -610,6 +711,57 @@ impl Server {
         #[cfg(test)]
         let router_join = router_override.or(router_join);
         let mut router_join = router_join;
+
+        // Stops the bridge driver. Deliberately its own token rather than the
+        // shared `shutdown_token`: that one fires before the pipeline drains, and
+        // the draining pipeline keeps dispatching queued turns through the brain.
+        // A bridge torn down under those turns would fail every one of them —
+        // either stalling the pipeline join for a full response budget or
+        // publishing into a dead bridge. `run` cancels this one after the pipeline
+        // has joined, when no further turn can be dispatched.
+        let bridge_teardown = CancellationToken::new();
+        // Set by the driver when the bridge ends mid-run. Read by the router
+        // supervision arms below, so the process's exit names the bridge outcome
+        // rather than the task exits that cancel provokes downstream.
+        let bridge_fatal: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        // The subscription plane holds subscriptions across attachments, so
+        // no subscribe call is needed here.
+        let driver_join = match (brenn_parts, brenn_brain) {
+            (Some(parts), Some(brain)) => {
+                let driver = BridgeDriver::new(
+                    parts.config,
+                    parts.bridge.handle,
+                    brain,
+                    DriverTokens {
+                        teardown: bridge_teardown.clone(),
+                        shutdown: shutdown_token.clone(),
+                        fatal: bridge_fatal.clone(),
+                    },
+                    jsonl.clone(),
+                );
+                Some(tokio::spawn(driver.run(DriverIo {
+                    events: parts.bridge.events,
+                    notices: parts.notices,
+                    bridge: parts.bridge.task,
+                })))
+            }
+            (None, None) => None,
+            // Both sides come from `mode = "brenn"`, so they agree or something
+            // upstream broke. Fatal rather than ignored: a bridge with no driver
+            // is never spawned and every publish then parks against a command
+            // channel nothing drains, and a bus brain with no bridge cannot
+            // answer a single turn. Either way the pod is silently inert.
+            (parts, _) => {
+                let missing = if parts.is_some() { "brain" } else { "bridge" };
+                return Err(std::io::Error::other(format!(
+                    "brain.mode = \"brenn\" built a bridge and a brain inconsistently: no {missing}"
+                )));
+            }
+        };
+        // Drops the real handle if any; the task stops on the teardown token.
+        #[cfg(test)]
+        let driver_join = driver_override.or(driver_join);
+        let mut driver_join = driver_join;
 
         let mut pipeline = tokio::spawn(crate::pipeline::run(
             item_rx,
@@ -708,6 +860,7 @@ impl Server {
         // shutdown-path join below neither re-polls the completed handle nor
         // re-emits. Single source of truth for which side observed the exit.
         let mut router_joined = false;
+        let mut driver_joined = false;
         // Cloned per accepted socket; every field is a handle, so a clone is
         // refcount traffic, not a copy of state.
         let conn_deps = ConnDeps {
@@ -762,7 +915,16 @@ impl Server {
                         handle_pipeline_result(pipeline_result, &jsonl, &mut pipeline_fatal);
                         pipeline_joined = true;
                     }
-                    handle_router_exit_midrun(result, &jsonl, &mut pipeline_fatal);
+                    handle_router_exit_midrun(result, &bridge_fatal, &jsonl, &mut pipeline_fatal);
+                    break;
+                }
+                result = async { driver_join.as_mut().expect("guarded by is_some").await },
+                        if driver_join.is_some() && !driver_joined => {
+                    // A mid-run driver exit means the bus brain can never answer
+                    // another turn — a fault reported here rather than discovered
+                    // at the shutdown join, which nothing would reach on its own.
+                    driver_joined = true;
+                    handle_driver_exit_midrun(result, &bridge_fatal, &jsonl, &mut pipeline_fatal);
                     break;
                 }
                 accepted = listener.accept() => {
@@ -867,6 +1029,15 @@ impl Server {
             handle_router_exit(join.await, &jsonl);
         }
 
+        // Only now is the bridge safe to stop: the pipeline has joined, so no
+        // further turn can be dispatched. On a bridge-initiated stop the driver
+        // has already exited, so the cancel is a no-op and the join returns
+        // immediately.
+        bridge_teardown.cancel();
+        if !driver_joined && let Some(join) = driver_join {
+            handle_driver_exit(join.await, &jsonl);
+        }
+
         // Final `stage_health` after the pipeline drained, before the caller
         // drops the JSONL handle and joins the sink writer.
         emit_stage_health(&health, true);
@@ -966,10 +1137,34 @@ async fn tap_listener(
 
 /// What `build_brain` produces: the optional brain implementation, the shared
 /// event adapter (the same instance the brain emits through, so the pipeline's
-/// confidence-gate decline reports through it too), and the shared `BrainStats`
-/// counters read by `stage_health`; all created in both cases so they report
-/// zeros even with no brain.
-type BuiltBrain = (Option<Arc<dyn Brain>>, BrainEventFn, Arc<BrainStats>);
+/// confidence-gate decline reports through it too), the shared `BrainStats`
+/// counters read by `stage_health`, and — for `mode = "brenn"` only — a second
+/// handle on the same brain at its concrete type.
+///
+/// The fourth slot exists because the bus brain is driven from two sides:
+/// the pipeline dispatches turns through `Brain`, and the bridge driver hands it
+/// response messages through `BrennBrain::deliver`, which is not a trait method
+/// and cannot be recovered from `Arc<dyn Brain>`. Returning both keeps the brain
+/// built in exactly one place. The first three are created for every mode, so
+/// they report zeros even with no brain.
+type BuiltBrain = (
+    Option<Arc<dyn Brain>>,
+    BrainEventFn,
+    Arc<BrainStats>,
+    Option<Arc<BrennBrain>>,
+);
+
+/// Why a brain could not be built. A clip that will not load, or a `mode =
+/// "brenn"` config missing a piece the mode cannot work without.
+#[derive(Debug, thiserror::Error)]
+enum BrainBuildError {
+    #[error(transparent)]
+    Clip(#[from] ClipError),
+    #[error("brain.mode = \"brenn\" requires a [brenn] table")]
+    BrennConfigAbsent,
+    #[error("brain.mode = \"brenn\" was built without a bridge link")]
+    BrennLinkAbsent,
+}
 
 /// Build the brain from config. An absent `[brain]` table wires no brain — the
 /// mint-and-emit-utterance behavior with no dispatch and a null `brain_dispatched`
@@ -977,12 +1172,19 @@ type BuiltBrain = (Option<Arc<dyn Brain>>, BrainEventFn, Arc<BrainStats>);
 /// `mode = "wav"` loads and format-validates the configured clip (a load failure
 /// is fatal at startup, naming the path and the offending property) and builds a
 /// `WavBrain` answering every utterance with it, emitting a `brain_clip_loaded`
-/// line carrying the clip's sample count and duration. Returns the brain (or
-/// `None`), the shared event adapter (the same instance the brain emits through,
-/// reused by the pipeline's confidence-gate decline), and the shared `BrainStats`
-/// counters read by `stage_health`; all created in both cases so they report zeros
-/// with no brain.
-fn build_brain(config: &Config, jsonl: &JsonlHandle) -> Result<BuiltBrain, ClipError> {
+/// line carrying the clip's sample count and duration. `mode = "brenn"` builds a
+/// `BrennBrain` over `link` — the caller's already-constructed transport, since
+/// the bridge behind it has a lifecycle no constructor can own.
+///
+/// A `mode = "brenn"` config with no `[brenn]` table or no `link` is a broken
+/// invariant `Config::validate` already rejects — but the library entry points do
+/// not re-validate, so it returns an error rather than panicking, the same way
+/// the missing wav clip does.
+fn build_brain(
+    config: &Config,
+    jsonl: &JsonlHandle,
+    link: Option<BridgeLink>,
+) -> Result<BuiltBrain, BrainBuildError> {
     let stats = Arc::new(BrainStats::default());
     // One event adapter, built once and shared: the brain emits through it, and
     // the returned clone lets the pipeline's confidence-gate decline report a
@@ -995,7 +1197,7 @@ fn build_brain(config: &Config, jsonl: &JsonlHandle) -> Result<BuiltBrain, ClipE
                 "brain_absent",
                 &json!({ "reason": "no [brain] table configured" }),
             );
-            Ok((None, events, stats))
+            Ok((None, events, stats, None))
         }
         Some(brain) => match brain.mode {
             BrainMode::Wav => {
@@ -1016,7 +1218,7 @@ fn build_brain(config: &Config, jsonl: &JsonlHandle) -> Result<BuiltBrain, ClipE
                     }),
                 );
                 let brain = WavBrain::new(clip, events.clone(), stats.clone());
-                Ok((Some(Arc::new(brain) as Arc<dyn Brain>), events, stats))
+                Ok((Some(Arc::new(brain) as Arc<dyn Brain>), events, stats, None))
             }
             BrainMode::Echo => {
                 // Echo reads the transcript back; it needs no clip. The transcript
@@ -1025,7 +1227,43 @@ fn build_brain(config: &Config, jsonl: &JsonlHandle) -> Result<BuiltBrain, ClipE
                 // shared event adapter and stats.
                 jsonl.emit("brain_echo", &json!({}));
                 let brain = EchoBrain::new(events.clone(), stats.clone());
-                Ok((Some(Arc::new(brain) as Arc<dyn Brain>), events, stats))
+                Ok((Some(Arc::new(brain) as Arc<dyn Brain>), events, stats, None))
+            }
+            BrainMode::Brenn => {
+                let brenn = config
+                    .brenn
+                    .as_ref()
+                    .ok_or(BrainBuildError::BrennConfigAbsent)?;
+                let link = link.ok_or(BrainBuildError::BrennLinkAbsent)?;
+                // Startup record: everything an operator needs to reconcile a
+                // silent pod against the harness at the other end.
+                jsonl.emit(
+                    "brain_brenn",
+                    &json!({
+                        "publish_channel": brenn.publish_channel,
+                        "response_channel": brenn.response_channel,
+                        "wake_channel": brenn.wake_channel,
+                        "help_channel": brenn.help_channel,
+                        "attribution": brenn.attribution,
+                        "response_timeout_ms": brenn.response_timeout_ms,
+                        "continuation_timeout_ms": brenn.continuation_timeout_ms,
+                        "failure_message": brenn.failure_message,
+                    }),
+                );
+                let brain = Arc::new(BrennBrain::new(
+                    Arc::new(link),
+                    Duration::from_millis(brenn.response_timeout_ms),
+                    Duration::from_millis(brenn.continuation_timeout_ms),
+                    brenn.failure_message.clone(),
+                    events.clone(),
+                    stats.clone(),
+                ));
+                Ok((
+                    Some(brain.clone() as Arc<dyn Brain>),
+                    events,
+                    stats,
+                    Some(brain),
+                ))
             }
         },
     }
@@ -1213,6 +1451,53 @@ fn brain_event_adapter(jsonl: JsonlHandle) -> BrainEventFn {
                 }),
             );
         }
+        BrainEvent::LinkPublishFailed { utterance, detail } => {
+            jsonl.emit(
+                "brain_link_publish_failed",
+                &json!({ "utterance": utterance, "detail": detail }),
+            );
+        }
+        BrainEvent::LinkResponseTimeout {
+            utterance,
+            waited_ms,
+            continuation,
+        } => {
+            jsonl.emit(
+                "brain_link_response_timeout",
+                &json!({
+                    "utterance": utterance,
+                    "waited_ms": waited_ms,
+                    "continuation": continuation,
+                }),
+            );
+        }
+        BrainEvent::LinkTagStripped { utterance, tag } => {
+            jsonl.emit(
+                "brain_link_tag_stripped",
+                &json!({ "utterance": utterance, "tag": tag }),
+            );
+        }
+        BrainEvent::LinkReplyAssumed { utterance } => {
+            jsonl.emit(
+                "brain_link_reply_assumed",
+                &json!({ "utterance": utterance }),
+            );
+        }
+        BrainEvent::LinkListenUnsupported { utterance } => {
+            jsonl.emit(
+                "brain_link_listen_unsupported",
+                &json!({ "utterance": utterance }),
+            );
+        }
+        BrainEvent::LinkContinuationCapped {
+            utterance,
+            segments,
+        } => {
+            jsonl.emit(
+                "brain_link_continuation_capped",
+                &json!({ "utterance": utterance, "segments": segments }),
+            );
+        }
     })
 }
 
@@ -1244,16 +1529,95 @@ fn handle_router_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlH
     }
 }
 
+/// Take the bridge's fault, if it left one, as the process's exit reason.
+///
+/// A bridge that ends mid-run cancels the shutdown token and ends its driver;
+/// both of the supervision arms downstream of that see only a task exiting. The
+/// bridge outcome is the fault and those exits are the symptom, so it goes in
+/// first and the first-writer-wins slot keeps it.
+fn adopt_bridge_fault(bridge_fatal: &OnceLock<String>, fatal: &mut Option<PipelineFatal>) {
+    if let Some(detail) = bridge_fatal.get() {
+        fatal.get_or_insert(PipelineFatal {
+            detail: detail.clone(),
+        });
+    }
+}
+
+/// Shared by the shutdown-path and mid-run reporters so the
+/// `brenn_driver_exited` line shape stays in one place.
+fn emit_driver_exited(jsonl: &JsonlHandle, reason: &str, detail: &str) {
+    jsonl.emit(
+        "brenn_driver_exited",
+        &json!({ "reason": reason, "detail": detail }),
+    );
+}
+
+/// Report the bridge driver's terminal join result at the shutdown-path join. A
+/// clean return is silent; this line fires only when the task itself died,
+/// taking every future bus event with it unreported.
+fn handle_driver_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
+    if let Err(e) = result {
+        emit_driver_exited(jsonl, driver_exit_reason(&e), &e.to_string());
+    }
+}
+
+/// A `JoinError` is a panic unless the task was aborted. Nothing aborts the
+/// driver today, but label a cancellation honestly rather than reporting it as a
+/// panic if that ever changes.
+fn driver_exit_reason(e: &tokio::task::JoinError) -> &'static str {
+    if e.is_cancelled() {
+        "cancelled"
+    } else {
+        "panic"
+    }
+}
+
+/// Report a driver exit observed mid-run by the supervision arm, and latch the
+/// fault that makes `run` return `Err`.
+///
+/// A bridge that ended terminally latched its own detail before cancelling the
+/// shutdown token, and that root fault wins over anything named here — the
+/// driver following its bridge out is the symptom, and the `brenn_bridge_exit`
+/// line already reported it, so that case stays silent. A driver that died on
+/// its own leaves no such account: it owns the bridge join and every bus event,
+/// so its death is reported here or nowhere.
+fn handle_driver_exit_midrun(
+    result: Result<(), tokio::task::JoinError>,
+    bridge_fatal: &OnceLock<String>,
+    jsonl: &JsonlHandle,
+    fatal: &mut Option<PipelineFatal>,
+) {
+    adopt_bridge_fault(bridge_fatal, fatal);
+    let (reason, detail) = match result {
+        Ok(()) if bridge_fatal.get().is_some() => return,
+        Ok(()) => ("clean_exit", "bridge driver exited mid-run".to_string()),
+        Err(e) => (
+            driver_exit_reason(&e),
+            format!("bridge driver died mid-run: {e}"),
+        ),
+    };
+    emit_driver_exited(jsonl, reason, &detail);
+    fatal.get_or_insert(PipelineFatal { detail });
+}
+
 /// Report a router exit observed mid-run by the supervision arm. Both a panic and
 /// a clean return are faults here — before shutdown, either means every
 /// `SpeakCmd` sender is gone and playback is permanently dead — so both emit
 /// `playback_router_exited` (distinguished by `reason`) and latch `pipeline_fatal`
 /// so `run` returns `Err` and a supervisor restarts the process.
+///
+/// The bridge's fault is adopted first, and that ordering is the whole point of
+/// doing it here rather than at the call site: one way a router returns cleanly
+/// mid-run is a terminally-exited bridge cancelling the shutdown token, and the
+/// exit string must then name the bridge outcome, not the router's clean return
+/// downstream of it.
 fn handle_router_exit_midrun(
     result: Result<(), tokio::task::JoinError>,
+    bridge_fatal: &OnceLock<String>,
     jsonl: &JsonlHandle,
     fatal: &mut Option<PipelineFatal>,
 ) {
+    adopt_bridge_fault(bridge_fatal, fatal);
     let (reason, detail) = match result {
         Ok(()) => ("clean_exit", "playback router exited mid-run".to_string()),
         Err(e) => ("panic", format!("playback router panicked mid-run: {e}")),
@@ -2481,8 +2845,9 @@ mod tests {
         let cfg = config(&dir.path().join("store"), false);
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
-        let (brain, _, stats) = build_brain(&cfg, &handle).unwrap();
+        let (brain, _, stats, brenn) = build_brain(&cfg, &handle, None).unwrap();
         assert!(brain.is_none());
+        assert!(brenn.is_none());
         assert_eq!(stats.snapshot().speak_send_failures, 0);
 
         drop(handle);
@@ -2501,8 +2866,9 @@ mod tests {
         let cfg = wav_brain_config(&dir.path().join("store"), Some(&clip_path));
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
-        let (brain, _, _stats) = build_brain(&cfg, &handle).unwrap();
+        let (brain, _, _stats, brenn) = build_brain(&cfg, &handle, None).unwrap();
         assert!(brain.is_some());
+        assert!(brenn.is_none());
 
         // The brain's event closure holds its own clone of the sink (so it can
         // emit `brain_sink_full` later); drop it too, or the writer's channel
@@ -2526,8 +2892,11 @@ mod tests {
         let (handle, _join, _path) = jsonl_file(dir.path()).await;
 
         // `Arc<dyn Brain>` is not `Debug`, so match rather than `unwrap_err`.
-        let result = build_brain(&cfg, &handle);
-        assert!(matches!(result, Err(ClipError::Open { .. })));
+        let result = build_brain(&cfg, &handle, None);
+        assert!(matches!(
+            result,
+            Err(BrainBuildError::Clip(ClipError::Open { .. }))
+        ));
     }
 
     #[tokio::test]
@@ -2540,29 +2909,42 @@ mod tests {
         let (handle, _join, _path) = jsonl_file(dir.path()).await;
 
         assert!(matches!(
-            build_brain(&cfg, &handle),
-            Err(ClipError::MissingPath)
+            build_brain(&cfg, &handle, None),
+            Err(BrainBuildError::Clip(ClipError::MissingPath))
         ));
+    }
+
+    /// Feed `events` through `brain_event_adapter` into a file-backed JSONL sink
+    /// and return the lines it wrote, in emission order.
+    ///
+    /// The adapter closure holds its own clone of the sink, so both it and the
+    /// emit handle must be dropped before `join`: until the writer's channel sees
+    /// its last sender go, the await never returns. Owning that discipline here
+    /// keeps it out of every adapter test.
+    async fn adapter_lines(events: Vec<BrainEvent>) -> Vec<Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let adapter = brain_event_adapter(handle.clone());
+        for event in events {
+            adapter(event);
+        }
+
+        drop(adapter);
+        drop(handle);
+        join.await.unwrap();
+        read_lines(&path)
     }
 
     #[tokio::test]
     async fn brain_event_adapter_maps_sink_full() {
         use speech_pipeline::UtteranceId;
 
-        let dir = tempfile::tempdir().unwrap();
-        let (handle, join, path) = jsonl_file(dir.path()).await;
-
-        let adapter = brain_event_adapter(handle.clone());
-        adapter(BrainEvent::SinkFull {
+        let lines = adapter_lines(vec![BrainEvent::SinkFull {
             utterance: UtteranceId(7),
-        });
+        }])
+        .await;
 
-        // The adapter closure holds its own clone of the sink; drop it too, or
-        // the writer's channel never sees its last sender go and `join` hangs.
-        drop(adapter);
-        drop(handle);
-        join.await.unwrap();
-        let lines = read_lines(&path);
         let sink_full = events_named(&lines, "brain_sink_full");
         assert_eq!(sink_full.len(), 1);
         assert_eq!(sink_full[0]["utterance"], 7);
@@ -2572,18 +2954,11 @@ mod tests {
     async fn brain_event_adapter_maps_no_transcript() {
         use speech_pipeline::UtteranceId;
 
-        let dir = tempfile::tempdir().unwrap();
-        let (handle, join, path) = jsonl_file(dir.path()).await;
-
-        let adapter = brain_event_adapter(handle.clone());
-        adapter(BrainEvent::NoTranscript {
+        let lines = adapter_lines(vec![BrainEvent::NoTranscript {
             utterance: UtteranceId(11),
-        });
+        }])
+        .await;
 
-        drop(adapter);
-        drop(handle);
-        join.await.unwrap();
-        let lines = read_lines(&path);
         let no_transcript = events_named(&lines, "brain_no_transcript");
         assert_eq!(no_transcript.len(), 1);
         assert_eq!(no_transcript[0]["utterance"], 11);
@@ -2594,11 +2969,7 @@ mod tests {
         use pod_ingest::SegmentRef;
         use speech_pipeline::{AudioSpan, UtteranceId};
 
-        let dir = tempfile::tempdir().unwrap();
-        let (handle, join, path) = jsonl_file(dir.path()).await;
-
-        let adapter = brain_event_adapter(handle.clone());
-        adapter(BrainEvent::WakeCommandAbsent {
+        let lines = adapter_lines(vec![BrainEvent::WakeCommandAbsent {
             utterance: UtteranceId(7),
             audio_ref: AudioSpan {
                 log: "pod-fbe2f8_0.framelog".into(),
@@ -2614,12 +2985,9 @@ mod tests {
             wake_end_sample: 39_040,
             stt_trim_samples: 35_840,
             reason: WakeCommandReason::Empty,
-        });
+        }])
+        .await;
 
-        drop(adapter);
-        drop(handle);
-        join.await.unwrap();
-        let lines = read_lines(&path);
         // Its own event name, never the generic no-transcript error path, and it
         // carries the wake context plus the audio-span reference for retrieval.
         assert!(events_named(&lines, "brain_no_transcript").is_empty());
@@ -2634,7 +3002,6 @@ mod tests {
         assert!((absent[0]["score"].as_f64().unwrap() - 0.998).abs() < 1e-6);
         assert_eq!(absent[0]["wake_end_sample"], 39_040);
         assert_eq!(absent[0]["stt_trim_samples"], 35_840);
-        // The empty cause is labelled and carries no confidence numbers.
         assert_eq!(absent[0]["reason"], "empty");
         assert!(absent[0].get("no_speech").is_none());
     }
@@ -2644,11 +3011,7 @@ mod tests {
         use pod_ingest::SegmentRef;
         use speech_pipeline::{AudioSpan, UtteranceId};
 
-        let dir = tempfile::tempdir().unwrap();
-        let (handle, join, path) = jsonl_file(dir.path()).await;
-
-        let adapter = brain_event_adapter(handle.clone());
-        adapter(BrainEvent::WakeCommandAbsent {
+        let lines = adapter_lines(vec![BrainEvent::WakeCommandAbsent {
             utterance: UtteranceId(9),
             audio_ref: AudioSpan {
                 log: "pod-fbe2f8_0.framelog".into(),
@@ -2667,14 +3030,9 @@ mod tests {
                 no_speech_prob: 0.37,
                 avg_logprob: -0.99,
             },
-        });
+        }])
+        .await;
 
-        drop(adapter);
-        drop(handle);
-        join.await.unwrap();
-        let lines = read_lines(&path);
-        // Still the non-error no-command event, but the reason and the offending
-        // signals ride the line so it is distinguishable from the empty case.
         assert!(events_named(&lines, "brain_no_transcript").is_empty());
         let absent = events_named(&lines, "wake_command_absent");
         assert_eq!(absent.len(), 1);
@@ -2684,15 +3042,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn brain_event_adapter_labels_arm_expired() {
+        use pod_ingest::SegmentRef;
+        use speech_pipeline::{AudioSpan, UtteranceId};
+
+        let lines = adapter_lines(vec![BrainEvent::WakeCommandAbsent {
+            utterance: UtteranceId(10),
+            audio_ref: AudioSpan {
+                log: "pod-fbe2f8_0.framelog".into(),
+                start_sample: 1_500,
+                end_sample: 41_500,
+                segments: vec![SegmentRef {
+                    log: "pod-fbe2f8_0.framelog".into(),
+                    segment_id: 8,
+                    part: 0,
+                }],
+            },
+            score: 0.977,
+            wake_end_sample: 39_040,
+            stt_trim_samples: 35_840,
+            reason: WakeCommandReason::ArmExpired,
+        }])
+        .await;
+
+        assert!(events_named(&lines, "brain_no_transcript").is_empty());
+        let absent = events_named(&lines, "wake_command_absent");
+        assert_eq!(absent.len(), 1);
+        assert_eq!(absent[0]["utterance"], 10);
+        assert_eq!(absent[0]["reason"], "arm_expired");
+        // The expiry carries no confidence numbers; it must not drift into
+        // reporting the low-confidence pair it has none of.
+        assert!(absent[0].get("no_speech").is_none());
+        assert!(absent[0].get("logprob").is_none());
+    }
+
+    #[tokio::test]
     async fn brain_event_adapter_maps_barge_command_absent() {
         use pod_ingest::SegmentRef;
         use speech_pipeline::{AudioSpan, UtteranceId};
 
-        let dir = tempfile::tempdir().unwrap();
-        let (handle, join, path) = jsonl_file(dir.path()).await;
-
-        let adapter = brain_event_adapter(handle.clone());
-        adapter(BrainEvent::BargeCommandAbsent {
+        let lines = adapter_lines(vec![BrainEvent::BargeCommandAbsent {
             utterance: UtteranceId(11),
             audio_ref: AudioSpan {
                 log: "pod-fbe2f8_0.framelog".into(),
@@ -2706,12 +3095,9 @@ mod tests {
             },
             no_speech_prob: 0.42,
             avg_logprob: -1.10,
-        });
+        }])
+        .await;
 
-        drop(adapter);
-        drop(handle);
-        join.await.unwrap();
-        let lines = read_lines(&path);
         // Its own event name, carrying the barge mark and offending signals — never
         // the wake vocabulary (a barge has no wake score to report).
         assert!(events_named(&lines, "wake_command_absent").is_empty());
@@ -2729,6 +3115,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn brain_event_adapter_maps_link_publish_failed() {
+        use speech_pipeline::UtteranceId;
+
+        let lines = adapter_lines(vec![BrainEvent::LinkPublishFailed {
+            utterance: UtteranceId(21),
+            detail: "bus said no".into(),
+        }])
+        .await;
+
+        let failed = events_named(&lines, "brain_link_publish_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["utterance"], 21);
+        assert_eq!(failed[0]["detail"], "bus said no");
+    }
+
+    #[tokio::test]
+    async fn brain_event_adapter_maps_link_response_timeout() {
+        use speech_pipeline::UtteranceId;
+
+        // Two events, differing in `continuation`: the flag has to reach the line
+        // as the event set it, not merely appear as a key.
+        let lines = adapter_lines(vec![
+            BrainEvent::LinkResponseTimeout {
+                utterance: UtteranceId(22),
+                waited_ms: 8_000,
+                continuation: false,
+            },
+            BrainEvent::LinkResponseTimeout {
+                utterance: UtteranceId(23),
+                waited_ms: 2_500,
+                continuation: true,
+            },
+        ])
+        .await;
+
+        let timeouts = events_named(&lines, "brain_link_response_timeout");
+        assert_eq!(timeouts.len(), 2);
+        assert_eq!(timeouts[0]["utterance"], 22);
+        assert_eq!(timeouts[0]["waited_ms"], 8_000);
+        assert_eq!(timeouts[0]["continuation"], false);
+        assert_eq!(timeouts[1]["utterance"], 23);
+        assert_eq!(timeouts[1]["waited_ms"], 2_500);
+        assert_eq!(timeouts[1]["continuation"], true);
+    }
+
+    #[tokio::test]
+    async fn brain_event_adapter_maps_link_tag_stripped() {
+        use speech_pipeline::UtteranceId;
+
+        let lines = adapter_lines(vec![BrainEvent::LinkTagStripped {
+            utterance: UtteranceId(24),
+            tag: "<frobnicate/>".into(),
+        }])
+        .await;
+
+        let stripped = events_named(&lines, "brain_link_tag_stripped");
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(stripped[0]["utterance"], 24);
+        // The raw text rides verbatim; the operator needs the exact island that
+        // failed to parse, not a sanitized rendering of it.
+        assert_eq!(stripped[0]["tag"], "<frobnicate/>");
+    }
+
+    #[tokio::test]
+    async fn brain_event_adapter_maps_link_reply_assumed() {
+        use speech_pipeline::UtteranceId;
+
+        let lines = adapter_lines(vec![BrainEvent::LinkReplyAssumed {
+            utterance: UtteranceId(25),
+        }])
+        .await;
+
+        // Structurally identical to `LinkListenUnsupported`, so the name is the
+        // only thing separating the two arms: assert the other one is absent.
+        assert!(events_named(&lines, "brain_link_listen_unsupported").is_empty());
+        let assumed = events_named(&lines, "brain_link_reply_assumed");
+        assert_eq!(assumed.len(), 1);
+        assert_eq!(assumed[0]["utterance"], 25);
+    }
+
+    #[tokio::test]
+    async fn brain_event_adapter_maps_link_listen_unsupported() {
+        use speech_pipeline::UtteranceId;
+
+        let lines = adapter_lines(vec![BrainEvent::LinkListenUnsupported {
+            utterance: UtteranceId(26),
+        }])
+        .await;
+
+        assert!(events_named(&lines, "brain_link_reply_assumed").is_empty());
+        let unsupported = events_named(&lines, "brain_link_listen_unsupported");
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0]["utterance"], 26);
+    }
+
+    #[tokio::test]
+    async fn brain_event_adapter_maps_link_continuation_capped() {
+        use speech_pipeline::UtteranceId;
+
+        let lines = adapter_lines(vec![BrainEvent::LinkContinuationCapped {
+            utterance: UtteranceId(27),
+            segments: 9,
+        }])
+        .await;
+
+        let capped = events_named(&lines, "brain_link_continuation_capped");
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0]["utterance"], 27);
+        assert_eq!(capped[0]["segments"], 9);
+    }
+
+    #[tokio::test]
     async fn build_brain_echo_builds_and_emits_line() {
         let dir = tempfile::tempdir().unwrap();
         let text = format!(
@@ -2740,8 +3238,9 @@ mod tests {
         let cfg = Arc::new(test_config(&text).expect("config parses"));
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
-        let (brain, _, _stats) = build_brain(&cfg, &handle).unwrap();
+        let (brain, _, _stats, brenn) = build_brain(&cfg, &handle, None).unwrap();
         assert!(brain.is_some());
+        assert!(brenn.is_none());
 
         // The event closure holds its own clone of the sink; drop the brain too, or
         // the writer's channel never sees its last sender go and `join` hangs.
@@ -2751,6 +3250,246 @@ mod tests {
         let lines = read_lines(&path);
         assert_eq!(events_named(&lines, "brain_echo").len(), 1);
         assert!(events_named(&lines, "brain_clip_loaded").is_empty());
+    }
+
+    /// A `mode = "brenn"` config whose bridge points at `token` and at a closed
+    /// loopback port. The bus is never really there, which is all the wiring
+    /// tests need: what is under test is what the server builds and how it stops
+    /// it, not the transport. The stt/tts pair is not decoration — `mode =
+    /// "brenn"` requires it, and a fixture the daemon would reject is a fixture
+    /// that exercises an unreachable shape, so this one is validated here.
+    fn brenn_config_with_token(dir: &Path, token: &Path) -> Arc<Config> {
+        let text = format!(
+            "listen_addr = \"127.0.0.1:0\"\n\
+             [record]\nenabled = false\ndir = {:?}\n\
+             [brain]\nmode = \"brenn\"\n\
+             [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\n\
+             [tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
+             model = \"m\"\nvoice = \"v\"\n\
+             [brenn]\n\
+             publish_channel = \"brenn:pod.utterance\"\n\
+             response_channel = \"brenn:pod.speak\"\n\
+             wake_channel = \"brenn:pod.wake\"\n\
+             response_timeout_ms = 5000\n\
+             continuation_timeout_ms = 2000\n\
+             failure_message = \"the bus is quiet\"\n\
+             [brenn.bridge]\n\
+             server_url = \"wss://127.0.0.1:1/ws\"\n\
+             token_file = {:?}\n",
+            dir.join("store").to_str().unwrap(),
+            token.to_str().unwrap(),
+        );
+        let config = test_config(&text).expect("config parses");
+        config.validate().expect("the daemon would accept it");
+        Arc::new(config)
+    }
+
+    /// [`brenn_config_with_token`] over a token file that is really there.
+    fn brenn_config(dir: &Path) -> Arc<Config> {
+        let token = dir.join("bus.token");
+        crate::psk::write_secret_file(&token, "a-bearer-token\n").expect("write token");
+        brenn_config_with_token(dir, &token)
+    }
+
+    #[tokio::test]
+    async fn build_brain_brenn_builds_both_handles_and_emits_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = brenn_config(dir.path());
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let (_bridge, bridge_handle, _events, _peers) = crate::brenn::scripted::scripted(&[], 1);
+        let (link, _notices) = BridgeLink::new(
+            bridge_handle,
+            "brenn:pod.utterance".to_string(),
+            None,
+            handle.clone(),
+        );
+
+        let (brain, _, _stats, brenn) = build_brain(&cfg, &handle, Some(link)).unwrap();
+        // One object behind both handles, and that is the whole reason the
+        // fourth slot exists: the driver delivers responses into the same
+        // pending slot the pipeline's dispatch arms. Two `BrennBrain`s here
+        // would drop every response as no-turn-pending in production while
+        // every test still passed, so the identity is asserted, not assumed.
+        let trait_ptr = Arc::as_ptr(brain.as_ref().expect("a brain")) as *const ();
+        let concrete_ptr = Arc::as_ptr(brenn.as_ref().expect("a brenn brain")) as *const ();
+        assert_eq!(trait_ptr, concrete_ptr, "both handles hold one brain");
+
+        drop(brain);
+        drop(brenn);
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let built = events_named(&lines, "brain_brenn");
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0]["publish_channel"], "brenn:pod.utterance");
+        assert_eq!(built[0]["response_channel"], "brenn:pod.speak");
+        assert_eq!(built[0]["wake_channel"], "brenn:pod.wake");
+        assert!(built[0]["help_channel"].is_null());
+        assert_eq!(built[0]["response_timeout_ms"], 5000);
+        assert_eq!(built[0]["continuation_timeout_ms"], 2000);
+        assert_eq!(built[0]["failure_message"], "the bus is quiet");
+        assert!(events_named(&lines, "brain_echo").is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_brain_brenn_without_its_pieces_errors_rather_than_panics() {
+        // `Config::validate` rejects both of these, but the library path into
+        // `build_brain` does not re-validate — so each must be a clean error, not
+        // a panic on an internal `expect`.
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _join, _path) = jsonl_file(dir.path()).await;
+
+        assert!(matches!(
+            build_brain(&brenn_config(dir.path()), &handle, None),
+            Err(BrainBuildError::BrennLinkAbsent)
+        ));
+
+        let text = format!(
+            "listen_addr = \"127.0.0.1:0\"\n\
+             [record]\nenabled = false\ndir = {:?}\n\
+             [brain]\nmode = \"brenn\"\n",
+            dir.path().join("store").to_str().unwrap(),
+        );
+        let cfg = Arc::new(test_config(&text).expect("config parses"));
+        assert!(matches!(
+            build_brain(&cfg, &handle, None),
+            Err(BrainBuildError::BrennConfigAbsent)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_brenn_server_stops_its_bridge_only_after_the_pipeline_drains() {
+        // The bridge must not be torn down until the pipeline has drained —
+        // otherwise a turn still in flight publishes into a dead bridge and the
+        // pod signs off with its failure message. File order is the proof: a
+        // segment left open at shutdown finalizes truncated and reaches the
+        // pipeline *during* the drain, so its `tracking` line can only precede
+        // `brenn_bridge_exit` if the teardown really waited for the drain.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = brenn_config(dir.path());
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let (addr, stop, server_join) = spawn_server(cfg, handle.clone()).await;
+        let mut client = connect_pod(addr).await;
+        for f in [
+            hello(ChannelSource::AsrBeam),
+            StreamFrame::SegmentStart(SegmentStart {
+                segment_id: 9,
+                base_sample_index: 0,
+                base_device_ts_us: 0,
+                preroll_samples: 0,
+            }),
+            audio(9, 0, 320),
+        ] {
+            client.write_all(&framed(&f)).await.unwrap();
+        }
+        wait_for_event(&path, "segment 9 opened", |v| {
+            v["event"] == "segment_opened" && v["segment_id"] == 9
+        })
+        .await;
+
+        stop.send(()).unwrap();
+        server_join.await.unwrap();
+        drop(client);
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        assert_eq!(events_named(&lines, "brain_brenn").len(), 1);
+        let exit = events_named(&lines, "brenn_bridge_exit");
+        assert_eq!(exit.len(), 1, "one exit line: {exit:?}");
+        // A requested stop, not a fault: nothing latched, nothing restarts.
+        assert_eq!(exit[0]["fatal"], false);
+        assert!(events_named(&lines, "brenn_driver_exited").is_empty());
+        assert!(events_named(&lines, "pipeline_fatal").is_empty());
+
+        let at = |event: &str| {
+            lines
+                .iter()
+                .position(|v| v["event"] == event)
+                .unwrap_or_else(|| panic!("no {event} line in {lines:?}"))
+        };
+        assert!(
+            at("tracking") < at("brenn_bridge_exit"),
+            "the truncated segment reached the pipeline before the bridge stopped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bridge_that_cannot_be_built_is_fatal_at_startup() {
+        // `Config::validate` deliberately leaves `[brenn.bridge]` to the bridge,
+        // which reads the token file when it is built — so this is the only
+        // place a missing or unreadable token is caught, and the likeliest brenn
+        // misconfiguration in the field. It must name the path, not come up mute.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-provisioned.token");
+        let cfg = brenn_config_with_token(dir.path(), &missing);
+        let (handle, join, _path) = jsonl_file(dir.path()).await;
+
+        let (server, _addr, _stop, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
+        let err = server
+            .run(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+            .expect_err("an unbuildable bridge stops the daemon");
+        assert!(
+            err.to_string().contains(missing.to_str().unwrap()),
+            "the failure names the token file: {err}"
+        );
+
+        drop(handle);
+        join.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_bridge_exit_stops_the_server_naming_the_bridge() {
+        // The whole chain, through a real `Server::run`: a bridge that ends
+        // terminally latches its outcome and cancels the shutdown token, the
+        // supervision arms observe the tasks that stop downstream of that
+        // cancel, and the process exits nonzero naming the bridge — never the
+        // symptom. Every link but the peer is the production one.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = brenn_config(dir.path());
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let (bridge, bridge_handle, events, mut peers) =
+            crate::brenn::scripted::scripted(&[crate::brenn::scripted::Attempt::Open], 3);
+        let (server, _addr, _stop, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
+        let server = server.with_brenn_override(tokio::spawn(bridge.run()), bridge_handle, events);
+        let run = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+
+        let mut peer = peers.pop_front().expect("the script opens a socket");
+        peer.handshake().await;
+        peer.answer_subscribe("brenn:pod.speak", "Ok").await;
+        // A frame this bridge cannot own: the protocol violation it ends on.
+        peer.say(json!({
+            "type": "DeferredView",
+            "channel": "brenn:pod.speak",
+            "entries": [],
+        }));
+
+        let err = run
+            .await
+            .unwrap()
+            .expect_err("a voice node with no brain transport does not keep serving");
+        assert!(
+            err.to_string().starts_with("brenn bridge exited:"),
+            "the exit names the bridge, not the router or driver it stopped: {err}"
+        );
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let exit = events_named(&lines, "brenn_bridge_exit");
+        assert_eq!(exit.len(), 1, "one exit line: {exit:?}");
+        assert_eq!(exit[0]["fatal"], true);
     }
 
     #[tokio::test]
@@ -2861,6 +3600,108 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn handle_driver_exit_reports_a_panicked_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        // A clean return says nothing. A panic is the task itself dying, which
+        // nothing else names.
+        handle_driver_exit(Ok(()), &handle);
+        let panicker = tokio::spawn(async { panic!("driver boom") });
+        handle_driver_exit(panicker.await, &handle);
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let exited = events_named(&lines, "brenn_driver_exited");
+        assert_eq!(exited.len(), 1);
+        assert_eq!(exited[0]["reason"], "panic");
+        assert!(
+            exited[0]["detail"].as_str().unwrap().contains("panic"),
+            "detail names the panic: {:?}",
+            exited[0]["detail"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bridge_fault_owns_the_exit_reason_over_the_router_symptom() {
+        // A terminal bridge exit cancels the shutdown token, the router returns
+        // cleanly, and the exit string must name the bridge rather than that
+        // clean return. The precedence lives inside the reporter, so this is the
+        // whole of the behaviour and not a re-enactment of a call order.
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, _join, _path) = jsonl_file(dir.path()).await;
+        let bridge_fatal = OnceLock::new();
+        bridge_fatal
+            .set("brenn bridge exited: incompatible".to_string())
+            .unwrap();
+        let mut fatal = None;
+
+        handle_router_exit_midrun(Ok(()), &bridge_fatal, &jsonl, &mut fatal);
+        assert_eq!(
+            fatal.as_ref().map(|f| f.detail.as_str()),
+            Some("brenn bridge exited: incompatible")
+        );
+
+        // With no bridge fault latched, the router's own detail stands.
+        let mut fatal = None;
+        handle_router_exit_midrun(Ok(()), &OnceLock::new(), &jsonl, &mut fatal);
+        assert_eq!(
+            fatal.as_ref().map(|f| f.detail.as_str()),
+            Some("playback router exited mid-run")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_that_dies_mid_run_is_reported_and_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, join, path) = jsonl_file(dir.path()).await;
+
+        // A driver following its terminally-exited bridge out is the symptom:
+        // the bridge's own exit line named the fault, so this one stays silent
+        // and the latched detail is the bridge's.
+        let bridge_fatal = OnceLock::new();
+        bridge_fatal
+            .set("brenn bridge exited: incompatible".to_string())
+            .unwrap();
+        let mut fatal = None;
+        handle_driver_exit_midrun(Ok(()), &bridge_fatal, &jsonl, &mut fatal);
+        assert_eq!(
+            fatal.as_ref().map(|f| f.detail.as_str()),
+            Some("brenn bridge exited: incompatible")
+        );
+
+        // A driver that died on its own leaves no other account: nothing else
+        // joins the bridge, drains its events, or reports its exit.
+        let mut fatal = None;
+        let panicker = tokio::spawn(async { panic!("driver boom") });
+        handle_driver_exit_midrun(panicker.await, &OnceLock::new(), &jsonl, &mut fatal);
+        assert!(
+            fatal
+                .as_ref()
+                .unwrap()
+                .detail
+                .contains("bridge driver died mid-run"),
+            "the exit names the driver: {fatal:?}"
+        );
+
+        drop(jsonl);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let exited = events_named(&lines, "brenn_driver_exited");
+        assert_eq!(exited.len(), 1, "only the unexplained death reports");
+        assert_eq!(exited[0]["reason"], "panic");
+        assert!(
+            exited[0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("driver boom"),
+            "detail names the payload: {:?}",
+            exited[0]["detail"]
+        );
+    }
+
     /// Spawn a server with a test-supplied router handle, returning its address,
     /// a shutdown trigger, and the run join handle — whose `io::Result` is
     /// returned (not `expect`ed) so a mid-run fault's `Err` exit is assertable.
@@ -2940,6 +3781,51 @@ mod tests {
 
         let result = run_join.await.unwrap();
         assert!(result.is_err(), "mid-run clean exit is a nonzero exit");
+
+        drop(handle);
+        join.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn driver_panic_midrun_is_prompt_and_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let (handle, join, jsonl_path) = jsonl_file(dir.path()).await;
+
+        // A panicking driver stands in for a mid-run driver death. Nothing else
+        // joins the bridge, drains its events, or publishes its notices, so an
+        // unsupervised death is a pod that answers every turn with its failure
+        // message forever — the limp-along the crisp stop exists to avoid.
+        let driver = tokio::spawn(async { panic!("driver boom") });
+        let (server, _addr, _stop, stop_rx) =
+            bind_with_stop(config(&store, false), handle.clone(), None).await;
+        let server = server.with_driver_override(driver);
+        let run = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+
+        let exited = wait_for_event(&jsonl_path, "brenn_driver_exited", |v| {
+            v["event"] == "brenn_driver_exited" && v["reason"] == "panic"
+        })
+        .await;
+        assert!(
+            exited["detail"].as_str().unwrap().contains("driver boom"),
+            "panic detail names the payload: {:?}",
+            exited["detail"]
+        );
+
+        let err = run
+            .await
+            .unwrap()
+            .expect_err("mid-run driver death is a nonzero exit");
+        assert!(
+            err.to_string().contains("bridge driver died mid-run"),
+            "the exit names the driver: {err}"
+        );
 
         drop(handle);
         join.await.unwrap();

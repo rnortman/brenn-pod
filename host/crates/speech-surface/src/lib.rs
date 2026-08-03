@@ -4,6 +4,7 @@
 //! the binaries assemble.
 
 mod barge;
+pub mod brenn;
 pub mod clip;
 pub mod config;
 mod console;
@@ -16,10 +17,12 @@ pub mod recorder;
 pub mod replay;
 pub mod server;
 
+pub use brenn::driver::{BridgeDriver, DriverIo, DriverTokens};
+pub use brenn::{BridgeLink, NOTICE_QUEUE_DEPTH, Notice};
 pub use clip::{ClipError, SpineFormatViolation, check_spine_format, load_clip};
 pub use config::{
-    Config, ConfigError, JsonlConfig, JsonlSink, PipelineConfig, PodConfig, RecordConfig,
-    RoomLookup, UNMAPPED_ROOM,
+    BrennConfig, Config, ConfigError, JsonlConfig, JsonlSink, PipelineConfig, PodConfig,
+    RecordConfig, RoomLookup, UNMAPPED_ROOM,
 };
 pub use jsonl::{JsonlHandle, emit_line, format_line};
 pub use prune::{PruneFailure, PruneHalt, PruneOutcome, PruneRequest, PruneTier, PrunedLog, prune};

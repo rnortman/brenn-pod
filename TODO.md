@@ -4,6 +4,35 @@
 
 This is a placeholder entry. Leave it here so the file is never empty. It is not a real TODO. You would reference it in code with `// TODO(example-placeholder)` comments. This is the basic TODO system design: An entry here with a slug used to join to code comments. Add real TODOs below this one in this format.
 
+## `brenn-brain-listen` — BLOCKED as of 2026-08-03 (needs a hold-open capability in the listener)
+
+The pub/sub response vocabulary carries a `<listen/>` marker: "hold the microphone open after this
+reply, the person is expected to keep talking without saying the wake word again". `BrennBrain`
+recognizes it, strips it out of the speech, and reports `LinkListenUnsupported` — the behavior
+behind it does not exist. Capture is wake-word-gated, and the only playback-time capture trigger
+today is the barge latch (`OwwStream`'s barge path, `host/crates/speech-pipeline/src/listener/
+runtime.rs`). Without the marker a conversational exchange costs a wake word per turn, which is
+exactly the interaction an LLM on the other end is best at.
+
+The marker is in the wire vocabulary now precisely so this lands without a schema change: the peer
+already emits it, the codec already parses it, and the help document already tells the peer it is
+accepted-but-inert. So this is listener + pipeline work only — a way to arm capture for a bounded
+window after a reply finishes playing, without the wake gate, and a way for the brain to request it
+that survives the pipeline's inline dispatch (the marker is known when the segment is spoken, but
+the window opens when playback of that segment *ends*).
+
+Deferred rather than dismissed: it is a listener state-machine change with its own failure modes
+(what closes the window, what happens when the user says nothing, what happens when the held-open
+capture picks up the pod's own playback tail), not a line in the brain.
+
+Done = a `<listen/>`-marked reply holds capture open for a bounded window after its playback ends,
+speech in that window dispatches as an ordinary utterance with no wake word, the window closes on
+timeout or on the next dispatch, and `LinkListenUnsupported` is retired along with its stat and
+console name.
+
+See `TODO(brenn-brain-listen)` at the `Tag::Listen` arm of `BrennBrain::deliver` in
+`host/crates/speech-pipeline/src/brenn_brain.rs`.
+
 ## `bridge-upgrade-rejection-terminal` — BLOCKED as of 2026-08-02 (needs a change in the brenn repo first)
 
 A bearer token the brenn server does not accept — stale, rotated, mistyped, or pointed at the
@@ -376,11 +405,33 @@ Deferred because a one-in-21 irreproducible failure is a stress-campaign problem
 read-the-code problem, and no work in flight touches the code it implicates.
 
 Next action: loop the test a few hundred times on a deliberately loaded host and capture
-the daemon JSONL plus the wire log on the first failure.
+the daemon JSONL plus the wire log on the first failure. Corollary from the note below:
+solo looping alone is insufficient — 29 cumulative clean isolated runs (15 at the original
+incident, 14 at the 2026-08-03 re-check) have produced nothing. Reproduce under
+load/contention resembling the judge's environment: whole-suite `speech-surface` runs on a
+loaded host.
 
 Done = the root cause found and fixed with a pinning test, **or** a recorded stress
 campaign (≥ 500 iterations under load) with zero failures, at which point this entry
 closes as unreproducible with that evidence attached.
+
+Note (2026-08-03, brenn brain/bridge integration round 2): newer and stronger evidence
+than the paragraph above records, with fact and inference kept distinct.
+
+*Fact.* The round-2 judge reports the test "failed once and reproduced ~1-in-12 reruns
+(`playback_no_pod` race when the client disconnects before synthesis lands)" —
+implicating the `None` arm of `emit_outcome` at
+`host/crates/speech-surface/src/playback_router.rs:361-369`. Source: brenn-ops
+`docs/adr/2026/08/03-multi--brenn-brain-bridge-integration/judge-verdict-deep-r2-a1.md`,
+respond-commit scan, final bullet. The judge did not record its rerun mode. So the
+observed rate is roughly double the one-in-21 above, and there is now a named suspect
+mechanism rather than none.
+
+*Inference (not established).* Reproduction may require suite contention: the judge saw
+the failure while running the full `speech-surface` suite, and 14 clean isolated runs at
+that HEAD are consistent with that reading. Counter-evidence that must not be dropped —
+the original incident's 6 full host-workspace runs were also green. Suite contention is
+the leading hypothesis, not a confirmed trigger.
 
 See `TODO(barge-in-flake)` at
 `barge_in_flushes_playback_and_chains_the_interrupted_turn` in
