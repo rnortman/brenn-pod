@@ -561,7 +561,7 @@ mod tests {
     use std::cell::RefCell;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
 
@@ -614,15 +614,24 @@ mod tests {
 
     /// Write every byte of `payload`, polling on the direction TLS asks for
     /// between `WouldBlock` retries. Returns the number of waits.
-    fn write_all_polled(link: &mut TlsLink, payload: &[u8]) -> u32 {
+    ///
+    /// `on_first_wait` runs once, after the first block has been counted and
+    /// before its poll. A caller whose peer must not act until the client is
+    /// already blocked releases it from there: at that point `waits > 0` is a
+    /// fact rather than a forecast. Callers with no such peer pass `|| {}`.
+    fn write_all_polled(link: &mut TlsLink, payload: &[u8], on_first_wait: impl FnOnce()) -> u32 {
         let deadline = Instant::now() + TEST_TIMEOUT;
         let mut sent = 0;
         let mut waits = 0;
+        let mut on_first_wait = Some(on_first_wait);
         while sent < payload.len() {
             match link.write(&payload[sent..]) {
                 Ok(n) => sent += n,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     waits += 1;
+                    if let Some(hook) = on_first_wait.take() {
+                        hook();
+                    }
                     let interest = link.poll_interest(false, true);
                     assert!(
                         Instant::now() < deadline,
@@ -639,11 +648,19 @@ mod tests {
 
     /// Read exactly `want` bytes, polling on the direction TLS asks for between
     /// `WouldBlock` retries. Returns the bytes and the number of waits.
-    fn read_exact_polled(link: &mut TlsLink, want: usize) -> (Vec<u8>, u32) {
+    ///
+    /// `on_first_wait` runs once, after the first block has been counted and
+    /// before its poll — same contract as [`write_all_polled`]'s.
+    fn read_exact_polled(
+        link: &mut TlsLink,
+        want: usize,
+        on_first_wait: impl FnOnce(),
+    ) -> (Vec<u8>, u32) {
         let deadline = Instant::now() + TEST_TIMEOUT;
         let mut got = Vec::with_capacity(want);
         let mut waits = 0;
         let mut chunk = [0u8; 256];
+        let mut on_first_wait = Some(on_first_wait);
         while got.len() < want {
             let room = (want - got.len()).min(chunk.len());
             match link.read(&mut chunk[..room]) {
@@ -651,6 +668,9 @@ mod tests {
                 Ok(n) => got.extend_from_slice(&chunk[..n]),
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     waits += 1;
+                    if let Some(hook) = on_first_wait.take() {
+                        hook();
+                    }
                     let interest = link.poll_interest(true, false);
                     assert!(
                         Instant::now() < deadline,
@@ -792,12 +812,27 @@ mod tests {
     /// A poll shim that holds one wait back until the peer signals, then either
     /// delegates to the real shim or answers with a synthetic fault.
     ///
-    /// This is how the CI race becomes an ordering instead of a coincidence: the
-    /// peer reaches the state the wake is about — an alert plus an RST on the
-    /// wire, or a completed server flight — before the wait is allowed to
-    /// proceed, so what the handshake sees is fixed rather than raced.
+    /// This is how the CI race becomes an ordering instead of a coincidence, and
+    /// it takes three bounds, because "the client is waiting", "the peer acted"
+    /// and "the client's kernel shows it" are three different instants and a
+    /// wake can only report the third.
+    ///
+    /// - The **token** bounds *when the client is committed to the wait*: one is
+    ///   handed to the peer per served wait, and [`GatedStream`] will not begin
+    ///   reading the flight that wait is about until it has one. Without it a
+    ///   descheduled client lets the peer answer early, `connect()` covers the
+    ///   whole remainder in one call, and the wait never happens at all.
+    /// - The **signal** bounds *when the peer acted* — an alert plus an RST
+    ///   written, or a server flight completed.
+    /// - The **barrier** in [`DelayedPoll::await_observable`] bounds *when that
+    ///   act is observable on the client fd*. Loopback delivery runs in softirq
+    ///   context and the kernel defers it under load, so the signal — plain
+    ///   cross-thread memory — can arrive first.
     struct DelayedPoll {
-        /// Signalled once the peer has reached the state the held wait is about.
+        /// Handed one token per served wait, before that wait blocks. The peer
+        /// gates its reads on these.
+        committed: mpsc::Sender<()>,
+        /// Signalled once the peer has acted on the state the held wait is about.
         signal: mpsc::Receiver<()>,
         /// Waits served so far.
         waits: Cell<u32>,
@@ -813,6 +848,51 @@ mod tests {
         interests: RefCell<Vec<PollInterest>>,
     }
 
+    impl DelayedPoll {
+        /// Block until the state the held wait's answer claims is observable on
+        /// the client fd, panicking if it never becomes so.
+        ///
+        /// Both barriers are a blocking `poll` on the very condition the answer
+        /// asserts, so the ordering is enforced by a syscall rather than assumed
+        /// from the peer's signal. Neither spins, and neither consumes anything:
+        /// `POLLIN` and the fault bits are level-triggered and sticky, so the
+        /// wait served afterwards sees the same state.
+        fn await_observable(&self, fd: RawFd, interest: PollInterest) {
+            if self.synthesize_fault {
+                // The synthetic fault replaces a real wake, so what must already
+                // hold is that the server's flight is *readable*: the signal only
+                // proves it was written, and a retried `connect()` that finds
+                // nothing wants I/O again and leaves through the pending-fault
+                // backstop, failing the test on delivery timing.
+                let readiness = LibcPoll
+                    .poll_readiness(fd, interest, TEST_TIMEOUT)
+                    .expect("poll the client socket");
+                assert!(
+                    matches!(readiness, Readiness::Ready { .. }),
+                    "the server's flight never became readable, so the fault wake this test \
+                     answers with would have nothing to complete the handshake from: \
+                     {readiness:?}"
+                );
+            } else {
+                // Interest in neither direction: `POLLERR`/`POLLHUP`/`POLLNVAL`
+                // are unmaskable output bits, so this wake cannot fire on the
+                // alert's `POLLIN` and blocks exactly until the peer's reset has
+                // been processed into this socket's state. In-order delivery on
+                // one stream then puts the alert — written before the close — in
+                // the receive queue already, which is the readable-and-dead wake
+                // (`revents=0x19`) the delegated wait is about.
+                let readiness = LibcPoll
+                    .poll_readiness(fd, PollInterest::NONE, TEST_TIMEOUT)
+                    .expect("poll the client socket");
+                assert!(
+                    matches!(readiness, Readiness::Fault(_)),
+                    "the peer's close no longer produces a reset observable on the client \
+                     socket, so the wake this test is about cannot occur: {readiness:?}"
+                );
+            }
+        }
+    }
+
     impl NetPoll for DelayedPoll {
         fn poll_readiness(
             &self,
@@ -823,12 +903,22 @@ mod tests {
             let wait = self.waits.get() + 1;
             self.waits.set(wait);
             self.interests.borrow_mut().push(interest);
+            // Unconditional, and before either kind of block: `drive_handshake`
+            // is inside this call, so nothing can advance the client between the
+            // send and the block, which makes the token a sound "the client can
+            // make no further progress until this wait is answered". A peer that
+            // acts between the send and the delegated `poll(2)` is still seen —
+            // the wake is level-triggered. A closed channel means the peer has
+            // finished, so it is the wait-count assertions, not this send, that
+            // report a handshake asking for waits the peer never expected.
+            let _ = self.committed.send(());
             if wait == self.hold_at {
                 self.signal.recv_timeout(TEST_TIMEOUT).expect(
                     "the peer never reached the state the held wait is about — wait 1 is the \
                      server's own flight and wait 2 the held one, so a handshake whose wake \
                      shape changed parks here until this timeout",
                 );
+                self.await_observable(fd, interest);
                 if self.synthesize_fault {
                     return Ok(classify_wake(true, false, Some(libc::POLLHUP as u32)));
                 }
@@ -858,6 +948,101 @@ mod tests {
         }
     }
 
+    /// The peer's socket, with its first two read-phases gated on the client's
+    /// commitment tokens from [`DelayedPoll`].
+    ///
+    /// A read-phase is a maximal run of reads: phase 1 is the ClientHello, phase
+    /// 2 the client's CKE+CCS+Finished — the first read after the server's own
+    /// flight. Holding each until a token arrives means the peer cannot begin
+    /// reading the flight whose answer wait N is about before the client has
+    /// entered wait N, so `connect()` call N finds nothing further readable and
+    /// the wait exists by construction rather than by luck. Both gates are
+    /// needed: gating only the second lets a skipped wait 1 deadlock, with the
+    /// client parked on the peer's final action and the peer parked on a token
+    /// sent only at wait 2.
+    ///
+    /// Reads past phase 2 are ungated — a settled session's peer reads until the
+    /// client drops, and that read must not demand a third token. Writes never
+    /// gate: no wait is about the peer consuming anything.
+    struct GatedStream {
+        inner: TcpStream,
+        tokens: mpsc::Receiver<()>,
+        /// Read-phases begun so far.
+        phase: u32,
+        /// Whether a write has happened since the last read — i.e. whether the
+        /// next read begins a new phase.
+        wrote_since_read: bool,
+    }
+
+    impl GatedStream {
+        fn new(inner: TcpStream, tokens: mpsc::Receiver<()>) -> Self {
+            Self {
+                inner,
+                tokens,
+                phase: 0,
+                wrote_since_read: false,
+            }
+        }
+    }
+
+    impl io::Read for GatedStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.phase == 0 || self.wrote_since_read {
+                self.phase += 1;
+                self.wrote_since_read = false;
+                if self.phase <= 2 {
+                    self.tokens.recv_timeout(TEST_TIMEOUT).expect(
+                        "the client never committed to the wait this read-phase answers — \
+                         phase 1 is the ClientHello and phase 2 the client's CKE+CCS+Finished, \
+                         so a handshake whose wake shape changed parks here until this timeout",
+                    );
+                }
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl io::Write for GatedStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.wrote_since_read = true;
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// Bind a listener on an ephemeral port and hand the one accepted
+    /// connection — a server `SslStream` over a [`GatedStream`], not yet
+    /// handshaked — to `run`, which owns it and performs the `accept()` itself.
+    ///
+    /// Separate from [`spawn_tls_peer`], which owns its socket and runs `serve`
+    /// only on a *successful* `accept()`: the ordering tests need the failing
+    /// case too, and need the drop to be theirs to time. Its other callers want
+    /// none of this machinery, so they keep the simpler helper.
+    fn spawn_gated_tls_peer<F>(
+        ctx: SslContext,
+        tokens: mpsc::Receiver<()>,
+        run: F,
+    ) -> (SocketAddr, JoinHandle<()>)
+    where
+        F: FnOnce(SslStream<GatedStream>) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let ssl = Ssl::new(&ctx).expect("server ssl");
+            // The peer's socket stays blocking: it is a test thread with nothing
+            // else to do, so an event loop here would only add a way to hang.
+            let stream =
+                SslStream::new(ssl, GatedStream::new(sock, tokens)).expect("wrap server socket");
+            run(stream);
+        });
+        (addr, handle)
+    }
+
     /// A refusal that lands together with the peer's reset still names the TLS
     /// stage — the CI flake, pinned.
     ///
@@ -866,29 +1051,33 @@ mod tests {
     /// CCS+Finished still queued, which makes the close an RST. Waking only after
     /// both have landed is the wake that used to be reported as a bare socket
     /// fault, discarding the alert that says *why* the peer refused.
+    ///
+    /// The peer reads through a [`GatedStream`], so it cannot refuse before the
+    /// client is parked in the wait the refusal is about.
     #[test]
     fn a_refusal_arriving_with_a_reset_still_names_the_tls_stage() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("local addr");
-        // Not `spawn_tls_peer`: its `serve` closure runs only when `accept()`
-        // succeeds, so a declined handshake could never produce the signal.
-        let ctx = test_server_context("some-other-pod", KEY);
+        let (committed_tx, committed_rx) = mpsc::channel::<()>();
         let (closed_tx, closed_rx) = mpsc::channel::<()>();
-        let peer = std::thread::spawn(move || {
-            let (sock, _) = listener.accept().expect("accept");
-            let ssl = Ssl::new(&ctx).expect("server ssl");
-            let mut stream = SslStream::new(ssl, sock).expect("wrap server socket");
-            stream
-                .accept()
-                .expect_err("an identity the table does not hold must be refused");
-            // Explicit, and strictly before the signal: this drop is what emits
-            // the RST. Signalling first would let the client's poll beat the
-            // reset and see a plain readable wake — the test itself would flake.
-            drop(stream);
-            closed_tx.send(()).expect("the client is waiting");
-        });
+        let (addr, peer) = spawn_gated_tls_peer(
+            test_server_context("some-other-pod", KEY),
+            committed_rx,
+            move |mut stream| {
+                stream
+                    .accept()
+                    .expect_err("an identity the table does not hold must be refused");
+                // Explicit, and strictly before the signal: this drop is what
+                // emits the RST, so signalling first would leave the shim's
+                // barrier waiting on a reset not yet sent, until it times out.
+                // The token bounded when the client committed to the wait; the
+                // signal bounds when this thread acted; the barrier bounds when
+                // the client's kernel shows it.
+                drop(stream);
+                closed_tx.send(()).expect("the client is waiting");
+            },
+        );
 
         let poll = DelayedPoll {
+            committed: committed_tx,
             signal: closed_rx,
             waits: Cell::new(0),
             // Wait 1 is the server's own flight; wait 2 is the one the refusal
@@ -947,22 +1136,33 @@ mod tests {
     /// `an_aborted_peer_reads_as_a_fault_rather_than_end_of_stream` pins.
     ///
     /// The fault is synthetic because a socket that is genuinely dead cannot also
-    /// complete a handshake; what is real is the ordering — the held wait is
-    /// released only once the server's `accept()` has returned, so its
-    /// CCS+Finished is on the wire and the retried `connect()` has something to
-    /// finish with.
+    /// complete a handshake; what is real is the ordering — the peer's final
+    /// flight is gated on the client committing to the held wait, and the wait is
+    /// released only once `accept()` has returned *and* the shim's barrier has
+    /// seen that flight become readable, so the retried `connect()` has something
+    /// to finish with.
     #[test]
     fn a_handshake_completing_after_a_fault_wake_still_connects() {
+        let (committed_tx, committed_rx) = mpsc::channel::<()>();
         let (flight_tx, flight_rx) = mpsc::channel::<()>();
-        let (addr, peer) = spawn_tls_peer(test_server_context(POD_ID, KEY), move |stream| {
-            // `serve` runs only after `accept()` returned, so reaching here is
-            // the proof that the server's last flight was written.
-            flight_tx.send(()).expect("the client is waiting");
-            let mut sink = [0u8; 16];
-            let _ = stream.read(&mut sink);
-        });
+        let (addr, peer) = spawn_gated_tls_peer(
+            test_server_context(POD_ID, KEY),
+            committed_rx,
+            move |mut stream| {
+                stream
+                    .accept()
+                    .expect("the pinned identity and key must be accepted");
+                // `accept()` returned, so the server's CCS+Finished is written.
+                flight_tx.send(()).expect("the client is waiting");
+                // Ungated — a third read-phase, holding the session open until
+                // the client drops it.
+                let mut sink = [0u8; 16];
+                let _ = stream.read(&mut sink);
+            },
+        );
 
         let poll = DelayedPoll {
+            committed: committed_tx,
             signal: flight_rx,
             waits: Cell::new(0),
             // Wait 1 is the server's first flight; wait 2 is the wait for its
@@ -1039,10 +1239,18 @@ mod tests {
     fn a_peer_that_never_speaks_tls_is_bounded_by_the_handshake_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("local addr");
+        // The release bounds *when the peer may close*: it is sent only once the
+        // client has already given up, so the kind asserted below is a fact about
+        // the handshake deadline rather than a bet that the client finishes its
+        // whole attempt — socket setup and OpenSSL context construction included —
+        // before some wall-clock grace on the peer runs out.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let peer = std::thread::spawn(move || {
             let (sock, _) = listener.accept().expect("accept");
             // Hold the connection open, silent, until the client gives up.
-            std::thread::sleep(Duration::from_millis(600));
+            release_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("the client never finished its handshake attempt");
             drop(sock);
         });
         let started = Instant::now();
@@ -1054,6 +1262,10 @@ mod tests {
             handshake_timeout: Duration::from_millis(150),
         })
         .expect_err("a silent peer must not connect");
+        // Before the asserts, so a failing one does not leave the peer parked for
+        // the whole `TEST_TIMEOUT`. A closed channel means the peer is already
+        // gone, which surfaces louder at `join` than it would here.
+        let _ = release_tx.send(());
         assert_eq!(
             err.kind(),
             io::ErrorKind::TimedOut,
@@ -1076,23 +1288,38 @@ mod tests {
         // Long enough to be several TLS records, so a partial write is likely.
         let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
         let expected = payload.clone();
+        // The token bounds *when the client's first read has already blocked*:
+        // it is sent from inside that wait, so the echo — the only thing that can
+        // ever make a client-bound byte exist — is strictly later than the wait
+        // this test asserts. The peer's own read stays ungated, so the client's
+        // write completes independently of the token.
+        let (blocked_tx, blocked_rx) = mpsc::channel::<()>();
         let (addr, peer) = spawn_tls_peer(test_server_context(POD_ID, KEY), move |stream| {
             let mut got = vec![0u8; expected.len()];
             stream.read_exact(&mut got).expect("peer read");
             assert_eq!(got, expected, "peer received different bytes");
+            blocked_rx
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("the client's first read never blocked, so the echo has no gate");
             stream.write_all(&got).expect("peer echo");
             stream.flush().expect("peer flush");
         });
 
         let mut link = connect(&addr, KEY).expect("handshake");
-        write_all_polled(&mut link, &payload);
+        // A no-op hook here on purpose: releasing the echo from a *write*-side
+        // wait would let it land before the client's first read, which is the
+        // window the token exists to close.
+        write_all_polled(&mut link, &payload, || {});
         link.flush().expect("flush");
-        let (echoed, read_waits) = read_exact_polled(&mut link, payload.len());
+        let (echoed, read_waits) = read_exact_polled(&mut link, payload.len(), move || {
+            let _ = blocked_tx.send(());
+        });
         assert_eq!(echoed, payload, "the echoed bytes must come back intact");
         assert!(
             read_waits > 0,
-            "an 8 KiB echo cannot all be there on the first read; the link must have \
-             reported WouldBlock at least once"
+            "the peer's echo is gated on a token sent from inside the first read's \
+             WouldBlock, so that block is a fact; counting zero waits means the gate \
+             itself regressed"
         );
         assert_eq!(
             link.want_substitutions(),
@@ -1194,8 +1421,11 @@ mod tests {
             let ssl = Ssl::new(&ctx).expect("server ssl");
             let mut stream = SslStream::new(ssl, sock).expect("wrap server socket");
             stream.accept().expect("server handshake");
-            // Read nothing until the client has seen its write blocked; an
-            // attentive peer would never let the send path fill.
+            // Read nothing until the client's resumed write has already blocked;
+            // an attentive peer would never let the send path fill. The token
+            // bounds *when that block happened* — it is sent from inside the
+            // wait, so the drain that could otherwise absorb the remainder
+            // without one starts strictly afterwards.
             release_rx.recv().expect("release");
             let mut got = vec![0u8; expected_len];
             stream.read_exact(&mut got).expect("peer read");
@@ -1227,14 +1457,19 @@ mod tests {
             "a write blocked on the socket asks for writability"
         );
 
-        release_tx.send(()).expect("peer thread is alive");
         // The same slice from the same start: `sent` advances only on a write that
         // took bytes, which is the buffer-stability rule OpenSSL enforces across a
-        // `WANT_WRITE` retry.
-        let waits = write_all_polled(&mut link, &payload[sent..]);
+        // `WANT_WRITE` retry. The peer is released from inside the first block of
+        // that resumed write, so it cannot drain the path early enough to carry the
+        // remainder through without one.
+        let waits = write_all_polled(&mut link, &payload[sent..], move || {
+            let _ = release_tx.send(());
+        });
         assert!(
             waits > 0,
-            "the payload was waited out through the poll shim at least once"
+            "the path to the peer holds far less than the remaining payload and its \
+             only reader is gated on a token sent from inside the first wait, so that \
+             wait is a fact; counting zero means the gate itself regressed"
         );
         link.flush().expect("flush");
         assert_eq!(
@@ -1281,7 +1516,7 @@ mod tests {
             // no `close_notify` — a killed daemon rather than a shutdown.
         });
         let mut link = connect(&addr, KEY).expect("handshake");
-        write_all_polled(&mut link, b"x");
+        write_all_polled(&mut link, b"x", || {});
 
         let deadline = Instant::now() + TEST_TIMEOUT;
         let mut buf = [0u8; 64];
@@ -1403,24 +1638,83 @@ mod tests {
     /// tear down a healthy TLS session. Any process embedding this transport that
     /// installs a handler (a `SIGTERM` shutdown handler is table stakes for a
     /// daemon) would arm that.
+    ///
+    /// The wait must be *interrupted* for any of that to be under test, and a
+    /// signal that lands before the wait is entered leaves every assertion below
+    /// true while the resume loop never runs. Two things stop that from passing
+    /// silently: the waker keeps signalling for as long as the wait lasts, and
+    /// the handler timestamps its delivery against the wait, so a run where no
+    /// signal fell inside it fails and names itself.
     #[test]
     fn a_signal_during_a_wait_resumes_instead_of_faulting() {
         /// The signal this test delivers to its own thread. Nothing else in the
         /// tree sends it, and the disposition is restored before returning.
         const SIG: libc::c_int = libc::SIGUSR1;
         const BUDGET: Duration = Duration::from_millis(300);
+        /// Gap between signals. Small against `BUDGET` so the waker gets many
+        /// attempts at the wait rather than one, whatever the scheduler does with
+        /// either thread.
+        const SIGNAL_GAP: Duration = Duration::from_millis(20);
+        /// `CLOCK_MONOTONIC` nanoseconds at the instant the wait was entered, or
+        /// 0 until then.
+        static WAIT_ORIGIN: AtomicU64 = AtomicU64::new(0);
+        /// Nanoseconds from `WAIT_ORIGIN` to the first delivery that followed it,
+        /// or 0 if every delivery beat the wait.
+        static DELIVERED_AT: AtomicU64 = AtomicU64::new(0);
         static DELIVERED: AtomicU32 = AtomicU32::new(0);
+        /// Set once the wait has returned; stops the waker signalling a thread
+        /// that may be about to unwind.
+        static WAIT_RETURNED: AtomicBool = AtomicBool::new(false);
+
+        /// `CLOCK_MONOTONIC` in nanoseconds. Read from the handler as well as the
+        /// test thread, so it is `clock_gettime` rather than `Instant`: only the
+        /// former is async-signal-safe.
+        fn monotonic_nanos() -> u64 {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `ts` is a valid `timespec` the call fully writes, and
+            // `CLOCK_MONOTONIC` is always available.
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+        }
 
         extern "C" fn on_signal(_: libc::c_int) {
             DELIVERED.fetch_add(1, Ordering::Relaxed);
+            let origin = WAIT_ORIGIN.load(Ordering::Relaxed);
+            if origin != 0 {
+                // Floored at 1 ns: 0 is the "never landed inside the wait"
+                // sentinel, so a delivery in the same nanosecond must not read as
+                // one. Only the first post-origin delivery is kept.
+                let offset = monotonic_nanos().saturating_sub(origin).max(1);
+                let _ =
+                    DELIVERED_AT.compare_exchange(0, offset, Ordering::Relaxed, Ordering::Relaxed);
+            }
+        }
+
+        /// Stops the waker and joins it on every exit path. `pthread_kill` aimed
+        /// at a thread that has already unwound is undefined, and the wait's own
+        /// `expect` can unwind this thread while the waker is still armed.
+        struct StopWaker(Option<JoinHandle<()>>);
+        impl Drop for StopWaker {
+            fn drop(&mut self) {
+                WAIT_RETURNED.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.0.take()
+                    && handle.join().is_err()
+                    && !std::thread::panicking()
+                {
+                    panic!("waker thread");
+                }
+            }
         }
 
         let (client, _server) = loopback_pair();
         // No `SA_RESTART`, an empty mask: the plainest handler that interrupts a
         // wait. The previous disposition is put back below.
         // SAFETY: both structs are fully initialized (zeroed is an empty mask and
-        // no flags) and outlive the calls; `on_signal` only touches an atomic, so
-        // it is safe to run in a signal context.
+        // no flags) and outlive the calls; `on_signal` only touches atomics and
+        // `clock_gettime`, both async-signal-safe.
         let previous = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
@@ -1435,35 +1729,73 @@ mod tests {
         };
         // SAFETY: `pthread_self` takes no arguments and cannot fail.
         let target = unsafe { libc::pthread_self() };
+        // Signals until the wait returns rather than once at a guessed instant: a
+        // single shot has to be timed against a wait it cannot observe, and one
+        // that lands early leaves the test green with the resume loop untouched.
+        // `WAIT_RETURNED` is the only exit, so every run that reaches the wait
+        // gets `BUDGET / SIGNAL_GAP` chances at it.
         let waker = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            // SAFETY: `target` names this process's still-running test thread,
-            // which is joined with this one below.
-            unsafe { libc::pthread_kill(target, SIG) }
+            // The deadline is not belt-and-braces: a resume that restarted on a
+            // fresh budget instead of the remaining one would never finish under
+            // an unbounded waker, turning that regression into a hang. Bounded,
+            // it becomes the elapsed assertion below.
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            while !WAIT_RETURNED.load(Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(SIGNAL_GAP);
+                if WAIT_RETURNED.load(Ordering::Relaxed) {
+                    break;
+                }
+                // SAFETY: `target` names this process's test thread, which is
+                // parked in the wait or joining this one — `StopWaker` sets
+                // `WAIT_RETURNED` and joins before that thread can unwind past it.
+                let rc = unsafe { libc::pthread_kill(target, SIG) };
+                assert_eq!(rc, 0, "pthread_kill: {rc}");
+            }
         });
+        let stop_waker = StopWaker(Some(waker));
 
-        let started = Instant::now();
+        let origin = monotonic_nanos();
+        WAIT_ORIGIN.store(origin, Ordering::Relaxed);
         let readiness = LibcPoll
             .poll_readiness(client.as_raw_fd(), PollInterest::READ, BUDGET)
             .expect("an interrupted wait is not a failure of the poll call");
-        let elapsed = started.elapsed();
-
-        assert_eq!(waker.join().expect("waker thread"), 0, "pthread_kill");
+        let waited = monotonic_nanos().saturating_sub(origin);
+        // Stops and joins the waker; must precede the disposition restore, since
+        // `SIGUSR1` at its default disposition kills the process.
+        drop(stop_waker);
         // SAFETY: `previous` is the disposition `sigaction` just filled in.
         unsafe { libc::sigaction(SIG, &previous, std::ptr::null_mut()) };
 
+        let delivered = DELIVERED.load(Ordering::Relaxed);
+        let delivered_at = DELIVERED_AT.load(Ordering::Relaxed);
         assert!(
-            DELIVERED.load(Ordering::Relaxed) >= 1,
-            "the signal never arrived, so nothing was interrupted and this test \
-             asserted nothing"
+            delivered >= 1,
+            "the waker never delivered a signal, so nothing was interrupted and \
+             this test asserted nothing"
+        );
+        assert!(
+            delivered_at > 0,
+            "all {delivered} signals landed before the wait was entered, so the \
+             EINTR resume never ran and this test asserted nothing"
+        );
+        assert!(
+            delivered_at < waited,
+            "the first signal to reach the wait landed {delivered_at} ns in, past \
+             the wait's own {waited} ns — nothing was interrupted"
         );
         assert!(
             matches!(readiness, Readiness::TimedOut),
             "an interrupted wait on a healthy socket is a timeout, not a fault: {readiness:?}"
         );
+        let elapsed = Duration::from_nanos(waited);
         assert!(
             elapsed >= BUDGET - Duration::from_millis(50),
             "the wait must resume on what is left of its budget, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < TEST_TIMEOUT,
+            "a resume on a fresh budget rather than the remaining one would run \
+             until the waker's own deadline, and this took {elapsed:?}"
         );
     }
 

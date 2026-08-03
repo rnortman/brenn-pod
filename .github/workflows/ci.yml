@@ -14,6 +14,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # A CI panic is read from the log or not at all — there is no rerunning it
+  # under a debugger. Inert for the jobs that run no Rust.
+  RUST_BACKTRACE: 1
 
 jobs:
   check:
