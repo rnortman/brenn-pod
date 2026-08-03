@@ -36,6 +36,16 @@ const CONSOLE_INFO: &[&str] = &[
     "wake_decision",
     "wake_detected",
     "wake_command_absent",
+    // A response accepted for the pending turn without its correlation marker:
+    // benign by the reply policy, worth watching while a peer's habits settle.
+    "brain_link_reply_assumed",
+    // The bus brain's healthy lifecycle: which channels it speaks over, when the
+    // attachment comes up, what it subscribed to, and the one-shot contract
+    // document reaching the harness.
+    "brain_brenn",
+    "brenn_attached",
+    "brenn_subscribed",
+    "brenn_help_published",
     // The listener's utterance lifecycle. All fire at speech-boundary rate (a
     // handful per utterance), never per-chunk, so the console stays bounded.
     "endpointer_transition",
@@ -63,8 +73,12 @@ const CONSOLE_INFO: &[&str] = &[
 /// name contains any of these is rendered loud even without an explicit
 /// mapping, so a new failure event named after in-repo precedent is loud from
 /// day one. The trailing entries exist because the vocabulary is not
-/// token-uniform: `brain_sink_full`, `*_no_*`, `*_skipped`, and
-/// `playback_aborted` are failure/warning events the earlier tokens miss. The
+/// token-uniform: `brain_sink_full`, `*_no_*`, `*_skipped`,
+/// `playback_aborted`, `*_timeout`, `*_stripped` (a marker the peer sent that
+/// this pod does not know), `*_capped` (a bound hit, not a limit respected) and
+/// `*_unavailable` (a channel the peer will not serve) are failure/warning events
+/// the earlier tokens miss. Two exception lists sit in front of this one:
+/// [`CALM_DESPITE_TOKEN`] and [`LOUD_WITHOUT_TOKEN`]. The
 /// `console_classification_is_exhaustive` test pins the current mapping: it
 /// fails if any event the `EVENTS` table classifies `Loud` stops rendering loud
 /// (a token deleted here, an explicit mapping dropped). It cannot catch a
@@ -86,6 +100,39 @@ const ERROR_TOKENS: &[&str] = &[
     "skipped",
     "aborted",
     "_no_",
+    "timeout",
+    "stripped",
+    "capped",
+    "unavailable",
+];
+
+/// Events whose names carry a failure token but which are not failures. Consulted
+/// before [`ERROR_TOKENS`], so a name that reads like a fault but is a shrug stays
+/// calm without being renamed against the convention it otherwise follows.
+const CALM_DESPITE_TOKEN: &[&str] = &[
+    // A wake nudge is an advisory pre-warm with no protocol weight: losing one to
+    // a full queue or a refusing peer costs a little first-token latency and
+    // nothing else.
+    "brenn_wake_dropped",
+    "brenn_wake_publish_failed",
+];
+
+/// Failures and warnings whose names carry no failure token, so the convention
+/// cannot classify them. Each is loud for a stated reason:
+///
+/// - `listener_absent`: the daemon mints no utterances — a legitimate state, but
+///   one that otherwise looks healthy.
+/// - `brenn_detached`: the bus brain has no path to its harness until the bridge
+///   reattaches, so every turn in that window fails.
+/// - `brenn_bridge_exit`: the bridge is gone for the rest of the process, whether
+///   it left cleanly or not.
+/// - `brenn_delivery_gap`: responses were lost on the bus before reaching this
+///   pod, so a turn was answered with part of its speech missing.
+const LOUD_WITHOUT_TOKEN: &[&str] = &[
+    "listener_absent",
+    "brenn_detached",
+    "brenn_bridge_exit",
+    "brenn_delivery_gap",
 ];
 
 /// Long string fields (transcript, error detail) truncate here; the file keeps
@@ -110,6 +157,13 @@ const HEALTH_COUNTER_LEAVES: &[&str] = &[
     "speak_send_failures",
     "send_failures",
     "no_transcript",
+    // The bus brain's failure counters. `link_replies_assumed` and
+    // `link_listen_unsupported` are deliberately absent: both are documented
+    // non-failures, and a mover line for either would cry wolf.
+    "link_publish_failures",
+    "link_response_timeouts",
+    "link_tags_stripped",
+    "link_continuations_capped",
     "no_pod",
     "unsupported",
     "failed",
@@ -127,21 +181,23 @@ pub(crate) fn wants(event: &str) -> bool {
     if event == "tracking" {
         return false;
     }
-    CONSOLE_INFO.contains(&event) || has_error_token(event)
+    CONSOLE_INFO.contains(&event) || LOUD_WITHOUT_TOKEN.contains(&event) || has_error_token(event)
 }
 
 fn has_error_token(event: &str) -> bool {
     ERROR_TOKENS.iter().any(|token| event.contains(token))
 }
 
-/// Whether an event renders loud (`!!! ` prefix, red on a terminal). Error-token
-/// names are loud; `listener_absent` is a loud warning (the daemon mints no
-/// utterances — a legitimate state, but one that otherwise looks healthy); a
-/// `wake_decision` is loud unless its outcome is one of the known calm verdicts,
-/// so an `error` or any unrecognized future outcome surfaces loudly rather than
-/// as a calm line.
+/// Whether an event renders loud (`!!! ` prefix, red on a terminal). The two
+/// exception lists win over the name convention (in that order — a name in both
+/// is calm); a `wake_decision` is loud unless its outcome is one of the known calm
+/// verdicts, so an `error` or any unrecognized future outcome surfaces loudly
+/// rather than as a calm line; every other error-token name is loud.
 fn is_loud(event: &str, fields: &Value) -> bool {
-    if event == "listener_absent" {
+    if CALM_DESPITE_TOKEN.contains(&event) {
+        return false;
+    }
+    if LOUD_WITHOUT_TOKEN.contains(&event) {
         return true;
     }
     if event == "wake_decision" {
@@ -2285,6 +2341,39 @@ mod tests {
     }
 
     #[test]
+    fn stage_health_surfaces_the_bus_brain_link_failures() {
+        let mut r = Renderer::new(false);
+        // A run where every turn's publish was refused or every response timed out
+        // is exactly what the backstop exists to summarize for an operator who was
+        // not watching the console live. The two non-failure link counters in the
+        // same snapshot must not move the line.
+        let line = r
+            .render(
+                0,
+                "stage_health",
+                &json!({
+                    "brain": {
+                        "link_publish_failures": 2,
+                        "link_response_timeouts": 1,
+                        "link_tags_stripped": 3,
+                        "link_continuations_capped": 1,
+                        "link_replies_assumed": 9,
+                        "link_listen_unsupported": 4,
+                    }
+                }),
+            )
+            .unwrap();
+        assert!(
+            line.ends_with(
+                "!!! stage_health: brain.link_continuations_capped +1, \
+                 brain.link_publish_failures +2, brain.link_response_timeouts +1, \
+                 brain.link_tags_stripped +3"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn stt_configured_mistyped_language_degrades_to_question_mark() {
         let mut r = Renderer::new(false);
         // A wrong-typed `language` is a malformed event; it degrades to `?` like
@@ -2476,11 +2565,33 @@ mod tests {
     const EVENTS: &[(&str, Class)] = &[
         ("arm_expired", Class::Calm),
         ("brain_absent", Class::Calm),
+        ("brain_brenn", Class::Calm),
         ("brain_clip_loaded", Class::Calm),
         ("brain_dispatched", Class::Calm),
         ("brain_echo", Class::Calm),
+        ("brain_link_continuation_capped", Class::Loud),
+        ("brain_link_listen_unsupported", Class::Loud),
+        ("brain_link_publish_failed", Class::Loud),
+        ("brain_link_reply_assumed", Class::Calm),
+        ("brain_link_response_timeout", Class::Loud),
+        ("brain_link_tag_stripped", Class::Loud),
         ("brain_no_transcript", Class::Loud),
         ("brain_sink_full", Class::Loud),
+        ("brenn_attached", Class::Calm),
+        ("brenn_bridge_exit", Class::Loud),
+        ("brenn_channel_unavailable", Class::Loud),
+        ("brenn_connect_failed", Class::Loud),
+        ("brenn_delivery_dropped", Class::Loud),
+        ("brenn_delivery_gap", Class::Loud),
+        ("brenn_detached", Class::Loud),
+        ("brenn_driver_exited", Class::Loud),
+        ("brenn_help_publish_failed", Class::Loud),
+        ("brenn_help_published", Class::Calm),
+        ("brenn_interruption_dropped", Class::Loud),
+        ("brenn_interruption_publish_failed", Class::Loud),
+        ("brenn_subscribed", Class::Calm),
+        ("brenn_wake_dropped", Class::Calm),
+        ("brenn_wake_publish_failed", Class::Calm),
         ("conn_accept_error", Class::Loud),
         ("conn_accepted", Class::FileOnly),
         ("conn_closed", Class::Calm),

@@ -34,6 +34,9 @@ const SAMPLES_PER_MS: u64 = 16;
 /// Room name used for a pod absent from the `[pods]` map.
 pub const UNMAPPED_ROOM: &str = "unmapped";
 
+/// The prefix a bus channel must carry to be transportable off this host.
+const BRENN_CHANNEL_PREFIX: &str = "brenn:";
+
 /// Parsed daemon configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +75,10 @@ pub struct Config {
     /// is wired and utterances go unanswered (increment-3 behavior).
     #[serde(default)]
     pub brain: Option<BrainConfig>,
+    /// Bus-brain configuration: the channels a `BrennBrain` speaks over and the
+    /// bridge that carries them. `None` when the `[brenn]` table is absent.
+    #[serde(default)]
+    pub brenn: Option<BrennConfig>,
     /// Speech-to-text configuration. `None` when the `[stt]` table is absent — no
     /// transcriber is wired and utterances mint with a null transcript. A present
     /// table enriches every utterance regardless of whether a brain consumes it.
@@ -137,31 +144,66 @@ impl Config {
         if let Some(brain) = &self.brain {
             brain.validate()?;
         }
+        if let Some(brenn) = &self.brenn {
+            brenn.validate()?;
+        }
         if let Some(stt) = &self.stt {
             stt.validate()?;
         }
         if let Some(tts) = &self.tts {
             tts.validate()?;
         }
-        // Cross-table: an echo brain reads back what it heard, so it is a
-        // misconfiguration without both a transcriber (to hear) and a
-        // synthesizer (to speak). Fatal at startup with the missing table named,
+        // Cross-table: a brain that answers in words needs both a transcriber (to
+        // hear) and a synthesizer (to speak), and the bus brain additionally needs
+        // the bus it speaks over. Fatal at startup with the missing table named,
         // rather than a silently mute daemon.
-        if let Some(brain) = &self.brain
-            && brain.mode == BrainMode::Echo
+        if let Some(brain) = &self.brain {
+            match brain.mode {
+                BrainMode::Wav => {}
+                BrainMode::Echo => {
+                    if self.stt.is_none() {
+                        return Err("brain.mode = \"echo\" requires an [stt] table \
+                             (nothing to transcribe with)"
+                            .to_string());
+                    }
+                    if self.tts.is_none() {
+                        return Err(
+                            "brain.mode = \"echo\" requires a [tts] table (nothing to speak with)"
+                                .to_string(),
+                        );
+                    }
+                }
+                BrainMode::Brenn => {
+                    if self.brenn.is_none() {
+                        return Err("brain.mode = \"brenn\" requires a [brenn] table \
+                             (no channels and no bridge to reach a harness over)"
+                            .to_string());
+                    }
+                    if self.stt.is_none() {
+                        return Err("brain.mode = \"brenn\" requires an [stt] table \
+                             (nothing to transcribe the utterances it publishes)"
+                            .to_string());
+                    }
+                    if self.tts.is_none() {
+                        return Err("brain.mode = \"brenn\" requires a [tts] table \
+                             (responses arrive as text, and something must speak them)"
+                            .to_string());
+                    }
+                }
+            }
+        }
+        // The converse of the brenn arm above. A `[brenn]` table under any other
+        // mode builds no bridge, no link and no driver: every channel, timeout
+        // and credential in it is read by nothing, and the only symptom is a
+        // harness that never hears a word.
+        if self.brenn.is_some()
+            && self.brain.as_ref().map(|brain| brain.mode) != Some(BrainMode::Brenn)
         {
-            if self.stt.is_none() {
-                return Err(
-                    "brain.mode = \"echo\" requires an [stt] table (nothing to transcribe with)"
-                        .to_string(),
-                );
-            }
-            if self.tts.is_none() {
-                return Err(
-                    "brain.mode = \"echo\" requires a [tts] table (nothing to speak with)"
-                        .to_string(),
-                );
-            }
+            return Err(
+                "a [brenn] table requires brain.mode = \"brenn\" (nothing else \
+                 dials the bus, so the table would be read by nothing)"
+                    .to_string(),
+            );
         }
         self.playback.validate()?;
         Ok(())
@@ -600,6 +642,119 @@ pub enum BrainMode {
     Wav,
     /// Read the transcript back as synthesized speech. Requires `[stt]` + `[tts]`.
     Echo,
+    /// Publish each utterance to a harness on the brenn bus and speak what comes
+    /// back. Requires `[brenn]` (the channels and the bridge) plus `[stt]` +
+    /// `[tts]`.
+    Brenn,
+}
+
+/// Bus-brain configuration: which channels the pod publishes on and subscribes
+/// to, how long it waits for an answer, and the bridge that carries all of it.
+///
+/// The channel names have no defaults. No channel-naming convention exists for
+/// this bus yet, and a minted one would be a guess baked into every install; an
+/// operator states the names the harness on the other end actually uses. Every
+/// configured channel must be transportable (`brenn:`-prefixed): the bridge's
+/// subscription plane *panics* on a `local:` address, so the refusal belongs
+/// here, at the config line, and not on the bridge task.
+///
+/// `[brenn.bridge]` nests [`brenn_bridge::Config`] verbatim rather than mirroring
+/// its fields, so the bridge's own schema — and its `deny_unknown_fields` — is
+/// the one an operator writes against. (Nested, not flattened: `serde(flatten)`
+/// and `deny_unknown_fields` do not compose.) The bridge re-validates that table
+/// and reads the token file when it is built, so nothing here duplicates those
+/// checks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrennConfig {
+    /// Channel the pod publishes utterance and interruption bodies on. The
+    /// harness answers on [`BrennConfig::response_channel`].
+    pub publish_channel: String,
+    /// Channel the pod subscribes to for response bodies.
+    pub response_channel: String,
+    /// Optional advisory pre-warm channel: a nudge is published here the moment a
+    /// wake word is confirmed, before the command has been transcribed. Absent
+    /// means no nudge is sent at all.
+    #[serde(default)]
+    pub wake_channel: Option<String>,
+    /// Optional channel the response contract document is published to once per
+    /// process run. Expected to be server-retained, so a harness participant
+    /// reads the instructions on join instead of needing them re-sent.
+    #[serde(default)]
+    pub help_channel: Option<String>,
+    /// How long a turn waits for the first response message after its utterance
+    /// is published. Must be greater than zero.
+    #[serde(default = "default_brenn_response_timeout_ms")]
+    pub response_timeout_ms: u64,
+    /// How long a turn waits for a *promised* continuation segment. Shorter than
+    /// the initial budget by default and deliberately so: once the harness has
+    /// started answering, a long silent gap is evidence of a lost continuation
+    /// rather than of a slow think. Must be greater than zero.
+    #[serde(default = "default_brenn_continuation_timeout_ms")]
+    pub continuation_timeout_ms: u64,
+    /// Sub-identity put on every publish, for the peer to attribute the message
+    /// to. Omitted from the request when absent.
+    #[serde(default)]
+    pub attribution: Option<String>,
+    /// Spoken when a turn ends on a link failure — a publish the bus refused, or
+    /// a response that never came — so a broken turn is audibly over instead of
+    /// silently abandoned. A whitespace-only value is the disable knob: it queues
+    /// no speech, restoring the silent-turn behavior.
+    #[serde(default = "default_brenn_failure_message")]
+    pub failure_message: String,
+    /// The bridge that carries the channels above.
+    pub bridge: brenn_bridge::Config,
+}
+
+impl BrennConfig {
+    /// Every configured channel, in a fixed order, tagged with the config key it
+    /// came from so a rejection names the line to fix.
+    fn channels(&self) -> Vec<(&'static str, &str)> {
+        let mut channels = vec![
+            ("publish_channel", self.publish_channel.as_str()),
+            ("response_channel", self.response_channel.as_str()),
+        ];
+        if let Some(wake) = &self.wake_channel {
+            channels.push(("wake_channel", wake.as_str()));
+        }
+        if let Some(help) = &self.help_channel {
+            channels.push(("help_channel", help.as_str()));
+        }
+        channels
+    }
+
+    /// Semantic checks: every channel is `brenn:`-prefixed, no two channels are
+    /// the same, and both response budgets are positive.
+    ///
+    /// Distinctness is not cosmetic. Sharing the publish and response channels
+    /// would feed the pod its own utterances, and every other pairing conflates
+    /// two message kinds the peer is expected to route apart.
+    pub fn validate(&self) -> Result<(), String> {
+        let channels = self.channels();
+        for (key, channel) in &channels {
+            if !channel.starts_with(BRENN_CHANNEL_PREFIX) {
+                return Err(format!(
+                    "brenn.{key} {channel:?} must name a transportable channel \
+                     (a {BRENN_CHANNEL_PREFIX:?} prefix); a local: address never crosses the wire"
+                ));
+            }
+        }
+        for (i, (key, channel)) in channels.iter().enumerate() {
+            if let Some((other, _)) = channels[..i].iter().find(|(_, c)| c == channel) {
+                return Err(format!(
+                    "brenn.{key} and brenn.{other} are both {channel:?}; each channel \
+                     carries a different message kind and must be distinct"
+                ));
+            }
+        }
+        if self.response_timeout_ms == 0 {
+            return Err("brenn.response_timeout_ms must be greater than 0".to_string());
+        }
+        if self.continuation_timeout_ms == 0 {
+            return Err("brenn.continuation_timeout_ms must be greater than 0".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Speech-to-text stage configuration. A present `[stt]` table names an explicit
@@ -974,6 +1129,20 @@ fn default_http_connect_timeout_ms() -> u64 {
 // measured populations (real commands ≤ 0.04, hallucinations ≥ 0.35).
 fn default_no_speech_max() -> f32 {
     0.2
+}
+// A language model answering over a bus may spend tens of seconds on a first
+// token; 30 s is generous enough not to cut a working install short and short
+// enough that a wedged harness does not park a turn indefinitely.
+fn default_brenn_response_timeout_ms() -> u64 {
+    30_000
+}
+fn default_brenn_continuation_timeout_ms() -> u64 {
+    10_000
+}
+// Apologetic, short, and content-free: it is spoken when the bus failed, so it
+// must not imply the request was understood.
+fn default_brenn_failure_message() -> String {
+    "Sorry, something's not working right now.".to_string()
 }
 
 #[cfg(test)]
@@ -1889,6 +2058,285 @@ model = "m"
         let config = Config::parse(&with_addr(stt_only)).expect("parse");
         let err = config.validate().unwrap_err();
         assert!(err.contains("[tts]"), "message: {err}");
+    }
+
+    /// A `[brenn]` table carrying the two required channels plus `extra`, with the
+    /// required `[brenn.bridge]` table after it. `extra` goes *before* the nested
+    /// table, where a key of the outer table belongs.
+    fn brenn_table(extra: &str) -> String {
+        format!(
+            "[brenn]\n\
+             publish_channel = \"brenn:pod.utterance\"\n\
+             response_channel = \"brenn:pod.speak\"\n\
+             {extra}\n\
+             [brenn.bridge]\n\
+             server_url = \"wss://bus.example.net/remote/pod-host/ws\"\n\
+             token_file = \"/etc/brenn/pod.token\"\n"
+        )
+    }
+
+    /// The tables a `[brenn]` table cannot be validated without: the bus brain
+    /// mode it belongs to, and the stt/tts pair that mode requires.
+    fn brenn_mode_tables() -> String {
+        format!("[brain]\nmode = \"brenn\"\n{STT_TTS_TABLES}")
+    }
+
+    #[test]
+    fn brenn_absent_table_is_none() {
+        let config = Config::parse(&with_addr("")).expect("parse");
+        assert!(config.brenn.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn brenn_minimal_table_takes_every_default() {
+        let config = Config::parse(&with_addr(&format!(
+            "{}{}",
+            brenn_mode_tables(),
+            brenn_table("")
+        )))
+        .expect("parse");
+        let brenn = config.brenn.as_ref().expect("brenn table");
+        assert_eq!(brenn.publish_channel, "brenn:pod.utterance");
+        assert_eq!(brenn.response_channel, "brenn:pod.speak");
+        assert_eq!(brenn.wake_channel, None);
+        assert_eq!(brenn.help_channel, None);
+        assert_eq!(brenn.response_timeout_ms, 30_000);
+        assert_eq!(brenn.continuation_timeout_ms, 10_000);
+        assert_eq!(brenn.attribution, None);
+        assert_eq!(
+            brenn.failure_message,
+            "Sorry, something's not working right now."
+        );
+        assert_eq!(
+            brenn.bridge.server_url,
+            "wss://bus.example.net/remote/pod-host/ws"
+        );
+        assert_eq!(
+            brenn.bridge.token_file,
+            PathBuf::from("/etc/brenn/pod.token")
+        );
+        assert_eq!(
+            brenn.bridge.reconnect,
+            brenn_bridge::ReconnectConfig::default()
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn brenn_full_table_parses() {
+        let text = r#"
+[brenn]
+publish_channel = "brenn:pod.utterance"
+response_channel = "brenn:pod.speak"
+wake_channel = "brenn:pod.wake"
+help_channel = "brenn:pod.help"
+response_timeout_ms = 45000
+continuation_timeout_ms = 5000
+attribution = "voice"
+failure_message = "The bus is down."
+[brenn.bridge]
+server_url = "wss://bus.example.net/remote/pod-host/ws"
+token_file = "/etc/brenn/pod.token"
+ident = "pod-host"
+[brenn.bridge.reconnect]
+max_backoff_ms = 9000
+"#;
+        let config =
+            Config::parse(&with_addr(&format!("{}{text}", brenn_mode_tables()))).expect("parse");
+        let brenn = config.brenn.as_ref().expect("brenn table");
+        assert_eq!(brenn.wake_channel.as_deref(), Some("brenn:pod.wake"));
+        assert_eq!(brenn.help_channel.as_deref(), Some("brenn:pod.help"));
+        assert_eq!(brenn.response_timeout_ms, 45_000);
+        assert_eq!(brenn.continuation_timeout_ms, 5_000);
+        assert_eq!(brenn.attribution.as_deref(), Some("voice"));
+        assert_eq!(brenn.failure_message, "The bus is down.");
+        assert_eq!(brenn.bridge.ident, "pod-host");
+        assert_eq!(brenn.bridge.reconnect.max_backoff_ms, 9_000);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn brenn_requires_both_channels_and_the_bridge_table() {
+        for missing in [
+            "publish_channel = \"brenn:a\"\nresponse_channel = \"brenn:b\"\n",
+            "publish_channel = \"brenn:a\"\n[brenn.bridge]\nserver_url = \"wss://h/w\"\ntoken_file = \"/t\"\n",
+            "response_channel = \"brenn:b\"\n[brenn.bridge]\nserver_url = \"wss://h/w\"\ntoken_file = \"/t\"\n",
+        ] {
+            assert!(
+                Config::parse(&with_addr(&format!("[brenn]\n{missing}"))).is_err(),
+                "accepted an incomplete [brenn]: {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn brenn_rejects_unknown_keys_in_both_tables() {
+        let err = Config::parse(&with_addr(&brenn_table("bogus = 1"))).expect_err("unknown key");
+        assert!(err.to_string().contains("bogus"), "message: {err}");
+
+        let err = Config::parse(&with_addr(&format!("{}bogus = 1\n", brenn_table(""))))
+            .expect_err("unknown brenn.bridge key");
+        assert!(err.to_string().contains("bogus"), "message: {err}");
+    }
+
+    #[test]
+    fn brenn_rejects_a_channel_that_cannot_leave_the_host() {
+        // Every channel key is checked, and the message names the offending one.
+        // The two required channels cannot be overridden by an `extra` line (a
+        // repeated key is a TOML error), so each gets a table of its own.
+        for (key, text) in [
+            (
+                "publish_channel",
+                "[brenn]\npublish_channel = \"local:pod.utterance\"\n\
+                 response_channel = \"brenn:pod.speak\"\n\
+                 [brenn.bridge]\nserver_url = \"wss://h/w\"\ntoken_file = \"/t\"\n",
+            ),
+            (
+                "response_channel",
+                "[brenn]\npublish_channel = \"brenn:pod.utterance\"\n\
+                 response_channel = \"pod.speak\"\n\
+                 [brenn.bridge]\nserver_url = \"wss://h/w\"\ntoken_file = \"/t\"\n",
+            ),
+        ] {
+            let err = Config::parse(&with_addr(text))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(err.contains(key), "expected {key} in message: {err}");
+        }
+        for (key, line) in [
+            ("wake_channel", "wake_channel = \"local:pod.wake\""),
+            ("help_channel", "help_channel = \"pod.help\""),
+        ] {
+            let err = Config::parse(&with_addr(&brenn_table(line)))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(err.contains(key), "expected {key} in message: {err}");
+        }
+    }
+
+    #[test]
+    fn brenn_rejects_two_channels_naming_one_address() {
+        // A shared publish/response channel would feed the pod its own utterances;
+        // every other pairing conflates two message kinds.
+        for line in [
+            "wake_channel = \"brenn:pod.utterance\"",
+            "help_channel = \"brenn:pod.speak\"",
+            "wake_channel = \"brenn:pod.wake\"\nhelp_channel = \"brenn:pod.wake\"",
+        ] {
+            let err = Config::parse(&with_addr(&brenn_table(line)))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("distinct"), "message: {err}");
+        }
+        let both = "[brenn]\npublish_channel = \"brenn:pod.chat\"\n\
+                    response_channel = \"brenn:pod.chat\"\n\
+                    [brenn.bridge]\nserver_url = \"wss://h/w\"\ntoken_file = \"/t\"\n";
+        let err = Config::parse(&with_addr(both))
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("distinct"), "message: {err}");
+    }
+
+    #[test]
+    fn brenn_rejects_a_zero_response_budget() {
+        for key in ["response_timeout_ms", "continuation_timeout_ms"] {
+            let err = Config::parse(&with_addr(&brenn_table(&format!("{key} = 0"))))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(err.contains(key), "expected {key} in message: {err}");
+        }
+    }
+
+    #[test]
+    fn brenn_accepts_a_whitespace_only_failure_message() {
+        // The documented disable knob: no apology is spoken on a link failure.
+        let config = Config::parse(&with_addr(&format!(
+            "{}{}",
+            brenn_mode_tables(),
+            brenn_table("failure_message = \"\"")
+        )))
+        .expect("parse");
+        assert_eq!(config.brenn.as_ref().unwrap().failure_message, "");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn a_brenn_table_under_any_other_brain_mode_is_rejected() {
+        // A configured bus nothing dials is the misconfiguration that looks
+        // healthy: the daemon comes up, and the only symptom is a harness that
+        // never hears anything.
+        for (what, brain) in [
+            (
+                "echo",
+                format!("[brain]\nmode = \"echo\"\n{STT_TTS_TABLES}"),
+            ),
+            (
+                "wav",
+                "[brain]\nmode = \"wav\"\nclip = \"/clips/ack.wav\"\n".to_string(),
+            ),
+            ("no [brain] table", String::new()),
+        ] {
+            let err = Config::parse(&with_addr(&format!("{brain}{}", brenn_table(""))))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.contains("brain.mode = \"brenn\""),
+                "expected the required mode named for {what}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn brain_brenn_parses_with_every_table_it_needs() {
+        let config = Config::parse(&with_addr(&format!(
+            "[brain]\nmode = \"brenn\"\n{STT_TTS_TABLES}{}",
+            brenn_table("")
+        )))
+        .expect("parse");
+        assert_eq!(config.brain.as_ref().unwrap().mode, BrainMode::Brenn);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn brain_brenn_without_a_table_it_needs_is_rejected() {
+        for (missing, text) in [
+            (
+                "[brenn]",
+                format!("[brain]\nmode = \"brenn\"\n{STT_TTS_TABLES}"),
+            ),
+            (
+                "[stt]",
+                format!(
+                    "[brain]\nmode = \"brenn\"\n[tts]\nbackend = \"http\"\n\
+                     url = \"http://h:8000\"\nmodel = \"m\"\nvoice = \"v\"\n{}",
+                    brenn_table("")
+                ),
+            ),
+            (
+                "[tts]",
+                format!(
+                    "[brain]\nmode = \"brenn\"\n[stt]\nbackend = \"http\"\n\
+                     url = \"http://h:8000\"\nmodel = \"m\"\n{}",
+                    brenn_table("")
+                ),
+            ),
+        ] {
+            let err = Config::parse(&with_addr(&text))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.contains(missing),
+                "expected {missing} in message: {err}"
+            );
+        }
     }
 
     #[test]

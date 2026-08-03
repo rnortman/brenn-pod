@@ -4,6 +4,7 @@
 
 pub mod assembler;
 pub mod brain;
+pub mod brenn_brain;
 pub mod echo_brain;
 pub mod http;
 pub mod listener;
@@ -21,6 +22,11 @@ pub mod wav_brain;
 
 pub use assembler::{AssemblerLimits, AssemblerStats, SegmentAssembler};
 pub use brain::{BrainEvent, BrainEventFn, BrainStats, BrainStatsSnapshot, WakeCommandReason};
+// The embedding surface only. The wire vocabulary — `scan`, `Tag`, the body
+// builders, the help document — reads as nothing in particular at the root of a
+// pipeline crate and means something only as "the bus brain's codec", so it stays
+// reachable through `brenn_brain::` alone.
+pub use brenn_brain::{BrainLink, BrennBrain, DeliverOutcome, LinkError};
 pub use echo_brain::EchoBrain;
 pub use http::{
     BuildError, HttpSynthesizer, HttpTranscriber, SttParams, SttStats, SttStatsSnapshot, TtsParams,

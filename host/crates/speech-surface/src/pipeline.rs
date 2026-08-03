@@ -408,6 +408,13 @@ async fn handle_listener(
             if !state.adopt_epoch(epoch) {
                 return; // Stale: a reconnect superseded this epoch.
             }
+            // Past the epoch check, so a superseded connection's wake never nudges a
+            // brain. Advisory and non-blocking by contract — a brain that pre-warms a
+            // remote peer starts the round trip here, before the command has even been
+            // spoken.
+            if let Some(wiring) = brain {
+                wiring.brain.wake(&pod);
+            }
             push_bounded(&mut state.recent_wakes, wake_end_sample);
             // Upgrade any already-labeled segment this detection now lands in: the
             // wake surfaced after its containing segment was assembled and provisionally
@@ -861,7 +868,12 @@ async fn handle_stt_done(
             decline_low_confidence(&utterance, &wake, reject, wiring)
         }
         GateOutcome::DeclineBarge(reject) => {
-            decline_barge_low_confidence(&utterance, reject, wiring)
+            decline_barge_low_confidence(&utterance, reject, wiring);
+            // The playback is already cut and `handle` will never run for this
+            // utterance, so this is the brain's only chance to hear that its response
+            // was interrupted with nothing usable said in its place. Non-blocking by
+            // contract, like `interrupt`.
+            wiring.brain.barge_declined(&utterance);
         }
         GateOutcome::Dispatch => {
             // Brain begin gets its own console instant. Emitted here, past the
@@ -1240,6 +1252,39 @@ mod tests {
         fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {}
     }
 
+    /// The advisory nudges a brain was handed, in order. A gate-declined barge
+    /// records the chain it carried, since "with the interrupted turn attached" is the
+    /// part that matters.
+    #[derive(Default)]
+    struct NudgeLog {
+        wakes: Vec<PodId>,
+        barge_declined: Vec<(UtteranceId, Option<UtteranceId>)>,
+    }
+
+    /// `EchoTestBrain` plus a record of the two non-dispatch seams, so a test can
+    /// assert what the pipeline nudged without a real link.
+    struct RecordingBrain {
+        log: Arc<Mutex<NudgeLog>>,
+    }
+
+    impl Brain for RecordingBrain {
+        fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, ()> {
+            EchoTestBrain.handle(u, out)
+        }
+        fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {}
+        fn wake(&self, pod: &PodId) {
+            self.log.lock().unwrap().wakes.push(pod.clone());
+        }
+        fn barge_declined(&self, u: &Utterance) {
+            let cut = u
+                .barge_in
+                .as_ref()
+                .and_then(|b| b.chain.last())
+                .map(|seg| seg.utterance);
+            self.log.lock().unwrap().barge_declined.push((u.id, cut));
+        }
+    }
+
     struct FakeTranscriber(Option<(String, Option<TranscriptConfidence>)>);
     impl Transcriber for FakeTranscriber {
         fn transcribe(
@@ -1280,6 +1325,7 @@ mod tests {
         events: Arc<Mutex<Vec<BrainEvent>>>,
         stats: Arc<BrainStats>,
         barge: Option<(Arc<TurnLedger>, FlushFn)>,
+        nudges: Arc<Mutex<NudgeLog>>,
     }
 
     impl Harness {
@@ -1292,6 +1338,7 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 stats: Arc::new(BrainStats::default()),
                 barge: None,
+                nudges: Arc::new(Mutex::new(NudgeLog::default())),
             }
         }
         /// Wire barge-in against `ledger` and a flush entry point that returns
@@ -1335,7 +1382,9 @@ mod tests {
                 let sink = self.events.clone();
                 let events: BrainEventFn = Arc::new(move |e| sink.lock().unwrap().push(e));
                 Some(BrainWiring {
-                    brain: Arc::new(EchoTestBrain),
+                    brain: Arc::new(RecordingBrain {
+                        log: self.nudges.clone(),
+                    }),
                     speak_tx,
                     events,
                     stats: self.stats.clone(),
@@ -2433,5 +2482,101 @@ mod tests {
 
         assert_eq!(cmds.len(), 1, "a confident barge dispatches");
         assert_eq!(stats.snapshot().barge_command_absent, 0);
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_wake_nudges_the_brain_once() {
+        // The pre-warm seam: a brain that talks to a remote peer wants to know a
+        // command is coming before it arrives.
+        let h = Harness::new().brain();
+        let nudges = h.nudges.clone();
+        h.run(vec![wake_detected(1, 8)]).await;
+
+        assert_eq!(nudges.lock().unwrap().wakes, [pod()]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_epoch_wake_does_not_nudge_the_brain() {
+        // The nudge sits past the epoch check, so a superseded connection's detection
+        // cannot pre-warm a peer for a command that will never be dispatched.
+        let h = Harness::new().brain();
+        let nudges = h.nudges.clone();
+        h.run(vec![wake_detected(2, 8), wake_detected(1, 8)]).await;
+
+        assert_eq!(
+            nudges.lock().unwrap().wakes,
+            [pod()],
+            "only the live epoch's wake nudges"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gated_barge_tells_the_brain_its_response_was_cut() {
+        // The playback is already gone and `handle` never runs, so this is the brain's
+        // one chance to hear about the cut — with the interrupted turn attached.
+        let ledger = Arc::new(TurnLedger::new());
+        ledger.interrupt(&pod(), UtteranceId(99), cut(100, 1_000));
+        let barge_carve = CarvedUtterance {
+            barge_in: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .brain()
+            .transcriber(FakeTranscriber(Some((
+                "phantom".into(),
+                Some(conf(0.37, -0.99)),
+            ))))
+            .barge(Arc::clone(&ledger), Err(FlushRejected::NotPlaying))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let nudges = h.nudges.clone();
+        h.run(vec![soft_endpoint(barge_carve)]).await;
+
+        assert_eq!(
+            nudges.lock().unwrap().barge_declined,
+            [(UtteranceId(1), Some(UtteranceId(99)))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gated_wake_and_a_plain_dispatch_report_no_declined_barge() {
+        // The two arms are disjoint: a wake utterance carries no barge, and a
+        // dispatched one reaches `handle`, which reports the interruption itself.
+        let wake = Some(WakeConfirmation {
+            score: 0.99,
+            wake_end_sample: 8,
+            stt_trim_samples: 0,
+        });
+        for (carve, transcript, dispatches) in [
+            (
+                carved(1, 0, 16, wake),
+                ("phantom".into(), Some(conf(0.37, -0.99))),
+                false,
+            ),
+            (carved(1, 0, 16, None), ("hello there".into(), None), true),
+        ] {
+            let h = Harness::new()
+                .brain()
+                .transcriber(FakeTranscriber(Some(transcript)))
+                .gate(ConfidenceGate {
+                    no_speech_max: 0.2,
+                    avg_logprob_min: None,
+                });
+            let nudges = h.nudges.clone();
+            let stats = h.stats.clone();
+            let (_lines, cmds) = h.run(vec![soft_endpoint(carve)]).await;
+
+            // Each arm asserts it reached the path it is named for first: an
+            // absence proves nothing about an input that never got there.
+            if dispatches {
+                assert_eq!(cmds.len(), 1, "the plain utterance reached `handle`");
+            } else {
+                assert!(cmds.is_empty(), "the gated wake never dispatches");
+                assert_eq!(stats.snapshot().wake_command_absent, 1);
+            }
+            assert!(nudges.lock().unwrap().barge_declined.is_empty());
+        }
     }
 }

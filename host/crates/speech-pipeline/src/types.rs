@@ -315,6 +315,45 @@ pub struct InterruptProgress {
     pub total_ms: u64,
 }
 
+impl InterruptProgress {
+    /// The prefix of `text` the user is estimated to have heard before the cut: a
+    /// character-proportional cut at `heard_ms / total_ms`, trimmed back to the last
+    /// whole word. `None` when the cut lands before the first word boundary — a barge
+    /// at the very start of a response, or a near-zero heard estimate — so a caller
+    /// never has to distinguish "heard nothing" from an empty string.
+    ///
+    /// Characters, not words or phonemes: the host knows the clip's nominal duration
+    /// and the text that produced it, and nothing about how the synthesizer paced
+    /// them. Inherits the accuracy caveat on the type — this is an estimate for
+    /// conversational context, never a transcript of what was played.
+    pub fn heard_prefix<'a>(&self, text: &'a str) -> Option<&'a str> {
+        let total = self.total_ms.max(1);
+        let heard = self.heard_ms.min(total);
+        // Character indices, so the cut lands on a boundary in any script.
+        let boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        let chars = boundaries.len();
+        let cut_char = (chars as u128 * heard as u128 / total as u128) as usize;
+        let cut = boundaries.get(cut_char).copied().unwrap_or(text.len());
+        let heard_prefix = &text[..cut];
+        // A cut that lands inside a word would quote half of it; drop that word by
+        // trimming back to the last whitespace run.
+        let mid_word = cut < text.len()
+            && !heard_prefix.ends_with(char::is_whitespace)
+            && !text[cut..].starts_with(char::is_whitespace);
+        let whole_words = if mid_word {
+            match heard_prefix.rfind(char::is_whitespace) {
+                Some(i) => &heard_prefix[..i],
+                // The cut is inside the response's first word: nothing whole was heard.
+                None => "",
+            }
+        } else {
+            heard_prefix
+        };
+        let trimmed = whole_words.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+}
+
 /// One link in a barge-in context chain: an interrupted turn's transcript,
 /// response, and where it was cut.
 #[derive(Debug, Clone, Serialize)]
@@ -711,6 +750,38 @@ pub(crate) fn test_segment(telemetry: Vec<SegmentTelemetry>) -> Segment {
     }
 }
 
+/// A representative dispatched `Utterance` for tests across the crate's brains,
+/// with a usable transcript and no wake provenance or barge context. Callers
+/// override the fields their case is about via struct update syntax.
+#[cfg(test)]
+pub(crate) fn test_utterance() -> Utterance {
+    Utterance {
+        id: UtteranceId(42),
+        pod: PodId("pod-x".into()),
+        room: RoomId("kitchen".into()),
+        speaker: None,
+        doa: DoaTrack::default(),
+        audio_ref: AudioSpan {
+            log: "pod-x_0.framelog".into(),
+            start_sample: 0,
+            end_sample: 16,
+            segments: vec![SegmentRef {
+                log: "pod-x_0.framelog".into(),
+                segment_id: 3,
+                part: 0,
+            }],
+        },
+        transcript: Some(Transcript {
+            text: "what is the weather".into(),
+            confidence: None,
+        }),
+        timings: StageTimings::default(),
+        endpoint_cause: EndpointCause::SoftEndpoint,
+        wake: None,
+        barge_in: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,6 +798,87 @@ mod tests {
                 codec: Codec::S16Le,
                 mono_beam_only: true,
             }
+        );
+    }
+
+    fn progress(heard_ms: u64, total_ms: u64) -> InterruptProgress {
+        InterruptProgress { heard_ms, total_ms }
+    }
+
+    #[test]
+    fn heard_prefix_cuts_proportionally_at_a_word_boundary() {
+        // Half of a 26-char response is 13 chars — "the weather t" — which lands
+        // inside "today", so that partial word is dropped.
+        assert_eq!(
+            progress(500, 1_000).heard_prefix("the weather today is sunny"),
+            Some("the weather")
+        );
+    }
+
+    #[test]
+    fn heard_prefix_keeps_a_word_the_cut_ends_exactly_on() {
+        // 11 of 26 chars is exactly "the weather": the next char is whitespace, so
+        // nothing is mid-word and the whole prefix stands.
+        assert_eq!(
+            progress(11, 26).heard_prefix("the weather today is sunny"),
+            Some("the weather")
+        );
+    }
+
+    #[test]
+    fn heard_prefix_of_a_fully_played_clip_is_the_whole_text() {
+        assert_eq!(
+            progress(1_000, 1_000).heard_prefix("all of it"),
+            Some("all of it")
+        );
+    }
+
+    #[test]
+    fn heard_prefix_clamps_heard_past_total() {
+        // The cut is best-effort at the frame boundary, so `heard_ms` can exceed
+        // `total_ms`; that must read as "heard all of it", not slice out of bounds.
+        assert_eq!(
+            progress(9_000, 1_000).heard_prefix("all of it"),
+            Some("all of it")
+        );
+    }
+
+    #[test]
+    fn heard_prefix_before_the_first_word_boundary_is_none() {
+        // A barge at the very start: nothing whole was heard.
+        assert_eq!(progress(0, 1_000).heard_prefix("the weather today"), None);
+        // A cut inside the first word is the same story.
+        assert_eq!(progress(1, 100).heard_prefix("supercalifragilistic"), None);
+    }
+
+    #[test]
+    fn heard_prefix_of_empty_text_is_none() {
+        assert_eq!(progress(500, 1_000).heard_prefix(""), None);
+    }
+
+    #[test]
+    fn heard_prefix_tolerates_a_zero_total() {
+        // `total_ms` of 0 would divide by zero; it clamps to 1, and any nonzero
+        // `heard_ms` then reads as the whole clip.
+        assert_eq!(progress(0, 0).heard_prefix("hello there"), None);
+        assert_eq!(
+            progress(1, 0).heard_prefix("hello there"),
+            Some("hello there")
+        );
+    }
+
+    #[test]
+    fn heard_prefix_cuts_on_character_boundaries_in_multibyte_text() {
+        // Character-proportional, not byte-proportional, and the two disagree here:
+        // 16 chars halved is char 8 (the `ü`), while 18 bytes halved is byte 9 — the
+        // *second* byte of that `ü`, which a byte-indexed slice would panic on.
+        assert_eq!(
+            progress(1, 2).heard_prefix("hello Grüß world"),
+            Some("hello")
+        );
+        assert_eq!(
+            progress(5, 11).heard_prefix("Grüß dich, Welt"),
+            Some("Grüß")
         );
     }
 

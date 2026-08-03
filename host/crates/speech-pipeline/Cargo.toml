@@ -32,6 +32,10 @@ reqwest = { workspace = true }
 # Parse the STT JSON response from a size-capped byte buffer (not reqwest's
 # `json()`, which reads the body uncapped).
 serde_json = "1"
+# Tolerant scanning of the tag-shaped islands in a pub/sub brain's response body.
+# A real parser is the wrong tool: the body is speech with markers in it, and one
+# malformed marker must not cost the whole turn.
+regex = "1"
 
 [dev-dependencies]
 serde_json = "1"

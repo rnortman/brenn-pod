@@ -9,6 +9,10 @@ pod-ingest = { path = "../pod-ingest" }
 speech-pipeline = { path = "../speech-pipeline" }
 pod-jsonl = { path = "../pod-jsonl" }
 pod-secrets = { path = "../pod-secrets" }
+# The bus transport a `BrennBrain` answers over, and the `[brenn.bridge]` config
+# table nested verbatim. The pinned brenn git revs stay inside this crate's own
+# manifest; the dependency edge still points one way — pod depends on brenn.
+brenn-bridge = { path = "../brenn-bridge" }
 # Wire decode (`decode_frame`) for replaying recorded frame logs offline.
 audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std"] }
 # The link's TLS-PSK parameters, shared with the device clients; re-exported as
@@ -46,8 +50,9 @@ tokio-openssl = "0.6"
 
 [dev-dependencies]
 # `#[tokio::test]` runtime for the file-sink writer test; `tempfile` for its dir.
-# `time` drives the connection-cap test's brief accept-settle sleep.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# `time` drives the connection-cap test's brief accept-settle sleep, and
+# `test-util` its paused clock for the resubscribe-delay test.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 tempfile = "3"
 # Wire fixtures (`heapless::Vec`/`String`) for the segments-export round-trip test.
 heapless = "0.9"
