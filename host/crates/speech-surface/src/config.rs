@@ -815,7 +815,7 @@ impl PskTable {
             path: path.to_path_buf(),
             source,
         })?;
-        let mode_check = psk_file_mode_error(path);
+        let mode_check = pod_secrets::mode_error(path, "psk file");
         let table = PskTable::parse(&text)
             .and_then(|table| match mode_check {
                 Some(message) => Err(message),
@@ -873,25 +873,6 @@ impl std::fmt::Debug for PskTable {
         ids.sort_unstable();
         write!(f, "PskTable {{ pods: {ids:?}, key_bytes: 32 }}")
     }
-}
-
-/// Reject a secrets file any other local account can read, matching ssh's posture
-/// on private keys. Unix only — elsewhere there is no mode to check.
-#[cfg(unix)]
-fn psk_file_mode_error(path: &Path) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Some(format!(
-            "psk file mode {mode:04o} is group/world-accessible; chmod 600 it"
-        ));
-    }
-    None
-}
-
-#[cfg(not(unix))]
-fn psk_file_mode_error(_path: &Path) -> Option<String> {
-    None
 }
 
 /// A failure loading configuration or the PSK secrets file it names, carrying

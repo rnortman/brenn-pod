@@ -4,6 +4,75 @@
 
 This is a placeholder entry. Leave it here so the file is never empty. It is not a real TODO. You would reference it in code with `// TODO(example-placeholder)` comments. This is the basic TODO system design: An entry here with a slug used to join to code comments. Add real TODOs below this one in this format.
 
+## `bridge-upgrade-rejection-terminal` — BLOCKED as of 2026-08-02 (needs a change in the brenn repo first)
+
+A bearer token the brenn server does not accept — stale, rotated, mistyped, or pointed at the
+wrong `[[remote]]` slug — is answered with a `401` on the websocket upgrade, before any socket
+exists. `brenn-bridge` treats that as an ordinary connect failure and re-dials on the backoff
+schedule forever, at `reconnect.max_backoff_ms` (default 30 s). Every one of those dials makes
+the server emit a fail2ban-fed `AuthFailure` security event, so a pod with a stale credential
+spends the rest of its uptime hammering the operator's own auth perimeter until it is banned
+by it. This is the front-door twin of `bridge-violation-close-code`, which covers only the
+post-attach refusal.
+
+The futile-attachment budget does not catch it: that budget counts attachments on which this
+bridge *sent* something, and a rejected upgrade never attaches at all.
+
+The bridge cannot tell the case apart today. `NativeConnector::connect` collapses the
+rejection into a stringly `TransportError` (which does carry tungstenite's status line), and
+`AttachDriver::connect` then drops the string, answering `ConnInput::ConnectFailed` — the same
+answer a refused TCP connect, a bad hostname or a dead server produces. Guessing from a run of
+indistinguishable failures would kill a pod for an ordinary server restart.
+
+What landed instead is visibility only: a failed dial now reaches the embedder as
+`BridgeEvent::ConnectFailed`, which `bridge-probe` prints, so the failure is diagnosable even
+though it is not classifiable.
+
+Done = `brenn-attach-client` surfaces the handshake's HTTP status on a failed connect (a
+status, not the response body), `brenn-bridge` ends the process on a `401`/`403` with an exit
+code of its own, and the pod's dependency pin moves to the rev carrying it.
+
+The brenn half is filed in the brenn repo's `TODO.md` under this same slug, at
+`NativeConnector::connect`. The slug is the cross-repo join key — move both entries together.
+
+See `TODO(bridge-upgrade-rejection-terminal)` at `Core::report_dial` in
+`host/crates/brenn-bridge/src/bridge.rs`.
+
+## `bridge-violation-close-code` — BLOCKED as of 2026-08-02 (needs a change in the brenn repo first)
+
+When the brenn backend judges an attacher's frame a protocol violation it drops the socket
+with no close code and no reason, so the bridge cannot tell a refusal from a network blip.
+That matters because the two demand opposite responses: a blip wants a reconnect, and a
+refusal wants the process to die — a bridge that reconnects and re-sends the refused
+statement earns the same close forever, and each round trips a fail2ban-grade security event
+against the operator's own pod.
+
+`brenn-bridge` currently infers the refusal from its shape: `ReconnectConfig::max_futile_attachments`
+consecutive attachments that sent something and were answered nothing end the process with
+`exit::HARD_FAILURE`. That is a heuristic. A long enough run of drops landing between a
+statement and its answer reads as a refusal, and a violation on an attachment that had
+already been answered something else does not.
+
+The exact signal is already half-built on both sides: `ConnConfig::terminal_close_code` and
+`ConnEvent::PeerClosedTerminal` exist in `brenn-attach-client` for precisely this, and the
+browser surface route already uses the mechanism for its stale-build code. What is missing is
+the server end.
+
+Done = the brenn remote route closes a violated attachment with a dedicated close code (a
+code only, never the violation detail — that text is a security record, not something to hand
+the offender), `brenn-bridge` declares it in `Config::conn_config`, the futile budget
+becomes a backstop for the shapes the code cannot cover rather than the primary detector, and
+a test pins whether a *pre-`Welcome`* handshake violation counts toward the futile budget at
+all — it turns on whether the handshake `Hello` sets `spoke`, which nobody has traced. That
+last item lives here rather than in brenn because the futile budget is pod code (the
+`ConnEvent::Detached` arm of `Core::on_conn_event`, `host/crates/brenn-bridge/src/bridge.rs`).
+
+The brenn half is filed in the brenn repo's `TODO.md` under this same slug, at the attach
+route's violation teardown. The slug is the cross-repo join key — move both entries together.
+
+See `TODO(bridge-violation-close-code)` at `terminal_close_code` in
+`host/crates/brenn-bridge/src/config.rs`.
+
 ## `ci-device-clippy-first-run` — BLOCKED as of 2026-07-25 (needs a real GitHub-hosted runner)
 
 The `device-clippy` job in `.github/workflows/ci.yml` has never executed. Everything below
