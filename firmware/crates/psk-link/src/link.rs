@@ -325,23 +325,7 @@ pub struct TlsConnectParams<'a> {
 /// unaffected by the wrapping.
 pub fn connect_psk(params: &TlsConnectParams) -> io::Result<TlsLink> {
     let started = Instant::now();
-    let tcp = TcpStream::connect_timeout(params.peer, params.connect_timeout).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "tcp connect to {} after {} ms: {e}",
-                params.peer,
-                started.elapsed().as_millis()
-            ),
-        )
-    })?;
-    // Frames are written one at a time and read as they arrive; Nagle would
-    // batch a 30-byte Hello behind the next frame's arrival.
-    if let Err(e) = tcp.set_nodelay(true) {
-        log::warn!("tls-psk: TCP_NODELAY not set on {}: {e}", params.peer);
-    }
-    tcp.set_nonblocking(true)
-        .map_err(|e| io::Error::new(e.kind(), format!("set non-blocking: {e}")))?;
+    let tcp = open_link_socket(params.peer, params.connect_timeout)?;
 
     let ctx = client_context(params.pod_id, *params.key)
         .map_err(|e| io::Error::other(format!("tls client context: {e}")))?;
@@ -349,45 +333,17 @@ pub fn connect_psk(params: &TlsConnectParams) -> io::Result<TlsLink> {
     let mut stream =
         SslStream::new(ssl, tcp).map_err(|e| io::Error::other(format!("ssl stream: {e}")))?;
 
-    // Anchored here, not at `started`: the budget this constant documents runs
-    // from the connected socket, and folding in the unused part of
-    // `connect_timeout` would hand a fast LAN connect's whole slack to the
-    // handshake — a bound that varies with connect speed is not a bound the
-    // caller's reconnect pacing can be tuned against.
-    let deadline = Instant::now() + params.handshake_timeout;
-    loop {
-        let e = match stream.connect() {
-            Ok(()) => break,
-            Err(e) => e,
-        };
-        // Wait on the one direction the session named. Anything else is a real
-        // failure — a refused PSK identity or a wrong key arrives here as an
-        // alert, not as a want.
-        let interest = match e.code() {
-            ErrorCode::WANT_READ => PollInterest::READ,
-            ErrorCode::WANT_WRITE => PollInterest::WRITE,
-            _ => return Err(handshake_error(e)),
-        };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "TLS handshake to {} did not complete within {} ms",
-                    params.peer,
-                    params.handshake_timeout.as_millis()
-                ),
-            ));
-        }
-        if let Readiness::Fault(e) =
-            LibcPoll.readiness(stream.get_ref().as_raw_fd(), interest, remaining)
-        {
-            return Err(io::Error::other(format!(
-                "socket fault during TLS handshake to {}: {e:?}",
-                params.peer
-            )));
-        }
-    }
+    // The handshake budget starts at the connected socket, not at `started`:
+    // folding in the unused part of `connect_timeout` would hand a fast LAN
+    // connect's whole slack to the handshake, and a bound that varies with
+    // connect speed is not a bound the caller's reconnect pacing can be tuned
+    // against.
+    drive_handshake(
+        &mut stream,
+        &LibcPoll,
+        params.peer,
+        params.handshake_timeout,
+    )?;
 
     let link = TlsLink::new(stream);
     let (version, suite) = link.negotiated();
@@ -398,6 +354,106 @@ pub fn connect_psk(params: &TlsConnectParams) -> io::Result<TlsLink> {
         started.elapsed().as_millis()
     );
     Ok(link)
+}
+
+/// Connect to `peer` and leave the socket in the shape a link needs.
+///
+/// Nagle is off because frames are written one at a time and read as they
+/// arrive; batching would hold a 30-byte Hello until the next frame. Failing to
+/// set it costs latency, not correctness, so it is logged rather than fatal. The
+/// socket is non-blocking: both the handshake and the session are driven by
+/// polls on the direction TLS names.
+fn open_link_socket(peer: &SocketAddr, connect_timeout: Duration) -> io::Result<TcpStream> {
+    let started = Instant::now();
+    let tcp = TcpStream::connect_timeout(peer, connect_timeout).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "tcp connect to {peer} after {} ms: {e}",
+                started.elapsed().as_millis()
+            ),
+        )
+    })?;
+    if let Err(e) = tcp.set_nodelay(true) {
+        log::warn!("tls-psk: TCP_NODELAY not set on {peer}: {e}");
+    }
+    tcp.set_nonblocking(true)
+        .map_err(|e| io::Error::new(e.kind(), format!("set non-blocking: {e}")))?;
+    Ok(tcp)
+}
+
+/// Drive `stream`'s TLS handshake to completion, waiting on `poll` for the one
+/// direction OpenSSL asks for, bounded by `timeout` from the moment of entry.
+///
+/// `poll` is a parameter rather than a hardcoded [`LibcPoll`] so tests can order
+/// the wakes this function has to survive; production passes [`LibcPoll`].
+///
+/// # A fault wake is one more attempt, not a verdict
+///
+/// A socket can be readable *and* dead in the same wake — `POLLIN|POLLERR|POLLHUP`
+/// is exactly what a peer that refuses the PSK produces, since it writes a fatal
+/// alert and then closes over the client's still-unread flight, which makes the
+/// close an RST. Reporting that wake as a socket fault throws away the alert
+/// sitting in the receive buffer, and with it the only thing that separates a
+/// provisioning error (fix the key table) from a network fault (go debug the
+/// LAN).
+///
+/// So a fault is remembered, not returned: `connect()` runs once more and does
+/// its own reads. It finds the alert (a named protocol error), or the socket's
+/// pending error (a reset whose `ErrorKind` survives), or nothing at all — and
+/// only that last case returns the socket fault. The retry is one non-blocking
+/// call and the fault arm is reachable at most once per handshake, so a dead
+/// socket whose polls return instantly cannot spin here.
+fn drive_handshake(
+    stream: &mut SslStream<TcpStream>,
+    poll: &dyn NetPoll,
+    peer: &SocketAddr,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut pending_fault: Option<io::Error> = None;
+    loop {
+        let e = match stream.connect() {
+            // Succeeding right after a fault wake is still success: the peer
+            // completed the handshake and then died, and that death surfaces on
+            // the session's first I/O exactly as it would have had the poll run a
+            // moment earlier.
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        // Wait on the one direction the session named. Anything else is a real
+        // failure — a refused PSK identity or a wrong key arrives here as an
+        // alert, not as a want.
+        let interest = match e.code() {
+            ErrorCode::WANT_READ => PollInterest::READ,
+            ErrorCode::WANT_WRITE => PollInterest::WRITE,
+            _ => return Err(handshake_error(e)),
+        };
+        // The backstop: the retry above had its chance to read and still wants
+        // I/O, so the socket is dead with nothing left to say. The raw mask is
+        // all the diagnostic there is.
+        if let Some(fault) = pending_fault {
+            return Err(io::Error::other(format!(
+                "socket fault during TLS handshake to {peer}: {fault:?}"
+            )));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "TLS handshake to {peer} did not complete within {} ms",
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        // A fault consumes no wait budget — the retry is immediate.
+        if let Readiness::Fault(e) =
+            poll.readiness(stream.get_ref().as_raw_fd(), interest, remaining)
+        {
+            pending_fault = Some(e);
+        }
+    }
 }
 
 /// Wrap a handshake failure, keeping OpenSSL's `ErrorKind` when it supplied one.
@@ -502,6 +558,7 @@ mod tests {
     use super::*;
     use crate::{PSK_CIPHERSUITE, test_server_context};
     use openssl::ssl::SslContext;
+    use std::cell::RefCell;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -534,6 +591,15 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    /// A client-side `SslStream` over a production-configured socket (via
+    /// [`open_link_socket`]), valid as [`drive_handshake`] input.
+    fn client_stream(addr: &SocketAddr, pod_id: &str, key: [u8; PSK_LEN]) -> SslStream<TcpStream> {
+        let tcp = open_link_socket(addr, DEFAULT_CONNECT_TIMEOUT).expect("tcp connect");
+        let ctx = client_context(pod_id, key).expect("client context");
+        let ssl = Ssl::new(&ctx).expect("client ssl");
+        SslStream::new(ssl, tcp).expect("wrap client socket")
     }
 
     fn connect(addr: &SocketAddr, key: [u8; PSK_LEN]) -> io::Result<TlsLink> {
@@ -696,6 +762,12 @@ mod tests {
             err.to_string().contains("tls handshake"),
             "the failing stage must be named: {err}"
         );
+        // The alert the peer sent, not the socket-fault backstop: the two classes
+        // must stay distinguishable by more than the casing of "TLS handshake".
+        assert!(
+            !err.to_string().contains("socket fault"),
+            "a rejected key is a protocol error, not a socket fault: {err}"
+        );
         peer.join().expect("peer thread");
     }
 
@@ -709,6 +781,255 @@ mod tests {
             err.to_string().contains("tls handshake"),
             "the failing stage must be named: {err}"
         );
+        // As above: a refusal must not be reported as the socket-fault class.
+        assert!(
+            !err.to_string().contains("socket fault"),
+            "a declined identity is a protocol error, not a socket fault: {err}"
+        );
+        peer.join().expect("peer thread");
+    }
+
+    /// A poll shim that holds one wait back until the peer signals, then either
+    /// delegates to the real shim or answers with a synthetic fault.
+    ///
+    /// This is how the CI race becomes an ordering instead of a coincidence: the
+    /// peer reaches the state the wake is about — an alert plus an RST on the
+    /// wire, or a completed server flight — before the wait is allowed to
+    /// proceed, so what the handshake sees is fixed rather than raced.
+    struct DelayedPoll {
+        /// Signalled once the peer has reached the state the held wait is about.
+        signal: mpsc::Receiver<()>,
+        /// Waits served so far.
+        waits: Cell<u32>,
+        /// Which wait to hold back — the one whose wake the test is about.
+        hold_at: u32,
+        /// Answer the held wait with a synthetic readable-and-hung-up fault
+        /// instead of delegating, for a socket that is healthy and only the wake
+        /// claims otherwise.
+        synthesize_fault: bool,
+        /// Whether the real shim ever answered with a fault.
+        saw_fault: Cell<bool>,
+        /// The interest each wait was armed with, in order.
+        interests: RefCell<Vec<PollInterest>>,
+    }
+
+    impl NetPoll for DelayedPoll {
+        fn poll_readiness(
+            &self,
+            fd: RawFd,
+            interest: PollInterest,
+            timeout: Duration,
+        ) -> io::Result<Readiness> {
+            let wait = self.waits.get() + 1;
+            self.waits.set(wait);
+            self.interests.borrow_mut().push(interest);
+            if wait == self.hold_at {
+                self.signal.recv_timeout(TEST_TIMEOUT).expect(
+                    "the peer never reached the state the held wait is about — wait 1 is the \
+                     server's own flight and wait 2 the held one, so a handshake whose wake \
+                     shape changed parks here until this timeout",
+                );
+                if self.synthesize_fault {
+                    return Ok(classify_wake(true, false, Some(libc::POLLHUP as u32)));
+                }
+            }
+            let readiness = LibcPoll.poll_readiness(fd, interest, timeout)?;
+            if matches!(readiness, Readiness::Fault(_)) {
+                self.saw_fault.set(true);
+            }
+            Ok(readiness)
+        }
+    }
+
+    /// A poll shim that reports a socket fault on every wake, counting them.
+    struct AlwaysFaultPoll {
+        waits: Cell<u32>,
+    }
+
+    impl NetPoll for AlwaysFaultPoll {
+        fn poll_readiness(
+            &self,
+            _fd: RawFd,
+            _interest: PollInterest,
+            _timeout: Duration,
+        ) -> io::Result<Readiness> {
+            self.waits.set(self.waits.get() + 1);
+            Ok(classify_wake(true, false, Some(libc::POLLHUP as u32)))
+        }
+    }
+
+    /// A refusal that lands together with the peer's reset still names the TLS
+    /// stage — the CI flake, pinned.
+    ///
+    /// The peer declines the identity, so `accept()` fails after writing a fatal
+    /// alert, and dropping the session closes a socket with the client's unread
+    /// CCS+Finished still queued, which makes the close an RST. Waking only after
+    /// both have landed is the wake that used to be reported as a bare socket
+    /// fault, discarding the alert that says *why* the peer refused.
+    #[test]
+    fn a_refusal_arriving_with_a_reset_still_names_the_tls_stage() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        // Not `spawn_tls_peer`: its `serve` closure runs only when `accept()`
+        // succeeds, so a declined handshake could never produce the signal.
+        let ctx = test_server_context("some-other-pod", KEY);
+        let (closed_tx, closed_rx) = mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let ssl = Ssl::new(&ctx).expect("server ssl");
+            let mut stream = SslStream::new(ssl, sock).expect("wrap server socket");
+            stream
+                .accept()
+                .expect_err("an identity the table does not hold must be refused");
+            // Explicit, and strictly before the signal: this drop is what emits
+            // the RST. Signalling first would let the client's poll beat the
+            // reset and see a plain readable wake — the test itself would flake.
+            drop(stream);
+            closed_tx.send(()).expect("the client is waiting");
+        });
+
+        let poll = DelayedPoll {
+            signal: closed_rx,
+            waits: Cell::new(0),
+            // Wait 1 is the server's own flight; wait 2 is the one the refusal
+            // arrives on, after the client has sent CKE+CCS+Finished.
+            hold_at: 2,
+            synthesize_fault: false,
+            saw_fault: Cell::new(false),
+            interests: RefCell::new(Vec::new()),
+        };
+        let mut stream = client_stream(&addr, POD_ID, KEY);
+        let err = drive_handshake(&mut stream, &poll, &addr, DEFAULT_HANDSHAKE_TIMEOUT)
+            .expect_err("an unknown identity must not connect");
+        assert!(
+            poll.saw_fault.get(),
+            "the real shim never reported a fault, so the race this test exists for \
+             did not happen and the assertion below proves nothing"
+        );
+        assert!(
+            err.to_string().contains("tls handshake"),
+            "the failing stage must be named: {err}"
+        );
+        // The whole point of the fault retry: the alert was read. Asserting the
+        // absence of the backstop's message keeps the two classes apart
+        // structurally, so normalizing either message's casing cannot make a
+        // discarded alert look like a read one.
+        assert!(
+            !err.to_string().contains("socket fault"),
+            "the alert was discarded — the readable-and-dead wake lost the refusal: {err}"
+        );
+        // `hold_at: 2` is only the refusal's wake while the handshake keeps this
+        // shape. Asserting the count makes a changed shape fail here, naming the
+        // cause, instead of failing as a wedged peer thread five seconds later.
+        assert_eq!(
+            poll.waits.get(),
+            2,
+            "wait 1 is the server's flight and wait 2 the refusal; a different count \
+             means the wake shape changed and `hold_at` no longer points at the refusal"
+        );
+        // Both handshake waits here are a `WANT_READ`: the loop must arm the
+        // direction TLS named, since arming writability on a connected socket
+        // returns immediately and spins the wake loop.
+        assert_eq!(
+            poll.interests.borrow().as_slice(),
+            [PollInterest::READ, PollInterest::READ].as_slice(),
+            "the handshake must wait on the direction TLS asked for"
+        );
+        peer.join().expect("peer thread");
+    }
+
+    /// A handshake that completes on the wake that reported a fault is a
+    /// session, not a failure.
+    ///
+    /// The mirror image of the flake: turning this wake away would send a pod
+    /// whose handshake *did* finish around the reconnect-and-backoff loop. The
+    /// peer's death, if it died, is the session's first I/O to report — which
+    /// `an_aborted_peer_reads_as_a_fault_rather_than_end_of_stream` pins.
+    ///
+    /// The fault is synthetic because a socket that is genuinely dead cannot also
+    /// complete a handshake; what is real is the ordering — the held wait is
+    /// released only once the server's `accept()` has returned, so its
+    /// CCS+Finished is on the wire and the retried `connect()` has something to
+    /// finish with.
+    #[test]
+    fn a_handshake_completing_after_a_fault_wake_still_connects() {
+        let (flight_tx, flight_rx) = mpsc::channel::<()>();
+        let (addr, peer) = spawn_tls_peer(test_server_context(POD_ID, KEY), move |stream| {
+            // `serve` runs only after `accept()` returned, so reaching here is
+            // the proof that the server's last flight was written.
+            flight_tx.send(()).expect("the client is waiting");
+            let mut sink = [0u8; 16];
+            let _ = stream.read(&mut sink);
+        });
+
+        let poll = DelayedPoll {
+            signal: flight_rx,
+            waits: Cell::new(0),
+            // Wait 1 is the server's first flight; wait 2 is the wait for its
+            // Finished, which is the one answered with the fault.
+            hold_at: 2,
+            synthesize_fault: true,
+            saw_fault: Cell::new(false),
+            interests: RefCell::new(Vec::new()),
+        };
+        let mut stream = client_stream(&addr, POD_ID, KEY);
+        drive_handshake(&mut stream, &poll, &addr, DEFAULT_HANDSHAKE_TIMEOUT)
+            .expect("a fault wake must not turn away a handshake that then completes");
+        assert_eq!(
+            poll.waits.get(),
+            2,
+            "wait 2 is the fault wake this test is about; a different count means the \
+             handshake completed without ever being handed one"
+        );
+        drop(stream);
+        peer.join().expect("peer thread");
+    }
+
+    /// A fault over a socket with nothing left to say still reports the socket
+    /// fault, and reports it without waiting again.
+    ///
+    /// The peer here is healthy and silent, so the retry the fault path grants
+    /// finds neither an alert nor a pending socket error; the raw mask is then
+    /// the whole truth and must survive. That the retry happens at all is pinned
+    /// by `a_refusal_arriving_with_a_reset_still_names_the_tls_stage` — a
+    /// retried `connect()` over a socket with nothing readable is not observable
+    /// from here. What this test holds is the message, the mask, and that the
+    /// fault path never waits a second time.
+    #[test]
+    fn a_fault_with_nothing_readable_reports_the_socket_fault_without_waiting_again() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            // Held open and silent until the client has given up, so nothing the
+            // client could read ever appears.
+            release_rx.recv_timeout(TEST_TIMEOUT).expect("release");
+            drop(sock);
+        });
+
+        let poll = AlwaysFaultPoll {
+            waits: Cell::new(0),
+        };
+        let mut stream = client_stream(&addr, POD_ID, KEY);
+        let err = drive_handshake(&mut stream, &poll, &addr, DEFAULT_HANDSHAKE_TIMEOUT)
+            .expect_err("a faulting socket must not connect");
+        assert!(
+            err.to_string()
+                .contains("socket fault during TLS handshake"),
+            "a fault with nothing to read is still a socket fault: {err}"
+        );
+        assert!(
+            err.to_string().contains(&format!("{:#x}", libc::POLLHUP)),
+            "the raw mask is the diagnostic that survives: {err}"
+        );
+        assert_eq!(
+            poll.waits.get(),
+            1,
+            "the fault path reports without waiting again; a second wait would let a \
+             socket whose polls return instantly spin to the deadline"
+        );
+        release_tx.send(()).expect("peer thread is alive");
         peer.join().expect("peer thread");
     }
 

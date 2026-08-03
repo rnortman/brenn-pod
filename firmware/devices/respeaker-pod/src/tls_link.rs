@@ -556,8 +556,24 @@ pub(crate) fn tls_connect_psk_staged(
 /// `esp_mbedtls_handshake` collapses both into `0`, so the direction mbedTLS is
 /// waiting on is not observable here. This loop maps those into `Ok(())` or an
 /// `io::Error`.
+///
+/// A fault wake buys one more `esp_tls_conn_new_async` rather than ending the
+/// handshake. A peer that refuses the PSK writes a fatal alert and then closes
+/// over the client's unread flight, so the alert and the reset can reach the
+/// socket together — readable and dead in the same wake. Returning the socket
+/// fault there discards the alert still in the buffer, and with it the
+/// "wrong or unknown PSK?" diagnostic that separates a misprovisioned pod from a
+/// broken LAN. The socket fault is reported only when the retried step still
+/// makes no progress; it is reachable once per handshake, so a dead socket whose
+/// polls return instantly cannot spin here.
+///
+/// What the retry cannot do on this platform is say which of the two it found:
+/// one negative code covers both a fatal alert and a socket-level reset. So a
+/// failure that follows a fault wake reports both possibilities and carries the
+/// wake's mask, rather than claiming the PSK is wrong.
 #[cfg(target_os = "espidf")]
 fn handshake(stream: &mut TlsStream, host: &str, deadline: Instant) -> io::Result<()> {
+    let mut pending_fault: Option<io::Error> = None;
     loop {
         // SAFETY: `stream.tls` is a live handle, `host` is a valid slice
         // described by the pointer/length pair, and the cfg is pinned in
@@ -576,10 +592,27 @@ fn handshake(stream: &mut TlsStream, host: &str, deadline: Instant) -> io::Resul
             // In progress, direction unknown (see this function's doc comment).
             0 => {}
             other => {
-                return Err(io::Error::other(format!(
-                    "TLS handshake failed ({other:#x}) — wrong or unknown PSK?"
-                )));
+                // After a fault wake the code is ambiguous by construction: the
+                // step collapses "the peer's fatal alert" and "the socket's
+                // pending reset" into one negative value, so the fault travels in
+                // the message rather than a confident hint that would send an
+                // operator to audit a key table over what may be a broken LAN.
+                return Err(io::Error::other(match &pending_fault {
+                    Some(fault) => format!(
+                        "TLS handshake failed ({other:#x}) on a faulted socket ({fault:?}) — \
+                         a refused PSK, or the peer reset the link"
+                    ),
+                    None => format!("TLS handshake failed ({other:#x}) — wrong or unknown PSK?"),
+                }));
             }
+        }
+
+        // The backstop: the step above had its chance to read whatever the socket
+        // held and still made no progress, so the raw mask is all there is.
+        if let Some(e) = pending_fault {
+            return Err(io::Error::other(format!(
+                "socket fault during TLS handshake: {e:?}"
+            )));
         }
 
         if Instant::now() >= deadline {
@@ -594,11 +627,8 @@ fn handshake(stream: &mut TlsStream, host: &str, deadline: Instant) -> io::Resul
         // wrong direction just re-calls `esp_tls_conn_new_async`, which is cheap.
         let remaining = deadline.saturating_duration_since(Instant::now());
         match crate::netpoll::EspPoll.readiness(stream.fd, PollInterest::BOTH, remaining) {
-            Readiness::Fault(e) => {
-                return Err(io::Error::other(format!(
-                    "socket fault during TLS handshake: {e:?}"
-                )));
-            }
+            // Remembered, not returned; the retry consumes no wait budget.
+            Readiness::Fault(e) => pending_fault = Some(e),
             Readiness::TimedOut | Readiness::Ready { .. } => {}
         }
     }

@@ -1904,6 +1904,19 @@ pub(crate) fn run_tls_psk_wrong_key_rejected() -> (Status, Payload) {
             "tls-psk wrong-key handshake hit the deadline instead of being refused",
             &f.error,
         ),
+        // The refusal has to be mbedTLS's own handshake failure and not the
+        // socket-fault backstop, whose message carries no handshake code: a fault
+        // reported in place of the refusal means the peer's alert was never read,
+        // so the run proves nothing about the key. On the device this is the only
+        // check that looks at the handshake loop's classification at all — host
+        // tests are compiled out of that loop — so without it a regression there
+        // reports green.
+        Err(f) if !f.error.to_string().contains("TLS handshake failed (") => {
+            test_report_fail_detail(
+                "tls-psk wrong-key handshake failed without the peer's refusal",
+                &f.error,
+            )
+        }
         // Refusal latency only — the connect that preceded it is excluded, so a SYN
         // retransmit cannot masquerade as a slow rejection.
         Err(f) => test_report_ok(TestData::TlsPskRejected {
