@@ -270,3 +270,18 @@ fn load_validates_as_well_as_parses() {
         "expected a validation refusal, got {error:?}"
     );
 }
+
+/// The channel grammar every embedder enforces through this one function, so a
+/// name accepted by one binary is accepted by the other.
+#[test]
+fn a_transportable_channel_carries_the_prefix_and_something_after_it() {
+    validate_channel_name("brenn:reachy.presence").expect("a transportable name");
+
+    let refused = validate_channel_name("local:reachy.presence")
+        .expect_err("a local address never crosses the wire");
+    assert!(refused.contains("local:reachy.presence"), "{refused}");
+    assert!(refused.contains("transportable"), "{refused}");
+
+    let bare = validate_channel_name(CHANNEL_PREFIX).expect_err("a bare prefix names nothing");
+    assert!(bare.contains("names nothing"), "{bare}");
+}

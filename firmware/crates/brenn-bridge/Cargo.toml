@@ -37,8 +37,9 @@ thiserror = "2"
 # own reconnect timings need it. `io-util`/`io-std` are the `bridge-probe` bin's
 # stdin reader, `signal` its interrupt handler.
 tokio = { version = "1", features = ["rt", "sync", "macros", "time", "io-util", "io-std", "signal"] }
-# `bridge-probe`: the JSONL event lines it writes and the publish lines it reads.
-# The library itself renders nothing — it hands its facts to the embedder typed.
+# The JSONL field objects `render` builds for embedders to emit, plus
+# `bridge-probe`'s own event lines and the publish lines it reads. The library
+# emits nothing itself — it hands its facts to the embedder typed.
 serde_json = "1"
 # `bridge-probe` argument parsing, the host workspace's convention for a bin.
 clap = { version = "4", features = ["derive"] }

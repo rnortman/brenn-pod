@@ -1,0 +1,16 @@
+[package]
+name = "presence-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The body's JSON shape, derived on both sides of the wire so the publisher and
+# the consumer cannot disagree about a field name.
+serde = { version = "1", features = ["derive"] }
+# The encoding itself. Bus bodies are JSON text, so this is what a body is.
+serde_json = "1"
+# Typed decode refusals. A body that does not parse is reported and dropped, so
+# the reason has to survive as a value the consumer can put in a log line rather
+# than as a string this crate prints.
+thiserror = "2"

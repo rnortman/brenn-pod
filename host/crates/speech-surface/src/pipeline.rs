@@ -47,6 +47,7 @@ use tokio::task::AbortHandle;
 
 use crate::barge::TurnLedger;
 use crate::jsonl::JsonlHandle;
+use crate::presence::{PresenceHandle, PresenceInput};
 use crate::recorder::{
     WakeClass, WakeClassUpdate, sanitize_filename, set_wake_class, sidecar_path,
 };
@@ -111,6 +112,10 @@ pub struct PipelineCtx {
     /// Barge-in wiring, or `None` in a pipeline with no playback path (the replay
     /// rigs), where a detected barge-in is a log line and nothing more.
     pub(crate) barge: Option<BargeWiring>,
+    /// Where the interaction's lifecycle points are reported for the head, or
+    /// `None` when no presence channel is configured. Every tap is a
+    /// non-blocking send; nothing in this task waits on it.
+    pub(crate) presence: Option<PresenceHandle>,
 }
 
 /// How many recent segments and wake detections to retain per pod for sidecar
@@ -237,6 +242,7 @@ pub async fn run(
         brain,
         confidence_gate,
         barge,
+        presence,
     } = ctx;
 
     let mut pods: HashMap<PodId, PodState> = HashMap::new();
@@ -271,6 +277,7 @@ pub async fn run(
                         &mut next_utterance_id,
                         brain.as_ref(),
                         barge.as_ref(),
+                        presence.as_ref(),
                         &jsonl,
                     )
                     .await;
@@ -284,6 +291,7 @@ pub async fn run(
                     &confidence_gate,
                     brain.as_ref(),
                     barge.as_ref(),
+                    presence.as_ref(),
                     &jsonl,
                 )
                 .await;
@@ -391,6 +399,7 @@ async fn handle_listener(
     next_utterance_id: &mut u64,
     brain: Option<&BrainWiring>,
     barge: Option<&BargeWiring>,
+    presence: Option<&PresenceHandle>,
     jsonl: &JsonlHandle,
 ) {
     match ev {
@@ -414,6 +423,12 @@ async fn handle_listener(
             // spoken.
             if let Some(wiring) = brain {
                 wiring.brain.wake(&pod);
+            }
+            // Past the epoch check for the same reason: a superseded
+            // connection's wake is not an interaction, and it must not raise a
+            // head.
+            if let Some(presence) = presence {
+                presence.send(PresenceInput::Wake(pod.clone()));
             }
             push_bounded(&mut state.recent_wakes, wake_end_sample);
             // Upgrade any already-labeled segment this detection now lands in: the
@@ -515,6 +530,12 @@ async fn handle_listener(
                     "host_rx_us": host_rx.0,
                 }),
             );
+            // Ahead of the playback wiring, like the line above: somebody spoke
+            // over the pod, which is a live interaction whether or not there is
+            // anything left to cut.
+            if let Some(presence) = presence {
+                presence.send(PresenceInput::Barge(pod.clone()));
+            }
             let Some(barge) = barge else {
                 return;
             };
@@ -611,6 +632,11 @@ async fn handle_listener(
                     "end_sample": end_sample,
                 }),
             );
+            // The usual false-positive-wake path: the head goes back down a
+            // linger after this, and it does so with or without a brain wired.
+            if let Some(presence) = presence {
+                presence.send(PresenceInput::Unanswered(pod.clone()));
+            }
             // "Wake, no follow": the wake fired but no command followed. Accounted
             // for through the same `WakeCommandAbsent` vocabulary as an empty or
             // low-confidence command — only meaningful with a brain wired (the
@@ -727,6 +753,7 @@ fn dispatch_delay(_transcript_tail: &str, _silence_ms: u32, mode: DispatchMode) 
 /// (a supersede/respawn would have replaced it), then run the dispatch-delay seam,
 /// mint the utterance from the carve plus recent-segment tracking, apply the
 /// confidence gate, and dispatch.
+#[allow(clippy::too_many_arguments)]
 async fn handle_stt_done(
     done: SttDone,
     pods: &mut HashMap<PodId, PodState>,
@@ -734,6 +761,7 @@ async fn handle_stt_done(
     confidence_gate: &ConfidenceGate,
     brain: Option<&BrainWiring>,
     barge: Option<&BargeWiring>,
+    presence: Option<&PresenceHandle>,
     jsonl: &JsonlHandle,
 ) {
     let Some(state) = pods.get_mut(&done.pod) else {
@@ -863,6 +891,14 @@ async fn handle_stt_done(
         (None, Some(reject)) if done.carve.barge_in => GateOutcome::DeclineBarge(reject),
         _ => GateOutcome::Dispatch,
     };
+    // A decline is a raise that produced no turn: the head is up and nothing
+    // will follow, so the settle starts here rather than waiting for the
+    // engagement's ceiling.
+    if let Some(presence) = presence
+        && !matches!(gate, GateOutcome::Dispatch)
+    {
+        presence.send(PresenceInput::Unanswered(utterance.pod.clone()));
+    }
     match gate {
         GateOutcome::DeclineWake(wake, reject) => {
             decline_low_confidence(&utterance, &wake, reject, wiring)
@@ -913,7 +949,17 @@ async fn handle_stt_done(
                 }
                 None => ResponseSink::new(wiring.speak_tx.clone()),
             };
+            // Around the await, not inside the barge arm below: a turn is in
+            // flight for as long as the brain has it, and that is what keeps
+            // the head up through a long think in a pipeline with no playback
+            // path at all.
+            if let Some(presence) = presence {
+                presence.send(PresenceInput::TurnStarted(pod.clone()));
+            }
             wiring.brain.handle(utterance, sink).await;
+            if let Some(presence) = presence {
+                presence.send(PresenceInput::TurnEnded(pod.clone()));
+            }
             if let Some(barge) = barge {
                 // Dispatch awaits the brain inline, so returning here is the proof
                 // that no further command is coming for this turn — which is what
@@ -1326,6 +1372,7 @@ mod tests {
         stats: Arc<BrainStats>,
         barge: Option<(Arc<TurnLedger>, FlushFn)>,
         nudges: Arc<Mutex<NudgeLog>>,
+        presence: Option<PresenceHandle>,
     }
 
     impl Harness {
@@ -1339,7 +1386,14 @@ mod tests {
                 stats: Arc::new(BrainStats::default()),
                 barge: None,
                 nudges: Arc::new(Mutex::new(NudgeLog::default())),
+                presence: None,
             }
+        }
+        /// Wire the head-presence taps to `handle`, so a test can read the
+        /// interaction lifecycle as the tracker receives it.
+        fn presence(mut self, handle: PresenceHandle) -> Harness {
+            self.presence = Some(handle);
+            self
         }
         /// Wire barge-in against `ledger` and a flush entry point that returns
         /// `flush` — the writer's answer, faked, so the pipeline's own ordering is
@@ -1410,6 +1464,7 @@ mod tests {
                     barge: self
                         .barge
                         .map(|(ledger, flush)| BargeWiring { ledger, flush }),
+                    presence: self.presence.clone(),
                 },
                 jsonl.clone(),
             )
@@ -1647,6 +1702,114 @@ mod tests {
         assert_eq!(cmds.len(), 1, "the utterance reached the brain");
     }
 
+    /// Drain everything the taps sent. The handle is dropped first so the
+    /// pipeline's own clone is gone and the queue ends.
+    async fn presence_inputs(
+        handle: PresenceHandle,
+        mut inbox: crate::presence::PresenceInbox,
+    ) -> Vec<PresenceInput> {
+        drop(handle);
+        let mut seen = Vec::new();
+        while let Some(input) = inbox.recv().await {
+            seen.push(input);
+        }
+        seen
+    }
+
+    /// The happy path's taps, in the order the interaction happened: the wake
+    /// raises, and the brain holding the turn is what keeps the head up across a
+    /// long think.
+    #[tokio::test]
+    async fn a_dispatched_turn_brackets_itself_for_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .presence(handle.clone())
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        assert_eq!(
+            presence_inputs(handle, rx).await,
+            vec![
+                PresenceInput::Wake(pod()),
+                PresenceInput::TurnStarted(pod()),
+                PresenceInput::TurnEnded(pod()),
+            ]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The false-positive wake: the arm dies with no command, and the head is
+    /// told so — with no brain wired, which is where the tap sits in the arm.
+    #[tokio::test]
+    async fn an_expired_arm_settles_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        Harness::new()
+            .presence(handle.clone())
+            .run(vec![
+                wake_detected(1, 8),
+                PipelineItem::Listener(ListenerEvent::ArmExpired {
+                    pod: pod(),
+                    wake: WakeConfirmation {
+                        score: 0.8,
+                        wake_end_sample: 0,
+                        stt_trim_samples: 0,
+                    },
+                    start_sample: 0,
+                    end_sample: 16,
+                }),
+            ])
+            .await;
+
+        assert_eq!(
+            presence_inputs(handle, rx).await,
+            vec![PresenceInput::Wake(pod()), PresenceInput::Unanswered(pod())]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A wake whose command transcribed to a likely hallucination: the gate
+    /// declines it, no turn is dispatched, and the head settles on the decline
+    /// rather than waiting out its engagement ceiling.
+    #[tokio::test]
+    async fn a_gate_decline_settles_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        let wake = WakeConfirmation {
+            score: 0.9,
+            wake_end_sample: 0,
+            stt_trim_samples: 0,
+        };
+        Harness::new()
+            .transcriber(FakeTranscriber(Some((
+                "thank you".into(),
+                Some(conf(0.9, -1.0)),
+            ))))
+            .brain()
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            })
+            .presence(handle.clone())
+            .run(vec![soft_endpoint(carved(1, 0, 16, Some(wake)))])
+            .await;
+
+        assert_eq!(
+            presence_inputs(handle, rx).await,
+            vec![PresenceInput::Unanswered(pod())]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
     #[tokio::test]
     async fn superseded_aborts_the_in_flight_stt() {
         // A slow STT superseded before it completes never dispatches.
@@ -1777,6 +1940,7 @@ mod tests {
             &mut pods,
             &mut next_id,
             &ConfidenceGate::OFF,
+            None,
             None,
             None,
             &jsonl,
@@ -2307,10 +2471,27 @@ mod tests {
     async fn a_barge_in_with_no_wiring_is_log_only() {
         // The replay and tuning rigs have no playback path at all; detection must
         // still leave its trace, which is the thing they exist to tune.
-        let (lines, _) = Harness::new().brain().run(vec![barge_in_event()]).await;
+        //
+        // The head raise is the other thing that has to survive a missing
+        // playback path: barge is the only raise with no wake word in front of
+        // it, so a tap sunk below the wiring guard loses the head for every
+        // interaction on a pod whose writer is gone.
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        let (lines, _) = Harness::new()
+            .brain()
+            .presence(handle.clone())
+            .run(vec![barge_in_event()])
+            .await;
 
         assert!(lines.iter().any(|v| v["event"] == "barge_in"));
         assert!(!lines.iter().any(|v| v["event"] == "barge_in_stale"));
+        assert_eq!(
+            presence_inputs(handle, rx).await,
+            vec![PresenceInput::Barge(pod())]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
     }
 
     #[tokio::test]
@@ -2508,6 +2689,29 @@ mod tests {
             [pod()],
             "only the live epoch's wake nudges"
         );
+    }
+
+    /// The presence half of the same placement rule, and the one only a
+    /// negative assertion can hold: a superseded connection's wake is not an
+    /// interaction, and it must not raise a head. Hoisting the tap above the
+    /// epoch guard would leave every positive tap test green.
+    #[tokio::test]
+    async fn a_stale_epoch_wake_does_not_raise_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        Harness::new()
+            .brain()
+            .presence(handle.clone())
+            .run(vec![wake_detected(2, 8), wake_detected(1, 8)])
+            .await;
+
+        assert_eq!(
+            presence_inputs(handle, rx).await,
+            vec![PresenceInput::Wake(pod())],
+            "the live epoch's wake raises, the superseded one does not"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
     }
 
     #[tokio::test]

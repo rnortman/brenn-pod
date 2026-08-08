@@ -125,7 +125,9 @@ fi
 
 OBJDUMP="${LLVM_OBJDUMP:-}"
 if [[ -z "$OBJDUMP" ]]; then
-  # Newest esp-clang install wins.
+  # Newest esp-clang install wins. The glob's own expansion is the file list and
+  # ls only orders it; the names are toolchain version directories.
+  # shellcheck disable=SC2012
   OBJDUMP="$(ls -1 "$HOME"/.espressif/tools/esp-clang/*/esp-clang/bin/llvm-objdump 2>/dev/null \
     | sort -V | tail -n1 || true)"
 fi

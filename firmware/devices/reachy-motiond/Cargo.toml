@@ -1,0 +1,58 @@
+[package]
+name = "reachy-motiond"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The head-presence motion daemon: an aarch64 binary that holds the Reachy's servo
+# bus open, subscribes to the presence channel on the brenn bus, and moves the head
+# between stow and neutral to match the desired posture it is told.
+#
+# A library plus a thin binary, the same shape reachy-pod takes: the modules are the
+# crate's public surface, which is what lets `cargo test -p reachy-motiond` exercise
+# the configuration and the shared state on the workstation with no machine present.
+#
+# Not in default-members — brenn-bridge links native-tls (openssl), so a plain
+# `cargo build` stays free of system dependencies; `make check-host`'s `--workspace`
+# clippy and tests cover it.
+
+[dependencies]
+# The motion repository's bring-up host, library half: the two standing gates (a
+# resolved crank datum and a green self-test record), the armed session, and the
+# neutral and stow postures. A git dependency because the dependency arrow runs
+# this way and never the reverse — the motion crates know nothing of a bus, a pod
+# identity or a presence channel.
+reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "4df68af91df5602e2504176118c6373b9914d616" }
+# The serial port and the typed refusal when something else already holds it.
+# Named directly because opening the port and classifying that refusal is the
+# daemon's; everything after the open goes through the session.
+reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "4df68af91df5602e2504176118c6373b9914d616" }
+# The joint-target type the two postures are expressed in. Named so the
+# posture-to-pose mapping can be a function of this daemon's own, with the type in
+# its signature, instead of living inside a trait implementation that needs a
+# servo bus to reach.
+reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "4df68af91df5602e2504176118c6373b9914d616" }
+# The presence vocabulary and the lease reducer, shared with the publisher on the
+# speech host so neither end carries protocol logic of its own.
+presence-proto = { path = "../../crates/presence-proto" }
+# The bus attachment: the dial, the token, the reconnect supervision, and the
+# subscription the daemon's intents arrive on. Its `Config` is nested whole into
+# this daemon's own configuration file.
+brenn-bridge = { path = "../../crates/brenn-bridge" }
+# The configuration file's shape, derived rather than hand-parsed so a typo is a
+# startup refusal naming the key.
+serde = { version = "1", features = ["derive"] }
+# The configuration file's format, matching every other daemon configuration here.
+toml = "0.8"
+# Typed startup and fault refusals: what stopped the daemon has to survive as a
+# value the bus thread can put on an alert, not as a string this crate prints.
+thiserror = "2"
+# The bus thread's runtime, its select loop, and the SIGTERM/SIGINT streams that
+# turn an operator's signal into the one ending that takes torque off.
+# Current-thread: one attachment, one channel, no parallelism to gain.
+tokio = { version = "1", features = ["rt", "sync", "macros", "time", "signal"] }
+# The JSONL event lines' field objects, built where they are emitted.
+serde_json = "1"
+# The JSONL envelope every binary in this workspace narrates itself in, so a
+# capture off this daemon parses off the same two keys as one off the audio pod.
+pod-jsonl = { path = "../../crates/pod-jsonl" }

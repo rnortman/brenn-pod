@@ -168,7 +168,6 @@ dependencies = [
  "pod-secrets",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
@@ -1115,9 +1114,6 @@ dependencies = [
 [[package]]
 name = "pod-secrets"
 version = "0.1.0"
-dependencies = [
- "tempfile",
-]
 
 [[package]]
 name = "pod-streamer"
@@ -1183,6 +1179,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "presence-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1558,6 +1563,7 @@ dependencies = [
  "pod-jsonl",
  "pod-secrets",
  "pod-streamer",
+ "presence-proto",
  "psk-link",
  "rustix",
  "serde",

@@ -7,12 +7,15 @@ license.workspace = true
 [dependencies]
 pod-ingest = { path = "../pod-ingest" }
 speech-pipeline = { path = "../speech-pipeline" }
-pod-jsonl = { path = "../pod-jsonl" }
-pod-secrets = { path = "../pod-secrets" }
+pod-jsonl = { path = "../../../firmware/crates/pod-jsonl" }
+pod-secrets = { path = "../../../firmware/crates/pod-secrets" }
 # The bus transport a `BrennBrain` answers over, and the `[brenn.bridge]` config
-# table nested verbatim. The pinned brenn git revs stay inside this crate's own
+# table nested verbatim. The pinned brenn git revs stay inside that crate's own
 # manifest; the dependency edge still points one way — pod depends on brenn.
-brenn-bridge = { path = "../brenn-bridge" }
+brenn-bridge = { path = "../../../firmware/crates/brenn-bridge" }
+# The head-presence vocabulary: the body this side encodes onto the presence
+# channel, shared with the motion daemon that decodes it.
+presence-proto = { path = "../../../firmware/crates/presence-proto" }
 # Wire decode (`decode_frame`) for replaying recorded frame logs offline.
 audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std"] }
 # The link's TLS-PSK parameters, shared with the device clients; re-exported as

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use audio_pipeline::playback::{
     INBOUND_PCM_RING_BYTES, INBOUND_PCM_WRITE_UNIT_BYTES, PLAYBACK_PREROLL_MAX_TARGET_BYTES,
@@ -33,9 +34,6 @@ const SAMPLES_PER_MS: u64 = 16;
 
 /// Room name used for a pod absent from the `[pods]` map.
 pub const UNMAPPED_ROOM: &str = "unmapped";
-
-/// The prefix a bus channel must carry to be transportable off this host.
-const BRENN_CHANNEL_PREFIX: &str = "brenn:";
 
 /// Parsed daemon configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -682,6 +680,31 @@ pub struct BrennConfig {
     /// reads the instructions on join instead of needing them re-sent.
     #[serde(default)]
     pub help_channel: Option<String>,
+    /// Optional channel head-presence intents are published on: `engaged` while
+    /// an interaction is live, `idle` when it is over. Absent means no presence
+    /// tracker runs and nothing is published — the state before a motion
+    /// consumer exists on the bus.
+    #[serde(default)]
+    pub presence_channel: Option<String>,
+    /// How often an `engaged` intent is republished while the interaction stays
+    /// live. The consumer holds it as a lease, so a refresh well inside that
+    /// lease is what keeps the head up; the lease is the consumer's own config.
+    /// Must be greater than zero.
+    #[serde(default = "default_presence_refresh_ms")]
+    pub presence_refresh_ms: u64,
+    /// How long the tracker waits after the last sign of activity before
+    /// publishing `idle`. Long enough to bridge the gap between turns of one
+    /// exchange, so a multi-turn conversation never stows and re-raises between
+    /// answers. Must be greater than zero.
+    #[serde(default = "default_presence_linger_ms")]
+    pub presence_linger_ms: u64,
+    /// The ceiling on one engagement: if nothing else settles it, this does.
+    /// It exists because the false-positive-wake path depends on a device
+    /// segment close with no verified wall-clock bound — the tracker carries its
+    /// own clock rather than trusting one it cannot see. Must be greater than
+    /// zero.
+    #[serde(default = "default_presence_max_engaged_ms")]
+    pub presence_max_engaged_ms: u64,
     /// How long a turn waits for the first response message after its utterance
     /// is published. Must be greater than zero.
     #[serde(default = "default_brenn_response_timeout_ms")]
@@ -720,6 +743,9 @@ impl BrennConfig {
         if let Some(help) = &self.help_channel {
             channels.push(("help_channel", help.as_str()));
         }
+        if let Some(presence) = &self.presence_channel {
+            channels.push(("presence_channel", presence.as_str()));
+        }
         channels
     }
 
@@ -732,12 +758,8 @@ impl BrennConfig {
     pub fn validate(&self) -> Result<(), String> {
         let channels = self.channels();
         for (key, channel) in &channels {
-            if !channel.starts_with(BRENN_CHANNEL_PREFIX) {
-                return Err(format!(
-                    "brenn.{key} {channel:?} must name a transportable channel \
-                     (a {BRENN_CHANNEL_PREFIX:?} prefix); a local: address never crosses the wire"
-                ));
-            }
+            brenn_bridge::validate_channel_name(channel)
+                .map_err(|refusal| format!("brenn.{key} {refusal}"))?;
         }
         for (i, (key, channel)) in channels.iter().enumerate() {
             if let Some((other, _)) = channels[..i].iter().find(|(_, c)| c == channel) {
@@ -753,7 +775,29 @@ impl BrennConfig {
         if self.continuation_timeout_ms == 0 {
             return Err("brenn.continuation_timeout_ms must be greater than 0".to_string());
         }
+        // Every presence interval is a timer the tracker arms. A zero would arm
+        // one that is always due: a refresh flooding the bus, a linger that
+        // stows the head between two turns of one exchange, a ceiling that ends
+        // every engagement the instant it begins.
+        for (key, ms) in [
+            ("presence_refresh_ms", self.presence_refresh_ms),
+            ("presence_linger_ms", self.presence_linger_ms),
+            ("presence_max_engaged_ms", self.presence_max_engaged_ms),
+        ] {
+            if ms == 0 {
+                return Err(format!("brenn.{key} must be greater than 0"));
+            }
+        }
         Ok(())
+    }
+
+    /// The presence timings as durations, for the tracker.
+    pub fn presence_timing(&self) -> crate::presence::PresenceTiming {
+        crate::presence::PresenceTiming {
+            refresh: Duration::from_millis(self.presence_refresh_ms),
+            linger: Duration::from_millis(self.presence_linger_ms),
+            max_engaged: Duration::from_millis(self.presence_max_engaged_ms),
+        }
     }
 }
 
@@ -1138,6 +1182,21 @@ fn default_brenn_response_timeout_ms() -> u64 {
 }
 fn default_brenn_continuation_timeout_ms() -> u64 {
     10_000
+}
+// Well inside any plausible consumer lease, so two lost refreshes in a row still
+// leave the head up.
+fn default_presence_refresh_ms() -> u64 {
+    5_000
+}
+// Wide enough to bridge the gap between the answer to one question and the wake
+// word starting the next.
+fn default_presence_linger_ms() -> u64 {
+    8_000
+}
+// Well past any plausible utterance capture, well short of a head left up
+// unattended.
+fn default_presence_max_engaged_ms() -> u64 {
+    30_000
 }
 // Apologetic, short, and content-free: it is spoken when the bus failed, so it
 // must not imply the request was understood.
@@ -2101,6 +2160,10 @@ model = "m"
         assert_eq!(brenn.response_channel, "brenn:pod.speak");
         assert_eq!(brenn.wake_channel, None);
         assert_eq!(brenn.help_channel, None);
+        assert_eq!(brenn.presence_channel, None);
+        assert_eq!(brenn.presence_refresh_ms, 5_000);
+        assert_eq!(brenn.presence_linger_ms, 8_000);
+        assert_eq!(brenn.presence_max_engaged_ms, 30_000);
         assert_eq!(brenn.response_timeout_ms, 30_000);
         assert_eq!(brenn.continuation_timeout_ms, 10_000);
         assert_eq!(brenn.attribution, None);
@@ -2131,6 +2194,10 @@ publish_channel = "brenn:pod.utterance"
 response_channel = "brenn:pod.speak"
 wake_channel = "brenn:pod.wake"
 help_channel = "brenn:pod.help"
+presence_channel = "brenn:reachy.presence"
+presence_refresh_ms = 4000
+presence_linger_ms = 6000
+presence_max_engaged_ms = 20000
 response_timeout_ms = 45000
 continuation_timeout_ms = 5000
 attribution = "voice"
@@ -2147,6 +2214,13 @@ max_backoff_ms = 9000
         let brenn = config.brenn.as_ref().expect("brenn table");
         assert_eq!(brenn.wake_channel.as_deref(), Some("brenn:pod.wake"));
         assert_eq!(brenn.help_channel.as_deref(), Some("brenn:pod.help"));
+        assert_eq!(
+            brenn.presence_channel.as_deref(),
+            Some("brenn:reachy.presence")
+        );
+        assert_eq!(brenn.presence_timing().refresh, Duration::from_secs(4));
+        assert_eq!(brenn.presence_timing().linger, Duration::from_secs(6));
+        assert_eq!(brenn.presence_timing().max_engaged, Duration::from_secs(20));
         assert_eq!(brenn.response_timeout_ms, 45_000);
         assert_eq!(brenn.continuation_timeout_ms, 5_000);
         assert_eq!(brenn.attribution.as_deref(), Some("voice"));
@@ -2208,6 +2282,10 @@ max_backoff_ms = 9000
         for (key, line) in [
             ("wake_channel", "wake_channel = \"local:pod.wake\""),
             ("help_channel", "help_channel = \"pod.help\""),
+            (
+                "presence_channel",
+                "presence_channel = \"local:reachy.presence\"",
+            ),
         ] {
             let err = Config::parse(&with_addr(&brenn_table(line)))
                 .expect("parse")
@@ -2225,6 +2303,7 @@ max_backoff_ms = 9000
             "wake_channel = \"brenn:pod.utterance\"",
             "help_channel = \"brenn:pod.speak\"",
             "wake_channel = \"brenn:pod.wake\"\nhelp_channel = \"brenn:pod.wake\"",
+            "presence_channel = \"brenn:pod.speak\"",
         ] {
             let err = Config::parse(&with_addr(&brenn_table(line)))
                 .expect("parse")
@@ -2240,6 +2319,23 @@ max_backoff_ms = 9000
             .validate()
             .unwrap_err();
         assert!(err.contains("distinct"), "message: {err}");
+    }
+
+    /// Every presence interval is a timer the tracker arms; a zero arms one
+    /// that is always due.
+    #[test]
+    fn brenn_rejects_a_zero_presence_interval() {
+        for key in [
+            "presence_refresh_ms",
+            "presence_linger_ms",
+            "presence_max_engaged_ms",
+        ] {
+            let err = Config::parse(&with_addr(&brenn_table(&format!("{key} = 0"))))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(err.contains(key), "expected {key} in message: {err}");
+        }
     }
 
     #[test]

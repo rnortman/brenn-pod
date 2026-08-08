@@ -46,6 +46,9 @@ const CONSOLE_INFO: &[&str] = &[
     "brenn_attached",
     "brenn_subscribed",
     "brenn_help_published",
+    // The head going up and coming down. One line per transition, never per
+    // lease refresh.
+    "presence",
     // The listener's utterance lifecycle. All fire at speech-boundary rate (a
     // handful per utterance), never per-chunk, so the console stays bounded.
     "endpointer_transition",
@@ -437,6 +440,7 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
         "playback_started" => Some(narrate_playback_started(fields)),
         "latency_summary" => Some(narrate_latency_summary(fields)),
         "playback_finished" => Some(narrate_playback_finished(fields)),
+        "presence" => Some(narrate_presence(fields)),
         "conn_hello" => Some(narrate_conn_hello(fields)),
         "conn_superseded" => Some(narrate_conn_superseded(fields)),
         "conn_closed" => Some(narrate_conn_closed(fields)),
@@ -449,6 +453,15 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
         "tts_configured" => Some(narrate_tts_configured(fields)),
         _ => None,
     }
+}
+
+/// The head's posture as prose: `presence engaged (wake) seq=4`. State and cause
+/// degrade to `?` when absent or the wrong type.
+fn narrate_presence(fields: &Value) -> String {
+    let state = fmt_str(fields.get("state"));
+    let cause = fmt_str(fields.get("cause"));
+    let seq = fmt_u64(fields.get("seq"));
+    format!("presence {state} ({cause}) seq={seq}")
 }
 
 /// The configured text-to-speech stage as prose:
@@ -1570,6 +1583,38 @@ mod tests {
         );
     }
 
+    /// The console line is the only place a supervised run watches the head
+    /// move, and it reads three field names straight out of the object the
+    /// tracker builds. Renaming or retyping one degrades the prose to `?` with
+    /// nothing else failing.
+    #[test]
+    fn presence_narrates() {
+        let mut r = Renderer::new(false);
+        let line = r
+            .render(
+                0,
+                "presence",
+                &json!({ "pod": "pod-a1b2c3", "state": "engaged", "cause": "wake", "seq": 4 }),
+            )
+            .unwrap();
+        assert!(line.ends_with("presence engaged (wake) seq=4"), "{line}");
+        assert!(!line.contains("!!!"), "a transition is calm: {line}");
+
+        let stowed = r
+            .render(
+                0,
+                "presence",
+                &json!({ "pod": "pod-a1b2c3", "state": "idle", "cause": "linger", "seq": 9 }),
+            )
+            .unwrap();
+        assert!(stowed.ends_with("presence idle (linger) seq=9"), "{stowed}");
+
+        // Every field degrades rather than panicking or rendering a plausible
+        // wrong value.
+        let bare = r.render(0, "presence", &json!({})).unwrap();
+        assert!(bare.ends_with("presence ? (?) seq=?"), "{bare}");
+    }
+
     #[test]
     fn playback_finished_narrates() {
         let mut r = Renderer::new(false);
@@ -2589,6 +2634,7 @@ mod tests {
         ("brenn_help_published", Class::Calm),
         ("brenn_interruption_dropped", Class::Loud),
         ("brenn_interruption_publish_failed", Class::Loud),
+        ("brenn_presence_publish_failed", Class::Loud),
         ("brenn_subscribed", Class::Calm),
         ("brenn_wake_dropped", Class::Calm),
         ("brenn_wake_publish_failed", Class::Calm),
@@ -2618,6 +2664,9 @@ mod tests {
         ("playback_router_exited", Class::Loud),
         ("playback_started", Class::Calm),
         ("playback_writer_dead", Class::Loud),
+        ("presence", Class::Calm),
+        ("presence_input_dropped", Class::Loud),
+        ("presence_tracker_exited", Class::Loud),
         ("protocol_error", Class::Loud),
         ("prune_delete_error", Class::Loud),
         ("prune_error", Class::Loud),

@@ -12,8 +12,9 @@
 #   libasound2-dev     — reachy-pod links libasound (the board's ALSA capture and
 #                        playback ends).
 # The device lanes (check-device, build-firmware, flash) additionally need espup.
-# The reachy lanes (reachy-pod and the deploy targets below) need podman, an
-# aarch64 binfmt_misc registration on a non-arm64 workstation, and ssh + rsync.
+# The reachy lanes (reachy-pod, reachy-motiond and the deploy targets below) need
+# podman, an aarch64 binfmt_misc registration on a non-arm64 workstation, and
+# ssh + rsync.
 
 .DEFAULT_GOAL := check
 
@@ -79,6 +80,12 @@ check-host: check-host-arch
 # touches a pod is text processing, and a wrong answer there mis-files or duplicates a key
 # that exists nowhere else. No toolchain, no device, no network.
 	tools/provision-reachy-pod.test.sh
+# The motion daemon's deploy path, with ssh and rsync stubbed, plus the overlay mount every
+# container build in this workspace currently depends on. The sharp one is the exit-status
+# passthrough: the daemon's verdict is the whole of what says a machine is holding torque.
+	tools/deploy-reachy-motiond.test.sh
+# Lint for this whole directory, which had none. Skips visibly where shellcheck is absent.
+	tools/check-shell.sh
 
 # Host-architecture workspace (host/) — stable toolchain, no espup.
 # Standalone workspace beside firmware/; check and check-host both depend on this
@@ -239,6 +246,58 @@ reachy-bench: reachy-host reachy-pod
 .PHONY: reachy-logs
 reachy-logs: reachy-host
 	tools/deploy-reachy-pod.sh $(REACHY_HOST) --logs
+
+# ── The head-presence daemon: build, provision, run ──────────────────────────
+#
+# A second Linux binary for the same unit, built in the same container and
+# pushed into the same executable store — and that is where the resemblance
+# ends. The daemon is not part of the brenn-app payload and is not a service:
+# it arms the machine and holds torque, so it is run in the foreground with an
+# operator watching, and it takes that operator's ^C as the one signal that
+# stows the head and releases.
+#
+# The machine's own configuration is not provisioned from here. The daemon reads
+# the bench file from the account home, so the crank datum and the envelope have
+# one source of truth on the unit; the self-test record that admits arming is
+# the file beside it. Neither is this repo's to write.
+
+# The daemon's own configuration for this unit, and the bearer token it presents
+# to the bus. Both gitignored: one names the unit's identity and channel, the
+# other is a credential.
+MOTIOND_CONFIG ?= .local/reachy-motiond.toml
+MOTIOND_TOKEN ?= .local/motiond-token
+
+# The aarch64 binary, built in the pinned container. Needs podman; needs no
+# device. While the workspace's [patch] table redirects the motion crates at a
+# clone beside this repo, this needs that clone too — the build script mounts it
+# into the container and says so if it is not there.
+.PHONY: reachy-motiond
+reachy-motiond:
+	tools/build-reachy-motiond.sh
+
+# Give the unit the daemon's configuration, and the token it attaches with.
+# Needs no build, so either can run before or after one; idempotent, and the
+# re-run after a reboot is the whole re-provisioning story — the device's copies
+# are in RAM.
+.PHONY: reachy-motiond-config
+reachy-motiond-config: reachy-host
+	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --config $(MOTIOND_CONFIG)
+
+.PHONY: reachy-motiond-token
+reachy-motiond-token: reachy-host
+	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --token $(MOTIOND_TOKEN)
+
+# Build, push into the executable store, and run it there in the foreground.
+# ARGS is passed to the daemon verbatim; with none it is given the configuration
+# reachy-motiond-config pushed. Run this from a terminal at the machine: it
+# torques the servos, and ^C is what stows and releases them.
+#
+# The terminal carries the narration only. The daemon's JSONL is captured on the
+# device — the run prints where, and how to fetch it — because the pty this needs
+# for ^C would otherwise merge the two streams into one.
+.PHONY: reachy-motiond-deploy
+reachy-motiond-deploy: reachy-host reachy-motiond
+	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --run $(ARGS)
 
 # Wire the repo-local git hooks directory so the pre-commit hook travels with the repo.
 # Run once per clone: make install-hooks

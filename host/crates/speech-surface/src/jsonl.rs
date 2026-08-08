@@ -329,6 +329,53 @@ async fn write_batch<W: AsyncWrite + Unpin>(writer: &mut W, batch: &[String]) ->
     writer.flush().await
 }
 
+/// Reading the sink back, for every module whose tests assert on a line.
+///
+/// The writer is a task: a line is emitted long before it reaches the file, so
+/// asserting on one means polling for it. That polling belongs in one place —
+/// several modules want it, and copies drift into different failure messages
+/// for the same wedge.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use serde_json::Value;
+
+    /// Long enough that reaching it means the writer is wedged rather than
+    /// slow: it flushes per batch, in microseconds.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// Every line written so far. The writer flushes per batch, so polling the
+    /// file needs no handle-dropping dance.
+    pub(crate) fn lines(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+            .collect()
+    }
+
+    /// The first line naming `event`, waiting for it to be written.
+    pub(crate) async fn expect_line(path: &Path, event: &str) -> Value {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            if let Some(line) = lines(path).into_iter().find(|line| line["event"] == event) {
+                return line;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {event} line arrived; got {:?}",
+                lines(path)
+                    .iter()
+                    .map(|line| line["event"].clone())
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

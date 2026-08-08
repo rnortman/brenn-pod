@@ -16,8 +16,41 @@ use serde::Deserialize;
 /// The only URL scheme this bridge will dial.
 const WSS_SCHEME: &str = "wss://";
 
+/// The prefix a channel name must carry to be transportable over the bus.
+///
+/// A `local:` address is delivered inside the process that minted it and never
+/// reaches this attachment, so a subscription to one waits forever and a publish
+/// to one is refused by the subscription plane.
+pub const CHANNEL_PREFIX: &str = "brenn:";
+
+/// Whether a channel name is one this attachment can carry.
+///
+/// The rule belongs to the bridge rather than to its embedders: it is this
+/// crate's transport that a `local:` address never crosses. Embedders put the
+/// configuration key in front of the message this answers with, so the same
+/// refusal reads correctly wherever a channel is configured.
+pub fn validate_channel_name(channel: &str) -> Result<(), String> {
+    let Some(rest) = channel.strip_prefix(CHANNEL_PREFIX) else {
+        return Err(format!(
+            "{channel:?} must name a transportable channel (a {CHANNEL_PREFIX:?} prefix); \
+             a local: address never crosses the wire"
+        ));
+    };
+    if rest.is_empty() {
+        return Err(format!(
+            "{channel:?} names nothing after the {CHANNEL_PREFIX:?} prefix"
+        ));
+    }
+    Ok(())
+}
+
 /// Parsed bridge configuration.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Comparable whole, so an embedder shipping an example file can assert that the
+/// values it writes out under a "this is the default" comment really are the
+/// defaults — and that a field added here is covered by that assertion without
+/// anyone remembering to extend it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The fully-formed websocket URL of the remote route, path included —

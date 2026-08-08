@@ -65,7 +65,7 @@ The brenn half is filed in the brenn repo's `TODO.md` under this same slug, at
 `NativeConnector::connect`. The slug is the cross-repo join key — move both entries together.
 
 See `TODO(bridge-upgrade-rejection-terminal)` at `Core::report_dial` in
-`host/crates/brenn-bridge/src/bridge.rs`.
+`firmware/crates/brenn-bridge/src/bridge.rs`.
 
 ## `bridge-violation-close-code` — BLOCKED as of 2026-08-02 (needs a change in the brenn repo first)
 
@@ -94,13 +94,13 @@ becomes a backstop for the shapes the code cannot cover rather than the primary 
 a test pins whether a *pre-`Welcome`* handshake violation counts toward the futile budget at
 all — it turns on whether the handshake `Hello` sets `spoke`, which nobody has traced. That
 last item lives here rather than in brenn because the futile budget is pod code (the
-`ConnEvent::Detached` arm of `Core::on_conn_event`, `host/crates/brenn-bridge/src/bridge.rs`).
+`ConnEvent::Detached` arm of `Core::on_conn_event`, `firmware/crates/brenn-bridge/src/bridge.rs`).
 
 The brenn half is filed in the brenn repo's `TODO.md` under this same slug, at the attach
 route's violation teardown. The slug is the cross-repo join key — move both entries together.
 
 See `TODO(bridge-violation-close-code)` at `terminal_close_code` in
-`host/crates/brenn-bridge/src/config.rs`.
+`firmware/crates/brenn-bridge/src/config.rs`.
 
 ## `ci-device-clippy-first-run` — BLOCKED as of 2026-07-25 (needs a real GitHub-hosted runner)
 
@@ -436,3 +436,86 @@ the leading hypothesis, not a confirmed trigger.
 See `TODO(barge-in-flake)` at
 `barge_in_flushes_playback_and_chains_the_interrupted_turn` in
 `host/crates/speech-surface/tests/barge_integration.rs`.
+
+## `presence-retarget` — a presence move runs to its endpoint before the reverse one starts
+
+The motion daemon commands one move at a time: the tick path refuses a retarget while a
+move is in flight, by design, so an intent that arrives mid-move is applied when that move
+completes. A wake landing halfway through a stow therefore waits out the rest of the stow
+before the head starts back up — at worst one move duration of lag, which at the shipped
+durations is a couple of seconds.
+
+The upgrade is to interrupt: hold the machine where the move has reached, then issue a
+fresh `MoveTo` from there. The pieces exist — a hold is a command the tick path takes at
+any point — but the shaping starts from rest at the new start point, so an interrupted
+move ends with a visible pause where the reversal happens.
+
+Deferred because the one-motion-at-a-time contract is load-bearing for everything else the
+tick path guarantees, and because the lag is only perceptible in the case where somebody
+re-wakes inside the stow that followed their own last turn. Hardware is what should decide
+whether that reads badly.
+
+Done = an intent that changes the desired posture mid-move stops the move in flight and
+starts the reverse one from where the machine actually is, with the interruption tested
+against a scripted machine.
+
+See `TODO(presence-retarget)` at the transition site in
+`firmware/devices/reachy-motiond/src/motion.rs`.
+
+## `motiond-service` — the motion daemon is operator-run, not supervised
+
+`reachy-motiond` is started by hand over ssh and runs in the foreground, and its shutdown
+semantics assume that: `SIGTERM` and `SIGINT` mean an operator is standing there, so the
+daemon stows the head, verifies the nine positions against the stow pose, and releases
+torque. That is the only path in the daemon that takes torque off, and it is correct
+exactly while a human is the one sending the signal.
+
+Running it under a service manager breaks that assumption in both directions. A unit's
+`ExecStop` sends the same `SIGTERM` with nobody present, so the release would drop the
+head if the verify ever passed on a machine that was not really at stow; and a unit that
+starts at boot would arm torque on a machine nobody is looking at, which is a different
+decision again and not one the daemon should make by itself.
+
+Deferred because the supervised-operator posture is deliberate for the first hardware
+milestones: every run of this daemon so far is one somebody is watching, and the value of
+unattended operation is not yet worth deciding the auto-arm question.
+
+Done = the daemon distinguishes a supervised stop from an operator's signal, a unit file
+exists with an answer to whether boot may arm, and the answer is written down where the
+runbook can find it.
+
+See `TODO(motiond-service)` at `main` in
+`firmware/devices/reachy-motiond/src/main.rs`.
+
+## `motiond-dwell-typed-events` — the dwell filter reads rendered text, not events
+
+The motion daemon watches the machine in short dwells, and each dwell is a fresh run of
+the motion libraries whose per-run bookkeeping starts over: the timing report is printed
+again, a register that stopped answering is announced again. `DwellNarration` keeps that
+stream readable by dropping the timing report and collapsing a repeated line into one
+episode with a span — and it does both by recognising the *shape of the rendered text*,
+which the motion repository mints and this one only reads.
+
+The typed seam already exists one layer down: the pump's move and hold take a callback of
+its own event type, and it is the operator-tool session wrapper above that which flattens
+those events to strings. A variant of that wrapper handing the events through would let
+this daemon key on the event kind, and the two text-shape functions here would go away
+with the coupling.
+
+Until then the coupling is only half-guarded. The shapes whose rendering carries a count
+are pinned by a test that renders the real events, so a reformatting upstream fails this
+repository's suite. The timing report's two lines cannot be pinned that way — the
+functions that mint them are private to the motion crate — so a reformatting of those
+would silently restore about ten lines a second of unreadable timing output to the one
+terminal a supervised bring-up run has, with nothing failing anywhere.
+
+Deferred because the fix is a public API addition in the motion repository, whose surface
+for this feature was deliberately held to two changes. Whether to widen that surface is a
+decision to make deliberately rather than in passing.
+
+Done = the motion crate's session offers a hold that hands typed tick events to its
+caller, the daemon's dwell filter keys on the event kind, and `is_dwell_report` and
+`COUNTED` are gone.
+
+See `TODO(motiond-dwell-typed-events)` at `is_dwell_report` in
+`firmware/devices/reachy-motiond/src/motion.rs`.

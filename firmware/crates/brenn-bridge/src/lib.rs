@@ -48,16 +48,21 @@
 //! a sink of its own: every fact worth a line leaves as a
 //! [`BridgeEvent`](bridge::BridgeEvent) or as the
 //! [`BridgeOutcome`](bridge::BridgeOutcome) the run loop ends with, and the
-//! embedder renders it in whatever shape its own event stream takes.
+//! embedder emits it into whatever stream it keeps. [`render`] holds the field
+//! spelling for the facts that have one, so two embedders' captures describe an
+//! attachment with the same keys — offered, never called from here.
 
 pub mod bridge;
 pub mod config;
 pub mod exit;
+pub mod render;
 
 pub use bridge::{
     Bridge, BridgeEvent, BridgeGone, BridgeHandle, BridgeOutcome, Delivery, PublishError,
 };
-pub use config::{Config, ConfigError, ReconnectConfig, Token};
+pub use config::{
+    CHANNEL_PREFIX, Config, ConfigError, ReconnectConfig, Token, validate_channel_name,
+};
 
 // The upstream vocabulary this crate's own API is stated in, re-exported so an
 // embedder names it through the crate it is calling rather than reaching past

@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::barge::TurnLedger;
 use crate::jsonl::JsonlHandle;
+use crate::presence::{PresenceHandle, PresenceInput};
 use crate::server::{PlaybackRegistry, playback_try_play};
 
 /// Router-side counters, atomics-only with a `Copy` snapshot for `stage_health`
@@ -396,6 +397,10 @@ pub(crate) struct PlaybackFanout {
     pub(crate) feed: FeedFn,
     pub(crate) reserve: ReserveFn,
     pub(crate) ledger: Arc<TurnLedger>,
+    /// The head-presence tracker, when a presence channel is configured. It
+    /// wants the same lifecycle the ledger settles on: a pod that is speaking
+    /// is a pod mid-interaction.
+    pub(crate) presence: Option<PresenceHandle>,
     /// The pacer's lead, which is how long the floor stays open past the last
     /// write. See [`schedule_floor_close`].
     pub(crate) lead_ms: u64,
@@ -445,6 +450,19 @@ pub(crate) fn playback_event_adapter(
     })
 }
 
+/// Report a playback state change to the presence tracker. Tapped at the event
+/// rather than at the listener floor's `lead_ms` delay: the head's timings are
+/// seconds, so a second of pacer lead is noise, and a job that ends and is
+/// immediately followed by another simply re-opens.
+fn tell_presence(fanout: &PlaybackFanout, pod: &PodId, speaking: bool) {
+    if let Some(presence) = &fanout.presence {
+        presence.send(PresenceInput::Playback {
+            pod: pod.clone(),
+            speaking,
+        });
+    }
+}
+
 /// Drive the listener floor and the ledger from one playback event.
 ///
 /// The floor tells detection whether the pod is speaking, which is what gates the
@@ -457,6 +475,7 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout, 
         PlaybackEvent::Started {
             pod, interruptible, ..
         } => {
+            tell_presence(fanout, pod, true);
             cancel_floor_close(gens, pod);
             (fanout.feed)(
                 pod.clone(),
@@ -483,12 +502,14 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout, 
             // until the next reconnect and sustained room speech mints a wake-less
             // dispatch.
             fanout.ledger.settle_job(pod, *in_reply_to, !*writer_dying);
+            tell_presence(fanout, pod, false);
             schedule_floor_close(fanout, gens, pod);
         }
         PlaybackEvent::Aborted {
             pod, in_reply_to, ..
         } => {
             fanout.ledger.settle_job(pod, *in_reply_to, false);
+            tell_presence(fanout, pod, false);
             schedule_floor_close(fanout, gens, pod);
         }
         PlaybackEvent::Flushed {
@@ -502,6 +523,7 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout, 
                 // The barge already happened and the device has discarded its bank;
                 // nothing is audible, so the floor closes now rather than on the
                 // lead delay a natural ending needs.
+                tell_presence(fanout, pod, false);
                 cancel_floor_close(gens, pod);
                 close_floor(fanout, pod).await;
             }
@@ -1828,6 +1850,7 @@ mod tests {
             feed,
             reserve,
             ledger: Arc::new(TurnLedger::new()),
+            presence: None,
             lead_ms,
         }
     }
@@ -1939,6 +1962,7 @@ mod tests {
                 feed,
                 reserve,
                 ledger: Arc::clone(&ledger),
+                presence: None,
                 lead_ms,
             }),
         );
@@ -1949,6 +1973,108 @@ mod tests {
         drop(jsonl);
         join.await.unwrap();
         (rx, ledger)
+    }
+
+    /// Feed `events` through an adapter whose fanout has a presence tap, and
+    /// hand back everything that tap sent. The floor and the ledger are wired
+    /// as ever, so what reaches presence is what reaches it in production.
+    async fn presence_from_fanout(events: Vec<PlaybackEvent>) -> Vec<PresenceInput> {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
+            .await
+            .unwrap();
+        let (handle, mut inbox) = crate::presence::channel(jsonl.clone());
+        let (feed, reserve, _rx) = spy_feed();
+        let adapter = playback_event_adapter(
+            jsonl.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Some(PlaybackFanout {
+                feed,
+                reserve,
+                ledger: Arc::new(TurnLedger::new()),
+                presence: Some(handle.clone()),
+                lead_ms: 1,
+            }),
+        );
+        for e in events {
+            adapter(e).await;
+        }
+        drop(adapter);
+        drop(handle);
+        drop(jsonl);
+        join.await.unwrap();
+
+        let mut seen = Vec::new();
+        while let Some(input) = inbox.recv().await {
+            seen.push(input);
+        }
+        seen
+    }
+
+    /// The head is held up through a spoken answer by this tap and nothing
+    /// else, so every arm's polarity is load-bearing: a `Started` reporting
+    /// silence stows the head mid-answer, and a terminal event reporting speech
+    /// leaves it up until a ceiling forfeits a flag nothing ever cleared.
+    #[tokio::test]
+    async fn every_playback_arm_tells_the_head_which_way_the_floor_moved() {
+        let pod = PodId("pod-x".into());
+        let cases = [
+            (started_event(full_timings()), true),
+            (finished(1, true), false),
+            (finished_writer_dying(1), false),
+            (
+                PlaybackEvent::Aborted {
+                    pod: pod.clone(),
+                    in_reply_to: Some(UtteranceId(1)),
+                    reason: AbortReason::WriteError,
+                },
+                false,
+            ),
+            (
+                PlaybackEvent::Flushed {
+                    pod: pod.clone(),
+                    in_reply_to: Some(UtteranceId(1)),
+                    was_playing: true,
+                    frames_written: 4,
+                    progress: InterruptProgress {
+                        heard_ms: 80,
+                        total_ms: 900,
+                    },
+                },
+                false,
+            ),
+        ];
+        for (event, speaking) in cases {
+            let label = format!("{event:?}");
+            assert_eq!(
+                presence_from_fanout(vec![event]).await,
+                vec![PresenceInput::Playback {
+                    pod: pod.clone(),
+                    speaking,
+                }],
+                "{label}"
+            );
+        }
+    }
+
+    /// A queued job flushed behind the playing one was never audible. It has
+    /// nothing to say about whether the pod is speaking, and saying it anyway
+    /// would end an engagement the audible job is still holding.
+    #[tokio::test]
+    async fn an_evicted_job_says_nothing_to_the_head() {
+        let seen = presence_from_fanout(vec![PlaybackEvent::Flushed {
+            pod: PodId("pod-x".into()),
+            in_reply_to: Some(UtteranceId(1)),
+            was_playing: false,
+            frames_written: 0,
+            progress: InterruptProgress {
+                heard_ms: 0,
+                total_ms: 0,
+            },
+        }])
+        .await;
+
+        assert!(seen.is_empty(), "{seen:?}");
     }
 
     fn finished(utterance: u64, eoa_written: bool) -> PlaybackEvent {
@@ -2225,6 +2351,7 @@ mod tests {
                     feed,
                     reserve,
                     ledger: Arc::clone(&ledger),
+                    presence: None,
                     lead_ms: 1,
                 }),
             );

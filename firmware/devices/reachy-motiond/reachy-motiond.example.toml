@@ -1,0 +1,79 @@
+# reachy-motiond.example.toml — every key the daemon reads.
+#
+# Copy it, change the values that describe your unit and your bus, and push it to
+# the device with `make reachy-motiond-config`. Every key that has a default is
+# written here at that default, so deleting one changes nothing and the file
+# doubles as the documentation of what omitting it means.
+#
+# Five keys have no default and must be given: motion_config, pod and channel
+# below, and server_url and token_file in [bridge]. A daemon that guessed at any
+# of them would move a machine on somebody else's word, or reach a bus nobody
+# named. Everything else here — the two timings below, the whole
+# [bridge.reconnect] block — is written at its default.
+#
+# What is NOT here is the machine: the servo bus, the crank datum, the envelope,
+# the move durations and the tick rates all live in the bench configuration
+# named below, which is the same file the operator tool reads on this unit.
+
+# The bench configuration for this unit, and — beside it, under the name the
+# bench writes — the self-test record. The daemon runs the same two standing
+# gates the bench does before it opens anything: the configuration must resolve
+# to a crank datum a human wrote in, and the record must say a self-test passed.
+motion_config = "/var/lib/brenn-app/reachy-bench.toml"
+
+# The identity whose presence intents this daemon obeys. Bodies addressed to any
+# other pod are reported and dropped: the channel is not assumed to carry one
+# machine's traffic.
+pod = "reachy00"
+
+# The channel the intents arrive on. Both ends have to name the same one, and
+# the publisher's grant on the bus has to allow it.
+channel = "brenn:reachy.presence"
+
+# How long an engaged intent stays good for, from the moment it arrived, on this
+# daemon's own monotonic clock — nothing here compares clocks across hosts.
+# Sized to survive two missed refreshes at the publisher's five-second cadence,
+# so one dropped message and the reconnect after it do not stow a head in the
+# middle of a conversation. When it lapses the desired posture is stowed: every
+# way this can fail parks the head, which is the safe posture.
+lease_ttl_ms = 15000
+
+# How long the motion loop watches the machine between polls of the lease. This
+# is the whole reaction latency to an intent, and it is also the cadence at which
+# the machine is monitored for a fault. Must be less than lease_ttl_ms, or a
+# lease could be granted and lapse between two polls and the head would never
+# rise.
+hold_dwell_ms = 200
+
+# The bus attachment. The same table every binary here that attaches to the bus
+# writes, nested whole.
+[bridge]
+# The remote route, path included. The bridge appends nothing: which host it
+# reaches the reverse proxy on, and under which slug, is operator topology.
+server_url = "wss://brenn.example.net/remote/reachy-motiond/ws"
+# The bearer token, mode 0600 and owned by the account the daemon runs as — a
+# group- or world-readable token file is a startup refusal. `make
+# reachy-motiond-token` installs it that way.
+token_file = "/var/lib/brenn-app/motiond-token"
+# A free-form build identifier put on the handshake, for the server's logs;
+# never parsed by either end. Omitted here rather than written out: it defaults
+# to the bridge library's own name and version, and a literal copy of that here
+# would be a version number nothing updates.
+# ident = "reachy-motiond"
+
+# Reconnect and liveness timings, all at the bridge's defaults — sized for an
+# appliance on a home LAN.
+[bridge.reconnect]
+# Delay before the first attempt after a drop, jittered so a fleet restarting
+# together does not re-dial in lockstep, doubling up to the ceiling below.
+initial_backoff_ms = 500
+max_backoff_ms = 30000
+# How long one connect-plus-handshake may take before the attempt is abandoned.
+connect_timeout_ms = 15000
+# Multiples of the server's advertised heartbeat interval of inbound silence
+# that mark the attachment dead.
+liveness_multiplier = 3
+# How many consecutive futile attachments end the process — an attachment is
+# futile when this end sent something and the peer answered nothing before the
+# socket died. The daemon stows and exits with torque held when they run out.
+max_futile_attachments = 3

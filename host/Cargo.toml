@@ -1,11 +1,16 @@
 [workspace]
 members = ["crates/*"]
-# All three crates are default members: none carries a dependency worth excluding
+# Every crate here is a default member: none carries a dependency worth excluding
 # from the default `cargo build`/`cargo test` lane (unlike firmware/, whose device
-# crate and hil-host stay out of default-members). host/ is a second standalone
-# workspace beside firmware/, with no repo-root Cargo.toml joining them; the
-# cross-workspace edge points one way only (host consumes firmware/crates/audio-pipeline
-# by path; nothing in firmware/ ever depends into host/).
+# crate, hil-host, psk-link and brenn-bridge stay out of default-members).
+#
+# host/ is a second standalone workspace beside firmware/, with no repo-root
+# Cargo.toml joining them, and the cross-workspace edge points one way only:
+# host/ consumes firmware/crates/ by path (audio-pipeline, psk-link, pod-streamer,
+# brenn-bridge, pod-jsonl, pod-secrets); nothing in firmware/ ever depends into
+# host/. That direction is why a crate a device binary needs lives under
+# firmware/crates/ even when a host crate is its other consumer: the invariant
+# has no exceptions, so the shared crate moves rather than the arrow bending.
 resolver = "2"
 
 [workspace.package]

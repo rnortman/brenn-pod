@@ -23,11 +23,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use brenn_bridge::render::{attached_fields, detached_fields, gap_reason};
 use brenn_bridge::{
-    AttachmentFacts, BridgeEvent, BridgeHandle, BridgeOutcome, Delivery, DetachReason, GapInfo,
-    GapReason, PublishRequest, ResumePolicy, SubscriptionDepths, Urgency,
+    BridgeEvent, BridgeHandle, BridgeOutcome, Delivery, PublishRequest, ResumePolicy,
+    SubscriptionDepths, Urgency,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use speech_pipeline::brenn_brain::{HelpChannels, response_contract_help};
 use speech_pipeline::{BrennBrain, DeliverOutcome};
 use tokio::sync::mpsc;
@@ -431,43 +432,12 @@ async fn resubscribe_due(deadline: Option<Instant>) {
     }
 }
 
-fn attached_fields(facts: &AttachmentFacts) -> Value {
-    json!({
-        "participant_id": facts.participant_id,
-        "session_id": facts.session_id,
-        "version": facts.version,
-        "heartbeat_secs": facts.heartbeat_secs,
-        "max_body_bytes": facts.max_body_bytes,
-        "max_frame_bytes": facts.max_frame_bytes,
-        "alert_granted": facts.alert_granted,
-    })
-}
-
-fn detached_fields(reason: &DetachReason) -> Value {
-    match reason {
-        DetachReason::LivenessTimeout => json!({ "reason": "liveness_timeout" }),
-        // Peer-supplied text: rendered as text, never interpolated anywhere.
-        DetachReason::TransportClosed { code, reason } => json!({
-            "reason": "transport_closed",
-            "code": code,
-            "detail": reason,
-        }),
-    }
-}
-
-/// Why a subscription's replay was gapped. A staleness report, not an error.
-fn gap_reason(gap: &GapInfo) -> &'static str {
-    match gap.reason {
-        GapReason::EpochChanged => "epoch_changed",
-        GapReason::BeyondRetained => "beyond_retained",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
     use futures::channel::mpsc as futures_mpsc;
+    use serde_json::Value;
     use speech_pipeline::{
         AudioSpan, Brain, BrainLink, BrainStats, DoaTrack, EndpointCause, PodId, ResponseSink,
         RoomId, SpeakBody, SpeakCmd, StageTimings, Transcript, Utterance, UtteranceId,
@@ -477,6 +447,7 @@ mod tests {
     use crate::brenn::BridgeLink;
     use crate::brenn::scripted::{Attempt, Peer, WAIT, scripted};
     use crate::config::JsonlSink;
+    use crate::jsonl::probe::{expect_line, lines};
 
     const PUBLISH: &str = "brenn:pod.utterance";
     const RESPONSE: &str = "brenn:pod.speak";
@@ -595,35 +566,6 @@ mod tests {
                 .await
                 .expect("the driver stops when told to")
                 .expect("the driver task does not panic");
-        }
-    }
-
-    /// Every line written so far. The writer flushes per batch, so polling the
-    /// file needs no handle-dropping dance.
-    fn lines(path: &Path) -> Vec<Value> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("each line is JSON"))
-            .collect()
-    }
-
-    /// The first line naming `event`, waiting for it to be written.
-    async fn expect_line(path: &Path, event: &str) -> Value {
-        let deadline = std::time::Instant::now() + WAIT;
-        loop {
-            if let Some(line) = lines(path).into_iter().find(|line| line["event"] == event) {
-                return line;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no {event} line arrived; got {:?}",
-                lines(path)
-                    .iter()
-                    .map(|line| line["event"].clone())
-                    .collect::<Vec<_>>()
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 

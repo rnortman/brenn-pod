@@ -12,6 +12,7 @@ pub mod exit;
 pub mod jsonl;
 pub mod pipeline;
 pub mod playback_router;
+pub mod presence;
 pub mod prune;
 pub mod recorder;
 pub mod replay;
@@ -25,6 +26,10 @@ pub use config::{
     RecordConfig, RoomLookup, UNMAPPED_ROOM,
 };
 pub use jsonl::{JsonlHandle, emit_line, format_line};
+pub use presence::{
+    PRESENCE_QUEUE_DEPTH, PresenceHandle, PresenceInbox, PresenceInput, PresenceTiming,
+    PresenceTracker,
+};
 pub use prune::{PruneFailure, PruneHalt, PruneOutcome, PruneRequest, PruneTier, PrunedLog, prune};
 /// The link's TLS-PSK parameters, shared with the device clients.
 pub use psk_link as psk;

@@ -569,6 +569,17 @@ impl Server {
         // utterance).
         let turn_ledger = Arc::new(TurnLedger::new());
 
+        // The head-presence taps, on the one condition that also decides
+        // whether the task owning the queue's other end is spawned.
+        let presence_channel = presence_channel(&config).map(str::to_owned);
+        let (presence_handle, presence_inbox) = match &presence_channel {
+            Some(_) => {
+                let (handle, inbox) = crate::presence::channel(jsonl.clone());
+                (Some(handle), Some(inbox))
+            }
+            None => (None, None),
+        };
+
         // Turns each writer's `PlaybackEvent`s into JSONL lines, and fans the same
         // events out to the listener's playback floor and the ledger. Built once
         // and cloned into every connection's writer spawn; emitting from the writer
@@ -596,6 +607,7 @@ impl Server {
                     })
                 },
                 ledger: turn_ledger.clone(),
+                presence: presence_handle.clone(),
                 lead_ms: config.playback.lead_ms,
             }),
         );
@@ -726,8 +738,23 @@ impl Server {
         let bridge_fatal: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
         // The subscription plane holds subscriptions across attachments, so
         // no subscribe call is needed here.
+        //
+        // The presence tracker rides the same bridge and stops on the same
+        // teardown token: it publishes intents and subscribes to nothing, so it
+        // needs the handle and no part of the driver's loop.
+        let mut presence_join: Option<tokio::task::JoinHandle<()>> = None;
         let driver_join = match (brenn_parts, brenn_brain) {
             (Some(parts), Some(brain)) => {
+                if let (Some(inbox), Some(channel)) = (presence_inbox, presence_channel) {
+                    let tracker = crate::presence::PresenceTracker::new(
+                        parts.config,
+                        channel,
+                        parts.bridge.handle.clone(),
+                        inbox,
+                        jsonl.clone(),
+                    );
+                    presence_join = Some(tokio::spawn(tracker.run(bridge_teardown.clone())));
+                }
                 let driver = BridgeDriver::new(
                     parts.config,
                     parts.bridge.handle,
@@ -789,6 +816,7 @@ impl Server {
                         Arc::new(move |pod: &PodId| playback_flush(&reg, pod))
                     },
                 }),
+                presence: presence_handle.clone(),
             },
             jsonl.clone(),
         ));
@@ -1034,6 +1062,12 @@ impl Server {
         // has already exited, so the cancel is a no-op and the join returns
         // immediately.
         bridge_teardown.cancel();
+        // Before the driver's join, because the driver is what tells the bridge
+        // to shut down: a tracker still holding a publish open past that point
+        // would only earn itself a failure line.
+        if let Some(join) = presence_join {
+            handle_presence_exit(join.await, &jsonl);
+        }
         if !driver_joined && let Some(join) = driver_join {
             handle_driver_exit(join.await, &jsonl);
         }
@@ -1091,6 +1125,24 @@ fn listener_absent_reason(config: &Config) -> &'static str {
         (true, false) => "no endpointer table configured",
         (true, true) => "the configured wake mode builds no streaming listener",
     }
+}
+
+/// The channel head-presence intents are published on, or `None` when no
+/// tracker runs.
+///
+/// One derivation, read by both the site that mints the taps' queue and the
+/// site — a couple of hundred lines away, inside the bus-brain arm — that
+/// spawns the task owning its other end. Two derivations of the same condition
+/// can drift, and drift here is silent: a queue whose receiver was never
+/// spawned turns every tap into a `presence_input_dropped` line, for every wake
+/// and every playback event, for the life of the process. The brenn-mode
+/// condition is part of it because the tracker publishes over the bus brain's
+/// bridge, and nothing else builds one.
+fn presence_channel(config: &Config) -> Option<&str> {
+    if config.brain.as_ref().map(|brain| brain.mode) != Some(BrainMode::Brenn) {
+        return None;
+    }
+    config.brenn.as_ref()?.presence_channel.as_deref()
 }
 
 /// A weak accessor for the listener's [`FeedSender`], for the playback fanout hooks.
@@ -1558,6 +1610,22 @@ fn emit_driver_exited(jsonl: &JsonlHandle, reason: &str, detail: &str) {
 fn handle_driver_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
     if let Err(e) = result {
         emit_driver_exited(jsonl, driver_exit_reason(&e), &e.to_string());
+    }
+}
+
+/// Report a presence tracker that did not exit cleanly.
+///
+/// A dead tracker degrades to a head that never rises again — safe, because the
+/// consumer's lease lapses to stow — but the degradation is silent otherwise:
+/// the taps' `presence_input_dropped` lines are the only trace, and only if
+/// somebody interacts afterwards. Whoever is diagnosing a head that stopped
+/// answering needs the death named.
+fn handle_presence_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
+    if let Err(e) = result {
+        jsonl.emit(
+            "presence_tracker_exited",
+            &json!({ "reason": driver_exit_reason(&e), "detail": e.to_string() }),
+        );
     }
 }
 
@@ -3252,14 +3320,10 @@ mod tests {
         assert!(events_named(&lines, "brain_clip_loaded").is_empty());
     }
 
-    /// A `mode = "brenn"` config whose bridge points at `token` and at a closed
-    /// loopback port. The bus is never really there, which is all the wiring
-    /// tests need: what is under test is what the server builds and how it stops
-    /// it, not the transport. The stt/tts pair is not decoration — `mode =
-    /// "brenn"` requires it, and a fixture the daemon would reject is a fixture
-    /// that exercises an unreachable shape, so this one is validated here.
-    fn brenn_config_with_token(dir: &Path, token: &Path) -> Arc<Config> {
-        let text = format!(
+    /// A bus-brain configuration as text, with `extra` folded into the
+    /// `[brenn]` table before its nested `[brenn.bridge]` opens.
+    fn brenn_text(dir: &Path, token: &Path, extra: &str) -> String {
+        format!(
             "listen_addr = \"127.0.0.1:0\"\n\
              [record]\nenabled = false\ndir = {:?}\n\
              [brain]\nmode = \"brenn\"\n\
@@ -3273,12 +3337,24 @@ mod tests {
              response_timeout_ms = 5000\n\
              continuation_timeout_ms = 2000\n\
              failure_message = \"the bus is quiet\"\n\
+             {extra}\
              [brenn.bridge]\n\
              server_url = \"wss://127.0.0.1:1/ws\"\n\
              token_file = {:?}\n",
             dir.join("store").to_str().unwrap(),
             token.to_str().unwrap(),
-        );
+        )
+    }
+
+    /// A validated `mode = "brenn"` config whose bridge points at `token` and
+    /// at a closed loopback port. The bus is never really there, which is all
+    /// the wiring tests need: what is under test is what the server builds and
+    /// how it stops it, not the transport. The stt/tts pair is not decoration —
+    /// `mode = "brenn"` requires it, and a fixture the daemon would reject is a
+    /// fixture that exercises an unreachable shape, so this one is validated
+    /// here.
+    fn brenn_config_with_token(dir: &Path, token: &Path) -> Arc<Config> {
+        let text = brenn_text(dir, token, "");
         let config = test_config(&text).expect("config parses");
         config.validate().expect("the daemon would accept it");
         Arc::new(config)
@@ -3598,6 +3674,68 @@ mod tests {
             "detail names the panic: {:?}",
             exited[0]["detail"]
         );
+    }
+
+    #[tokio::test]
+    async fn handle_presence_exit_reports_a_dead_tracker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        // A tracker that stops on its teardown token returns cleanly and says
+        // nothing. One that died takes the head's only intent source with it,
+        // and the taps' drop lines are not a diagnosis.
+        handle_presence_exit(Ok(()), &handle);
+        let panicker = tokio::spawn(async { panic!("presence boom") });
+        handle_presence_exit(panicker.await, &handle);
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let exited = events_named(&lines, "presence_tracker_exited");
+        assert_eq!(exited.len(), 1);
+        assert_eq!(exited[0]["reason"], "panic");
+        assert!(
+            exited[0]["detail"].as_str().unwrap().contains("panic"),
+            "detail names the panic: {:?}",
+            exited[0]["detail"]
+        );
+    }
+
+    /// The taps' queue and the task that drains it are wired from this one
+    /// answer. A handle minted where no task is spawned makes every lifecycle
+    /// point a loud drop line for the life of the process, which is a console
+    /// flood and not a compile error.
+    #[test]
+    fn presence_is_wired_exactly_when_the_channel_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("bus.token");
+        crate::psk::write_secret_file(&token, "a-bearer-token\n").expect("write token");
+
+        let with = brenn_text(dir.path(), &token, "presence_channel = \"brenn:head\"\n");
+        let cfg = test_config(&with).expect("config parses");
+        cfg.validate().expect("the daemon would accept it");
+        assert_eq!(presence_channel(&cfg), Some("brenn:head"));
+
+        let without = brenn_text(dir.path(), &token, "");
+        let cfg = test_config(&without).expect("config parses");
+        cfg.validate().expect("the daemon would accept it");
+        assert_eq!(presence_channel(&cfg), None, "no channel, no tracker");
+    }
+
+    /// The other half of the same condition. The tracker publishes over the bus
+    /// brain's bridge and nothing else builds one, so a presence channel under
+    /// any other brain mode wires nothing — `Config::validate` refuses that
+    /// table, and this is what makes the two agree if it ever stops.
+    #[test]
+    fn presence_is_not_wired_without_the_bus_brain() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("bus.token");
+        crate::psk::write_secret_file(&token, "a-bearer-token\n").expect("write token");
+
+        let text = brenn_text(dir.path(), &token, "presence_channel = \"brenn:head\"\n")
+            .replace("mode = \"brenn\"", "mode = \"echo\"");
+        let cfg = test_config(&text).expect("config parses");
+        assert_eq!(presence_channel(&cfg), None);
     }
 
     #[tokio::test]

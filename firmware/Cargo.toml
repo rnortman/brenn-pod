@@ -1,12 +1,17 @@
 [workspace]
 members = [
+    "devices/reachy-motiond",
     "devices/reachy-pod",
     "devices/respeaker-pod",
     "crates/audio-pipeline",
+    "crates/brenn-bridge",
     "crates/device-protocol",
     "crates/build-id",
     "crates/hil-host",
+    "crates/pod-jsonl",
+    "crates/pod-secrets",
     "crates/pod-streamer",
+    "crates/presence-proto",
     "crates/pod-transport",
     "crates/podctl",
     "crates/psk-link",
@@ -25,7 +30,12 @@ members = [
 # reason (openssl, which needs libssl-dev); `make check-host` covers it via --workspace.
 # reachy-pod is out for the same reason too (rusb → libusb-1.0); it is a Linux binary
 # built for the Pi in a container, and its host-triple unit tests run under --workspace.
-default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/pod-streamer", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
+# brenn-bridge is out for the same reason again (native-tls → openssl); its own tests
+# and its consumers' run under --workspace. reachy-motiond is out because it is one of
+# those consumers, and because it is another Pi binary built in a container. pod-jsonl
+# and pod-secrets are in: they are small, pure-Rust, and everything else here can depend
+# on them freely.
+default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/presence-proto", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
 resolver = "2"
 
 [workspace.package]
@@ -38,6 +48,12 @@ license = "Apache-2.0"
 [workspace.dependencies]
 esp-idf-svc = { version = "0.52.1" }
 log = "0.4"
+
+# Uncomment these during development when needed to build against local brenn-reachy.
+# [patch."https://github.com/rnortman/brenn-reachy"]
+# reachy-bench = { path = "../../brenn-reachy/crates/reachy-bench" }
+# reachy-bus = { path = "../../brenn-reachy/crates/reachy-bus" }
+# reachy-motion = { path = "../../brenn-reachy/crates/reachy-motion" }
 
 [profile.release]
 opt-level = "s"
