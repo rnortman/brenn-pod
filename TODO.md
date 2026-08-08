@@ -433,6 +433,31 @@ that HEAD are consistent with that reading. Counter-evidence that must not be dr
 the original incident's 6 full host-workspace runs were also green. Suite contention is
 the leading hypothesis, not a confirmed trigger.
 
+Note (2026-08-08, wake-driven head presence): three gate rejections in one feature,
+two of them mute. Fact and inference kept distinct as above.
+
+*Fact.* During the head-presence work the pre-commit gate rejected three commits, all
+green on an immediate re-run of the same tree with nothing disabled and no
+`--no-verify`. The first (increment 4) named
+`barge_in_flushes_playback_and_chains_the_interrupted_turn` — this flake, in a crate
+that increment did not touch. The other two (increment 5; the pre-pass response in
+round 3) exited non-zero somewhere in the `host` workspace suite with **no failure
+line surviving in the captured output**, and in both cases the standalone `make`
+lane run immediately afterwards on the same tree was green end to end. Source:
+brenn-ops `docs/adr/2026/08/07-multi--wake-driven-head-presence/implementation-log.md`,
+increments 4 and 5 and the round-3 pre-pass response.
+
+*Inference (not established).* The two mute rejections are **unattributed**. This
+flake fails by naming its test, which the first rejection did and they did not, so
+they are not evidence of it; the gate lanes are unwrapped `cargo fmt/clippy/test`
+(`host/Makefile:21-24`, `firmware/Makefile:68-71`) and nothing in the repo swallows
+output, so the loss may equally be in how a long run was captured rather than in what
+ran. Recorded here because the evidence otherwise lives only in a workflow artifact,
+and because a gate that rejects without saying why is precisely the
+re-run-instead-of-read cost this entry predicted, now observed three times in one
+feature. It raises the priority of the stress campaign; it does not change what the
+campaign is.
+
 See `TODO(barge-in-flake)` at
 `barge_in_flushes_playback_and_chains_the_interrupted_turn` in
 `host/crates/speech-surface/tests/barge_integration.rs`.
@@ -487,35 +512,3 @@ runbook can find it.
 See `TODO(motiond-service)` at `main` in
 `firmware/devices/reachy-motiond/src/main.rs`.
 
-## `motiond-dwell-typed-events` — the dwell filter reads rendered text, not events
-
-The motion daemon watches the machine in short dwells, and each dwell is a fresh run of
-the motion libraries whose per-run bookkeeping starts over: the timing report is printed
-again, a register that stopped answering is announced again. `DwellNarration` keeps that
-stream readable by dropping the timing report and collapsing a repeated line into one
-episode with a span — and it does both by recognising the *shape of the rendered text*,
-which the motion repository mints and this one only reads.
-
-The typed seam already exists one layer down: the pump's move and hold take a callback of
-its own event type, and it is the operator-tool session wrapper above that which flattens
-those events to strings. A variant of that wrapper handing the events through would let
-this daemon key on the event kind, and the two text-shape functions here would go away
-with the coupling.
-
-Until then the coupling is only half-guarded. The shapes whose rendering carries a count
-are pinned by a test that renders the real events, so a reformatting upstream fails this
-repository's suite. The timing report's two lines cannot be pinned that way — the
-functions that mint them are private to the motion crate — so a reformatting of those
-would silently restore about ten lines a second of unreadable timing output to the one
-terminal a supervised bring-up run has, with nothing failing anywhere.
-
-Deferred because the fix is a public API addition in the motion repository, whose surface
-for this feature was deliberately held to two changes. Whether to widen that surface is a
-decision to make deliberately rather than in passing.
-
-Done = the motion crate's session offers a hold that hands typed tick events to its
-caller, the daemon's dwell filter keys on the event kind, and `is_dwell_report` and
-`COUNTED` are gone.
-
-See `TODO(motiond-dwell-typed-events)` at `is_dwell_report` in
-`firmware/devices/reachy-motiond/src/motion.rs`.

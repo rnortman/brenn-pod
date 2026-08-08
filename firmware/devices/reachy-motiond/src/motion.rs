@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use presence_proto::PresenceState;
 use reachy_bench::commands::{Session, neutral_targets, stow_pose_targets};
 use reachy_bench::config::{self, Resolved, arm_gates, record_path_beside};
-use reachy_bench::pump::{MonotonicClock, PumpError};
+use reachy_bench::pump::{MonotonicClock, PumpError, TickEvent};
 use reachy_bus::{BusPort, OpenError, SerialBusPort};
 use reachy_motion::JointTargets;
 use serde_json::json;
@@ -200,7 +200,11 @@ pub trait Head {
     ) -> Result<(), Refusal>;
 
     /// Watch the machine hold for `dwell`, commanding nothing.
-    fn hold(&mut self, dwell: Duration, line: &mut dyn FnMut(&str)) -> Result<(), Refusal>;
+    ///
+    /// Typed events rather than rendered lines: what a dwell is worth saying
+    /// about is this daemon's policy, and keying on the event kind is what
+    /// keeps that policy off the wording another repository chose.
+    fn hold(&mut self, dwell: Duration, event: &mut dyn FnMut(TickEvent)) -> Result<(), Refusal>;
 
     /// Verify the machine is at stow and release torque servo by servo.
     ///
@@ -254,8 +258,11 @@ impl<P: BusPort> Head for SessionHead<'_, P> {
         Ok(())
     }
 
-    fn hold(&mut self, dwell: Duration, line: &mut dyn FnMut(&str)) -> Result<(), Refusal> {
-        self.session.hold(dwell, &mut self.clock, line)?;
+    fn hold(&mut self, dwell: Duration, event: &mut dyn FnMut(TickEvent)) -> Result<(), Refusal> {
+        // The summary is dropped: a 200 ms window's period counts and jitter say
+        // nothing a reader or this loop can act on, and the conditions worth
+        // knowing about all arrive as events.
+        self.session.hold_events(dwell, &mut self.clock, event)?;
         Ok(())
     }
 
@@ -306,69 +313,73 @@ impl Outcome {
 
 /// What a dwell is allowed to put on the terminal.
 ///
-/// Each dwell call produces full per-run output — timing report, health sweep,
-/// every condition — starting fresh even when the previous call reported the
-/// same conditions. At five calls a second, that is a dozen lines of nothing,
-/// with the lines that matter buried in it — on the stream an operator reads
-/// while the head moves.
+/// Each dwell is a fresh run of the motion libraries, and their per-run
+/// bookkeeping starts over with it: a register that stopped answering is
+/// announced again, a loop running late is announced again. At five dwells a
+/// second that is a dozen lines of nothing, with the lines that matter buried in
+/// it — on the stream an operator reads while the head moves.
 ///
 /// So a dwell narrates news and nothing else:
 ///
-/// - the per-run timing report is dropped, because a 200 ms window's period
-///   counts and jitter say nothing a reader can act on. A *move* still narrates
-///   in full — it is rare, it is the interesting one, and its numbers are the
+/// - an event the previous dwell also produced is dropped, and the dwells it
+///   spans are counted. When something finally changes, the count is stated and
+///   the new event printed. A register failing for an hour is one episode with a
+///   span, not eighteen thousand identical lines.
+/// - the hold's disposition is dropped: a dwell holds, which is the one thing
+///   this loop already knows. A *move* still narrates in full, timing report
+///   included — it is rare, it is the interesting one, and its numbers are the
 ///   ones worth reading.
-/// - a line the previous dwell also produced is dropped, and the dwells it spans
-///   are counted. When something finally changes, the count is stated and the new
-///   line printed. A register failing for an hour is one episode with a span, not
-///   eighteen thousand identical lines.
 ///
 /// A dwell's news is held until the dwell ends, because whether the dwell
-/// continued a running episode is not known until every one of its lines is in:
+/// continued a running episode is not known until every one of its events is in:
 /// a dwell that repeats one condition *and* reports a new one has done both, and
-/// stating the span before the last line arrived would leave the repeat counted
+/// stating the span before the last event arrived would leave the repeat counted
 /// in no span at all.
 ///
-/// Recognition is by shape, and only the two report lines are recognised:
-/// anything unrecognised is printed. A filter that guesses wrong prints noise,
-/// which is recoverable; one that guessed by position would swallow a fault.
+/// Recognition is by event kind, through [`dedup_key`], and the wording is
+/// nobody's business here: what reaches the terminal is the event's own
+/// rendering, which the motion libraries own and this crate takes at build time.
 #[derive(Debug, Default)]
 pub struct DwellNarration {
-    /// The previous dwell's lines, as [`dedup_key`] compares them — the repeat
-    /// test. A set rather than a single last line, so two conditions reported
+    /// The previous dwell's events, as [`dedup_key`] compares them — the repeat
+    /// test. A set rather than a single last event, so two conditions reported
     /// together in either order are still recognised as the same pair.
     ///
-    /// A dwell whose lines are a strict subset of its predecessor's reads as
-    /// unchanged. That is sound only because a line stops appearing when its
+    /// A dwell whose events are a strict subset of its predecessor's reads as
+    /// unchanged. That is sound only because an event stops appearing when its
     /// condition stops being reported at all, which for the one-shot-per-change
-    /// lines means nothing changed — an invariant of the motion libraries' own
+    /// events means nothing changed — an invariant of the motion libraries' own
     /// per-run event semantics, not something enforced here.
-    prev: Vec<String>,
+    prev: Vec<TickEvent>,
     /// What this dwell has produced so far, in the same form.
-    current: Vec<String>,
-    /// This dwell's lines that the one before it did not produce, verbatim and
-    /// in order, waiting for the dwell to end.
-    news: Vec<String>,
-    /// Whether this dwell has repeated a line of the one before it.
+    current: Vec<TickEvent>,
+    /// This dwell's events that the one before it did not produce, whole and in
+    /// order, waiting for the dwell to end.
+    news: Vec<TickEvent>,
+    /// Whether this dwell has repeated an event of the one before it.
     repeated: bool,
-    /// Dwells that carried a line of the running episode, since it was stated.
+    /// Dwells that carried an event of the running episode, since it was stated.
     repeats: u64,
 }
 
 impl DwellNarration {
-    /// One line out of a dwell: dropped, or held for the end of the dwell.
-    pub fn observe(&mut self, text: &str) {
-        if is_dwell_report(text) {
+    /// One event out of a dwell: dropped, or held for the end of the dwell.
+    pub fn observe(&mut self, event: &TickEvent) {
+        if matches!(event, TickEvent::Command(_)) {
+            // The disposition of a dwell is the one thing this loop asked for
+            // and so the one thing that is never news.
             return;
         }
-        let key = dedup_key(text);
-        let repeat = self.prev.contains(&key);
+        let key = dedup_key(event);
+        // A fault is always said, even mid-episode: it also ends the dwell with
+        // a refusal into the park path, and the two lines belong together.
+        let repeat = !matches!(event, TickEvent::Faulted(_)) && self.prev.contains(&key);
         self.current.push(key);
         if repeat {
             self.repeated = true;
             return;
         }
-        self.news.push(text.to_owned());
+        self.news.push(*event);
     }
 
     /// The dwell is over: say what it said that was new, and rotate what it said
@@ -379,15 +390,15 @@ impl DwellNarration {
             // carried news of its own.
             self.repeats += 1;
         }
-        if !self.news.is_empty() {
-            self.close(out);
-            for text in std::mem::take(&mut self.news) {
-                out(&text);
+        if self.news.is_empty() {
+            if !self.repeated {
+                // Silence ends an episode as surely as a change does, and
+                // nothing is coming that would state its span.
+                self.close(out);
             }
-        } else if !self.repeated {
-            // Silence ends an episode as surely as a change does, and nothing is
-            // coming that would state its span.
+        } else {
             self.close(out);
+            self.say_news(out);
         }
         std::mem::swap(&mut self.prev, &mut self.current);
         self.current.clear();
@@ -399,19 +410,27 @@ impl DwellNarration {
     ///
     /// A move, an ending or a fault is about to print, and it must not print
     /// under a running episode's count. Forgets the repeat test too: the same
-    /// line after a move is news again, because the machine did something in
+    /// event after a move is news again, because the machine did something in
     /// between.
     pub fn flush(&mut self, out: &mut dyn FnMut(&str)) {
         // Span first, then anything a dwell interrupted mid-flight was holding:
         // that news is still this dwell's and belongs after the span of the
         // episode it ended.
         self.close(out);
-        for text in std::mem::take(&mut self.news) {
-            out(&text);
-        }
+        self.say_news(out);
         self.prev.clear();
         self.current.clear();
         self.repeated = false;
+    }
+
+    /// Print what this dwell had that was new, in the events' own words.
+    ///
+    /// The two-space indent is the framing every nested line of this daemon's
+    /// narration carries, the span line included.
+    fn say_news(&mut self, out: &mut dyn FnMut(&str)) {
+        for event in std::mem::take(&mut self.news) {
+            out(&format!("  {event}"));
+        }
     }
 
     /// State the span of a run of identical dwells, if there was one.
@@ -426,56 +445,39 @@ impl DwellNarration {
     }
 }
 
-/// Lines that carry a count of the occasion rather than of the condition, as a
-/// (leading, trailing) pair of the fixed text around the number.
-///
-/// One entry per motion-library line whose rendering embeds a per-run number:
-/// which period ran late and by how much, and how many periods or sweeps a loss
-/// lasted before it cleared.
-const COUNTED: [(&str, &str); 3] = [
-    ("period ", " ms late"),
-    ("position read back after ", " period(s)"),
-    ("health sweep back after ", " sweep(s)"),
-];
-
-/// The form of a line the repeat test compares.
+/// The form of an event the repeat test compares.
 ///
 /// A condition that persists is reported afresh by every dwell, and a dwell is a
-/// fresh run: the numbers in [`COUNTED`] are counted from the start of that run,
-/// so the same condition renders differently every time. Compared verbatim those
-/// lines never match, and the condition is announced five times a second forever
-/// — which is the one thing this filter exists to stop. The worst of them is the
-/// overrun line, and a loaded Pi is exactly where it fires.
+/// fresh run: the counters below are counted from the start of that run, so the
+/// same condition arrives carrying a different number every time. Compared whole
+/// those events never match, and the condition is announced five times a second
+/// forever — which is the one thing this filter exists to stop. The worst of them
+/// is the overrun, and a loaded Pi is exactly where it fires.
 ///
-/// So the count comes out of the key and nothing else does. Servo ids, error
-/// bits and the list of servos that fell short stay in it: those are what a
-/// *change* of condition looks like on the wire, and a key that elided them
-/// would collapse a change into the episode that preceded it — a swallowed
-/// fault, which is the failure this filter is not allowed to have.
-fn dedup_key(text: &str) -> String {
-    let body = text.trim_start();
-    for (head, tail) in COUNTED {
-        if body.len() > head.len() + tail.len() && body.starts_with(head) && body.ends_with(tail) {
-            return format!("{head}#{tail}");
-        }
+/// So the counts of the occasion come out of the key and nothing else does.
+/// Servo ids, error bits and the sets of servos that fell short stay in it: those
+/// are what a *change* of condition looks like, and a key that elided them would
+/// collapse a change into the episode that preceded it — a swallowed fault,
+/// which is the failure this filter is not allowed to have.
+///
+/// Matched variant by variant with no catch-all, so a variant added upstream
+/// fails this build at the next pin bump rather than being keyed by a rule
+/// nobody chose for it.
+fn dedup_key(event: &TickEvent) -> TickEvent {
+    match *event {
+        TickEvent::Overrun { .. } => TickEvent::Overrun {
+            tick: 0,
+            late: Duration::ZERO,
+        },
+        TickEvent::ReadRestored { .. } => TickEvent::ReadRestored { after: 0 },
+        TickEvent::HealthRestored { .. } => TickEvent::HealthRestored { after: 0 },
+        event @ (TickEvent::Command(_)
+        | TickEvent::ReadLost { .. }
+        | TickEvent::HealthLost { .. }
+        | TickEvent::Health(_)
+        | TickEvent::Completed
+        | TickEvent::Faulted(_)) => event,
     }
-    body.to_owned()
-}
-
-/// Whether a line is the motion libraries' per-run timing report.
-///
-/// The two lines that close every run: period counts with jitter, and worst lag
-/// per joint. Matched on the shape of each, so a line that is anything else —
-/// including a shape that changes upstream — reaches the reader.
-// TODO(motiond-dwell-typed-events): this and [`COUNTED`] mirror text minted in
-// another repository — `move_line` and `lag_line` in reachy-bench's `commands`
-// module, and the `Display` for its `TickEvent`. The shapes in `COUNTED` are
-// pinned by a test against the real renderings; these two are not, because the
-// functions that mint them are private. Take the typed events instead.
-fn is_dwell_report(text: &str) -> bool {
-    let text = text.trim_start();
-    text.starts_with("worst lag [")
-        || (text.contains(" period(s), ") && text.contains(" overrun(s), "))
 }
 
 /// Hold the machine at the posture the lease asks for until something stops it.
@@ -534,7 +536,7 @@ fn cycle<H: Head>(mut head: H, shared: &Shared, dwell: Duration, sink: &dyn Sink
             continue;
         }
 
-        let held = head.hold(dwell, &mut |text| dwells.observe(text));
+        let held = head.hold(dwell, &mut |event| dwells.observe(&event));
         dwells.end_dwell(&mut line);
         if let Err(refusal) = held {
             dwells.flush(&mut line);
@@ -684,7 +686,9 @@ mod tests {
     use std::sync::Arc;
 
     use presence_proto::PresenceBody;
-    use reachy_bench::pump::TickEvent;
+    use reachy_bench::pump::ReadFailures;
+    use reachy_bus::IdOutcome;
+    use reachy_motion::{CommandDisposition, Fault, JointId, ServoHealth};
 
     use super::*;
     use crate::report::Collect;
@@ -731,11 +735,12 @@ mod tests {
         /// Whether the release refuses.
         refuse_release: bool,
         moves: usize,
-        /// What the machine narrates on each dwell, one entry per dwell. A dwell
-        /// past the end of the script narrates nothing.
-        says: VecDeque<Vec<&'static str>>,
-        /// The same for each move, one entry per move counted from the opening
-        /// stow.
+        /// What the machine reports on each dwell, one entry per dwell. A dwell
+        /// past the end of the script reports nothing.
+        says: VecDeque<Vec<TickEvent>>,
+        /// What it narrates on each move, one entry per move counted from the
+        /// opening stow. Text, because a move still narrates through the motion
+        /// libraries' own rendering.
         says_moving: VecDeque<Vec<&'static str>>,
     }
 
@@ -753,8 +758,8 @@ mod tests {
             }
         }
 
-        /// What the motion libraries narrate, dwell by dwell.
-        fn saying(mut self, script: impl IntoIterator<Item = Vec<&'static str>>) -> Self {
+        /// What the motion libraries report, dwell by dwell.
+        fn saying(mut self, script: impl IntoIterator<Item = Vec<TickEvent>>) -> Self {
             self.says = script.into_iter().collect();
             self
         }
@@ -838,10 +843,14 @@ mod tests {
             Ok(())
         }
 
-        fn hold(&mut self, _dwell: Duration, line: &mut dyn FnMut(&str)) -> Result<(), Refusal> {
+        fn hold(
+            &mut self,
+            _dwell: Duration,
+            event: &mut dyn FnMut(TickEvent),
+        ) -> Result<(), Refusal> {
             self.record(Act::Hold);
-            for text in self.says.pop_front().unwrap_or_default() {
-                line(text);
+            for reported in self.says.pop_front().unwrap_or_default() {
+                event(reported);
             }
             match self.advance() {
                 Some(Event::Refuse) => {
@@ -1280,25 +1289,66 @@ mod tests {
         assert_eq!(fields["detail"], json!("servo 21 answered nothing"));
     }
 
-    /// The two lines the motion libraries close every run with. Verbatim in
-    /// shape, because what the filter recognises is the shape.
+    /// The two lines the motion libraries close a *move* with. Only a move
+    /// narrates as text, so this is a fixture for `says_moving` alone.
     const REPORT: [&str; 2] = [
         "  40 period(s), 1 commanding, 9 frame(s), 0 blind, 0 overrun(s), \
          worst jitter 1.2 ms, 0.20 s",
         "  worst lag [0.010, 0.011, 0.009, 0.012, 0.008, 0.010, 0.011, 0.009, 0.010] deg",
     ];
 
-    const LOST: &str = "  health sweep lost: 13";
-    const SWEEP: &str = "  health 11:0x00 12:0x00 13:0x00";
+    /// The health sweep failing. The set of servos is empty because what this
+    /// fixture is for is the kind of the event and its sameness across dwells.
+    fn lost() -> TickEvent {
+        TickEvent::HealthLost {
+            failed: ReadFailures::default(),
+        }
+    }
+
+    /// The health sweep failing with `id` the servo that kept it from
+    /// completing. Which servos fell short is part of the condition, so two of
+    /// these naming different servos are two conditions.
+    fn lost_on(id: u8) -> TickEvent {
+        TickEvent::HealthLost {
+            failed: ReadFailures::from_verdicts(&[(id, IdOutcome::Timeout)], 0),
+        }
+    }
+
+    /// The position read failing — a different condition from [`lost`], so a
+    /// dwell reporting both reports two things.
+    fn read_lost() -> TickEvent {
+        TickEvent::ReadLost {
+            failed: ReadFailures::default(),
+        }
+    }
+
+    /// A health sweep of nine servos, `bits` latched on the second of them.
+    fn sweep(bits: u8) -> TickEvent {
+        let mut servos = [ServoHealth::default(); JointId::COUNT];
+        for (index, servo) in servos.iter_mut().enumerate() {
+            servo.id = 11 + u8::try_from(index).expect("nine servos fit in a byte");
+        }
+        if let Some(servo) = servos.get_mut(1) {
+            servo.bits = bits;
+        }
+        TickEvent::Health(servos)
+    }
+
+    /// What the daemon puts on the terminal for `event`: the event's own words,
+    /// in the frame every nested narration line carries. Asserted against
+    /// rather than spelled out, so no upstream wording is pinned in this repo.
+    fn rendered(event: TickEvent) -> String {
+        format!("  {event}")
+    }
 
     /// Feed the filter a script, one entry per dwell, and hand back what got
     /// past it. The closing flush is the one a move or an ending would do.
-    fn through(script: impl IntoIterator<Item = Vec<&'static str>>) -> Vec<String> {
+    fn through(script: impl IntoIterator<Item = Vec<TickEvent>>) -> Vec<String> {
         let mut said = Vec::new();
         let mut narration = DwellNarration::default();
         for dwell in script {
-            for text in dwell {
-                narration.observe(text);
+            for event in dwell {
+                narration.observe(&event);
             }
             narration.end_dwell(&mut |line| said.push(line.to_owned()));
         }
@@ -1306,104 +1356,178 @@ mod tests {
         said
     }
 
-    /// The per-run timing report is written for a supervised one-shot command.
-    /// Five of them a second is the bulk of what an operator would see and none
-    /// of it is actionable, so a dwell never carries it.
+    /// The disposition of a dwell is that it is holding — the one thing the
+    /// loop asked for, and the only event every dwell is guaranteed to carry.
+    /// Five of those a second is the bulk of what an operator would see and
+    /// none of it is news.
     #[test]
-    fn a_dwell_never_narrates_the_per_run_timing_report() {
-        let said = through([REPORT.to_vec(), REPORT.to_vec(), REPORT.to_vec()]);
+    fn a_dwell_never_narrates_the_disposition_it_asked_for() {
+        let held = TickEvent::Command(CommandDisposition::Held);
+        let said = through([vec![held], vec![held], vec![held]]);
 
         assert!(said.is_empty(), "a quiet dwell said: {said:?}");
     }
 
-    /// The filter recognises the two report lines and nothing else: an
-    /// unrecognised line is printed. Guessing wrong must cost noise, never a
-    /// swallowed fault.
+    /// News is printed in the event's own words. The wording belongs to the
+    /// motion libraries and reaches this daemon at build time, so the assertion
+    /// renders the event rather than spelling its text out here.
     #[test]
-    fn a_line_the_filter_does_not_recognise_is_narrated() {
-        let said = through([vec!["  faulted: envelope on path at leg 2"]]);
+    fn news_is_printed_in_the_events_own_words() {
+        let event = TickEvent::ReadRestored { after: 7 };
+        let said = through([vec![event]]);
 
-        assert_eq!(said, ["  faulted: envelope on path at leg 2"]);
+        assert_eq!(said, [rendered(event)]);
+        assert!(
+            !event.to_string().is_empty(),
+            "an event that says nothing would make the line above the frame alone"
+        );
+    }
+
+    /// A condition that clears twice inside one dwell cleared twice, and both
+    /// are said. The two key alike — the count of the occasion comes out of the
+    /// key — but the repeat test is against the dwell before, not against the
+    /// dwell in hand: a bus dropping and coming back twice in 200 ms is a
+    /// flapping bus, and a terminal that said it once would be describing a
+    /// quieter machine than the one in front of the operator.
+    #[test]
+    fn a_condition_clearing_twice_within_one_dwell_is_said_twice() {
+        let first = TickEvent::ReadRestored { after: 1 };
+        let again = TickEvent::ReadRestored { after: 3 };
+        let said = through([vec![first, again]]);
+
+        assert_eq!(said, [rendered(first), rendered(again)]);
+    }
+
+    /// The servos that fell short are the condition, not the occasion: a sweep
+    /// that starts failing on a different servo is a different failure, and
+    /// absorbing it into the running episode would be the swallowed fault this
+    /// filter is not allowed to have.
+    #[test]
+    fn a_changed_set_of_failed_servos_is_not_absorbed_into_the_episode() {
+        let said = through([vec![lost_on(11)], vec![lost_on(11)], vec![lost_on(13)]]);
+
+        assert_eq!(
+            said,
+            [
+                rendered(lost_on(11)),
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
+                rendered(lost_on(13)),
+            ]
+        );
+    }
+
+    /// A fault is never absorbed into a running episode, whatever else the
+    /// dwell repeated. It is defence in depth — a faulted hold also refuses
+    /// into the park path — and the one event this filter must not be clever
+    /// about.
+    #[test]
+    fn a_fault_is_printed_even_in_the_middle_of_an_episode() {
+        let faulted = TickEvent::Faulted(Fault::ReadLoss { misses: 12 });
+        let said = through([
+            vec![lost()],
+            vec![lost()],
+            vec![lost(), faulted],
+            vec![lost(), faulted],
+        ]);
+
+        assert_eq!(
+            said,
+            [
+                rendered(lost()),
+                "  ... unchanged across 2 further dwell(s)".to_owned(),
+                rendered(faulted),
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
+                // Said again: the dwell before it said the very same thing, and
+                // a fault is the one event never absorbed into an episode.
+                rendered(faulted),
+            ]
+        );
     }
 
     /// The heart of it: a register that stops answering is announced on the
     /// dwell that first saw it and not again, and the span it lasted is stated
     /// when it clears. One episode, not one line per dwell.
     #[test]
-    fn a_repeated_dwell_line_is_one_episode_with_its_span() {
-        let restored = "  health sweep back after 4 sweep(s)";
+    fn a_repeated_dwell_event_is_one_episode_with_its_span() {
+        let restored = TickEvent::HealthRestored { after: 4 };
         let said = through([
-            vec![LOST],
-            vec![LOST],
-            vec![LOST],
-            vec![LOST],
-            vec![restored, SWEEP],
-            vec![SWEEP],
+            vec![lost()],
+            vec![lost()],
+            vec![lost()],
+            vec![lost()],
+            vec![restored, sweep(0)],
+            vec![sweep(0)],
         ]);
 
         assert_eq!(
             said,
             [
-                LOST,
-                "  ... unchanged across 3 further dwell(s)",
-                restored,
-                SWEEP,
-                "  ... unchanged across 1 further dwell(s)",
+                rendered(lost()),
+                "  ... unchanged across 3 further dwell(s)".to_owned(),
+                rendered(restored),
+                rendered(sweep(0)),
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
             ]
         );
     }
 
     /// A loop running late says so once per dwell, and says it with a different
-    /// period number and a different lateness every time. Compared verbatim
-    /// those never repeat, so sustained scheduling pressure — the state this Pi
-    /// is in when it is sharing itself with the audio pipeline, and the state an
+    /// period number and a different lateness every time. Compared whole those
+    /// never repeat, so sustained scheduling pressure — the state this Pi is in
+    /// when it is sharing itself with the audio pipeline, and the state an
     /// operator most needs a readable terminal for — would bury everything else
     /// under one line per dwell. It is one episode.
     #[test]
     fn an_overrun_reported_afresh_every_dwell_is_one_episode() {
+        let late = |tick, micros| TickEvent::Overrun {
+            tick,
+            late: Duration::from_micros(micros),
+        };
         let said = through([
-            vec!["  period 3 began 1.4 ms late"],
-            vec!["  period 7 began 2.9 ms late"],
-            vec!["  period 1 began 11.0 ms late"],
+            vec![late(3, 1_400)],
+            vec![late(7, 2_900)],
+            vec![late(1, 11_000)],
         ]);
 
         assert_eq!(
             said,
             [
-                "  period 3 began 1.4 ms late",
-                "  ... unchanged across 2 further dwell(s)",
+                rendered(late(3, 1_400)),
+                "  ... unchanged across 2 further dwell(s)".to_owned(),
             ]
         );
     }
 
-    /// The counts elided from the key are counts of the occasion. What a line
-    /// says about the *machine* — which servo, which bits — stays in it, so a
-    /// changed reading is news even though its shape did not change.
+    /// The counters elided from the key are counts of the occasion. What an
+    /// event says about the *machine* — which servo, which bits — stays in it,
+    /// so a changed reading is news even though its kind did not change.
     #[test]
     fn a_changed_reading_is_not_folded_into_the_episode_before_it() {
-        let clean = "  health 11:0x00 12:0x00 13:0x00";
-        let latched = "  health 11:0x00 12:0x20 13:0x00";
-        let said = through([vec![clean], vec![clean], vec![latched]]);
+        let latched = 0x20;
+        let said = through([vec![sweep(0)], vec![sweep(0)], vec![sweep(latched)]]);
 
         assert_eq!(
             said,
-            [clean, "  ... unchanged across 1 further dwell(s)", latched,]
+            [
+                rendered(sweep(0)),
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
+                rendered(sweep(latched)),
+            ]
         );
     }
 
-    /// The shapes [`COUNTED`] mirrors are minted in another repository. Pin them
-    /// against the real renderings rather than against a copy of them: a
-    /// reformatting upstream then fails here instead of quietly restoring the
-    /// spam this filter exists to stop.
+    /// The three events whose payload counts the occasion rather than the
+    /// condition, keyed alike across occasions and apart from each other. The
+    /// pairs are built from the library's own type, so a variant that grew a
+    /// counter fails to compile here rather than announcing itself five times a
+    /// second.
     #[test]
-    fn the_counted_shapes_are_the_ones_the_motion_libraries_render() {
-        // Two-space indent mirrors the production framing.
-        let rendered = |event: TickEvent| format!("  {event}");
+    fn the_counters_of_the_occasion_are_the_only_thing_the_key_drops() {
         let pairs = [
             (
                 TickEvent::Overrun {
                     tick: 3,
-                    late: Duration::from_micros(1400),
+                    late: Duration::from_micros(1_400),
                 },
                 TickEvent::Overrun {
                     tick: 91,
@@ -1421,18 +1545,21 @@ mod tests {
         ];
 
         for (one, other) in pairs {
-            let (one, other) = (rendered(one), rendered(other));
-            assert_ne!(one, other, "the fixture pair renders the same text");
+            assert_ne!(one, other, "the fixture pair is the same event twice");
             assert_eq!(
                 dedup_key(&one),
                 dedup_key(&other),
                 "two occasions of one condition key differently: {one:?} / {other:?}"
             );
-            assert_ne!(
-                dedup_key(&one),
-                one.trim_start(),
-                "no shape in COUNTED matches {one:?}"
-            );
+        }
+        for (index, (one, _)) in pairs.iter().enumerate() {
+            for (other, _) in pairs.iter().skip(index + 1) {
+                assert_ne!(
+                    dedup_key(one),
+                    dedup_key(other),
+                    "two conditions share a key: {one:?} / {other:?}"
+                );
+            }
         }
     }
 
@@ -1441,12 +1568,19 @@ mod tests {
     /// the sequence it said it in.
     #[test]
     fn the_repeat_test_does_not_depend_on_the_order_within_a_dwell() {
-        let read = "  position read lost: 21";
-        let said = through([vec![LOST, read], vec![read, LOST], vec![LOST, read]]);
+        let said = through([
+            vec![lost(), read_lost()],
+            vec![read_lost(), lost()],
+            vec![lost(), read_lost()],
+        ]);
 
         assert_eq!(
             said,
-            [LOST, read, "  ... unchanged across 2 further dwell(s)"]
+            [
+                rendered(lost()),
+                rendered(read_lost()),
+                "  ... unchanged across 2 further dwell(s)".to_owned(),
+            ]
         );
     }
 
@@ -1456,65 +1590,65 @@ mod tests {
     /// every dwell that also had something to say.
     #[test]
     fn a_dwell_that_repeats_and_reports_at_once_is_counted_in_the_span() {
-        let read = "  position read lost: 21";
-        let said = through([vec![LOST], vec![LOST, read], vec![LOST, read]]);
+        let said = through([
+            vec![lost()],
+            vec![lost(), read_lost()],
+            vec![lost(), read_lost()],
+        ]);
 
         assert_eq!(
             said,
             [
-                LOST,
-                // The dwell that produced `read` still carried LOST, so it is
-                // inside the episode LOST opened.
-                "  ... unchanged across 1 further dwell(s)",
-                read,
-                "  ... unchanged across 1 further dwell(s)",
+                rendered(lost()),
+                // The dwell that produced the read loss still carried the health
+                // loss, so it is inside the episode the health loss opened.
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
+                rendered(read_lost()),
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
             ]
         );
     }
 
     /// A dwell that reports less than the one before it reads as unchanged, and
-    /// that is deliberate: a line stops appearing when its condition stops being
-    /// reported at all, which for the one-shot-per-change lines means nothing
-    /// changed. Comparing the two dwells as sets instead would open a fresh
-    /// episode every time a sporadic line failed to recur.
+    /// that is deliberate: an event stops appearing when its condition stops
+    /// being reported at all, which for the one-shot-per-change events means
+    /// nothing changed. Comparing the two dwells as sets instead would open a
+    /// fresh episode every time a sporadic event failed to recur.
     #[test]
     fn a_dwell_that_reports_less_than_the_one_before_is_still_unchanged() {
-        let read = "  position read lost: 21";
-        let said = through([vec![LOST, read], vec![LOST, read], vec![LOST], vec![LOST]]);
-
-        assert_eq!(
-            said,
-            [LOST, read, "  ... unchanged across 3 further dwell(s)"]
-        );
-    }
-
-    /// `period(s)` appears in the per-run timing report and in the announcement
-    /// that the position read came back, and the two mean opposite things by it.
-    /// Only the report is dropped: a bus that went blind and recovered is a
-    /// fault-adjacent signal on the one terminal a supervised run has.
-    #[test]
-    fn a_read_that_came_back_is_not_taken_for_a_timing_report() {
-        let lost = "  position read lost: 21";
-        let restored = "  position read back after 40 period(s)";
-        let said = through([vec![lost], vec![restored]]);
-
-        assert_eq!(said, [lost, restored]);
-    }
-
-    /// A dwell that goes quiet ends the episode there and then: nothing else is
-    /// coming that would state its span.
-    #[test]
-    fn silence_closes_a_running_episode() {
-        let said = through([vec![LOST], vec![LOST], REPORT.to_vec(), vec![LOST]]);
+        let said = through([
+            vec![lost(), read_lost()],
+            vec![lost(), read_lost()],
+            vec![lost()],
+            vec![lost()],
+        ]);
 
         assert_eq!(
             said,
             [
-                LOST,
-                "  ... unchanged across 1 further dwell(s)",
+                rendered(lost()),
+                rendered(read_lost()),
+                "  ... unchanged across 3 further dwell(s)".to_owned(),
+            ]
+        );
+    }
+
+    /// A dwell that goes quiet ends the episode there and then: nothing else is
+    /// coming that would state its span. A dwell carrying only the disposition
+    /// it was asked for is exactly that quiet dwell.
+    #[test]
+    fn silence_closes_a_running_episode() {
+        let held = TickEvent::Command(CommandDisposition::Held);
+        let said = through([vec![lost()], vec![lost()], vec![held], vec![lost()]]);
+
+        assert_eq!(
+            said,
+            [
+                rendered(lost()),
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
                 // Said again, because the dwell in between said nothing at all:
                 // this is a fresh episode, not the same one continuing.
-                LOST,
+                rendered(lost()),
             ]
         );
     }
@@ -1527,34 +1661,42 @@ mod tests {
         let mut narration = DwellNarration::default();
         let mut push = |line: &str| said.push(line.to_owned());
 
-        narration.observe(LOST);
+        narration.observe(&lost());
         narration.end_dwell(&mut push);
-        narration.observe(LOST);
+        narration.observe(&lost());
         narration.end_dwell(&mut push);
         narration.flush(&mut push);
-        narration.observe(LOST);
+        narration.observe(&lost());
         narration.end_dwell(&mut push);
 
         assert_eq!(
             said,
-            [LOST, "  ... unchanged across 1 further dwell(s)", LOST]
+            [
+                rendered(lost()),
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
+                rendered(lost()),
+            ]
         );
     }
 
-    /// A move narrates in full. Its two-line timing report is the same shape a
-    /// dwell's is dropped for, and it is dropped there precisely because a move
-    /// is where those numbers mean something: the period counts, the jitter and
-    /// the per-joint lag are what the durations and the tracking threshold are
-    /// judged against on a supervised run.
+    /// A move narrates in full, timing report and all: it is rare, and the
+    /// period counts, the jitter and the per-joint lag are what the durations
+    /// and the tracking threshold are judged against on a supervised run. A
+    /// dwell is never handed those numbers at all — it takes typed events, and
+    /// the report is not one of them.
     #[test]
-    fn a_move_narrates_what_a_dwell_would_have_had_dropped() {
+    fn a_move_narrates_its_full_report() {
         let shared = Arc::new(Shared::new(POD));
         let head = Fake::new(&shared, [Event::Engage, Event::Stop(Stop::Operator)])
             // The opening stow says nothing; the move up says what every move
             // says at the end of its run.
             .saying_moving([vec![], REPORT.to_vec()])
-            // And the dwell after it says the very same two lines.
-            .saying([vec![], REPORT.to_vec()]);
+            // Every dwell reports the disposition it was asked for, and nothing
+            // else — the one thing a dwell always carries.
+            .saying([
+                vec![TickEvent::Command(CommandDisposition::Held)],
+                vec![TickEvent::Command(CommandDisposition::Held)],
+            ]);
 
         let (outcome, _, sink) = driven(&shared, head);
 
@@ -1564,9 +1706,13 @@ mod tests {
             assert_eq!(
                 said.iter().filter(|line| *line == report).count(),
                 1,
-                "the move's report is the only one that reaches the terminal: {said:?}"
+                "the move's report reaches the terminal exactly once: {said:?}"
             );
         }
+        assert!(
+            !said.contains(&rendered(TickEvent::Command(CommandDisposition::Held))),
+            "a dwell narrated the disposition it asked for: {said:?}"
+        );
     }
 
     /// The flush on the way into a move is load-bearing twice over: the span of
@@ -1580,7 +1726,7 @@ mod tests {
             &shared,
             [Event::Idle, Event::Engage, Event::Stop(Stop::Operator)],
         )
-        .saying([vec![LOST], vec![LOST], vec![LOST]]);
+        .saying([vec![lost()], vec![lost()], vec![lost()]]);
 
         let (outcome, _, sink) = driven(&shared, head);
 
@@ -1588,13 +1734,13 @@ mod tests {
         assert_eq!(
             sink.said().lines,
             [
-                "stow: the posture this daemon rests in, torque on",
-                LOST,
-                "  ... unchanged across 1 further dwell(s)",
-                "presence: stow -> up",
-                LOST,
-                "stopping on an operator's signal",
-                "released: torque is off and the machine is at rest",
+                "stow: the posture this daemon rests in, torque on".to_owned(),
+                rendered(lost()),
+                "  ... unchanged across 1 further dwell(s)".to_owned(),
+                "presence: stow -> up".to_owned(),
+                rendered(lost()),
+                "stopping on an operator's signal".to_owned(),
+                "released: torque is off and the machine is at rest".to_owned(),
             ]
         );
     }
@@ -1607,9 +1753,9 @@ mod tests {
     fn a_fault_states_the_span_of_the_episode_it_interrupts() {
         let shared = Arc::new(Shared::new(POD));
         let head = Fake::new(&shared, [Event::Idle, Event::Idle, Event::Refuse]).saying([
-            vec![LOST],
-            vec![LOST],
-            vec![LOST],
+            vec![lost()],
+            vec![lost()],
+            vec![lost()],
         ]);
 
         let (outcome, _, sink) = driven(&shared, head);
@@ -1635,6 +1781,7 @@ mod tests {
     #[test]
     fn a_health_register_failing_across_dwells_logs_one_episode() {
         let shared = Arc::new(Shared::new(POD));
+        let held = TickEvent::Command(CommandDisposition::Held);
         let head = Fake::new(
             &shared,
             [
@@ -1645,10 +1792,10 @@ mod tests {
             ],
         )
         .saying([
-            vec![SWEEP, REPORT[0], REPORT[1]],
-            vec![LOST, REPORT[0], REPORT[1]],
-            vec![LOST, REPORT[0], REPORT[1]],
-            vec![LOST, REPORT[0], REPORT[1]],
+            vec![held, sweep(0)],
+            vec![held, lost()],
+            vec![held, lost()],
+            vec![held, lost()],
         ]);
 
         let (outcome, _, sink) = driven(&shared, head);
@@ -1656,13 +1803,15 @@ mod tests {
         assert_eq!(outcome, Outcome::Released);
         let said = sink.said().lines;
         assert_eq!(
-            said.iter().filter(|line| *line == LOST).count(),
+            said.iter()
+                .filter(|line| **line == rendered(lost()))
+                .count(),
             1,
             "one episode, not one line per dwell: {said:?}"
         );
         assert!(
-            !said.iter().any(|line| line.contains("period(s), ")),
-            "a dwell's timing report reached the terminal: {said:?}"
+            !said.contains(&rendered(TickEvent::Command(CommandDisposition::Held))),
+            "a dwell's disposition reached the terminal: {said:?}"
         );
         assert!(
             said.iter()

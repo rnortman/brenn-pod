@@ -22,16 +22,16 @@ license.workspace = true
 # neutral and stow postures. A git dependency because the dependency arrow runs
 # this way and never the reverse — the motion crates know nothing of a bus, a pod
 # identity or a presence channel.
-reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "4df68af91df5602e2504176118c6373b9914d616" }
+reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "fe6745d127b3cace49df42c1ebb861d59de2aa96" }
 # The serial port and the typed refusal when something else already holds it.
 # Named directly because opening the port and classifying that refusal is the
 # daemon's; everything after the open goes through the session.
-reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "4df68af91df5602e2504176118c6373b9914d616" }
+reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "fe6745d127b3cace49df42c1ebb861d59de2aa96" }
 # The joint-target type the two postures are expressed in. Named so the
 # posture-to-pose mapping can be a function of this daemon's own, with the type in
 # its signature, instead of living inside a trait implementation that needs a
 # servo bus to reach.
-reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "4df68af91df5602e2504176118c6373b9914d616" }
+reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "fe6745d127b3cace49df42c1ebb861d59de2aa96" }
 # The presence vocabulary and the lease reducer, shared with the publisher on the
 # speech host so neither end carries protocol logic of its own.
 presence-proto = { path = "../../crates/presence-proto" }

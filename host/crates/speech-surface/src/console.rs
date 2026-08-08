@@ -47,8 +47,10 @@ const CONSOLE_INFO: &[&str] = &[
     "brenn_subscribed",
     "brenn_help_published",
     // The head going up and coming down. One line per transition, never per
-    // lease refresh.
+    // lease refresh. `presence_absent` is its startup sibling: a bus-brain pod
+    // whose head will never move, said once at startup.
     "presence",
+    "presence_absent",
     // The listener's utterance lifecycle. All fire at speech-boundary rate (a
     // handful per utterance), never per-chunk, so the console stays bounded.
     "endpointer_transition",
@@ -441,6 +443,7 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
         "latency_summary" => Some(narrate_latency_summary(fields)),
         "playback_finished" => Some(narrate_playback_finished(fields)),
         "presence" => Some(narrate_presence(fields)),
+        "presence_absent" => Some("presence: none".to_string()),
         "conn_hello" => Some(narrate_conn_hello(fields)),
         "conn_superseded" => Some(narrate_conn_superseded(fields)),
         "conn_closed" => Some(narrate_conn_closed(fields)),
@@ -1616,6 +1619,20 @@ mod tests {
     }
 
     #[test]
+    fn presence_absent_narrates_as_a_fixed_label() {
+        let mut r = Renderer::new(false);
+        let line = r
+            .render(
+                0,
+                "presence_absent",
+                &json!({ "reason": "no presence_channel" }),
+            )
+            .unwrap();
+        assert!(line.ends_with("presence: none"), "{line}");
+        assert!(!line.contains("!!!"), "a configuration is calm: {line}");
+    }
+
+    #[test]
     fn playback_finished_narrates() {
         let mut r = Renderer::new(false);
         // The real emit site sets only `pod` (no `room`), so the tag is pod-only.
@@ -2665,6 +2682,7 @@ mod tests {
         ("playback_started", Class::Calm),
         ("playback_writer_dead", Class::Loud),
         ("presence", Class::Calm),
+        ("presence_absent", Class::Calm),
         ("presence_input_dropped", Class::Loud),
         ("presence_tracker_exited", Class::Loud),
         ("protocol_error", Class::Loud),

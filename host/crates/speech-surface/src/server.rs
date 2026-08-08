@@ -59,6 +59,7 @@ use crate::pipeline::{BargeWiring, BrainWiring, PipelineFatal};
 use crate::playback_router::{
     self, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
 };
+use crate::presence::{PresenceHandle, PresenceInbox};
 use crate::prune::{PruneOutcome, PruneRequest, prune};
 use crate::recorder::{OpenLogs, Recorder, RecorderShared};
 
@@ -571,14 +572,7 @@ impl Server {
 
         // The head-presence taps, on the one condition that also decides
         // whether the task owning the queue's other end is spawned.
-        let presence_channel = presence_channel(&config).map(str::to_owned);
-        let (presence_handle, presence_inbox) = match &presence_channel {
-            Some(_) => {
-                let (handle, inbox) = crate::presence::channel(jsonl.clone());
-                (Some(handle), Some(inbox))
-            }
-            None => (None, None),
-        };
+        let (presence_channel, presence_handle, presence_inbox) = build_presence(&config, &jsonl);
 
         // Turns each writer's `PlaybackEvent`s into JSONL lines, and fans the same
         // events out to the listener's playback floor and the ledger. Built once
@@ -1124,6 +1118,40 @@ fn listener_absent_reason(config: &Config) -> &'static str {
         (false, true) => "no wake table configured",
         (true, false) => "no endpointer table configured",
         (true, true) => "the configured wake mode builds no streaming listener",
+    }
+}
+
+/// The head-presence pieces the server wires. All three come from the single
+/// [`presence_channel`] answer, so the site that mints the queue and the site
+/// that spawns its drain cannot disagree.
+///
+/// The `None` path emits `presence_absent` when the bus brain is configured
+/// without a channel — without it, head presence is silently absent and a
+/// bring-up bench gives no clue why. No line when `[brenn]` is absent
+/// entirely: the pod's own absence lines already cover that.
+fn build_presence(
+    config: &Config,
+    jsonl: &JsonlHandle,
+) -> (
+    Option<String>,
+    Option<PresenceHandle>,
+    Option<PresenceInbox>,
+) {
+    match presence_channel(config) {
+        Some(channel) => {
+            let channel = channel.to_owned();
+            let (handle, inbox) = crate::presence::channel(jsonl.clone());
+            (Some(channel), Some(handle), Some(inbox))
+        }
+        None => {
+            if config.brenn.is_some() {
+                jsonl.emit(
+                    "presence_absent",
+                    &json!({ "reason": "no presence_channel" }),
+                );
+            }
+            (None, None, None)
+        }
     }
 }
 
@@ -3736,6 +3764,59 @@ mod tests {
             .replace("mode = \"brenn\"", "mode = \"echo\"");
         let cfg = test_config(&text).expect("config parses");
         assert_eq!(presence_channel(&cfg), None);
+    }
+
+    /// Without the startup line, a bus-brain pod with no presence channel
+    /// produces "nothing happens" on a bring-up bench — no clue the head is
+    /// simply unconfigured.
+    #[tokio::test]
+    async fn presence_absent_is_said_once_when_the_bus_brain_has_no_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("bus.token");
+        crate::psk::write_secret_file(&token, "a-bearer-token\n").expect("write token");
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let with = test_config(&brenn_text(
+            dir.path(),
+            &token,
+            "presence_channel = \"brenn:head\"\n",
+        ))
+        .expect("config parses");
+        let (channel, taps, inbox) = build_presence(&with, &handle);
+        assert_eq!(channel.as_deref(), Some("brenn:head"));
+        assert!(taps.is_some() && inbox.is_some());
+        drop((taps, inbox));
+
+        let without = test_config(&brenn_text(dir.path(), &token, "")).expect("config parses");
+        let (channel, taps, inbox) = build_presence(&without, &handle);
+        assert!(channel.is_none() && taps.is_none() && inbox.is_none());
+
+        let no_brenn = config(&dir.path().join("store"), false);
+        let (channel, taps, inbox) = build_presence(&no_brenn, &handle);
+        assert!(channel.is_none() && taps.is_none() && inbox.is_none());
+
+        // The fourth shape, and the premise the reason above rests on: a
+        // `[brenn]` table carrying a channel under another brain mode wires
+        // nothing either, and would be told "no presence_channel" while the
+        // channel sat configured in front of the operator. It never reaches a
+        // running daemon, because validation refuses it — if that ever stops,
+        // the line points at the wrong knob and this fails first.
+        let miswired = test_config(
+            &brenn_text(dir.path(), &token, "presence_channel = \"brenn:head\"\n")
+                .replace("mode = \"brenn\"", "mode = \"echo\""),
+        )
+        .expect("config parses");
+        let refused = miswired
+            .validate()
+            .expect_err("the daemon refuses a [brenn] table under another brain mode");
+        assert!(refused.contains("brain.mode"), "{refused}");
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let absent = events_named(&lines, "presence_absent");
+        assert_eq!(absent.len(), 1, "one line, from the middle case only");
+        assert_eq!(absent[0]["reason"], "no presence_channel");
     }
 
     #[tokio::test]
