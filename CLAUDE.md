@@ -14,6 +14,29 @@ Product-grade code — write every line as if it ships. Full charter: `README.md
 - Once an observed value is confirmed correct-and-expected, bake it into the test. It then stays in the self-test registry (run by `crates/hil-host`) permanently as a regression guard — the same expensive hardware round-trip yields a durable asset instead of a discarded script.
 - Guardrail: an UNEXPECTED reading gets human review before you make the test pass. Do not let make-it-green launder an unexpected value into accepted truth. Keep presence-tests (does the device ACK at address X) separate from identity-tests (register Y reads value Z).
 
+## Reachy Fault Management
+
+The fault-management doctrine for the Reachy motion stack (including
+`reachy-motiond` in this repo) lives at `docs/fault-management.md` in the
+sibling `brenn-reachy` checkout (`../brenn-reachy/docs/fault-management.md`).
+Read it before touching anything that arms, disarms, or handles a motion
+fault. The short form: the Minimum Risk Condition is *stowed and de-torqued*;
+a fault response de-torques the motors (controlled stow first when control is
+trusted, immediate best-effort torque-off when it is not); **nothing ever
+gates de-torquing**; holding torque is never a fault response — stowed with
+torque held is that machine's only pinch hazard.
+
+## Device Deployment Doctrine (dev cycles)
+
+During development iteration, **nothing we push touches a device's eMMC**.
+Binaries, configs, tokens, secrets — all of it lands in RAM (tmpfs) and is
+re-pushed after a reboot by one command. This is the brenn-os design: the only
+flash-resident state is fundamental remote-access credentials and identity.
+Flash-backed ("baked") placement of anything else is a release-hardening act
+performed on a stable release — never a dev-cycle convenience. Do not propose
+persisting app state to `/persistent` (or anywhere else on flash) to make a
+dev workflow nicer; fix the deploy command instead.
+
 ## TODO System
 
 Two pieces that stay in sync:
