@@ -25,8 +25,18 @@
 //!   absolute instant, so a re-emission never moves the stow.
 //!
 //! There is no third answer for "down": a script that has run its stow leaves
-//! the daemon resting, which is its default state, so the scripter simply goes
-//! quiet.
+//! the daemon resting, which is its default state, so the scripter goes quiet —
+//! after saying the stow one last time. That confirming `stow@0` is what makes
+//! the refresh cadence's repair promise true for a turn whose stow falls due
+//! inside one refresh period; two lost messages in a row fall to the standing
+//! script's own timeout, which is what that timeout is for.
+//!
+//! Every emitted script's timeout covers its own timeline, because the wire
+//! contract makes the timeout an unconditional ceiling: the configured bound, or
+//! the stow offset plus a refresh period where the speech reaches further. A
+//! plan reaching past the protocol's own ceiling is cut back to it and said out
+//! loud rather than emitted and refused — the scripter bounding its own plan,
+//! which is what keeps script construction infallible here.
 //!
 //! The closing answer waits on three facts, in any arrival order — the brain has
 //! said how the turn ended, dispatch has returned, and no cmd is still waiting to
@@ -58,7 +68,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use brenn_bridge::{BridgeHandle, PublishRequest, Urgency};
-use motion_proto::{MotionScript, Posture, SeqSource, Step, unix_millis};
+use motion_proto::{MAX_TIMEOUT_MS, MotionScript, Posture, SeqSource, Step, unix_millis};
 use serde_json::json;
 use speech_pipeline::{PodId, TurnEnd, UtteranceId};
 use tokio::sync::{Notify, mpsc};
@@ -76,14 +86,21 @@ use crate::time::due;
 pub struct ScriptTiming {
     /// How often the standing script is re-emitted while it still says
     /// something. A lost message is repaired within one of these, and a hold
-    /// script is kept clear of its own timeout by them.
+    /// script is kept clear of its own timeout by them. Also the headroom every
+    /// emitted timeout carries past its own last step, so a re-emission always
+    /// has room to land. Must not exceed [`MAX_TIMEOUT_MS`].
     pub refresh: Duration,
     /// How long the head stays up after a turn that asked to keep listening, and
     /// after a raise that produced no turn at all. The `<listen/>` window.
     pub linger: Duration,
-    /// The timeout every emitted script carries: the daemon stows this long
-    /// after receipt whatever else happens. On a closing script it is a pure
-    /// backstop; on a hold script it is the bound.
+    /// The *floor* under the timeout every emitted script carries: the daemon
+    /// stows this long after receipt whatever else happens. On a hold script,
+    /// whose timeline is not known yet, it is the whole bound; on a closing
+    /// script whose stow falls inside it, it is a backstop past the stow. A
+    /// closing script reaching further than this carries a timeout sized from
+    /// its own timeline instead, because the timeout is a ceiling on that
+    /// timeline and may not be shorter than it. Must not exceed
+    /// [`MAX_TIMEOUT_MS`].
     pub max_engaged: Duration,
     /// How long after the estimated end of a closed turn's speech the head
     /// starts down. Absorbs the jitter between an estimate made when playback
@@ -223,6 +240,14 @@ pub struct ScriptPublish {
     /// than a re-emission of the standing answer. Only a change is worth a
     /// console line; saying the same thing every few seconds is not.
     pub change: bool,
+    /// The stow offset this script would have named had the ceiling not cut it
+    /// back, in milliseconds from the decision instant. `None` on every script
+    /// the ceiling did not touch, which is all of them under any horizon a real
+    /// turn produces.
+    ///
+    /// Carried out rather than logged here because the decision half of this
+    /// module owns no I/O: the task publishing the script is what narrates it.
+    pub clamped_from_ms: Option<u64>,
 }
 
 /// What the scripter wants standing at the daemon for one pod.
@@ -239,6 +264,14 @@ enum Want {
         /// re-emissions do not move it.
         stow_at: Instant,
     },
+    /// Head down now, and said once already.
+    ///
+    /// The state between a closing want whose stow instant was already past
+    /// when the want was born and the silence that follows it. The head is on
+    /// its way down and nothing is scheduled; what is left is to say so a second
+    /// time, because a stow due at the moment it was decided never got the
+    /// re-emission the refresh cadence gives every other closing instruction.
+    Stowing,
 }
 
 impl Want {
@@ -248,7 +281,7 @@ impl Want {
     /// caller's: it depends on what is standing at the daemon.
     fn steps(self, now: Instant) -> Option<Vec<Step>> {
         match self {
-            Want::Quiet => None,
+            Want::Quiet | Want::Stowing => None,
             Want::Hold => Some(vec![Step::new(0, Posture::Up)]),
             // A raise and a stow at the same offset is not a timeline, so a
             // stow that is already due has no future to describe.
@@ -334,19 +367,20 @@ impl Scripter {
                     self.reconsider(&pod, now)
                 }
             }
-            ScriptInput::Unanswered(_) if self.want(&pod) == Want::Quiet => {
-                // The head is down: this pod's script has run, or it never had
-                // one. Both tap sites can fire twice about the same raise — the
-                // confidence gate declines and the arm then expires — and
-                // raising the head to lower it again is not what either means.
+            ScriptInput::Unanswered(_)
+                if matches!(self.want(&pod), Want::Quiet | Want::Stowing) =>
+            {
+                // The head is down or on its way: this pod's script has run, or
+                // it never had one. Both tap sites can fire twice about the same
+                // raise — the confidence gate declines and the arm then expires
+                // — and raising the head to lower it again is not what either
+                // means.
                 None
             }
             ScriptInput::Unanswered(_) => {
                 self.pods.entry(pod.clone()).or_default().clear_turn();
-                let want = Want::Closing {
-                    stow_at: now.at + self.timing.linger,
-                };
-                self.set(&pod, now, want, Cause::Unanswered)
+                let (want, clamped) = self.closing(&pod, now, now.at + self.timing.linger);
+                self.set(&pod, now, want, Cause::Unanswered, clamped)
             }
             ScriptInput::Audio { turn, audio, .. } => {
                 let p = self.pods.entry(pod.clone()).or_default();
@@ -364,9 +398,10 @@ impl Scripter {
 
     /// Fire every re-emission due at `now`.
     ///
-    /// A closing script whose stow instant has arrived is not re-emitted: the
-    /// standing copy carries the stow, the daemon rests once it executes it, and
-    /// resting is what the scripter wanted anyway. It goes quiet instead.
+    /// A closing script whose stow instant has arrived gets one last emission —
+    /// the stow, immediately — and then the scripter goes quiet. See
+    /// [`Scripter::emit`] for why that confirming re-send is what makes the
+    /// refresh cadence's repair promise true for short turns.
     pub fn tick(&mut self, now: Now) -> Vec<ScriptPublish> {
         let due: Vec<PodId> = self
             .pods
@@ -376,7 +411,7 @@ impl Scripter {
             .collect();
         let mut out = Vec::new();
         for pod in due {
-            if let Some(publish) = self.emit(&pod, now, Cause::Refresh, false) {
+            if let Some(publish) = self.emit(&pod, now, Cause::Refresh, false, None) {
                 out.push(publish);
             }
             self.tidy(&pod);
@@ -397,7 +432,47 @@ impl Scripter {
     /// one hold script.
     fn raise(&mut self, pod: &PodId, now: Now, cause: Cause) -> Option<ScriptPublish> {
         self.pods.entry(pod.clone()).or_default().clear_turn();
-        self.set(pod, now, Want::Hold, cause)
+        self.set(pod, now, Want::Hold, cause, None)
+    }
+
+    /// A stow at `stow_at` as a want, cut back to the last instant a script
+    /// emitted at `now` may name — and the offset it asked for when the cut
+    /// engaged.
+    ///
+    /// Every script carries a timeout that covers its own timeline, and no
+    /// timeout may exceed [`MAX_TIMEOUT_MS`], so the furthest stow this scripter
+    /// can express is the ceiling less the headroom every timeout keeps past its
+    /// last step. Bounding the plan here rather than letting the emission fail
+    /// is what keeps script construction infallible, and it is the host-side
+    /// half of the slip protection: a stow instant computed from seconds where
+    /// milliseconds were meant lands at the ceiling, minutes out and narrated,
+    /// rather than hours out.
+    ///
+    /// This is not the daemon clamping somebody's timeline. The scripter is
+    /// bounding its own plan from its own facts, and saying so; the instruction
+    /// that goes out is whole.
+    ///
+    /// An ending already scheduled stands. The cut instant is dated from `now`
+    /// where an uncut one is dated from the audio, so re-deriving it on every
+    /// further fact about the same slipped turn would walk the stow forward one
+    /// inter-fact gap at a time and emit a script for each step — the head's
+    /// exposure measured from the last fact instead of from the decision. This
+    /// is the rule the no-horizon branch of [`Scripter::reconsider`] already
+    /// keeps, for the same reason.
+    fn closing(&self, pod: &PodId, now: Now, stow_at: Instant) -> (Want, Option<u64>) {
+        let headroom = Duration::from_millis(MAX_TIMEOUT_MS).saturating_sub(self.timing.refresh);
+        let ceiling = now.at + headroom;
+        if stow_at <= ceiling {
+            return (Want::Closing { stow_at }, None);
+        }
+        let scheduled = match self.pods.get(pod).map(|p| p.want) {
+            Some(Want::Closing { stow_at }) => stow_at.min(ceiling),
+            _ => ceiling,
+        };
+        (
+            Want::Closing { stow_at: scheduled },
+            Some(millis_between(now.at, stow_at)),
+        )
     }
 
     /// Decide whether the turn in flight can be scheduled to its end yet, and
@@ -411,8 +486,14 @@ impl Scripter {
     /// pod with nothing standing is dropped from the map, so the caller's turn
     /// check finds no turn to match and refuses it before this is called.
     fn reconsider(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
-        let want = {
+        let stow_at = {
             let p = self.pods.get(pod)?;
+            // The stow has been said and is being confirmed. The turn is over
+            // as far as this pod is concerned, and a further fact about it must
+            // not reopen an ending already in front of the daemon.
+            if p.want == Want::Stowing {
+                return None;
+            }
             let end = p.end?;
             let audio = p.audio?;
             if !audio.dispatch_done || audio.awaiting_start > 0 {
@@ -425,25 +506,32 @@ impl Scripter {
             match audio.horizon {
                 // The stow is dated from the audio, not from now, so every
                 // recomputation over the same horizon yields the same instant.
-                Some(horizon) => Want::Closing {
-                    stow_at: horizon + tail,
-                },
+                // A horizon past the ceiling is the one that would be dated from
+                // now instead; `closing` keeps the instant it already scheduled
+                // so that this holds there too.
+                Some(horizon) => horizon + tail,
                 // Nothing has played. Keep an ending already scheduled rather
                 // than sliding it forward on each further fact.
                 None => match p.want {
-                    Want::Closing { .. } => return None,
-                    _ => Want::Closing {
-                        stow_at: now.at + tail,
-                    },
+                    Want::Closing { .. } | Want::Stowing => return None,
+                    _ => now.at + tail,
                 },
             }
         };
-        self.set(pod, now, want, Cause::Closing)
+        let (want, clamped) = self.closing(pod, now, stow_at);
+        self.set(pod, now, want, Cause::Closing, clamped)
     }
 
     /// Adopt `want` and say so, unless it is what this pod is already being
     /// asked for.
-    fn set(&mut self, pod: &PodId, now: Now, want: Want, cause: Cause) -> Option<ScriptPublish> {
+    fn set(
+        &mut self,
+        pod: &PodId,
+        now: Now,
+        want: Want,
+        cause: Cause,
+        clamped_from_ms: Option<u64>,
+    ) -> Option<ScriptPublish> {
         {
             let p = self.pods.get_mut(pod)?;
             if p.want == want {
@@ -451,48 +539,101 @@ impl Scripter {
             }
             p.want = want;
         }
-        self.emit(pod, now, cause, true)
+        self.emit(pod, now, cause, true, clamped_from_ms)
     }
 
     /// Render the pod's standing want as a script and arm the next re-emission.
-    /// A want with nothing left to say goes quiet instead.
-    fn emit(&mut self, pod: &PodId, now: Now, cause: Cause, change: bool) -> Option<ScriptPublish> {
+    /// A want with nothing left to say publishes the stow once and then goes
+    /// quiet.
+    ///
+    /// The overdue branch is the confirming re-send. Past the stow instant the
+    /// want has no future to describe, and saying nothing would be the one turn
+    /// shape whose closing instruction went out exactly once: the refresh
+    /// cadence repairs a lost message only while the stow it carries is still
+    /// ahead, and on a short answer or a silent turn it never is. One immediate
+    /// `stow@0` here means every closing instruction is sent at least twice, so
+    /// a single lost message is repaired within one refresh period — and it is
+    /// safe when nothing was lost, because a stow-resolving script at a resting
+    /// daemon commands nothing and this script cannot raise a head: it has no
+    /// `up` step, and a wake arriving first replaces the want outright.
+    ///
+    /// A stow that was *already* due when the want was decided — a short answer
+    /// whose facts settle after its own audio finished — reaches that branch on
+    /// its very first publish, where one immediate stow would again be a single
+    /// send. That one is armed for one more refresh instead, as
+    /// [`Want::Stowing`], and confirmed on the tick after it. Either way the
+    /// instruction goes out twice and the pod is then forgotten.
+    fn emit(
+        &mut self,
+        pod: &PodId,
+        now: Now,
+        cause: Cause,
+        change: bool,
+        clamped_from_ms: Option<u64>,
+    ) -> Option<ScriptPublish> {
         let refresh = self.timing.refresh;
-        let timeout_ms = millis(self.timing.max_engaged);
+        let floor_ms = millis(self.timing.max_engaged);
         let p = self.pods.get_mut(pod)?;
+        // A repair publish is a change whatever the caller thought: it puts a
+        // stow in front of a daemon holding a script that has none. Without
+        // this the refresh path would publish it and never narrate it.
+        let mut change = change;
         let steps = match p.want.steps(now.at) {
             Some(steps) => {
                 p.refresh = Some(now.at + refresh);
                 steps
             }
             None => {
-                // A stow with no future left to describe. On a re-emission that
-                // is silence: the standing script is that same closing script
-                // and it has carried the stow since it went out. On a change it
-                // is not — what is standing is the hold script, which has no
-                // stow in it at all — so the ending goes out now rather than
-                // waiting out that script's timeout with the head up.
-                let overdue = change && matches!(p.want, Want::Closing { .. });
-                p.want = Want::Quiet;
-                p.refresh = None;
-                if !overdue {
-                    return None;
+                match p.want {
+                    // A stow already due when the want was born: this publish is
+                    // its first, so it is owed the second that every other
+                    // closing instruction gets from the refresh cadence. One
+                    // more refresh, and then quiet.
+                    Want::Closing { .. } if change => {
+                        p.want = Want::Stowing;
+                        p.refresh = Some(now.at + refresh);
+                    }
+                    // A stow that has been standing at the daemon since before
+                    // it came due, or the second half of the pair above: said
+                    // once more and done with.
+                    Want::Closing { .. } | Want::Stowing => {
+                        p.want = Want::Quiet;
+                        p.refresh = None;
+                    }
+                    // Nothing was wanted, so there is nothing to confirm.
+                    Want::Quiet | Want::Hold => {
+                        p.want = Want::Quiet;
+                        p.refresh = None;
+                        return None;
+                    }
                 }
+                change = true;
                 vec![Step::new(0, Posture::Stow)]
             }
         };
+        // The timeout is a ceiling on this script's own timeline, so it is the
+        // configured bound or the timeline plus one refresh period, whichever is
+        // larger — a stow that outruns the bound takes the timeout with it
+        // rather than being executed past a number the message contradicts. The
+        // refresh period is the headroom: a re-emission that lands late still
+        // finds the previous script standing.
+        let last_step_ms = steps.last().map_or(0, |step| step.after_ms);
+        let timeout_ms = floor_ms.max(last_step_ms.saturating_add(millis(refresh)));
         let seq = self.seq.next(now.unix_ms);
-        // Both refusals are unreachable by construction: the steps above ascend
-        // from zero, and the timeout is a config value validated positive. The
-        // expect states that rather than pushing an impossible error onto every
-        // caller.
+        // Every refusal is unreachable by construction: the steps ascend from
+        // zero; the timeout exceeds the last step by a refresh period, which
+        // config validation keeps positive; and `Scripter::closing` bounds the
+        // stow so that sum stays inside `MAX_TIMEOUT_MS`, which config
+        // validation also holds `max_engaged` under. The expect states that
+        // rather than pushing an impossible error onto every caller.
         let script = MotionScript::new(pod.0.clone(), seq, steps, timeout_ms)
-            .expect("the scripter's timelines ascend under a timeout config refuses to leave zero");
+            .expect("the scripter's timelines ascend inside a timeout sized to cover them");
         Some(ScriptPublish {
             pod: pod.clone(),
             script,
             cause,
             change,
+            clamped_from_ms,
         })
     }
 
@@ -802,6 +943,20 @@ impl ScriptTask {
     /// by the next re-emission.
     fn publish(&self, outbound: &Publisher, publish: ScriptPublish) {
         let script = &publish.script;
+        // Ahead of the script's own line, because it explains that line's
+        // numbers: the stow it names is the ceiling's, not the horizon's.
+        if let Some(requested_stow_ms) = publish.clamped_from_ms {
+            self.jsonl.emit(
+                "script_horizon_clamped",
+                &json!({
+                    "pod": script.pod(),
+                    "seq": script.seq(),
+                    "requested_stow_ms": requested_stow_ms,
+                    "stow_ms": script.steps().last().map(|step| step.after_ms),
+                    "ceiling_ms": MAX_TIMEOUT_MS,
+                }),
+            );
+        }
         if publish.change {
             self.jsonl.emit(
                 "motion_script",
@@ -961,8 +1116,14 @@ mod tests {
     }
 
     fn fixture() -> Fx {
+        fixture_with(timing())
+    }
+
+    /// The same, on timings a test chooses — for the ones about what the
+    /// configuration's own admitted extremes do to the arithmetic.
+    fn fixture_with(timing: ScriptTiming) -> Fx {
         Fx {
-            scripter: Scripter::new(timing()),
+            scripter: Scripter::new(timing),
             t0: Instant::now(),
         }
     }
@@ -1368,10 +1529,16 @@ mod tests {
         assert!(again[0].script.seq() > first.script.seq());
     }
 
-    /// Past the stow instant the scripter goes quiet: the standing script
-    /// carries the stow, and a rested daemon needs no message to stay rested.
+    /// Past the stow instant the scripter says the stow once more and then goes
+    /// quiet.
+    ///
+    /// The confirming re-send is the whole repair for a short turn: this stow
+    /// was due at 2.5 s, inside the first refresh, so the closing script that
+    /// carried it was sent exactly once and a bus that dropped it would have
+    /// left the head up until the standing script timed out. The re-send is
+    /// narrated, because it changes what stands at the daemon.
     #[test]
-    fn the_scripter_goes_quiet_once_the_stow_instant_has_passed() {
+    fn the_scripter_confirms_the_stow_once_and_then_goes_quiet() {
         let mut fx = fixture();
         fx.wake_and_dispatch(ZERO);
         fx.apply(
@@ -1392,7 +1559,16 @@ mod tests {
         );
         // 2.5 s is the stow instant; the refresh at 5 s is the first tick past
         // it.
-        assert!(fx.tick(REFRESH).is_empty(), "nothing left to say");
+        let repair = fx.tick(REFRESH);
+        assert_eq!(repair.len(), 1, "the stow is confirmed: {repair:?}");
+        assert_eq!(steps(&repair[0]), vec![(0, Posture::Stow)]);
+        assert_eq!(repair[0].cause, Cause::Refresh);
+        assert!(
+            repair[0].change,
+            "it puts a stow in front of a daemon that may never have got one"
+        );
+        assert_eq!(repair[0].script.timeout_ms(), 30_000);
+        assert!(fx.tick(REFRESH * 2).is_empty(), "and then nothing further");
         assert_eq!(fx.want(), Want::Quiet);
         assert_eq!(fx.scripter.deadline(), None);
         // And a late fact about that turn does not raise a head that is down.
@@ -1589,6 +1765,11 @@ mod tests {
     /// has no stow in it and whose timeout the refresh keeps re-arming. Saying
     /// nothing here is the head waiting out that timeout — the very defect the
     /// scheduled stow exists to end, in the cases where the tail is slow.
+    ///
+    /// And it goes out twice. This is the shape whose stow was already due when
+    /// it was decided, so the refresh cadence never carried it: without the
+    /// confirming re-send below, one lost message would leave this head up until
+    /// the hold script's own timeout, which is the case the re-send exists for.
     #[test]
     fn facts_completing_after_the_stow_was_due_publish_the_stow_at_once() {
         let mut fx = fixture();
@@ -1630,10 +1811,66 @@ mod tests {
         assert_eq!(steps(&publish), vec![(0, Posture::Stow)]);
         assert_eq!(publish.cause, Cause::Closing);
         assert!(publish.change);
+
+        // One confirmation is owed, because that publish was this instruction's
+        // first and only send.
+        assert_eq!(fx.want(), Want::Stowing);
+        assert_eq!(fx.scripter.deadline(), Some(fx.t0 + late + REFRESH));
+        let again = fx.tick(late + REFRESH);
+        assert_eq!(again.len(), 1, "the stow was said once only: {again:?}");
+        assert_eq!(steps(&again[0]), vec![(0, Posture::Stow)]);
+        assert!(
+            again[0].change,
+            "a stow the daemon may not have is a change"
+        );
+        assert!(
+            again[0].script.seq() > publish.script.seq(),
+            "the confirmation must replace the first at the daemon"
+        );
+
         // And then there is nothing further to say: the stow is on the wire.
         assert_eq!(fx.want(), Want::Quiet);
         assert_eq!(fx.scripter.deadline(), None);
-        assert!(fx.tick(late + REFRESH).is_empty());
+        assert!(fx.tick(late + REFRESH + REFRESH).is_empty());
+    }
+
+    /// A wake between the stow and its confirmation cancels the confirmation:
+    /// the pod is being asked for the head up, and a stow behind that would put
+    /// it straight back down.
+    #[test]
+    fn a_wake_before_the_confirming_stow_replaces_it() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        let horizon = fx.t0 + Duration::from_secs(1);
+        let late = Duration::from_secs(10);
+        fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(horizon)),
+            },
+            late,
+        );
+        assert_eq!(fx.want(), Want::Stowing);
+
+        let raised = fx.publish(ScriptInput::Wake(pod()), late + Duration::from_millis(1));
+
+        assert_eq!(steps(&raised), vec![(0, Posture::Up)]);
+        assert_eq!(fx.want(), Want::Hold);
+        assert!(
+            fx.tick(late + REFRESH)
+                .iter()
+                .all(|out| steps(out) == vec![(0, Posture::Up)]),
+            "the head was put back down under a live interaction"
+        );
     }
 
     /// An `Unanswered` for a pod whose head is already down schedules nothing.
@@ -1663,16 +1900,15 @@ mod tests {
         assert!(fx.scripter.pods.is_empty());
     }
 
-    /// A turn whose speech outlasts the engagement ceiling still carries its own
-    /// stow, past the timeout the same script states.
+    /// A turn whose speech outlasts `max_engaged` carries a timeout sized from
+    /// its own timeline, because the timeout is a ceiling on that timeline.
     ///
-    /// This pins today's answer to `TODO(script-timeout-bound)`: `timeout_ms` is
-    /// the later-of-two bound the daemon's `expiry_ms` implements, not a ceiling
-    /// on this scripter's output, so a 40 s read-aloud keeps the head up for
-    /// 40.5 s under a stated timeout of 30 s. Whichever way that decision goes,
-    /// it changes this assertion — which is the point of writing it down.
+    /// A 40 s read-aloud stows at 40.5 s under a stated timeout of 45.5 s — the
+    /// stow plus one refresh period of headroom — rather than under a stated
+    /// 30 s the head then sails past. What a reader of the message gets is the
+    /// truth: this head is up for at most 45.5 s.
     #[test]
-    fn a_turn_whose_speech_outlasts_the_ceiling_carries_its_own_stow() {
+    fn a_turn_whose_speech_outlasts_the_ceiling_carries_a_timeout_that_covers_it() {
         let mut fx = fixture();
         fx.wake_and_dispatch(ZERO);
         fx.apply(
@@ -1697,9 +1933,243 @@ mod tests {
         );
         assert_eq!(
             publish.script.timeout_ms(),
-            30_000,
-            "the ceiling is not a bound on the timeline"
+            45_500,
+            "the timeline plus a refresh period, not the configured floor"
         );
+        assert!(publish.clamped_from_ms.is_none(), "well inside the ceiling");
+    }
+
+    /// The ordinary turn is untouched by the sizing rule: its stow is well
+    /// inside the configured ceiling, so the ceiling stands as the timeout and
+    /// as the backstop past the stow.
+    #[test]
+    fn an_ordinary_turns_timeout_is_the_configured_ceiling() {
+        let mut fx = fixture();
+        let hold = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        assert_eq!(hold.script.timeout_ms(), 30_000);
+
+        let unanswered = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
+        assert_eq!(stow_ms(&unanswered), 8_000);
+        assert_eq!(unanswered.script.timeout_ms(), 30_000);
+    }
+
+    /// The seconds-for-milliseconds slip: a horizon eleven hours out, which is
+    /// what a duration read on the wrong scale produces. The stow lands at the
+    /// protocol's ceiling instead — minutes out, not hours — and the script
+    /// says what it wanted.
+    #[test]
+    fn a_horizon_past_the_protocols_ceiling_stows_at_the_ceiling_and_says_so() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        let slipped = Duration::from_secs(40_000);
+        let publish = fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0 + slipped)),
+            },
+            ZERO,
+        );
+
+        let headroom = MAX_TIMEOUT_MS - millis(REFRESH);
+        assert_eq!(stow_ms(&publish), headroom);
+        assert_eq!(publish.script.timeout_ms(), MAX_TIMEOUT_MS);
+        assert_eq!(
+            publish.clamped_from_ms,
+            Some(millis(slipped) + millis(MARGIN)),
+            "the instant it asked for, so the trace names the slip"
+        );
+    }
+
+    /// A second fact about the same slipped turn does not walk the cut stow
+    /// forward.
+    ///
+    /// The cut instant is the only one dated from the decision rather than from
+    /// the audio, so re-deriving it on every further fact would push the head's
+    /// exposure out by the inter-fact gap each time and emit a script — and a
+    /// clamp trace — for every step of it. One decision, one instant, one line.
+    #[test]
+    fn a_further_fact_over_a_slipped_horizon_leaves_the_cut_stow_where_it_was() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        let slipped = audio(true, 1, 0, Some(fx.t0 + Duration::from_secs(40_000)));
+        fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: slipped,
+            },
+            ZERO,
+        );
+        let cut = fx.want();
+
+        // The same horizon, a second later — another clip of the same turn
+        // reporting in.
+        let again = fx.apply(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: slipped,
+            },
+            Duration::from_secs(1),
+        );
+
+        assert!(
+            again.is_none(),
+            "the ending was already scheduled, so nothing new is asked for: {again:?}"
+        );
+        assert_eq!(fx.want(), cut, "and the instant it was scheduled at stands");
+    }
+
+    /// Whatever the inputs, the script that comes out is one the daemon
+    /// accepts. Construction already refuses an unlawful timeline, so a
+    /// violation is a panic here; these assertions name which rule broke when
+    /// it is the numbers rather than the construction that drifted.
+    ///
+    /// Over the configurations as well as the turns. The two knobs that feed
+    /// the arithmetic — the refresh period and the engaged bound — are
+    /// admitted by configuration validation anywhere up to the protocol
+    /// ceiling, and both ends of that range are load-bearing: the ceiling cut is
+    /// `MAX_TIMEOUT_MS − refresh`, which a refresh at the ceiling takes to
+    /// nothing, and the timeout is the engaged bound or the timeline plus a
+    /// refresh, whichever is larger. A pairing that broke the invariant would
+    /// not be refused — it would panic the host's script task, taking presence
+    /// down for every pod — so the sweep has to reach the corners validation
+    /// tells an operator are fine.
+    #[test]
+    fn every_script_the_scripter_can_be_driven_to_emit_is_lawful() {
+        let horizons = [
+            None,
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_secs(6)),
+            Some(Duration::from_secs(45)),
+            Some(Duration::from_secs(3_600)),
+            Some(Duration::from_secs(40_000)),
+        ];
+        let ceiling = Duration::from_millis(MAX_TIMEOUT_MS);
+        let tick = Duration::from_millis(1);
+        let configs = [
+            timing(),
+            ScriptTiming {
+                refresh: tick,
+                max_engaged: ceiling,
+                ..timing()
+            },
+            ScriptTiming {
+                refresh: ceiling,
+                max_engaged: ceiling,
+                ..timing()
+            },
+            ScriptTiming {
+                refresh: ceiling,
+                max_engaged: tick,
+                ..timing()
+            },
+        ];
+        for timing in configs {
+            for horizon in horizons {
+                for end in [TurnEnd::Closed, TurnEnd::Open] {
+                    let named = format!(
+                        "refresh {:?}/engaged {:?}/{horizon:?}/{end:?}",
+                        timing.refresh, timing.max_engaged
+                    );
+                    let mut fx = fixture_with(timing);
+                    let mut seen = vec![fx.publish(ScriptInput::Wake(pod()), ZERO)];
+                    fx.apply(
+                        ScriptInput::TurnStarted {
+                            pod: pod(),
+                            turn: TURN,
+                        },
+                        ZERO,
+                    );
+                    fx.apply(
+                        ScriptInput::TurnEnded {
+                            pod: pod(),
+                            turn: TURN,
+                            end,
+                        },
+                        ZERO,
+                    );
+                    seen.extend(fx.apply(
+                        ScriptInput::Audio {
+                            pod: pod(),
+                            turn: TURN,
+                            audio: audio(true, 1, 0, horizon.map(|h| fx.t0 + h)),
+                        },
+                        ZERO,
+                    ));
+                    // Far enough past any stow this table can produce that the
+                    // repair emit fires, and then its confirmation.
+                    seen.extend(fx.tick(Duration::from_secs(1_000_000)));
+                    seen.extend(fx.tick(Duration::from_secs(2_000_000)));
+
+                    assert!(seen.len() >= 2, "{named}: only {} published", seen.len());
+                    for publish in &seen {
+                        let script = &publish.script;
+                        let last = script.steps().last().map_or(0, |step| step.after_ms);
+                        assert!(
+                            last < script.timeout_ms(),
+                            "{named}: {last} against {}",
+                            script.timeout_ms()
+                        );
+                        assert!(
+                            script.timeout_ms() <= MAX_TIMEOUT_MS,
+                            "{named}: {}",
+                            script.timeout_ms()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A wake between the stow instant and the refresh takes the pod back to a
+    /// hold, so the repair never fires under a live interaction: the want it
+    /// would have confirmed is gone.
+    #[test]
+    fn a_wake_before_the_repair_suppresses_it() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0 + Duration::from_secs(2))),
+            },
+            ZERO,
+        );
+        // The stow is due at 2.5 s; the wake lands at 3 s, before the refresh.
+        let raise = fx.publish(ScriptInput::Wake(pod()), Duration::from_secs(3));
+        assert_eq!(steps(&raise), vec![(0, Posture::Up)]);
+
+        let due = fx.tick(REFRESH + Duration::from_secs(3));
+        assert_eq!(due.len(), 1, "the hold's own re-emission: {due:?}");
+        assert_eq!(steps(&due[0]), vec![(0, Posture::Up)], "no stow went out");
+        assert_eq!(fx.want(), Want::Hold);
     }
 
     /// Sequence numbers are the wall clock, so a restarted scripter resumes
@@ -1990,6 +2460,97 @@ mod tests {
         assert_eq!(narrated["pod"], "pod-kitchen");
         assert_eq!(narrated["steps"], closing["steps"]);
         assert_eq!(narrated["timeout_ms"], closing["timeout_ms"]);
+        fx.stop().await;
+    }
+
+    /// The confirming re-send, end to end: the stow instant passes, one
+    /// `stow@0` reaches the bus, and it is narrated — a refresh re-emission is
+    /// not, so an operator reading the file sees the head's closing instruction
+    /// go out rather than a silent extra message.
+    #[tokio::test]
+    async fn the_confirming_stow_reaches_the_bus_and_is_narrated() {
+        let mut fx = task_fixture_with(brenn_config_with(40, 60_000, 60_000)).await;
+        let mut peer = fx.peers.pop_front().expect("the script opens a socket");
+        peer.handshake().await;
+
+        fx.send(ScriptInput::TurnStarted {
+            pod: pod(),
+            turn: TURN,
+        });
+        let hold = body_of(&peer.answer_publish("Ok").await);
+        assert_eq!(hold["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+
+        // A silent turn: the stow is the 500 ms margin alone, a dozen refresh
+        // periods out, so the re-emissions walk it down to zero.
+        fx.send(ScriptInput::TurnEnded {
+            pod: pod(),
+            turn: TURN,
+            end: TurnEnd::Closed,
+        });
+        fx.send(ScriptInput::Audio {
+            pod: pod(),
+            turn: TURN,
+            audio: audio(true, 0, 0, None),
+        });
+
+        let confirming = json!([{ "after_ms": 0, "posture": "stow" }]);
+        let mut walked = 0;
+        let stow = loop {
+            let body = body_of(&peer.answer_publish("Ok").await);
+            if body["steps"] == confirming {
+                break body;
+            }
+            walked += 1;
+            assert!(walked < 60, "the stow never came down to zero: {body}");
+        };
+
+        let narrated = expect_narrated(&fx.path, stow["seq"].as_u64().unwrap()).await;
+        assert_eq!(narrated["steps"], confirming);
+        assert_eq!(narrated["cause"], "refresh", "the timer is what fired");
+        fx.stop().await;
+    }
+
+    /// A horizon past the protocol's ceiling: the stow lands at the ceiling and
+    /// the file carries the instant it asked for, which is the only trace of a
+    /// duration read on the wrong scale.
+    #[tokio::test]
+    async fn a_clamped_horizon_is_narrated_with_what_it_asked_for() {
+        let mut fx = task_fixture().await;
+        let mut peer = fx.peers.pop_front().expect("the script opens a socket");
+        peer.handshake().await;
+
+        fx.send(ScriptInput::TurnStarted {
+            pod: pod(),
+            turn: TURN,
+        });
+        peer.answer_publish("Ok").await;
+
+        let slipped = Duration::from_secs(40_000);
+        fx.send(ScriptInput::TurnEnded {
+            pod: pod(),
+            turn: TURN,
+            end: TurnEnd::Closed,
+        });
+        fx.send(ScriptInput::Audio {
+            pod: pod(),
+            turn: TURN,
+            audio: audio(true, 1, 0, Some(Instant::now() + slipped)),
+        });
+
+        let closing = body_of(&peer.answer_publish("Ok").await);
+        assert_eq!(closing["timeout_ms"], MAX_TIMEOUT_MS);
+        assert_eq!(closing["steps"][1]["after_ms"], MAX_TIMEOUT_MS - 5_000);
+
+        let line = expect_line(&fx.path, "script_horizon_clamped").await;
+        assert_eq!(line["pod"], "pod-kitchen");
+        assert_eq!(line["seq"], closing["seq"]);
+        assert_eq!(line["stow_ms"], MAX_TIMEOUT_MS - 5_000);
+        assert_eq!(line["ceiling_ms"], MAX_TIMEOUT_MS);
+        let requested = line["requested_stow_ms"].as_u64().expect("an offset");
+        assert!(
+            (40_000_000..=40_000_500).contains(&requested),
+            "the horizon it was handed, plus the margin: {requested}"
+        );
         fx.stop().await;
     }
 

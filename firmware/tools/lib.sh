@@ -41,6 +41,18 @@ store_mount=/run/brenn-app
 # path the bench configuration is provisioned to; the daemon reads it in place.
 app_home=/var/lib/brenn-app
 
+# Where the motion daemon says which of starting, resting, active, parked and
+# stopping it is in, and whether its pre-torque sweeps are answering.
+#
+# A name rather than a path, because systemd takes it as one: RuntimeDirectory=
+# in the unit creates /run/<name> for the account on start and removes it on
+# stop, so a stopped or crashed service leaves no stale state behind for the
+# next reader to be misled by. A parked daemon deliberately does not exit —
+# clearing a fault is an operator's decision — so `systemctl is-active` calls it
+# running, and this file is the only thing that tells the two apart.
+motiond_runtime_dir=reachy-motiond
+motiond_state="/run/${motiond_runtime_dir}/state"
+
 # Fail with a headline and any number of indented detail lines.
 die() {
 	echo "${prog}: $1" >&2

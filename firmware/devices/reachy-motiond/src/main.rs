@@ -22,6 +22,7 @@ use reachy_motiond::cli::{self, Invocation};
 use reachy_motiond::config::Config;
 use reachy_motiond::motion::{self, Machine, Timing};
 use reachy_motiond::report::{Sink, Streams};
+use reachy_motiond::state::{self, Surface};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -78,12 +79,17 @@ fn run(path: &Path) -> u8 {
     let shared = Arc::new(Shared::new(&config.pod));
     let bus = spawn_bus(bridge, handle, events, &config, Arc::clone(&shared));
 
+    // Before commissioning, which is the first thing here that takes real time.
+    // Under systemd the directory is the unit's RuntimeDirectory; a supervised
+    // foreground run usually has nowhere to write and says so once.
+    let surface = Surface::opening(state::DEFAULT_PATH, &sink);
+
     // Commissioning touches no torque in either direction, so a refusal here
     // leaves the machine exactly as limp as it was found.
     let resting = match machine.commission(port, &mut |text| sink.line(text)) {
         Ok(resting) => resting,
         Err(refusal) => {
-            let outcome = motion::commission_failed(&shared, refusal, &sink);
+            let outcome = motion::commission_failed(&shared, refusal, &sink, &surface);
             return finish(bus, &sink, &outcome);
         }
     };
@@ -93,7 +99,7 @@ fn run(path: &Path) -> u8 {
         rest_poll: config.rest_poll(),
         rest_delay: config.rest_delay(),
     };
-    let outcome = motion::run(resting, &shared, timing, &sink);
+    let outcome = motion::run(resting, &shared, timing, &sink, &surface);
     finish(bus, &sink, &outcome)
 }
 

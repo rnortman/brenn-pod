@@ -303,8 +303,9 @@ pub(crate) fn spawn_streamer_thread() {
     //
     // SAFETY: esp_pthread_set_cfg deep-copies the cfg; the 'static C string is
     // valid for the spawn duration. A failed spawn panics (unrecoverable).
-    // TODO(supervisor-spawn-tls-restore): if panic="unwind" is adopted, the TLS
-    // restore would be skipped on panic. Use a scopeguard in that scenario.
+    // If panic="unwind" is ever adopted, the TLS restore below would be skipped
+    // on panic and a later spawn would inherit "streamer"; that scenario needs a
+    // scopeguard here.
     {
         let mut cfg = unsafe { esp_idf_svc::sys::esp_pthread_get_default_config() };
         // 15 chars = CONFIG_FREERTOS_MAX_TASK_NAME_LEN - 1 (NUL). Do not lengthen.

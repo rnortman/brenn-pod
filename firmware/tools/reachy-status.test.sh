@@ -57,6 +57,7 @@ probe=$(cat)
 # Absolute device paths become fixture paths. The two prefixes the probe uses
 # are the payload store and the account's home.
 probe=${probe//\/run\/brenn-app/$STUB_ROOT/run/brenn-app}
+probe=${probe//\/run\/reachy-motiond/$STUB_ROOT/run/reachy-motiond}
 probe=${probe//\/var\/lib\/brenn-app/$STUB_ROOT/var/lib/brenn-app}
 probe=${probe//\/dev\/tty/$STUB_ROOT/dev/tty}
 printf '%s' "$probe" >"$STUB_SSH_PROBE"
@@ -102,6 +103,7 @@ new_tree() {
 	chmod +x "$TREE/firmware/tools/$(basename -- "$TOOL")"
 	mkdir -p "$ROOT/run/brenn-app/conf" "$ROOT/run/brenn-app/releases/motiond" \
 		"$ROOT/var/lib/brenn-app" "$ROOT/dev" "$ROOT/active"
+	STATE="$ROOT/run/reachy-motiond/state"
 	SSH_ARGV="$TREE/ssh.argv"
 	PROBE="$TREE/ssh.probe"
 	: >"$SSH_ARGV"
@@ -128,6 +130,17 @@ provision_all() {
 	touch "$ROOT/var/lib/brenn-app/motiond-token"
 	install -m 0755 /dev/null "$ROOT/run/brenn-app/releases/motiond/reachy-motiond"
 	touch "$ROOT/dev/ttyAMA3"
+	# A running daemon writes this into its RuntimeDirectory, so a device that
+	# is actually ready has one. The unit does not, which is exactly why the
+	# `absent` case is a MISSING line rather than a silent pass.
+	daemon_says state=resting watch=ok
+}
+
+# What the motion daemon has written about itself, as its own key=value lines.
+daemon_says() {
+	mkdir -p -- "$(dirname -- "$STATE")"
+	printf '%s\n' "$@" >"$STATE"
+	printf 'updated_unix=%s\n' "$(date +%s)" >>"$STATE"
 }
 
 run_tool() {
@@ -194,6 +207,114 @@ check "status-asks-once" \
 check "status-runs-nothing-that-moves" \
 	"$(no_yes grep -qE 'reachy-motiond |reachy-bench |systemctl (start|restart|stop)' -- "$PROBE")" \
 	"the probe was: $(cat -- "$PROBE")"
+
+# ── what the motion daemon says it is doing ───────────────────────────────────
+#
+# The check this command exists for as much as any file: a parked daemon does
+# not exit, so its unit is active while it commands nothing at all. Every row
+# below is a robot that would otherwise have been called `ready`.
+
+new_tree
+provision_all
+run_tool reachy-dev
+says "a-resting-daemon-is-ready" 'OK .*motion daemon is running and ready'
+
+new_tree
+provision_all
+daemon_says state=active watch=ok
+run_tool reachy-dev
+check "an-active-daemon-is-ready-too" "$(yes_no [ "$EC" = 0 ])" "exit ${EC}: $OUT"
+says "an-active-daemon-says-which-state" 'OK .*ready \(active\)'
+
+# The line that stops a dead robot answering ready.
+new_tree
+provision_all
+daemon_says state=parked watch=ok \
+	'fault_stage=the motion loop' 'fault_detail=servo 4: timed out'
+run_tool reachy-dev
+check "a-parked-daemon-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
+says "a-parked-daemon-is-reported-as-faulted" 'MISSING.*FAULTED and is parked'
+says "a-parked-daemon-names-the-stage" 'the motion loop'
+says "a-parked-daemon-names-the-fault" 'servo 4: timed out'
+says "a-parked-daemon-names-the-action" 'make reachy-motiond-logs'
+silent_about "a-parked-daemon-is-not-called-ready" '^reachy-status.*: ready'
+# Pushing files does not clear a fault, and saying so would send an operator
+# round a loop that cannot end.
+says "a-parked-daemon-says-the-push-does-not-fix-it" 'make reachy-up does not fix that'
+silent_about "a-parked-daemon-is-not-blamed-on-a-missing-file" 'everything above is pushed by'
+
+# Limp, safe, and unable to raise its head: the machine is at the minimum risk
+# condition and recovers by itself, but nothing will wake until reads come back.
+new_tree
+provision_all
+daemon_says state=resting watch=failing
+run_tool reachy-dev
+check "a-failing-watch-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
+says "a-failing-watch-says-the-head-will-not-raise" 'MISSING.*cannot read the machine'
+says "a-failing-watch-says-it-recovers-by-itself" 'recovers by itself'
+
+new_tree
+provision_all
+daemon_says state=starting watch=ok
+run_tool reachy-dev
+check "a-starting-daemon-is-not-yet-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
+says "a-starting-daemon-says-to-re-run" 'MISSING.*still coming up'
+
+# The boot this feature was built for: a daemon that came up over a dead servo
+# bus retries its startup look forever, so it holds `starting` until somebody
+# fixes the cabling. Telling that operator to re-run in a moment is the one
+# action that can never resolve it.
+new_tree
+provision_all
+daemon_says state=starting watch=failing
+run_tool reachy-dev
+check "a-starting-daemon-over-a-dead-bus-is-not-ready" "$(yes_no [ "$EC" = 1 ])" \
+	"exit ${EC}: $OUT"
+says "a-starting-daemon-over-a-dead-bus-names-the-bus" 'MISSING.*cannot read the machine'
+silent_about "a-starting-daemon-over-a-dead-bus-is-not-told-to-wait" 'still coming up'
+
+# Mid-shutdown is not ready either, and it resolves on its own.
+new_tree
+provision_all
+daemon_says state=stopping watch=ok
+run_tool reachy-dev
+check "a-stopping-daemon-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
+says "a-stopping-daemon-says-so" 'MISSING.*shutting down'
+silent_about "a-stopping-daemon-is-not-called-ready" '^reachy-status.*: ready'
+
+# A phase this script predates. Host and daemon are pushed separately, so the
+# skew is a state this command will meet — and the answer that must never come
+# out of it is `ready`.
+new_tree
+provision_all
+daemon_says state=wedged watch=ok
+run_tool reachy-dev
+check "an-unknown-state-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
+says "an-unknown-state-says-it-does-not-know" 'MISSING.*does not know'
+says "an-unknown-state-quotes-what-it-was-told" 'wedged'
+silent_about "an-unknown-state-is-not-called-ready" '^reachy-status.*: ready'
+
+# The unit is up and there is no file: either a daemon that has only just
+# started, or one deployed before this file existed. Both are "come back", and
+# neither is `ready`.
+new_tree
+provision_all
+rm -f -- "$STATE"
+run_tool reachy-dev
+check "no-state-file-under-a-running-unit-is-not-ready" "$(yes_no [ "$EC" = 1 ])" \
+	"exit ${EC}: $OUT"
+says "no-state-file-says-what-to-do" 'MISSING.*written no state'
+
+# With the unit down, its own MISSING line is the answer and the state is
+# reported without being judged: RuntimeDirectory takes the file away on stop,
+# so anything still there is a race with that.
+new_tree
+provision_all
+rm -f -- "$ROOT/active/reachy-motiond.service"
+run_tool reachy-dev
+says "a-dead-unit-is-what-is-reported" 'MISSING.*reachy-motiond.service is running'
+says "a-dead-unit-leaves-the-state-informational" '^  [-][-].*motion daemon state'
+silent_about "a-dead-unit-does-not-double-report-the-daemon" 'MISSING.*motion daemon'
 
 # ── the servo node the machine's own configuration names ──────────────────────
 

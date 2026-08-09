@@ -17,8 +17,9 @@
 //! - **Every script lapses.** At its expiry the schedule says so, and the
 //!   daemon stows and rests. This is the loss-of-instruction bound: a scripter
 //!   that dies mid-conversation leaves the head up for a bounded time and no
-//!   longer. The bound is the script's timeout, or its last step where the
-//!   timeline runs past that — see [`MotionScript::expiry_ms`].
+//!   longer. The bound is the script's timeout, full stop — a timeline that
+//!   reached it was refused before it ever became a [`MotionScript`], so no
+//!   step can be waiting when the lapse arrives.
 //!
 //! Offsets are measured from the moment a script *arrived*, on the caller's own
 //! monotonic clock. Two hosts' wall clocks are never compared here, and one of
@@ -451,39 +452,37 @@ mod tests {
         assert_eq!(schedule.next_boundary(start + ms(30_000)), None);
     }
 
-    /// A script never lapses with a step unexecuted, so a timeline that
-    /// outlasts its own timeout runs to its end and expires just after it.
-    ///
-    /// The step at 9,000 ms is resolved as the posture it names and not
-    /// swallowed by the lapse: the expiry check runs first, so an expiry level
-    /// with the last step would answer `Expired` at the instant the step came
-    /// due and the script's last instruction would never be seen.
+    /// A step one millisecond inside the timeout is executed, and the lapse
+    /// arrives the millisecond after it. That margin is why validation demands
+    /// a *strictly* smaller last step: level with the timeout, the expiry check
+    /// running first would answer `Expired` at the instant the step came due
+    /// and the script's last instruction would never be seen.
     #[test]
-    fn a_timeline_past_its_timeout_still_reaches_its_last_step() {
+    fn the_last_step_inside_the_timeout_is_reached_before_the_lapse() {
         let start = Instant::now();
         let mut schedule = Schedule::new(POD);
         schedule.accept(
             &script(
                 1,
-                vec![Step::new(0, Posture::Up), Step::new(9_000, Posture::Stow)],
-                5_000,
+                vec![Step::new(0, Posture::Up), Step::new(8_999, Posture::Stow)],
+                9_000,
             ),
             start,
         );
 
         assert_eq!(
-            schedule.desired(start + ms(8_999)),
+            schedule.desired(start + ms(8_998)),
             Desired::Posture(Posture::Up)
         );
         assert_eq!(
-            schedule.desired(start + ms(9_000)),
+            schedule.desired(start + ms(8_999)),
             Desired::Posture(Posture::Stow)
         );
-        assert_eq!(schedule.desired(start + ms(9_001)), Desired::Expired);
-        assert_eq!(schedule.next_boundary(start), Some(start + ms(9_000)));
+        assert_eq!(schedule.desired(start + ms(9_000)), Desired::Expired);
+        assert_eq!(schedule.next_boundary(start), Some(start + ms(8_999)));
         assert_eq!(
-            schedule.next_boundary(start + ms(9_000)),
-            Some(start + ms(9_001))
+            schedule.next_boundary(start + ms(8_999)),
+            Some(start + ms(9_000))
         );
     }
 
@@ -495,7 +494,7 @@ mod tests {
         let start = Instant::now();
         let mut schedule = Schedule::new(POD);
         schedule.accept(
-            &script(1, vec![Step::new(9_000, Posture::Up)], 5_000),
+            &script(1, vec![Step::new(9_000, Posture::Up)], 9_001),
             start,
         );
 

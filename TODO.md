@@ -463,42 +463,6 @@ See `TODO(barge-in-flake)` at
 `host/crates/speech-surface/tests/barge_integration.rs`.
 
 
-## `recovery-move-clock` — a stow from far enough round faults partway and drops the head
-
-The daemon's moves run on two durations — `up` and `stow` — sized for the spans a
-presence move covers, and the same two whatever the move is. The body yaw's per-tick
-step bound is what a duration has to clear: at the shipped `stow_duration_s = 2.0` and
-`max_step_body_yaw_rad = 0.05` at 50 Hz, a stow can carry the body about 2.67 rad,
-roughly 153°. A commanded yaw target
-is capped at 60°, so nothing the daemon *asks for* comes near that. Where the machine
-physically stands is not capped: the yaw servo's provisioned range is the full turn,
-and a hand, a crash or a previous fault can leave the body anywhere in it.
-
-The motion library now admits a move out of a pose the envelope refuses — that is the
-recovery, and it is what makes startup normalization work on a machine somebody
-nudged. The step guard is the half that was not fixed: a startup stow from beyond
-~153° faults on `Fault::StepTooLarge` partway through, and a fault de-torques, so the
-head stops and settles wherever it got to. Unattended, which is this daemon's whole
-posture — and a parked fault does not exit, so a restart policy does not clear it.
-
-This entry is the pod half. The fix is a clock a recovering move derives from its own
-span, which lives in the motion library; what the daemon owns is the duration it hands
-in. Its example TOML now documents the yaw floor beside the antenna and head-group
-ones, so an operator lengthening `stow_duration_s` past the case that bites them has
-the number — but that is a caveat and not the fix, because the case that bites is the
-startup fold, which nobody is present for.
-
-Done = the daemon's startup stow reaches stow from any body angle the servo's range
-allows, or refuses before torque with something an operator can act on.
-
-The brenn-reachy half is filed in that repo's `TODO.md` under this same slug, at the
-step guard in `crates/reachy-motion/src/tick.rs`. The slug is the cross-repo join key
-— move both entries together.
-
-See `TODO(recovery-move-clock)` at `SessionActive` in
-`firmware/devices/reachy-motiond/src/motion.rs`.
-
-
 ## `script-timebase` — BLOCKED as of 2026-08-09 (needs the Clockwork port's shared clock)
 
 A motion script's step offsets are measured from the moment the daemon *received* the
@@ -532,37 +496,3 @@ is present.
 
 See `TODO(script-timebase)` at the wire schema in
 `firmware/crates/motion-proto/src/script.rs`.
-
-## `script-timeout-bound` — a script's timeout is not a ceiling on its own timeline
-
-`MotionScript::expiry_ms` answers the later of the script's `timeout_ms` and its last
-step, so a timeline that runs past its own timeout carries the head to the end of the
-timeline. That is deliberate — a script whose last instruction never ran would be a
-script the daemon half-executed — and it is what lets a turn whose speech outlasts
-`presence_max_engaged_ms` keep the head up while the audio is still playing.
-
-The cost is that `timeout_ms` is not on its own a ceiling on how long the head stays up.
-A scripter arithmetic bug — a stow offset computed from a bad duration, seconds where
-milliseconds were meant — makes the exposure whatever that number says, on a script
-whose stated timeout is 30 s, and any publisher entitled to the channel can do it
-deliberately with one message. The daemon lapses on schedule and reports nothing unusual,
-because as far as it can tell the timeline is the instruction.
-
-The two candidate answers both change the wire contract rather than the arithmetic:
-refuse a script whose last step is at or past its timeout (a third `ScriptError`, which
-makes the scripter responsible for sizing every timeout from its own horizon), or clamp
-the expiry to the timeout and drop the steps past it (which throws away instructions the
-publisher asked for). Bounding the extension by a constant is a third, and picking that
-constant is the same decision in disguise. Not a patch: whichever way it goes, the host
-scripter has to be written against it.
-
-Done = the wire contract says which of the two the timeout is — an unconditional ceiling
-or the later-of-two bound it is today — the crate docs and `expiry_ms` agree with it, and
-the scripter emits timeouts that satisfy it.
-
-See `TODO(script-timeout-bound)` at `MotionScript::expiry_ms` in
-`firmware/crates/motion-proto/src/script.rs`, and the scripter's half of the same
-contract at `a_turn_whose_speech_outlasts_the_ceiling_carries_its_own_stow` in
-`host/crates/speech-surface/src/scripter.rs`, which pins today's answer.
-
-

@@ -72,12 +72,19 @@ rest_delay_ms = 5000
 # clock of their own — a lift tuned to be quick has no business being floored by
 # an antenna arc.
 #
-# FLOORS. A per-tick step past the bound in the bench file is a fault, never a
-# clamp, and after the gate audit a fault takes torque off: a duration under its
-# floor is not a slow head, it is a move that stops partway and a head that
-# settles limp. A shaped move's peak rate is 1.875 times its average, so for a
-# joint that moves linearly in its own coordinate the floor is closed-form —
-# 1.875 x span in radians / (bound x tick rate). At the shipped bounds and 50 Hz:
+# FLOORS. These durations are a nominal policy rather than a promise: a move
+# whose span will not fit inside the per-tick step bounds at the duration named
+# here runs on a clock stretched to fit, and says so — a `motion_clock_stretched`
+# line in the capture carrying what was asked for and what it ran on. The path is
+# unchanged; it is traversed more slowly. So a value set too low costs a slower
+# move and a line of output, never a move that stops partway and a head that
+# settles limp.
+#
+# What the floors are still for is knowing when a stretch is about to be the
+# ordinary case rather than the exception. A shaped move's peak rate is 1.875
+# times its average, so for a joint that moves linearly in its own coordinate the
+# floor is closed-form — 1.875 x span in radians / (bound x tick rate). At the
+# shipped bounds and 50 Hz:
 #
 #   head group   1.07 s for the stow-to-neutral span. No closed form (the legs
 #                move through the IK); derived by sampling the move at tick rate
@@ -85,10 +92,11 @@ rest_delay_ms = 5000
 #                the geometry, the tick rate or `max_step_legs_rad` does.
 #   body yaw     0.79 s from the 60-degree cap the bench file ships,
 #                and 1.571 s for the widest sweep a command can lawfully ask —
-#                cap to cap. The startup fold is the case to watch: it starts
-#                wherever the machine was physically left, which no cap binds,
-#                and from beyond about 153 degrees round `stow_duration_s = 2.0`
-#                does not clear the bound. TODO(recovery-move-clock) is the fix.
+#                cap to cap. The startup fold is the case the stretch exists for:
+#                it starts wherever the machine was physically left, which no cap
+#                binds, and folding from beyond about 153 degrees round takes
+#                longer than `stow_duration_s = 2.0`. It runs on the longer clock
+#                and lands, rather than being refused or dropped.
 #   antennas     0.81 s for the 3.23 rad stow-to-neutral arc, 1.21 s to re-stow
 #                an antenna left just inboard of sideways, and 1.57 s for the
 #                widest sweep the bench command can ask for. The daemon only ever
@@ -99,8 +107,11 @@ rest_delay_ms = 5000
 # is meant to be a quick acknowledgement, so they are the obvious thing to tune;
 # what stops a shorter recommendation shipping here is that nobody has run the
 # machine at one yet. Lower them a step at a time and watch the tracking error in
-# the capture. The antenna clock needs no such trial: its floor is closed-form,
-# and 1.5 s clears the 1.21 s worst case the daemon can reach with real margin.
+# the capture; a value under the floor is not a hazard to hand-check, it is a
+# stretch line in the capture saying the clock this file asked for was not the
+# one the move ran on. The antenna clock needs no such trial: its floor is
+# closed-form, and 1.5 s clears the 1.21 s worst case the daemon can reach with
+# real margin.
 # up_duration_s = 3.0
 # stow_duration_s = 2.0
 antenna_duration_s = 1.5

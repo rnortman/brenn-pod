@@ -27,7 +27,7 @@
 //! 6,740 ms after it lands gets one then, not at the next multiple of the
 //! configured dwell.
 //!
-//! Three things are deliberate about the shape:
+//! Four things are deliberate about the shape:
 //!
 //! - **Nothing gates torque coming off.** Every ending writes it off: the
 //!   orderly one settles, measures and reports where the machine was before it
@@ -39,6 +39,14 @@
 //! - **A refused engage is not a fault.** The two torque-on gates — the supply
 //!   floor and the latched error bits — write nothing when they refuse, so the
 //!   machine is exactly as it was and the next script may simply ask again.
+//! - **A pre-torque sweep never faults, however long it fails.** A limp machine
+//!   is already at the minimum risk condition, so a sweep that stops answering
+//!   costs the daemon its picture of the machine and not its control of it:
+//!   there is nothing a fault response could make safer, and parking would
+//!   forfeit a recovery that otherwise costs nothing. The startup look and the
+//!   resting watch both keep sweeping, say so once per run, and refuse an
+//!   engage until a sweep answers. Deliberately asymmetric with the engaged
+//!   path, whose read-loss budget guards a machine under torque and does fault.
 //!
 //! The loop is written against [`Rest`] and [`Active`] rather than against the
 //! motion libraries' own typestate. What a move does to nine servos belongs to
@@ -72,6 +80,7 @@ use thiserror::Error;
 use crate::cells::{FaultReport, FaultStage, Shared, Stop};
 use crate::config::Overrides;
 use crate::report::Sink;
+use crate::state::{Phase, Surface, Watching};
 
 /// The shortest dwell the loop will ask for.
 ///
@@ -208,8 +217,7 @@ impl Machine {
             up: self.clocks.up_durations(),
             stow: self.clocks.stow_durations(),
             clock,
-            rail_every: rail_period(self.resolved.health_poll_hz),
-            last_rail: None,
+            rail: Rail::new(rail_period(self.resolved.health_poll_hz)),
         })
     }
 }
@@ -393,15 +401,61 @@ fn rail_period(health_poll_hz: u32) -> Duration {
     Duration::from_secs(1) / health_poll_hz.max(1)
 }
 
-/// Whether this sweep re-reads the supply and the error bits.
+/// When a sweep last read the supply and the error bits, and how often one
+/// must.
 ///
 /// The two torque-on gates are evaluated from whatever the last such sweep
 /// read, so this decides how stale their inputs may be: never re-reading leaves
 /// them judging an engage against commissioning-time numbers, and re-reading on
 /// every sweep makes the resting watch most of the traffic on the wire. Daemon
-/// policy, so it is arithmetic here rather than a branch buried in a transaction.
-fn rail_due(last: Option<Instant>, now: Instant, every: Duration) -> bool {
-    last.is_none_or(|last| now.duration_since(last) >= every)
+/// policy, so it is arithmetic here rather than a branch buried in a
+/// transaction.
+#[derive(Debug, Clone, Copy)]
+struct Rail {
+    /// The longest a gate's inputs may be carried forward.
+    every: Duration,
+    /// When a sweep last read them, or `None` when the next sweep must.
+    last: Option<Instant>,
+}
+
+impl Rail {
+    /// A machine whose gates have nothing but commissioning behind them: the
+    /// first sweep reads.
+    fn new(every: Duration) -> Self {
+        Self { every, last: None }
+    }
+
+    /// What a sweep taken at `now` reads.
+    fn cadence(&self, now: Instant) -> PollCadence {
+        if self
+            .last
+            .is_none_or(|last| now.duration_since(last) >= self.every)
+        {
+            PollCadence::PositionsAndRail
+        } else {
+            PollCadence::Positions
+        }
+    }
+
+    /// A sweep taken at `now` answered, having read whatever `cadence` asked
+    /// for.
+    fn read(&mut self, now: Instant, cadence: PollCadence) {
+        if matches!(cadence, PollCadence::PositionsAndRail) {
+            self.last = Some(now);
+        }
+    }
+
+    /// A sweep failed: the next one that answers reads the rail, whenever that
+    /// is.
+    ///
+    /// A positions-only sweep carries the previous rail reading forward, so
+    /// without this an engage after an outage of any length would judge its two
+    /// torque-on gates against a supply and error bits measured before it —
+    /// arbitrarily long before it. The cost is nine extra reads on a path that
+    /// is already a recovery.
+    fn lost(&mut self) {
+        self.last = None;
+    }
 }
 
 /// A configuration error, rendered whole.
@@ -471,9 +525,11 @@ impl Verdict {
 /// not.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EngageFailed {
-    /// One of the two torque-on gates refused — the supply below its floor, or
-    /// a latched hardware error. Nothing was written, the machine is limp
-    /// exactly where it was, and the next script may ask again.
+    /// A refusal from before torque: one of the two torque-on gates — the
+    /// supply below its floor, or a latched hardware error — or a remedial
+    /// sweep that could not measure the machine an engage has to pin. Nothing
+    /// was written, the machine is limp exactly where it was, and the next
+    /// script may ask again.
     #[error("{0}")]
     Gate(Refusal),
 
@@ -511,6 +567,11 @@ pub trait Rest {
     fn watch(&mut self, line: &mut dyn FnMut(&str)) -> Result<Standing, Refusal>;
 
     /// Pin every joint where the last sweep found it and enable torque.
+    ///
+    /// A posture no sweep has confirmed since is measured again first: pinning
+    /// a limp head at where it *was* is the slam that measurement prevents. A
+    /// machine that cannot be measured refuses the engage rather than faulting
+    /// — torque is still off, so there is nothing to undo.
     fn engage(&mut self, line: &mut dyn FnMut(&str)) -> Result<Self::Active<'_>, EngageFailed>;
 }
 
@@ -533,10 +594,16 @@ pub trait Active {
     /// `retarget` must answer `None` for the posture already in flight: a
     /// caller that keeps answering with it would keep restarting the same
     /// trajectory and the head would never arrive.
+    ///
+    /// `line` is the run as the motion library words it, for the console;
+    /// `event` is the same run typed, for the facts this daemon has to record
+    /// as more than prose. Both, because the library's per-period report has no
+    /// typed form and a rendered line is not something a capture can key on.
     fn move_to(
         &mut self,
         posture: Posture,
         line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
         retarget: &mut dyn FnMut() -> Option<Posture>,
     ) -> Result<Posture, Refusal>;
 
@@ -586,14 +653,11 @@ pub struct SessionRest<'a, P: BusPort> {
     /// The fold's, likewise.
     stow: MoveDurations,
     clock: MonotonicClock,
-    /// How long between two sweeps that re-read the supply and the error bits.
-    /// The positions move under a hand; those change on the timescale of a power
-    /// supply, and reading them every sweep would be most of the resting
-    /// traffic on the wire.
-    rail_every: Duration,
-    /// When a sweep last read them, or `None` when none has since
-    /// commissioning.
-    last_rail: Option<Instant>,
+    /// When the supply and the error bits were last read, and how long they may
+    /// be carried forward. The positions move under a hand; those change on the
+    /// timescale of a power supply, and reading them every sweep would be most
+    /// of the resting traffic on the wire.
+    rail: Rail,
 }
 
 /// The same machine holding torque.
@@ -601,11 +665,12 @@ pub struct SessionActive<'m, 'a, P: BusPort> {
     engaged: Engaged<'m, 'a, P>,
     clock: MonotonicClock,
     up: MoveDurations,
-    // TODO(recovery-move-clock): both clocks are configuration, resolved once
-    // and sized for the spans a presence move covers. The startup stow runs on
-    // `stow` from wherever the machine was left, and a body left more than about
-    // 153° round at the shipped value is further than that clock can carry
-    // within the per-tick step bound — the move faults partway and de-torques.
+    // Both clocks are configuration, resolved once and sized for the spans a
+    // presence move covers. The startup stow runs on `stow` from wherever the
+    // machine was left, which no configuration can size for; the motion library
+    // right-sizes a clock too short for the span it actually covers before the
+    // move is commanded, and says so, which is what `motion_clock_stretched`
+    // carries.
     stow: MoveDurations,
 }
 
@@ -628,6 +693,55 @@ pub fn targets_for(
     }
 }
 
+/// A sweep taken while torque is off, with the rail bookkeeping around it.
+///
+/// Both pre-torque sweeps — the resting watch and the remedial one an engage
+/// takes past a stale posture — agree about what a failure costs. Nothing was
+/// commanded, so the machine is exactly as safe as it was; what is lost is the
+/// rail reading, which no longer describes anything, because nothing bounds how
+/// long the outage lasts. Written once so the two cannot come to disagree.
+fn pre_torque_sweep<T>(
+    rail: &mut Rail,
+    now: Instant,
+    cadence: PollCadence,
+    sweep: impl FnOnce(PollCadence) -> Result<T, PumpError>,
+) -> Result<T, PumpError> {
+    match sweep(cadence) {
+        Ok(measured) => {
+            rail.read(now, cadence);
+            Ok(measured)
+        }
+        Err(error) => {
+            rail.lost();
+            Err(error)
+        }
+    }
+}
+
+/// The sweep an engage takes when the posture it would pin is stale, and what
+/// its failure means.
+///
+/// Taken here rather than left to the library, because the classification is
+/// the whole point and only this side knows torque is still off: this sweep and
+/// the enable walk after it raise the same refusals, so the error value alone
+/// cannot say which side of a torque write it came from. On this side nothing
+/// has been written, so a failure is a refusal the next script may simply ask
+/// again after — never a fault to park a limp daemon for, which is the
+/// difference between a daemon that recovers in five seconds and one that waits
+/// for a person.
+///
+/// Always the rail as well as the positions: an engage that follows an outage
+/// would otherwise judge its two torque-on gates against a supply and error
+/// bits measured before the outage began.
+fn remedial_sweep<T>(
+    rail: &mut Rail,
+    now: Instant,
+    sweep: impl FnOnce(PollCadence) -> Result<T, PumpError>,
+) -> Result<T, EngageFailed> {
+    pre_torque_sweep(rail, now, PollCadence::PositionsAndRail, sweep)
+        .map_err(|error| EngageFailed::Gate(error.into()))
+}
+
 impl<'a, P: BusPort> Rest for SessionRest<'a, P> {
     type Active<'e>
         = SessionActive<'e, 'a, P>
@@ -636,16 +750,11 @@ impl<'a, P: BusPort> Rest for SessionRest<'a, P> {
 
     fn watch(&mut self, line: &mut dyn FnMut(&str)) -> Result<Standing, Refusal> {
         let now = Instant::now();
-        let rail_due = rail_due(self.last_rail, now, self.rail_every);
-        let cadence = if rail_due {
-            PollCadence::PositionsAndRail
-        } else {
-            PollCadence::Positions
-        };
-        let sweep = self.machine.poll(cadence, &mut self.clock, line)?;
-        if rail_due {
-            self.last_rail = Some(now);
-        }
+        let cadence = self.rail.cadence(now);
+        let (machine, clock) = (&mut self.machine, &mut self.clock);
+        let sweep = pre_torque_sweep(&mut self.rail, now, cadence, |cadence| {
+            machine.poll(cadence, clock, line)
+        })?;
         Ok(if at_stow(&self.resolved.disarm, &sweep.present) {
             Standing::AtStow
         } else {
@@ -656,6 +765,12 @@ impl<'a, P: BusPort> Rest for SessionRest<'a, P> {
     fn engage(&mut self, line: &mut dyn FnMut(&str)) -> Result<Self::Active<'_>, EngageFailed> {
         let (up, stow) = (self.up, self.stow);
         let mut clock = self.clock;
+        if !self.machine.fresh() {
+            let machine = &mut self.machine;
+            remedial_sweep(&mut self.rail, Instant::now(), |cadence| {
+                machine.poll(cadence, &mut clock, line)
+            })?;
+        }
         let engaged = self.machine.engage(&mut clock, line)?;
         Ok(SessionActive {
             engaged,
@@ -671,17 +786,24 @@ impl<P: BusPort> Active for SessionActive<'_, '_, P> {
         &mut self,
         posture: Posture,
         line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
         retarget: &mut dyn FnMut() -> Option<Posture>,
     ) -> Result<Posture, Refusal> {
         let (up, stow) = (self.up, self.stow);
         let (targets, durations) = targets_for(posture, up, stow);
         let mut arrived = posture;
-        self.engaged
-            .move_retargeting(targets, durations, &mut self.clock, line, &mut || {
+        self.engaged.move_retargeting_events(
+            targets,
+            durations,
+            &mut self.clock,
+            line,
+            event,
+            &mut || {
                 let next = retarget()?;
                 arrived = next;
                 Some(targets_for(next, up, stow))
-            })?;
+            },
+        )?;
         Ok(arrived)
     }
 
@@ -911,10 +1033,15 @@ fn dedup_key(event: &TickEvent) -> TickEvent {
         },
         TickEvent::ReadRestored { .. } => TickEvent::ReadRestored { after: 0 },
         TickEvent::HealthRestored { .. } => TickEvent::HealthRestored { after: 0 },
+        // A stretch is a move's event, so it never reaches a dwell's filter at
+        // all. Keyed whole for the day that changes: two right-sizings of the
+        // same clock are two facts about the configuration, and a key that
+        // dropped the durations would swallow the second one.
         event @ (TickEvent::Command(_)
         | TickEvent::ReadLost { .. }
         | TickEvent::HealthLost { .. }
         | TickEvent::Health(_)
+        | TickEvent::Stretched(_)
         | TickEvent::Completed
         | TickEvent::Faulted(_)) => event,
     }
@@ -954,6 +1081,35 @@ struct Watch {
     /// the head up would otherwise be ten refusals a second, and the accepted
     /// rate is one per script.
     engage_refused_for: Option<u64>,
+    /// The run of pre-torque sweeps that are failing, if any are.
+    sweeps: SweepRun,
+}
+
+/// A run of pre-torque sweeps that stopped answering.
+///
+/// A dead bus fails a sweep every `rest_poll` for as long as it is dead, so
+/// what is reported is the run and not the sweep: the first failure is
+/// narrated, evented and alerted, the ones behind it are counted, and the sweep
+/// that finally answers says how many there were.
+#[derive(Debug, Default)]
+struct SweepRun {
+    /// Failed sweeps since the last one that answered.
+    failures: u64,
+}
+
+impl SweepRun {
+    /// Note a sweep that failed, and answer whether it opened the run.
+    fn failed(&mut self) -> bool {
+        self.failures += 1;
+        self.failures == 1
+    }
+
+    /// Note a sweep that answered, and answer how many failures it ended — or
+    /// `None` when nothing was failing, which is the ordinary case and says
+    /// nothing.
+    fn recovered(&mut self) -> Option<u64> {
+        (self.failures > 0).then(|| std::mem::take(&mut self.failures))
+    }
 }
 
 /// Why a phase handed control back.
@@ -983,8 +1139,18 @@ enum Ending {
 /// every one of its control periods: a script that arrives mid-move turns that
 /// move around from where the head has got to. Never a queue and never a
 /// refusal — the latest script is the only one there is.
-pub fn run<R: Rest>(machine: R, shared: &Shared, timing: Timing, sink: &dyn Sink) -> Outcome {
-    let outcome = cycle(machine, shared, timing, sink);
+///
+/// Every phase this passes through is published to `surface`, best-effort and
+/// after the fact, so something outside the process can tell a resting daemon
+/// from a parked one. Nothing here waits on it or checks whether it worked.
+pub fn run<R: Rest>(
+    machine: R,
+    shared: &Shared,
+    timing: Timing,
+    sink: &dyn Sink,
+    surface: &Surface,
+) -> Outcome {
+    let outcome = cycle(machine, shared, timing, sink, surface);
     // Last, and after every ending: the bus thread keeps the attachment up until
     // this is set, so a fault taken during the ending still has somewhere to
     // send its alert.
@@ -994,16 +1160,22 @@ pub fn run<R: Rest>(machine: R, shared: &Shared, timing: Timing, sink: &dyn Sink
 
 /// The loop itself. Separate from [`run`] only so every one of its endings goes
 /// through the one place that notes the machine is no longer being touched.
-fn cycle<R: Rest>(mut machine: R, shared: &Shared, timing: Timing, sink: &dyn Sink) -> Outcome {
+fn cycle<R: Rest>(
+    mut machine: R,
+    shared: &Shared,
+    timing: Timing,
+    sink: &dyn Sink,
+    surface: &Surface,
+) -> Outcome {
     let mut watch = Watch::default();
-    match phases(&mut machine, shared, timing, &mut watch, sink) {
+    match phases(&mut machine, shared, timing, &mut watch, sink, surface) {
         Ending::Stopped(stop) => {
             sink.line(&format!(
                 "stopped on {stop}: the machine is at rest, torque off"
             ));
             Outcome::Released(stop)
         }
-        Ending::Faulted(stage, refusal) => park(machine, shared, stage, refusal, sink),
+        Ending::Faulted(stage, refusal) => park(machine, shared, stage, refusal, sink, surface),
     }
 }
 
@@ -1015,21 +1187,22 @@ fn phases<R: Rest>(
     timing: Timing,
     watch: &mut Watch,
     sink: &dyn Sink,
+    surface: &Surface,
 ) -> Ending {
     // Where the machine is standing follows the loop from phase to phase: the
     // resting watch measures it, a release reports it, and an engage plans the
     // first move of the next turn from it. Assuming it instead is how a head
     // gets released from wherever it happens to be standing.
-    let mut standing = match normalise(machine, shared, watch, sink) {
+    let mut standing = match normalise(machine, shared, timing, watch, sink, surface) {
         Ok(standing) => standing,
         Err(ending) => return ending,
     };
     loop {
-        standing = match resting(machine, shared, timing, watch, sink, standing) {
+        standing = match resting(machine, shared, timing, watch, sink, surface, standing) {
             Ok(standing) => standing,
             Err(ending) => return ending,
         };
-        standing = match active(machine, shared, timing, watch, sink, standing) {
+        standing = match active(machine, shared, timing, watch, sink, surface, standing) {
             Ok(standing) => standing,
             Err(ending) => return ending,
         };
@@ -1042,15 +1215,32 @@ fn phases<R: Rest>(
 /// measure it and fold it — never to refuse it. Where the machine is standing
 /// is physical reality: the only thing that can be done about it is to plan a
 /// move out of it, and this is that move.
+///
+/// The look that precedes the fold is retried rather than faulted: a daemon
+/// that came up over a flaky bus is a limp machine over a flaky bus, which is
+/// nobody's hazard, and this is the unattended-at-boot case where parking would
+/// cost the most. Everything from the moment torque goes on keeps its fault
+/// handling.
 fn normalise<R: Rest>(
     machine: &mut R,
     shared: &Shared,
+    timing: Timing,
     watch: &mut Watch,
     sink: &dyn Sink,
+    surface: &Surface,
 ) -> Result<Standing, Ending> {
-    let standing = machine
-        .watch(&mut |text| sink.line(text))
-        .map_err(|refusal| Ending::Faulted(FaultStage::Startup, refusal))?;
+    let standing = loop {
+        if let Some(standing) = watched_sweep(machine, shared, watch, sink, surface) {
+            break standing;
+        }
+        if let Some(stop) = shared.stopping() {
+            // Nothing was ever taken hold of, so there is nothing to fold and
+            // nothing to release: the machine is limp where the bus left it.
+            surface.phase(Phase::Stopping, sink);
+            return Err(Ending::Stopped(stop));
+        }
+        thread::sleep(timing.rest_poll);
+    };
     sink.event(
         "motion_startup",
         &json!({ "at_stow": standing == Standing::AtStow }),
@@ -1061,7 +1251,7 @@ fn normalise<R: Rest>(
     }
 
     sink.line("startup: the machine is not at stow. taking hold to fold it, then letting go.");
-    let mut head = match take_hold(machine, shared, watch, sink) {
+    let mut head = match take_hold(machine, shared, watch, sink, surface) {
         Ok(head) => head,
         // Limp and crooked is still limp: the gate wrote nothing, the machine
         // is at no more risk than it was, and the next script's engage plans
@@ -1076,7 +1266,12 @@ fn normalise<R: Rest>(
     // whose pose nobody has ever commanded is not the one to start splicing
     // trajectories on. A script that lands during the fold is executed by the
     // loop this returns into, from a known pose.
-    let folded = head.move_to(Posture::Stow, &mut |text| sink.line(text), &mut || None);
+    let folded = head.move_to(
+        Posture::Stow,
+        &mut |text| sink.line(text),
+        &mut |event| moving(sink, event),
+        &mut || None,
+    );
     if let Err(refusal) = folded {
         return Err(fault_now(head, FaultStage::Startup, refusal, sink));
     }
@@ -1096,6 +1291,7 @@ fn resting<R: Rest>(
     timing: Timing,
     watch: &mut Watch,
     sink: &dyn Sink,
+    surface: &Surface,
     entered: Standing,
 ) -> Result<Standing, Ending> {
     sink.line("resting: torque off, the port held, watching the machine");
@@ -1103,21 +1299,93 @@ fn resting<R: Rest>(
         "motion_resting",
         &json!({ "poll_ms": millis(timing.rest_poll) }),
     );
+    surface.phase(Phase::Resting, sink);
     let mut standing = entered;
     loop {
         if let Some(stop) = shared.stopping() {
             // Nothing to command and nothing to release: the machine is already
             // where every ending is trying to get it.
+            surface.phase(Phase::Stopping, sink);
             return Err(Ending::Stopped(stop));
         }
         if wants_up(shared, watch) {
             return Ok(standing);
         }
-        standing = machine
-            .watch(&mut |text| sink.line(text))
-            .map_err(|refusal| Ending::Faulted(FaultStage::Resting, refusal))?;
+        // A sweep that failed leaves the last one's answer standing: where the
+        // machine was found is still the best thing known about it, and a
+        // machine nobody is commanding does not move by itself. What a hand
+        // does to it while the bus is down is what the sweep after the recovery
+        // is for.
+        if let Some(seen) = watched_sweep(machine, shared, watch, sink, surface) {
+            standing = seen;
+        }
         thread::sleep(timing.rest_poll);
     }
+}
+
+/// One sweep of a limp machine, where a failure is an expected error.
+///
+/// Never an ending. The machine here has no torque on it — it is at the minimum
+/// risk condition already — so a sweep that stops answering costs the daemon
+/// its picture of the machine and nothing else: no fault response would make a
+/// limp machine safer, and parking on it would forfeit the recovery that
+/// arrives free with the next sweep that answers. `None` says the sweep failed
+/// and the caller keeps whatever it knew before.
+///
+/// Reported on the edges of a failure run, because a dead bus fails a sweep
+/// every `rest_poll` for as long as it is dead and a line per sweep would bury
+/// the run that matters underneath itself.
+fn watched_sweep<R: Rest>(
+    machine: &mut R,
+    shared: &Shared,
+    watch: &mut Watch,
+    sink: &dyn Sink,
+    surface: &Surface,
+) -> Option<Standing> {
+    match machine.watch(&mut |text| sink.line(text)) {
+        Ok(standing) => {
+            watch_answered(watch, shared, sink, surface);
+            Some(standing)
+        }
+        Err(refusal) => {
+            if watch.sweeps.failed() {
+                surface.watching(Watching::Failing, sink);
+                sink.line(&format!(
+                    "the watch cannot read the machine: {refusal}. torque is off and stays off, \
+                     so nothing is at risk; sweeping on, and no script will raise the head until \
+                     a sweep answers."
+                ));
+                sink.event(
+                    "resting_watch_lost",
+                    &json!({ "detail": refusal.to_string() }),
+                );
+                shared.note_watch_lost(refusal.to_string());
+            }
+            None
+        }
+    }
+}
+
+/// Close a failure run because the machine answered, wherever the sweep that
+/// answered happened to be taken.
+///
+/// The resting watch is not the only pre-torque sweep: an engage past a stale
+/// posture takes a remedial one of its own, and torque only goes on once it has
+/// answered. A run left open by that sweep would leave the state file saying
+/// the daemon cannot read a machine it has just measured and put the head up
+/// on — for the whole of a session, since nothing else looks until the release
+/// — and the probe reading it would call a working robot degraded.
+fn watch_answered(watch: &mut Watch, shared: &Shared, sink: &dyn Sink, surface: &Surface) {
+    let Some(failures) = watch.sweeps.recovered() else {
+        return;
+    };
+    surface.watching(Watching::Ok, sink);
+    sink.line(&format!(
+        "the watch is reading again after {failures} failed sweep(s); the head can take hold once \
+         more"
+    ));
+    sink.event("resting_watch_restored", &json!({ "failures": failures }));
+    shared.note_watch_restored();
 }
 
 /// Whether a script is asking for the head up, and this daemon may act on it.
@@ -1142,15 +1410,20 @@ fn active<R: Rest>(
     timing: Timing,
     watch: &mut Watch,
     sink: &dyn Sink,
+    surface: &Surface,
     standing: Standing,
 ) -> Result<Standing, Ending> {
-    let mut head = match take_hold(machine, shared, watch, sink) {
+    let mut head = match take_hold(machine, shared, watch, sink, surface) {
         Ok(head) => head,
         Err(EngageFailed::Gate(_)) => return Ok(standing),
         Err(EngageFailed::Fault(refusal)) => {
             return Err(Ending::Faulted(FaultStage::Engage, refusal));
         }
     };
+    // Said once torque is on and not before: a refused engage leaves the machine
+    // resting, and a surface that had already claimed active would have to be
+    // taken back.
+    surface.phase(Phase::Active, sink);
 
     // Engaging pins the machine where the resting watch found it, so the
     // posture the loop starts from is that measurement and not an assumption. A
@@ -1168,6 +1441,7 @@ fn active<R: Rest>(
     loop {
         if let Some(stop) = shared.stopping() {
             watch.dwells.flush(&mut |text| sink.line(text));
+            surface.phase(Phase::Stopping, sink);
             return Err(release_for(head, posture, stop, shared, sink));
         }
 
@@ -1186,13 +1460,18 @@ fn active<R: Rest>(
             // raise that had to finish before the fold could start would put
             // the head down a whole move after it was asked for.
             let mut in_flight = desired;
-            let outcome = head.move_to(desired, &mut |text| sink.line(text), &mut || {
-                let (next, reason) = retarget_to(shared, watch, sink, in_flight)?;
-                sink.line(&format!("motion: {in_flight} -> {next}, mid-move"));
-                started(sink, Some(in_flight), next, reason);
-                in_flight = next;
-                Some(next)
-            });
+            let outcome = head.move_to(
+                desired,
+                &mut |text| sink.line(text),
+                &mut |event| moving(sink, event),
+                &mut || {
+                    let (next, reason) = retarget_to(shared, watch, sink, in_flight)?;
+                    sink.line(&format!("motion: {in_flight} -> {next}, mid-move"));
+                    started(sink, Some(in_flight), next, reason);
+                    in_flight = next;
+                    Some(next)
+                },
+            );
             let arrived = match outcome {
                 Ok(arrived) => arrived,
                 Err(refusal) => return Err(fault_now(head, FaultStage::Motion, refusal, sink)),
@@ -1236,11 +1515,16 @@ fn from(posture: Option<Posture>) -> &'static str {
 /// The engage wall clock is on every engage because a wake word is supposed to
 /// reach the servos in tens of milliseconds, and a capture is where that
 /// number is read off.
+///
+/// An engage that succeeded measured the machine, whether it took a remedial
+/// sweep of its own or found the resting watch's last one still current, so it
+/// is also where a failure run can end.
 fn take_hold<'e, R: Rest>(
     machine: &'e mut R,
     shared: &Shared,
     watch: &mut Watch,
     sink: &dyn Sink,
+    surface: &Surface,
 ) -> Result<R::Active<'e>, EngageFailed> {
     // Read before the attempt, not after it. An engage takes tens of
     // milliseconds and the bus thread writes the schedule the whole time, so a
@@ -1255,6 +1539,7 @@ fn take_hold<'e, R: Rest>(
         Ok(head) => {
             sink.line(&format!("engaged: torque on, {took} ms"));
             sink.event("motion_engaged", &json!({ "ms": took }));
+            watch_answered(watch, shared, sink, surface);
             Ok(head)
         }
         Err(EngageFailed::Gate(refusal)) => {
@@ -1367,6 +1652,33 @@ fn reached(sink: &dyn Sink, posture: Posture) {
     sink.event("motion_posture", &json!({ "state": posture.as_str() }));
 }
 
+/// What a move says while it runs, as this daemon records it.
+///
+/// One event is worth more than its line. A clock too short for the span the
+/// move actually covers is right-sized before the move is commanded — the head
+/// travels slower than the configuration asked for rather than stepping past
+/// the guard and dropping — and the pair of durations is the only sign that a
+/// configured value never fitted the case it met. It is its own line rather
+/// than a field on [`started`]'s: that one is emitted before the move is
+/// commanded, because its timestamp is what a capture measures wake-to-motion
+/// against, and the stretch is not known until the command is accepted.
+///
+/// Everything else a move reports is already on the console through the
+/// library's own words.
+fn moving(sink: &dyn Sink, event: TickEvent) {
+    if let TickEvent::Stretched(stretch) = event {
+        sink.event(
+            "motion_clock_stretched",
+            &json!({
+                "requested_head_s": stretch.requested.head.as_secs_f64(),
+                "effective_head_s": stretch.effective.head.as_secs_f64(),
+                "requested_antennas_s": stretch.requested.antennas.as_secs_f64(),
+                "effective_antennas_s": stretch.effective.antennas.as_secs_f64(),
+            }),
+        );
+    }
+}
+
 /// Fold the head if it is not folded, then release: the expected ending, and
 /// the one every stop takes.
 ///
@@ -1386,7 +1698,12 @@ fn release_for<A: Active>(
         started(sink, posture, Posture::Stow, "shutdown");
         // Nothing may divert this one: the daemon is on its way out and the
         // fold is the last thing it owes the machine.
-        let folded = head.move_to(Posture::Stow, &mut |text| sink.line(text), &mut || None);
+        let folded = head.move_to(
+            Posture::Stow,
+            &mut |text| sink.line(text),
+            &mut |event| moving(sink, event),
+            &mut || None,
+        );
         if let Err(refusal) = folded {
             return fault_now(head, FaultStage::Shutdown, refusal, sink);
         }
@@ -1478,8 +1795,13 @@ fn fault_now<A: Active>(head: A, stage: FaultStage, refusal: Refusal, sink: &dyn
 /// thread, and the ending has to be noted here too: the bus thread waits for one
 /// before it closes the attachment the alert travels over, and no loop is coming
 /// that would set it.
-pub fn commission_failed(shared: &Shared, refusal: Refusal, sink: &dyn Sink) -> Outcome {
-    let outcome = faulted(shared, FaultStage::Commission, refusal, sink);
+pub fn commission_failed(
+    shared: &Shared,
+    refusal: Refusal,
+    sink: &dyn Sink,
+    surface: &Surface,
+) -> Outcome {
+    let outcome = faulted(shared, FaultStage::Commission, refusal, sink, surface);
     shared.request_stop(Stop::Detached);
     shared.end_motion();
     outcome
@@ -1499,8 +1821,9 @@ fn park<R>(
     stage: FaultStage,
     refusal: Refusal,
     sink: &dyn Sink,
+    surface: &Surface,
 ) -> Outcome {
-    let outcome = faulted(shared, stage, refusal, sink);
+    let outcome = faulted(shared, stage, refusal, sink, surface);
     while shared.stopping().is_none() {
         thread::sleep(PARK_POLL);
     }
@@ -1516,9 +1839,20 @@ fn park<R>(
 /// already shutting down would otherwise reach the capture after the reader is
 /// gone, or not at all. The bridge alert stays the bus thread's — it is the one
 /// with an attachment.
-fn faulted(shared: &Shared, stage: FaultStage, refusal: Refusal, sink: &dyn Sink) -> Outcome {
+///
+/// The state surface is written here too, and here is after: torque came off
+/// before this was reached, so nothing about a file has ever stood between the
+/// machine and the minimum risk condition.
+fn faulted(
+    shared: &Shared,
+    stage: FaultStage,
+    refusal: Refusal,
+    sink: &dyn Sink,
+    surface: &Surface,
+) -> Outcome {
     let report = FaultReport::new(stage, refusal.to_string());
     shared.set_fault(report.clone());
+    surface.parked(report.stage, &report.detail, sink);
     sink.event(
         "motion_fault",
         &json!({ "stage": report.stage.to_string(), "detail": report.detail }),
@@ -1539,6 +1873,7 @@ fn millis(span: Duration) -> u64 {
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -1546,12 +1881,14 @@ mod tests {
     use reachy_bench::pump::ReadFailures;
     use reachy_bus::IdOutcome;
     use reachy_motion::{
-        CommandDisposition, Fault, JointId, RegId, SeqError, SeqStep, ServoHealth, StepContext,
+        ClockStretch, CommandDisposition, Fault, JointId, RegId, SeqError, SeqStep, ServoHealth,
+        StepContext,
     };
 
     use super::*;
     use crate::cells::Delivered;
     use crate::report::Collect;
+    use crate::state::{state_in, temp_dir, value_of};
 
     const POD: &str = "reachy00";
     /// Short enough that a test which really sleeps through one is not slow,
@@ -1645,8 +1982,18 @@ mod tests {
         seq: u64,
         /// Where the resting watch says the machine is standing.
         standing: Standing,
-        /// The sweep, counted from zero, that refuses.
-        refuse_watch: Option<usize>,
+        /// The sweeps, counted from zero, that refuse: the first of the run and
+        /// how many there are.
+        refuse_watch: Option<(usize, usize)>,
+        /// Whether the last sweep failed, which is the state a real engage's
+        /// remedial sweep would find the bus in.
+        watch_failing: bool,
+        /// Whether an engage refuses while the bus is not answering, as the real
+        /// one does: past a stale posture it sweeps first, and a sweep that
+        /// cannot measure is the refusal. Off by default, because a bus that
+        /// came back between the last failed sweep and the wake is the other
+        /// case worth driving.
+        unreadable_engage: bool,
         /// The engage, counted from zero, that a torque-on gate refuses.
         gate_engage: Option<usize>,
         /// The engage, counted from zero, that fails outright.
@@ -1684,6 +2031,19 @@ mod tests {
         /// first. Text, because a move still narrates through the motion
         /// libraries' own rendering.
         says_moving: VecDeque<Vec<&'static str>>,
+        /// What it reports as values on each move, one entry per move. The
+        /// typed half of the same run: the events a move carries that this
+        /// daemon records as facts rather than as prose.
+        reports_moving: VecDeque<Vec<TickEvent>>,
+        /// The state file to read at every act, when a test is watching it.
+        ///
+        /// The surface holds one record and replaces it, so the sequence it
+        /// passed through is observable only from inside the run. This is that
+        /// inside: the machine is the only thing the loop calls on its way
+        /// between phases.
+        trail: Option<PathBuf>,
+        /// What the state file said at each recorded act, in the same order.
+        seen: Rc<RefCell<Vec<String>>>,
     }
 
     impl Fake {
@@ -1695,6 +2055,8 @@ mod tests {
                 seq: 0,
                 standing: Standing::AtStow,
                 refuse_watch: None,
+                watch_failing: false,
+                unreadable_engage: false,
                 gate_engage: None,
                 fault_engage: None,
                 refuse_move: None,
@@ -1711,7 +2073,21 @@ mod tests {
                 moves: 0,
                 says: VecDeque::new(),
                 says_moving: VecDeque::new(),
+                reports_moving: VecDeque::new(),
+                trail: None,
+                seen: Rc::new(RefCell::new(Vec::new())),
             }
+        }
+
+        /// Read `path` at every act, so what the state surface said as the run
+        /// went through it can be asserted as a sequence.
+        fn watching_state(mut self, path: impl Into<PathBuf>) -> Self {
+            self.trail = Some(path.into());
+            self
+        }
+
+        fn seen(&self) -> Rc<RefCell<Vec<String>>> {
+            Rc::clone(&self.seen)
         }
 
         /// A machine a crash or a hand left somewhere other than its fold.
@@ -1732,6 +2108,12 @@ mod tests {
             self
         }
 
+        /// The same for what they report as values while moving, move by move.
+        fn reporting_moving(mut self, per_move: impl IntoIterator<Item = Vec<TickEvent>>) -> Self {
+            self.reports_moving = per_move.into_iter().collect();
+            self
+        }
+
         /// A refusal out of the nth move, which also stops the daemon: a parked
         /// thread waits for that, and a test that never sent one would wait with
         /// it.
@@ -1748,8 +2130,19 @@ mod tests {
             self
         }
 
-        fn refusing_watch(mut self, nth: usize) -> Self {
-            self.refuse_watch = Some(nth);
+        /// A run of `count` sweeps refusing, from the nth: a bus that goes away
+        /// and comes back, which is the shape the daemon is built to ride out.
+        fn refusing_watch(mut self, nth: usize, count: usize) -> Self {
+            self.refuse_watch = Some((nth, count));
+            self
+        }
+
+        /// An engage refusing for as long as the sweeps are failing, which is
+        /// what the real one does: past a stale posture it takes a remedial
+        /// sweep of its own, and a sweep that cannot measure the machine is a
+        /// refusal — nothing written, nothing to undo.
+        fn unreadable_engage(mut self) -> Self {
+            self.unreadable_engage = true;
             self
         }
 
@@ -1820,6 +2213,12 @@ mod tests {
         }
 
         fn record(&self, act: Act) {
+            if let Some(path) = &self.trail {
+                let read = |key| value_of(path, key).unwrap_or_else(|| "absent".to_owned());
+                self.seen
+                    .borrow_mut()
+                    .push(format!("{}/{}", read("state"), read("watch")));
+            }
             self.acts.borrow_mut().push(act);
         }
 
@@ -1901,12 +2300,17 @@ mod tests {
             let nth = self.watches;
             self.watches += 1;
             self.record(Act::Watch);
-            if self.refuse_watch == Some(nth) {
-                self.shared.request_stop(Stop::Operator);
-                return Err(Refusal::new("servo 11: timed out"));
-            }
+            // The world moves whether or not the machine answered: a failing
+            // sweep does not stop scripts arriving, and it must not stop a test
+            // running out of events either — a failure is no longer an ending.
             let event = self.advance();
             self.stop_if_spent(event);
+            self.watch_failing = self
+                .refuse_watch
+                .is_some_and(|(from, count)| (from..from + count).contains(&nth));
+            if self.watch_failing {
+                return Err(Refusal::new("servo 11: timed out"));
+            }
             Ok(self.standing)
         }
 
@@ -1914,6 +2318,12 @@ mod tests {
             let nth = self.engages;
             self.engages += 1;
             thread::sleep(self.engage_takes);
+            // The remedial sweep first, as the real one does: it is the reason
+            // an engage over a bus that is not answering refuses rather than
+            // faults, and it happens before any of the torque-on gates.
+            if self.unreadable_engage && self.watch_failing {
+                return Err(EngageFailed::Gate(Refusal::new("servo 11: timed out")));
+            }
             if self.gate_engage == Some(nth) {
                 return Err(EngageFailed::Gate(Refusal::new(
                     "the supply is below the floor: 5.5 V against 6.0 V",
@@ -1937,11 +2347,13 @@ mod tests {
             &mut self,
             posture: Posture,
             line: &mut dyn FnMut(&str),
+            event: &mut dyn FnMut(TickEvent),
             retarget: &mut dyn FnMut() -> Option<Posture>,
         ) -> Result<Posture, Refusal> {
             let nth = self.machine.moves;
             self.machine.moves += 1;
             let says = self.machine.says_moving.pop_front().unwrap_or_default();
+            let reports = self.machine.reports_moving.pop_front().unwrap_or_default();
             if self.machine.refuse_move == Some(nth) {
                 if self.machine.refusal_stops {
                     self.machine.shared.request_stop(Stop::Operator);
@@ -1951,6 +2363,12 @@ mod tests {
             self.machine.record(Act::Move(posture));
             for text in says {
                 line(text);
+            }
+            // After the lines and before the retargets, which is where the real
+            // one falls: the library right-sizes the clock as it accepts the
+            // command, so a stretch is the first thing a move has to say.
+            for reported in reports {
+                event(reported);
             }
             // What the real move does over its control periods, compressed: the
             // world changes once if the test said so, and then the loop is asked
@@ -2039,12 +2457,36 @@ mod tests {
     }
 
     /// The same, keeping what the run said as well as what it did.
+    ///
+    /// The state surface writes into a temporary directory that lasts exactly as
+    /// long as the run: every test drives the real writer, so a transition that
+    /// panicked or a path the loop got wrong is a failure here rather than on a
+    /// device.
     fn driven(shared: &Shared, machine: Fake) -> (Outcome, Vec<Act>, Collect) {
+        let dir = temp_dir();
+        let (outcome, acts, _, sink) = stated(&state_in(&dir), shared, machine);
+        (outcome, acts, sink)
+    }
+
+    /// The same again, against a state surface at `path`, and keeping what that
+    /// surface said as the run passed through it.
+    ///
+    /// The surface is opened through [`Surface::opening`], which is what the
+    /// binary calls too: `starting` is published before the loop begins because
+    /// commissioning is over by the time [`run`] is reached.
+    fn stated(
+        path: &Path,
+        shared: &Shared,
+        machine: Fake,
+    ) -> (Outcome, Vec<Act>, Vec<String>, Collect) {
         let acts = machine.acts();
+        let seen = machine.seen();
         let sink = Collect::default();
-        let outcome = run(machine, shared, timing(), &sink);
+        let surface = Surface::opening(path, &sink);
+        let outcome = run(machine, shared, timing(), &sink, &surface);
         let done = acts.borrow().clone();
-        (outcome, done, sink)
+        let trail = seen.borrow().clone();
+        (outcome, done, trail, sink)
     }
 
     /// The resting posture is folded with the motors unpowered, and a machine
@@ -2764,20 +3206,379 @@ mod tests {
         assert!(!acts.contains(&Act::ReleaseNow), "{acts:?}");
     }
 
-    /// The resting watch is the only thing looking at an idle machine, so a
-    /// sweep that stops answering is a fault. The machine is already limp; what
-    /// the daemon does about it is stop and say so.
+    /// A limp machine nobody can read is at the minimum risk condition already,
+    /// so the watch losing it is a picture lost and not control lost. The
+    /// daemon keeps sweeping, says so once, and picks the machine up again on
+    /// the first sweep that answers — no fault, no park, no operator.
     #[test]
-    fn a_sweep_that_stops_answering_faults() {
+    fn a_watch_that_stops_answering_keeps_sweeping_and_recovers_by_itself() {
         let shared = Arc::new(Shared::new(POD));
-        let machine = Fake::new(&shared, [Event::Wait, Event::Wait]).refusing_watch(1);
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .refusing_watch(1, 3);
+
+        let (outcome, acts, sink) = driven(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert!(!shared.faulted(), "a failing watch parked the daemon");
+        assert!(
+            acts.iter().filter(|act| **act == Act::Watch).count() >= 5,
+            "the watch stopped sweeping: {acts:?}"
+        );
+        assert_eq!(
+            sink.all_fields("resting_watch_lost").len(),
+            1,
+            "a run of failures is one piece of news, not one per sweep"
+        );
+        let restored = sink
+            .fields("resting_watch_restored")
+            .expect("the recovery is captured");
+        assert_eq!(restored["failures"], json!(3));
+    }
+
+    /// The alert half of the same thing: somebody is told the head cannot be
+    /// raised, once per run of failures, while the fault cell stays empty.
+    #[test]
+    fn a_failing_watch_owes_an_alarm_and_not_a_fault() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [Event::Wait, Event::Wait, Event::Stop(Stop::Operator)],
+        )
+        .refusing_watch(0, 2);
 
         let (outcome, _) = drive(&shared, machine);
 
-        let Outcome::Faulted(report) = outcome else {
-            panic!("the sweep refused");
-        };
-        assert_eq!(report.stage, FaultStage::Resting);
+        assert!(outcome.is_clean(), "{outcome}");
+        let alarm = shared.take_watch_alarm().expect("a failing watch owes one");
+        assert_eq!(alarm.runs, 1, "one alarm for the run, not one per sweep");
+        assert!(alarm.detail.contains("servo 11"), "{}", alarm.detail);
+        assert_eq!(shared.fault(), None);
+    }
+
+    /// The startup look is the same decision at the worst moment for a park:
+    /// boot, unattended, over a bus that is not answering yet. It retries at the
+    /// resting cadence and folds the machine on the first sweep that answers.
+    #[test]
+    fn a_startup_look_that_cannot_read_the_machine_retries_instead_of_parking() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .standing_elsewhere()
+        .refusing_watch(0, 2);
+
+        let (outcome, acts, sink) = driven(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert_eq!(
+            acts,
+            [
+                Act::Watch,
+                Act::Watch,
+                Act::Watch,
+                Act::Engage,
+                Act::Move(Posture::Stow),
+                Act::Release,
+                Act::Watch,
+            ],
+            "the fold waited for a sweep that answered, then ran"
+        );
+        assert!(sink.saw("resting_watch_lost"));
+        assert_eq!(
+            sink.fields("motion_startup").expect("the look is reported")["at_stow"],
+            json!(false)
+        );
+    }
+
+    /// A daemon stopped while it is still trying to read a machine over a dead
+    /// bus exits rather than retrying forever. Nothing was ever taken hold of,
+    /// so there is nothing to fold: the machine is limp already.
+    #[test]
+    fn a_stop_during_a_startup_retry_ends_the_run_cleanly() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(&shared, [Event::Wait, Event::Stop(Stop::Operator)])
+            .standing_elsewhere()
+            .refusing_watch(0, 9);
+
+        let (outcome, acts) = drive(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert_eq!(acts, [Act::Watch, Act::Watch], "the retry ignored the stop");
+    }
+
+    /// The head still refuses to come up while the machine cannot be measured —
+    /// an engage plans the pin from a sweep — but a refusal is a refusal: the
+    /// daemon stays resting and the next script asks again.
+    ///
+    /// The refusal here is the unreadable bus and nothing else, so what is
+    /// pinned is the loop's answer to it: no fault, no raise, an alert owed, and
+    /// a run that goes on to end the ordinary way.
+    #[test]
+    fn a_wake_over_a_bus_that_cannot_be_read_is_refused_and_not_faulted() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Wait,
+                Event::Raise,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .refusing_watch(1, 2)
+        .unreadable_engage();
+
+        let (outcome, acts) = drive(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert!(!shared.faulted());
+        assert!(!acts.contains(&Act::Move(Posture::Up)), "{acts:?}");
+        let (detail, _) = shared
+            .take_engage_refusal()
+            .expect("a refused engage owes an alert");
+        assert!(detail.contains("timed out"), "{detail}");
+    }
+
+    /// A gate refusal while the sweeps happen to be failing is still a gate
+    /// refusal: two independent reasons an engage can decline, neither of them
+    /// a fault, and the one that answered is the one reported.
+    #[test]
+    fn a_torque_on_gate_refusing_over_a_failing_watch_still_does_not_park() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Raise,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .refusing_watch(1, 2)
+        .gating_engage(0);
+
+        let (outcome, acts) = drive(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert!(!shared.faulted());
+        assert!(!acts.contains(&Act::Move(Posture::Up)), "{acts:?}");
+        let (detail, _) = shared
+            .take_engage_refusal()
+            .expect("a refused engage owes an alert");
+        assert!(detail.contains("below the floor"), "{detail}");
+    }
+
+    /// The bus can come back between the last failed sweep and the wake that
+    /// follows it, and then the engage's own remedial sweep is what finds it
+    /// answering. The failure run ends there.
+    ///
+    /// Otherwise the surface would say `active/failing` for the whole of a
+    /// session — nothing else sweeps until the release — and the probe reading
+    /// it would call a robot with its head demonstrably up unable to raise it.
+    #[test]
+    fn an_engage_that_measures_the_machine_ends_the_failure_run() {
+        let dir = temp_dir();
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Wait,
+                Event::Raise,
+                Event::Lower,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .refusing_watch(1, 1)
+        .watching_state(state_in(&dir));
+
+        let (outcome, acts, trail, sink) = stated(&state_in(&dir), &shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert!(acts.contains(&Act::Move(Posture::Up)), "{acts:?}");
+        assert!(
+            trail.contains(&"resting/failing".to_owned()),
+            "the run was not open when the wake arrived: {trail:?}"
+        );
+        assert!(
+            !trail
+                .iter()
+                .any(|seen| seen.ends_with("/failing") && seen.starts_with("active")),
+            "a session ran with the surface still saying the machine cannot be read: {trail:?}"
+        );
+        let fields = sink
+            .fields("resting_watch_restored")
+            .expect("the run that the engage closed is reported like any other");
+        assert_eq!(fields["failures"], json!(1));
+    }
+
+    /// The state surface follows the loop rather than describing it afterwards:
+    /// the file is replaced in place, so the only way to see the sequence it
+    /// passed through is from inside the run, which is what the fixture reads at
+    /// every act.
+    ///
+    /// `active` is deliberately not said until torque is on — a refused engage
+    /// leaves the machine resting, and a surface that had already claimed active
+    /// would have to be taken back.
+    #[test]
+    fn the_surface_follows_the_loop_through_every_phase() {
+        let dir = temp_dir();
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Raise,
+                Event::Lower,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .sleeping()
+        .watching_state(state_in(&dir));
+
+        let (outcome, acts, trail, _) = stated(&state_in(&dir), &shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert_eq!(acts.len(), trail.len(), "{acts:?} {trail:?}");
+        assert_eq!(
+            trail,
+            [
+                // The startup look, before the loop has said anything.
+                "starting/ok",
+                // Resting, and the engage that ends it: torque goes on during
+                // this act, so the phase is still the honest one.
+                "resting/ok",
+                "active/ok",
+                "active/ok",
+                "active/ok",
+                "active/ok",
+                "active/ok",
+                // Released, and watching a limp machine again.
+                "resting/ok",
+                "resting/ok",
+            ]
+        );
+        assert_eq!(
+            value_of(&state_in(&dir), "state").as_deref(),
+            Some("stopping"),
+            "the last thing a stopped daemon says is that it is stopping"
+        );
+    }
+
+    /// The failure this surface exists for: a parked daemon does not exit, so
+    /// `systemctl is-active` calls it running over a journal that has gone
+    /// quiet. The file says otherwise, and carries what stopped it.
+    #[test]
+    fn a_parked_daemon_says_so_and_says_what_stopped_it() {
+        let dir = temp_dir();
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(&shared, [Event::Raise, Event::Wait]).refusing_move(0);
+
+        let (outcome, _, _, _) = stated(&state_in(&dir), &shared, machine);
+
+        assert!(matches!(outcome, Outcome::Faulted(_)), "{outcome}");
+        assert_eq!(
+            value_of(&state_in(&dir), "state").as_deref(),
+            Some("parked")
+        );
+        assert_eq!(
+            value_of(&state_in(&dir), "fault_stage").as_deref(),
+            Some("the motion loop")
+        );
+        assert!(
+            value_of(&state_in(&dir), "fault_detail")
+                .is_some_and(|detail| detail.contains("envelope")),
+            "the fault detail is what an operator reads before deciding anything"
+        );
+    }
+
+    /// A machine nobody can read is resting, safely, and cannot raise its head.
+    /// Both facts are in the file at once, because a probe that saw only the
+    /// phase would call a robot that will not answer a wake word ready.
+    #[test]
+    fn a_failing_watch_shows_on_the_surface_without_moving_the_phase() {
+        let dir = temp_dir();
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .refusing_watch(1, 2)
+        .watching_state(state_in(&dir));
+
+        let (outcome, _, trail, _) = stated(&state_in(&dir), &shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert!(
+            trail.contains(&"resting/failing".to_owned()),
+            "the failing watch never reached the surface: {trail:?}"
+        );
+        assert!(
+            trail.iter().all(|seen| !seen.starts_with("parked")),
+            "a failing watch parked the daemon: {trail:?}"
+        );
+        assert_eq!(
+            trail.last().map(String::as_str),
+            Some("resting/ok"),
+            "the flag did not come back with the reads: {trail:?}"
+        );
+    }
+
+    /// Nothing about this surface may ever stand between the machine and the
+    /// minimum risk condition. A run with nowhere to write commands exactly what
+    /// the same run with somewhere to write commands, and says why once.
+    #[test]
+    fn a_surface_that_cannot_be_written_changes_nothing_the_machine_does() {
+        let dir = temp_dir();
+        let nowhere = state_in(&dir).join("no-such-directory").join("state");
+        let events = [
+            Event::Raise,
+            Event::Lower,
+            Event::Wait,
+            Event::Stop(Stop::Operator),
+        ];
+
+        let shared = Arc::new(Shared::new(POD));
+        let (wrote, expected, _) = driven(&shared, Fake::new(&shared, events).sleeping());
+
+        let shared = Arc::new(Shared::new(POD));
+        let (outcome, acts, _, sink) =
+            stated(&nowhere, &shared, Fake::new(&shared, events).sleeping());
+
+        assert_eq!(outcome, wrote);
+        assert_eq!(acts, expected);
+        assert_eq!(
+            sink.said()
+                .lines
+                .iter()
+                .filter(|line| line.contains("state file"))
+                .count(),
+            1,
+            "a directory that is not there stays not there"
+        );
     }
 
     /// A release that cannot report itself complete still happened — the
@@ -3236,18 +4037,136 @@ mod tests {
     fn the_rail_is_re_read_on_its_own_cadence_and_not_every_sweep() {
         let now = Instant::now();
         let every = Duration::from_millis(500);
+        let mut rail = Rail::new(every);
 
-        assert!(
-            rail_due(None, now, every),
+        assert_eq!(
+            rail.cadence(now),
+            PollCadence::PositionsAndRail,
             "the first sweep since commissioning has no rail reading to carry forward"
         );
-        assert!(!rail_due(
-            Some(now),
-            now + Duration::from_millis(499),
-            every
-        ));
-        assert!(rail_due(Some(now), now + every, every));
-        assert!(rail_due(Some(now), now + Duration::from_secs(3), every));
+        rail.read(now, PollCadence::PositionsAndRail);
+
+        let soon = now + Duration::from_millis(499);
+        assert_eq!(rail.cadence(soon), PollCadence::Positions);
+        rail.read(soon, PollCadence::Positions);
+        assert_eq!(rail.cadence(now + every), PollCadence::PositionsAndRail);
+        assert_eq!(
+            rail.cadence(now + Duration::from_secs(3)),
+            PollCadence::PositionsAndRail
+        );
+    }
+
+    /// A failed sweep does not merely fail to read the rail — it makes the
+    /// reading already in hand worthless, because nothing bounds how long the
+    /// outage lasts. The engage that follows a recovery must not judge its two
+    /// torque-on gates on a supply measured before the bus went away.
+    #[test]
+    fn a_failed_sweep_makes_the_next_one_that_answers_re_read_the_rail() {
+        let now = Instant::now();
+        let every = Duration::from_millis(500);
+        let mut rail = Rail::new(every);
+        rail.read(now, PollCadence::PositionsAndRail);
+        assert_eq!(rail.cadence(now), PollCadence::Positions);
+
+        rail.lost();
+
+        assert_eq!(rail.cadence(now), PollCadence::PositionsAndRail);
+    }
+
+    /// A pre-torque sweep that failed leaves the rail to be read again, and one
+    /// that answered leaves what it read standing.
+    ///
+    /// The wiring, not the arithmetic: `Rail` knows what a lost reading means,
+    /// and this is what says the sweeps call it. Dropped from the failure arm,
+    /// an engage after an hour-long outage would judge its two torque-on gates
+    /// against a supply measured before the outage began, and nothing else
+    /// would notice.
+    #[test]
+    fn a_pre_torque_sweep_carries_the_rail_with_it() {
+        let now = Instant::now();
+        let mut rail = Rail::new(Duration::from_millis(500));
+        rail.read(now, PollCadence::PositionsAndRail);
+        assert_eq!(rail.cadence(now), PollCadence::Positions);
+
+        let failed: Result<(), PumpError> =
+            pre_torque_sweep(&mut rail, now, PollCadence::Positions, |_| {
+                Err(PumpError::TorqueOffUnacked { id: 11 })
+            });
+
+        assert!(failed.is_err());
+        assert_eq!(
+            rail.cadence(now),
+            PollCadence::PositionsAndRail,
+            "the reading the failed sweep invalidated is still being carried"
+        );
+
+        pre_torque_sweep(&mut rail, now, PollCadence::PositionsAndRail, |_| {
+            Ok::<(), PumpError>(())
+        })
+        .expect("a sweep that answered");
+
+        assert_eq!(
+            rail.cadence(now),
+            PollCadence::Positions,
+            "the sweep that answered read the rail and the reading did not stick"
+        );
+    }
+
+    /// The remedial sweep an engage takes past a stale posture measures the
+    /// supply as well as the positions, and a failure refuses the engage rather
+    /// than faulting the daemon.
+    ///
+    /// One word, and the whole unattended lifecycle turns on it: this sweep and
+    /// the enable walk after it raise the same refusals, so nothing about the
+    /// error says which side of the torque write it came from. Classified
+    /// `Fault`, a wake arriving during a bus outage would park the daemon and
+    /// wait for a person — which is the availability hole a pre-torque sweep
+    /// that never faults exists to close.
+    #[test]
+    fn a_remedial_sweep_that_cannot_measure_refuses_the_engage() {
+        let now = Instant::now();
+        let mut rail = Rail::new(Duration::from_millis(500));
+        rail.read(now, PollCadence::PositionsAndRail);
+
+        let refused: Result<(), EngageFailed> = remedial_sweep(&mut rail, now, |_| {
+            Err(PumpError::TorqueOffUnacked { id: 11 })
+        });
+
+        assert!(
+            matches!(refused, Err(EngageFailed::Gate(_))),
+            "a sweep taken before torque parked the daemon: {refused:?}"
+        );
+        assert_eq!(rail.cadence(now), PollCadence::PositionsAndRail);
+
+        let mut asked = None;
+        remedial_sweep(&mut rail, now, |cadence| {
+            asked = Some(cadence);
+            Ok::<(), PumpError>(())
+        })
+        .expect("a sweep that answered");
+
+        assert_eq!(
+            asked,
+            Some(PollCadence::PositionsAndRail),
+            "an engage recovering from an outage judged its gates on positions alone"
+        );
+    }
+
+    /// The run and not the sweep is what gets reported: a dead bus fails one
+    /// every `rest_poll`, and the sweep that finally answers is what says how
+    /// many there were.
+    #[test]
+    fn a_failure_run_is_opened_once_and_closed_with_its_count() {
+        let mut run = SweepRun::default();
+        assert_eq!(run.recovered(), None, "nothing was failing");
+
+        assert!(run.failed(), "the first failure opens the run");
+        assert!(!run.failed());
+        assert!(!run.failed());
+
+        assert_eq!(run.recovered(), Some(3));
+        assert_eq!(run.recovered(), None, "the run was closed twice");
+        assert!(run.failed(), "the next failure opens a fresh run");
     }
 
     /// The health-poll rate becomes a period by division, so a zero rate is the
@@ -3539,17 +4458,34 @@ mod tests {
         );
     }
 
-    /// A commissioning that refused never took the machine. Four things follow,
+    /// A commissioning that refused never took the machine. Five things follow,
     /// and every one of them is safety posture: the fault is recorded so the bus
     /// thread alerts, a stop is requested so nothing waits on a motion loop that
-    /// is not coming, the ending is noted so the bus thread closes down, and the
-    /// run ends faulted. Nothing is released, because nothing was ever torqued.
+    /// is not coming, the ending is noted so the bus thread closes down, the
+    /// state surface says parked, and the run ends faulted. Nothing is released,
+    /// because nothing was ever torqued.
     #[test]
     fn a_commissioning_that_refused_faults_without_touching_torque() {
         let shared = Shared::new(POD);
         let sink = Collect::default();
+        let dir = temp_dir();
+        let surface = Surface::at(state_in(&dir));
 
-        let outcome = commission_failed(&shared, Refusal::new("servo 21 answered nothing"), &sink);
+        let outcome = commission_failed(
+            &shared,
+            Refusal::new("servo 21 answered nothing"),
+            &sink,
+            &surface,
+        );
+
+        assert_eq!(
+            value_of(&state_in(&dir), "state").as_deref(),
+            Some("parked")
+        );
+        assert_eq!(
+            value_of(&state_in(&dir), "fault_stage").as_deref(),
+            Some("commissioning")
+        );
 
         let Outcome::Faulted(report) = &outcome else {
             panic!("a commissioning that refused is a fault");
@@ -3989,6 +4925,70 @@ mod tests {
         assert!(
             !said.contains(&rendered(TickEvent::Command(CommandDisposition::Held))),
             "a dwell narrated the disposition it asked for: {said:?}"
+        );
+    }
+
+    /// A move whose clock the library had to right-size says so as a fact, not
+    /// only as a line.
+    ///
+    /// The case is the startup fold out of a machine somebody left most of a
+    /// turn round: the configured fold clock was never sized for that span, the
+    /// library stretches it rather than stepping past the guard and dropping the
+    /// head, and the pair of durations is the only sign that a configured value
+    /// did not fit what it met. Nobody is at the console for a boot, so it has
+    /// to be in the capture.
+    #[test]
+    fn a_stretched_clock_is_recorded_with_both_durations() {
+        let shared = Arc::new(Shared::new(POD));
+        let stretch = ClockStretch {
+            requested: MoveDurations {
+                head: Duration::from_millis(2_000),
+                antennas: Duration::from_millis(2_000),
+            },
+            effective: MoveDurations {
+                head: Duration::from_millis(3_400),
+                antennas: Duration::from_millis(2_000),
+            },
+        };
+        let head = Fake::new(&shared, [Event::Stop(Stop::Operator)])
+            // Left most of a turn round, so the boot folds it: the move whose
+            // span no configured clock was sized for.
+            .standing_elsewhere()
+            .reporting_moving([vec![TickEvent::Stretched(stretch)]]);
+
+        let (outcome, _, sink) = driven(&shared, head);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        let stretches = sink.all_fields("motion_clock_stretched");
+        assert_eq!(
+            stretches.len(),
+            1,
+            "the fold's stretch is stated once: {stretches:?}"
+        );
+        assert_eq!(stretches[0]["requested_head_s"], json!(2.0));
+        assert_eq!(stretches[0]["effective_head_s"], json!(3.4));
+        assert_eq!(stretches[0]["requested_antennas_s"], json!(2.0));
+        assert_eq!(
+            stretches[0]["effective_antennas_s"],
+            json!(2.0),
+            "the group that fitted is reported as it was asked for: {stretches:?}"
+        );
+    }
+
+    /// A move the library did not have to touch says nothing about its clock:
+    /// the event is the exception, and a line on every ordinary move would make
+    /// the exception unreadable.
+    #[test]
+    fn an_ordinary_move_records_no_stretch() {
+        let shared = Arc::new(Shared::new(POD));
+        let head = Fake::new(&shared, [Event::Raise, Event::Stop(Stop::Operator)]);
+
+        let (outcome, _, sink) = driven(&shared, head);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert!(
+            sink.all_fields("motion_clock_stretched").is_empty(),
+            "nothing was stretched"
         );
     }
 

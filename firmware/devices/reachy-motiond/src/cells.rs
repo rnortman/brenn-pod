@@ -2,7 +2,7 @@
 //!
 //! The bus thread is async and owns the attachment; the motion thread blocks and
 //! owns the port. Neither can call into the other, and neither shares a data
-//! structure with the other beyond what is here. Six cells, and each one goes
+//! structure with the other beyond what is here. Seven cells, and each one goes
 //! in a single direction:
 //!
 //! - **The schedule** — written by the bus thread as scripts arrive, read by the
@@ -18,6 +18,12 @@
 //!   gate refuses, drained by the bus thread to alert on. Deliberately apart
 //!   from the fault: nothing was written, the machine is limp where it was, and
 //!   the daemon goes on resting.
+//! - **The watch alarm** — written by the motion thread when the pre-torque
+//!   sweeps stop answering and again when they come back, drained by the bus
+//!   thread to alert on. Also not a fault: a machine nobody can read while it
+//!   lies limp is already at the minimum risk condition, so the daemon keeps
+//!   sweeping and sends the news instead of parking. What it costs meanwhile is
+//!   presence — the head cannot engage from a posture nobody has measured.
 //! - **The stow misses** — written by the motion thread when an orderly release
 //!   measured the machine somewhere other than its fold, drained the same way.
 //!   Also not a fault: torque came off, which is the whole doctrine, and the
@@ -84,11 +90,11 @@ impl fmt::Display for Stop {
 pub enum FaultStage {
     /// The once-per-process ceremony — the machine was never taken.
     Commission,
-    /// The look at where the machine is standing, and the fold that follows it
-    /// when a crash or a hand left the head somewhere else.
+    /// The startup fold, from the moment torque goes on: a crash or a hand left
+    /// the head somewhere else and it is being put back. The look that decides
+    /// whether a fold is needed happens before torque and never faults — it
+    /// retries until the machine answers.
     Startup,
-    /// The resting watch: the machine limp, being looked at.
-    Resting,
     /// Taking hold — pinning the joints and enabling torque.
     Engage,
     /// The steady state: dwelling, reading the schedule, moving between
@@ -105,7 +111,6 @@ impl fmt::Display for FaultStage {
         f.write_str(match self {
             Self::Commission => "commissioning",
             Self::Startup => "startup normalisation",
-            Self::Resting => "the resting watch",
             Self::Engage => "taking hold",
             Self::Motion => "the motion loop",
             Self::Release => "the release back to rest",
@@ -184,7 +189,71 @@ impl Collapsed {
     }
 }
 
-/// The six cells, held behind one handle both threads clone.
+/// A run of pre-torque sweeps that stopped answering, as the alert reads it.
+///
+/// Deliberately not a [`Collapsed`]: how many sweeps failed is not a number
+/// anybody can act on — a dead bus fails ten a second for as long as it is dead
+/// — and it is not what makes this worth an alert either. What is worth
+/// reporting is that reads went away, whether they have come back since, and
+/// what the machine said the last time it refused. So the motion thread writes
+/// the edges of a failure run and this counts those.
+#[derive(Debug, Default)]
+pub struct WatchNotice {
+    /// What the first sweep of the most recent failure run reported.
+    latest: Option<String>,
+    /// Failure runs begun since the last drain.
+    runs: u64,
+    /// Runs ended by reads coming back, since the last drain.
+    restores: u64,
+    /// Whether sweeps are failing as of the last edge written.
+    failing: bool,
+}
+
+impl WatchNotice {
+    /// A run of failing sweeps has begun, with what its first failure said.
+    fn lost(&mut self, detail: impl Into<String>) {
+        self.latest = Some(detail.into());
+        self.runs += 1;
+        self.failing = true;
+    }
+
+    /// Reads have come back.
+    fn restored(&mut self) {
+        self.restores += 1;
+        self.failing = false;
+    }
+
+    /// Take what is owed an alert, or `None` when no failure run has begun
+    /// since this last answered.
+    ///
+    /// A restore on its own is not alerted on: reads coming back is the thing
+    /// nobody has to be told about, and the count of them rides on the next
+    /// alarm as the evidence that the bus is flapping rather than dead.
+    fn take(&mut self) -> Option<WatchAlarm> {
+        let detail = (self.runs > 0).then(|| self.latest.take())??;
+        Some(WatchAlarm {
+            detail,
+            runs: std::mem::take(&mut self.runs),
+            restores: std::mem::take(&mut self.restores),
+            failing: self.failing,
+        })
+    }
+}
+
+/// What a drained [`WatchNotice`] owes an alert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchAlarm {
+    /// What the machine said the last time a sweep started failing.
+    pub detail: String,
+    /// Failure runs begun since the last alarm was taken.
+    pub runs: u64,
+    /// Runs that ended in reads coming back, over the same span.
+    pub restores: u64,
+    /// Whether sweeps are still failing now.
+    pub failing: bool,
+}
+
+/// The seven cells, held behind one handle both threads clone.
 #[derive(Debug)]
 pub struct Shared {
     schedule: Mutex<Schedule>,
@@ -206,6 +275,14 @@ pub struct Shared {
     /// engage refusals: a machine that misses its fold once will miss it every
     /// turn until somebody looks.
     stow_misses: Mutex<Collapsed>,
+    /// Pre-torque sweeps that stopped answering, on the edges the bus thread
+    /// alerts on.
+    ///
+    /// The counterpart of the engage refusals for the phase before an engage is
+    /// even asked for: the machine is limp, so a sweep nobody can complete is a
+    /// picture lost and not control lost. The daemon keeps sweeping and
+    /// recovers by itself; this is how somebody hears about the wire meanwhile.
+    watch: Mutex<WatchNotice>,
     stop: OnceLock<Stop>,
     fault: OnceLock<FaultReport>,
     ended: OnceLock<()>,
@@ -222,6 +299,7 @@ impl Shared {
             schedule: Mutex::new(Schedule::new(pod)),
             engage_refusals: Mutex::new(Collapsed::default()),
             stow_misses: Mutex::new(Collapsed::default()),
+            watch: Mutex::new(WatchNotice::default()),
             stop: OnceLock::new(),
             fault: OnceLock::new(),
             ended: OnceLock::new(),
@@ -253,6 +331,27 @@ impl Shared {
     /// Take the stow misses owed an alert, the most recent and the count.
     pub fn take_stow_miss(&self) -> Option<(String, u64)> {
         self.stow_misses().take()
+    }
+
+    /// Note that the pre-torque watch has stopped answering, with what the
+    /// first sweep of the run reported.
+    ///
+    /// Written on the edge, by the motion thread, which goes on sweeping: this
+    /// is degraded presence, not a fault, and the daemon needs nobody's
+    /// permission to recover from it.
+    pub fn note_watch_lost(&self, detail: impl Into<String>) {
+        self.watch().lost(detail);
+    }
+
+    /// Note that a sweep has answered again after a run of failures.
+    pub fn note_watch_restored(&self) {
+        self.watch().restored();
+    }
+
+    /// Take the watch alarm owed an alert, or `None` when no run of failures
+    /// has begun since this last answered.
+    pub fn take_watch_alarm(&self) -> Option<WatchAlarm> {
+        self.watch().take()
     }
 
     /// Offer one script to the schedule, arriving at `now`.
@@ -370,6 +469,14 @@ impl Shared {
         self.stow_misses
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The watch notice, recovered the same way. The reason is stronger here
+    /// than anywhere else: this lock is taken by the thread that sweeps a limp
+    /// machine, and a poisoned lock that stopped it sweeping would turn a
+    /// panicked bus thread into a head that never engages again.
+    fn watch(&self) -> std::sync::MutexGuard<'_, WatchNotice> {
+        self.watch.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -586,6 +693,51 @@ mod tests {
             None,
             "a drained refusal is not alerted on twice"
         );
+    }
+
+    /// The watch is reported on its edges, not per sweep: a run of failures is
+    /// one alarm however many sweeps it spans, and it carries what the machine
+    /// said when it started and whether reads are back.
+    #[test]
+    fn a_run_of_failing_sweeps_is_one_alarm_that_says_whether_reads_came_back() {
+        let shared = shared();
+        assert_eq!(shared.take_watch_alarm(), None);
+
+        shared.note_watch_lost("servo 11: timed out");
+        let alarm = shared.take_watch_alarm().expect("a failing watch owes one");
+        assert_eq!(alarm.detail, "servo 11: timed out");
+        assert_eq!((alarm.runs, alarm.restores), (1, 0));
+        assert!(alarm.failing);
+        assert!(!shared.faulted(), "a failing watch is not a fault");
+        assert_eq!(
+            shared.take_watch_alarm(),
+            None,
+            "an alarm already taken is alerted on twice"
+        );
+
+        shared.note_watch_restored();
+        assert_eq!(
+            shared.take_watch_alarm(),
+            None,
+            "reads coming back is not itself an alert"
+        );
+    }
+
+    /// A bus that flaps: the runs and the recoveries between them are both
+    /// counted, so one alarm can say the wire is unreliable rather than dead.
+    #[test]
+    fn the_alarm_counts_the_runs_and_the_recoveries_it_stands_for() {
+        let shared = shared();
+
+        shared.note_watch_lost("servo 11: timed out");
+        shared.note_watch_restored();
+        shared.note_watch_lost("servo 12: timed out");
+        shared.note_watch_restored();
+
+        let alarm = shared.take_watch_alarm().expect("two runs stand");
+        assert_eq!(alarm.detail, "servo 12: timed out");
+        assert_eq!((alarm.runs, alarm.restores), (2, 2));
+        assert!(!alarm.failing, "the second run ended in reads coming back");
     }
 
     /// The whole point of the type: one handle, two threads, no other contact

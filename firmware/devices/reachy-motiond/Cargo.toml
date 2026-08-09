@@ -17,6 +17,12 @@ license.workspace = true
 # clippy and tests cover it.
 
 [dependencies]
+# The three `rev =` pins below are stale on purpose: the revision this daemon
+# needs is not pushed yet, and the workspace manifest's [patch] table redirects
+# all three at the clone beside this repository until it is. Read that table
+# before touching them — built against the pinned revision alone, this daemon
+# would enable torque at a posture it never measured.
+#
 # The motion repository's bring-up host, library half: the two standing gates (a
 # resolved crank datum and a green self-test record), the armed session, and the
 # neutral and stow postures. A git dependency because the dependency arrow runs
@@ -56,3 +62,9 @@ serde_json = "1"
 # The JSONL envelope every binary in this workspace narrates itself in, so a
 # capture off this daemon parses off the same two keys as one off the audio pod.
 pod-jsonl = { path = "../../crates/pod-jsonl" }
+
+[dev-dependencies]
+# The state file's decisions are about a filesystem, so its tests are too: a
+# directory per test, cleaned up on drop. The same crate pod-secrets, podctl,
+# brenn-bridge and psk-link already test against in this workspace.
+tempfile = "3"

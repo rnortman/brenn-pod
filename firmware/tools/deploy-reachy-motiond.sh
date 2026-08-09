@@ -134,6 +134,14 @@ usage() {
 # verify sweep and the release — with margin. SIGTERM is the daemon's own
 # shutdown path and needs no special casing here.
 #
+# RuntimeDirectory is where the daemon writes its state — starting, resting,
+# active, parked, stopping — for `reachy-status` to read. systemd creates it for
+# the account on start and removes it on stop, so a stopped or crashed service
+# leaves no stale `parked` behind for the next run to be judged by. That is why
+# the staleness is solved here rather than with a timestamp the reader has to
+# interpret. A parked daemon does not exit, so this file is the only thing that
+# distinguishes it from a working one.
+#
 # The hardening mirrors brenn-app.service, with the one exception this daemon
 # exists for: PrivateDevices stays off, because the servo bus is a device node
 # and the `app` account's supplementary groups are what grant it.
@@ -157,6 +165,7 @@ unit_text() {
 		RestartSec=5s
 		RestartPreventExitStatus=6 7
 		TimeoutStopSec=30
+		RuntimeDirectory=${motiond_runtime_dir}
 
 		ProtectSystem=strict
 		ProtectHome=yes

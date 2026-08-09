@@ -96,6 +96,15 @@ const ALERT_GRACE: Duration = Duration::from_secs(5);
 /// explain.
 const STALE_ALERT_RUN: u64 = 3;
 
+/// The least time between two alerts about the pre-torque watch.
+///
+/// One alert per failure run is the policy, and a flapping bus is a run every
+/// few seconds — over the channel a motion fault has to arrive on. One a minute
+/// is enough to say the wire is unreliable, and the alert that finally goes
+/// carries how many runs and recoveries stand behind it. Every edge is in the
+/// capture regardless.
+const WATCH_ALERT_EVERY: Duration = Duration::from_secs(60);
+
 /// How much of a refusal's own text goes onto the narration stream.
 const DETAIL_LIMIT: usize = 200;
 
@@ -109,7 +118,11 @@ const DETAIL_LIMIT: usize = 200;
 /// terminal. Control characters become spaces and the length is bounded. The
 /// unabridged text still reaches the capture, in a JSON string field, where it
 /// is escaped rather than rendered.
-fn one_line(detail: &str) -> String {
+///
+/// The state file takes fault details through the same treatment for the same
+/// reason: its reader splits on lines, so a newline in a detail would forge a
+/// key.
+pub(crate) fn one_line(detail: &str) -> String {
     let mut clean: String = detail
         .chars()
         .take(DETAIL_LIMIT)
@@ -135,7 +148,15 @@ fn one_line(detail: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Chore {
     /// Raise this alert, once.
-    Alert { title: String, body: String },
+    ///
+    /// The severity is decided where the condition is: a machine that has
+    /// stopped taking commands and a machine that is limp, safe and unreadable
+    /// are both worth an alert and are not the same news.
+    Alert {
+        severity: AlertSeverity,
+        title: String,
+        body: String,
+    },
     /// The daemon is stopping for this reason: end the attachment.
     Shutdown(Stop),
     /// State the motion hold again, after a peer that would not serve it.
@@ -178,6 +199,9 @@ pub struct Listener<'a> {
     /// Whether the staleness alert has been raised, latched for the same reason
     /// the refusal alert is.
     alerted_stale: bool,
+    /// When the last watch alert went out, which is what bounds how often a
+    /// flapping bus may produce another.
+    watch_alerted_at: Option<Instant>,
     /// Whether the shutdown chore has already been produced.
     shutting_down: bool,
     /// When the shutdown first became due, which is what bounds the wait an
@@ -201,6 +225,7 @@ impl<'a> Listener<'a> {
             alerted_refusal: false,
             stale_run: 0,
             alerted_stale: false,
+            watch_alerted_at: None,
             shutting_down: false,
             shutdown_due_at: None,
             resubscribe_at: None,
@@ -467,6 +492,7 @@ impl<'a> Listener<'a> {
             if self.attached {
                 self.alerted = true;
                 return Some(Chore::Alert {
+                    severity: AlertSeverity::Critical,
                     title: "reachy head motion stopped".to_owned(),
                     body: format!(
                         "{report}. commanding has stopped and torque is off: the head has \
@@ -494,6 +520,7 @@ impl<'a> Listener<'a> {
         {
             self.alerted_refusal = true;
             return Some(Chore::Alert {
+                severity: AlertSeverity::Critical,
                 title: "reachy motion scripts refused".to_owned(),
                 body: format!(
                     "{count} script(s) refused so far; the most recent was: {detail}. the \
@@ -513,6 +540,7 @@ impl<'a> Listener<'a> {
             self.alerted_stale = true;
             let run = self.stale_run;
             return Some(Chore::Alert {
+                severity: AlertSeverity::Critical,
                 title: "reachy head is dropping every script".to_owned(),
                 body: format!(
                     "{run} script(s) in a row dropped as stale: their sequence numbers are at or \
@@ -532,6 +560,7 @@ impl<'a> Listener<'a> {
             && let Some((detail, count)) = self.shared.take_stow_miss()
         {
             return Some(Chore::Alert {
+                severity: AlertSeverity::Critical,
                 title: "reachy head released away from stow".to_owned(),
                 body: format!(
                     "{count} release(s) did not find the head folded; the most recent: {detail} \
@@ -549,11 +578,43 @@ impl<'a> Listener<'a> {
             && let Some((detail, count)) = self.shared.take_engage_refusal()
         {
             return Some(Chore::Alert {
+                severity: AlertSeverity::Critical,
                 title: "reachy head could not take torque".to_owned(),
                 body: format!(
                     "{count} engage(s) refused; the most recent was: {detail}. torque was not \
                      written, so the machine is limp where it stands and the next script tries \
                      again."
+                ),
+            });
+        }
+
+        // A machine nobody can read while it lies limp. A warning and not a
+        // fault, deliberately: torque is off, the head is where it was, and the
+        // daemon goes on sweeping and recovers by itself the moment the wire
+        // does. What is lost meanwhile is presence — an engage plans from a
+        // measurement, so the head stays down until a sweep answers.
+        if self.attached
+            && self
+                .watch_alerted_at
+                .is_none_or(|last| now.duration_since(last) >= WATCH_ALERT_EVERY)
+            && let Some(alarm) = self.shared.take_watch_alarm()
+        {
+            self.watch_alerted_at = Some(now);
+            let state = if alarm.failing {
+                "sweeps are still failing".to_owned()
+            } else {
+                format!("reads have come back {} time(s) since", alarm.restores)
+            };
+            return Some(Chore::Alert {
+                severity: AlertSeverity::Warning,
+                title: "reachy head cannot read its machine".to_owned(),
+                body: format!(
+                    "{} run(s) of failing position sweeps; the most recent began: {}. {state}. \
+                     torque is off and the head is limp where it was left, so nothing is at risk \
+                     and nothing has to be restarted — but no script will raise the head until \
+                     the sweeps answer again. at most one of these a minute; the capture carries \
+                     every one.",
+                    alarm.runs, alarm.detail
                 ),
             });
         }
@@ -733,8 +794,12 @@ pub async fn serve<C: TransportConnector>(
 /// which the loop learns about from the arm that owns that fact.
 async fn do_chore(handle: &BridgeHandle, channel: &str, chore: Chore) {
     match chore {
-        Chore::Alert { title, body } => {
-            let _ = handle.alert(AlertSeverity::Critical, title, body).await;
+        Chore::Alert {
+            severity,
+            title,
+            body,
+        } => {
+            let _ = handle.alert(severity, title, body).await;
         }
         Chore::Shutdown(_) => {
             let _ = handle.shutdown().await;
@@ -1026,7 +1091,7 @@ mod tests {
         listener.on_event(delivered(r#"{"type":"motion-script","seq":"soon"}"#));
 
         assert_eq!(shared.desired(now), Desired::Posture(Posture::Up));
-        let Some(Chore::Alert { title, body }) = listener.chore(now) else {
+        let Some(Chore::Alert { title, body, .. }) = listener.chore(now) else {
             panic!("a refused script owes one alert");
         };
         assert!(title.contains("refused"), "{title}");
@@ -1099,9 +1164,19 @@ mod tests {
             "the head is not where it says",
         ));
 
-        let Some(Chore::Alert { title, body }) = listener.chore(now) else {
+        let Some(Chore::Alert {
+            severity,
+            title,
+            body,
+        }) = listener.chore(now)
+        else {
             panic!("a fault owes an alert");
         };
+        assert_eq!(
+            severity,
+            AlertSeverity::Critical,
+            "a machine that stopped taking commands is not a warning"
+        );
         assert!(title.contains("motion"), "{title}");
         assert!(body.contains("torque is off"), "{body}");
         assert_eq!(listener.chore(now), None);
@@ -1195,7 +1270,7 @@ mod tests {
         shared.refuse_engage("the supply is below the floor: 5.5 V against 6.0 V");
         shared.refuse_engage("the supply is below the floor: 5.4 V against 6.0 V");
 
-        let Some(Chore::Alert { title, body }) = listener.chore(now) else {
+        let Some(Chore::Alert { title, body, .. }) = listener.chore(now) else {
             panic!("a refused engage owes an alert");
         };
         assert!(title.contains("could not take torque"), "{title}");
@@ -1212,6 +1287,67 @@ mod tests {
         assert!(!shared.faulted(), "a gate refusal parked the daemon");
     }
 
+    /// A machine that cannot be read while it lies limp is degraded presence,
+    /// not a hazard: the alert says so at warning, where a fault says so at
+    /// critical, and nothing about it parks the daemon.
+    #[test]
+    fn a_watch_that_stopped_reading_is_a_warning_and_not_a_fault() {
+        let sink = Collect::default();
+        let (shared, mut listener) = fixture(&sink);
+        let now = Instant::now();
+        assert_eq!(listener.chore(now), None);
+
+        shared.note_watch_lost("servo 11: timed out waiting for a reply");
+
+        let Some(Chore::Alert {
+            severity,
+            title,
+            body,
+        }) = listener.chore(now)
+        else {
+            panic!("a watch that stopped reading owes an alert");
+        };
+        assert_eq!(severity, AlertSeverity::Warning);
+        assert!(title.contains("cannot read"), "{title}");
+        assert!(body.contains("1 run(s)"), "{body}");
+        assert!(body.contains("servo 11"), "{body}");
+        assert!(body.contains("still failing"), "{body}");
+        assert_eq!(listener.chore(now), None, "alerted on twice");
+        assert!(!shared.faulted(), "a failing watch parked the daemon");
+    }
+
+    /// A bus that flaps would otherwise be an alert every few seconds, over the
+    /// channel a motion fault has to arrive on. The runs behind the suppressed
+    /// ones are not lost — the next alert that goes out carries them.
+    #[test]
+    fn a_flapping_watch_alerts_at_most_once_a_minute_and_carries_what_it_missed() {
+        let sink = Collect::default();
+        let (shared, mut listener) = fixture(&sink);
+        let now = Instant::now();
+
+        shared.note_watch_lost("servo 11: timed out");
+        assert!(matches!(listener.chore(now), Some(Chore::Alert { .. })));
+
+        // Two more runs, inside the window the first alert opened.
+        shared.note_watch_restored();
+        shared.note_watch_lost("servo 12: timed out");
+        shared.note_watch_restored();
+        shared.note_watch_lost("servo 13: timed out");
+        assert_eq!(
+            listener.chore(now + WATCH_ALERT_EVERY / 2),
+            None,
+            "a run inside the window raised its own alert"
+        );
+
+        shared.note_watch_restored();
+        let Some(Chore::Alert { body, .. }) = listener.chore(now + WATCH_ALERT_EVERY) else {
+            panic!("the window passed with runs still owed");
+        };
+        assert!(body.contains("2 run(s)"), "{body}");
+        assert!(body.contains("servo 13"), "{body}");
+        assert!(body.contains("come back 3 time(s)"), "{body}");
+    }
+
     /// A release that did not find the head folded is the one thing a capture
     /// alone would not get in front of anybody, and it is the state a hand might
     /// go near. Not a fault — torque is off, which is the whole doctrine — and
@@ -1225,7 +1361,7 @@ mod tests {
 
         shared.note_stow_miss("released away from stow: 14.5° off at the worst joint");
 
-        let Some(Chore::Alert { title, body }) = listener.chore(now) else {
+        let Some(Chore::Alert { title, body, .. }) = listener.chore(now) else {
             panic!("a release away from stow owes an alert");
         };
         assert!(title.contains("away from stow"), "{title}");
@@ -1254,7 +1390,7 @@ mod tests {
             );
         }
 
-        let Some(Chore::Alert { title, body }) = listener.chore(now) else {
+        let Some(Chore::Alert { title, body, .. }) = listener.chore(now) else {
             panic!("a daemon dropping every script owes an alert");
         };
         assert!(title.contains("dropping every script"), "{title}");

@@ -420,6 +420,18 @@ unit_says "restarts-a-crash" "Restart=on-failure"
 unit_says "never-restarts-a-fault-or-a-futile-bridge" "RestartPreventExitStatus=6 7"
 # The orderly stop is a stow move, a dwell, a verify sweep and the release.
 unit_says "gives-the-stop-time-to-fold-the-head" "TimeoutStopSec=30"
+# Where the daemon writes its state for reachy-status to read. systemd owns the
+# directory's lifetime, which is what stops a stopped service leaving a stale
+# `parked` behind for the next run to be judged by.
+unit_says "gives-the-daemon-somewhere-to-say-what-it-is-doing" \
+	"RuntimeDirectory=reachy-motiond"
+# The file itself is a contract across two languages joined by nothing but the
+# literal: the daemon writes this path, `reachy-status` reads it, and a
+# `state::DEFAULT_PATH` unit test pins the same string on the Rust side. The
+# unit's RuntimeDirectory is the directory half of it, checked above.
+check "the-state-file-is-where-the-daemon-writes-it" \
+	"$(yes_no [ "$motiond_state" = /run/reachy-motiond/state ])" \
+	"lib.sh resolves it to: ${motiond_state}"
 
 # A restart whose ConditionPathExists lines are unmet succeeds and leaves the
 # unit inactive. Reported as "installed but not running" rather than as a

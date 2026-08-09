@@ -287,12 +287,31 @@ To ask whether it worked, or whether it is still true:
 make -C firmware reachy-status
 ```
 
-Read-only, one ssh, and it touches no servo. It prints ten checks — the payload store, the
-payload, `brenn-app.service`, the pod's `audio.conf`, the three motion files, the motion
-binary, `reachy-motiond.service`, and the servo bus node the machine's own configuration
-names — each `OK` or `MISSING`, and exits nonzero if anything is missing. Every `MISSING`
-line has the same fix, which is `make reachy-up`. The self-test record is reported and
-never counted: nothing gates on it.
+Read-only, one ssh, and it touches no servo. It prints eleven checks — the payload store,
+the payload, `brenn-app.service`, the pod's `audio.conf`, the three motion files, the
+motion binary, `reachy-motiond.service`, the servo bus node the machine's own
+configuration names, and what the motion daemon says it is doing — each `OK` or `MISSING`,
+and exits nonzero if anything is missing. Ten of the eleven have the same fix, which is
+`make reachy-up`. The self-test record is reported and never counted: nothing gates on it.
+
+The eleventh is the daemon's own state, and it is the one whose fix is not a push. A
+daemon whose machine faulted **parks**: torque comes off, it commands nothing further, and
+it deliberately does not exit — a fault is never auto-cleared, and a process that exited
+would let systemd's restart policy re-torque a machine nobody has looked at. So
+`systemctl is-active` calls a parked daemon running. It writes `starting`, `resting`,
+`active`, `parked` or `stopping` to `/run/reachy-motiond/state` — its unit's
+`RuntimeDirectory`, so the file goes away with the service and can never be stale — along
+with whether its pre-torque sweeps are answering. `reachy-status` reads that file and says
+so:
+
+- `resting` or `active`, sweeps answering → `OK`.
+- `parked` → `MISSING`, printing the fault's stage and detail. Read
+  `make -C firmware reachy-motiond-logs`, then restart the unit. `make reachy-up` does not
+  clear a fault and the report says as much.
+- sweeps failing → `MISSING`. The machine is limp and safe, and no wake will raise the
+  head until the servo bus answers again; it recovers by itself when it does.
+- no file while the unit is running → `MISSING`: the daemon has only just started, or the
+  deployed binary predates the state file. Re-run, then redeploy if it persists.
 
 Then watch the daemon:
 
@@ -374,7 +393,7 @@ whichever `speech-surface` config the daemon is actually started with (`SPEECH_C
 | `presence_channel` | `[brenn]` | unset | The channel scripts are published on. Unset means no scripts and a head that never moves (`presence_absent` at startup) |
 | `presence_refresh_ms` | `[brenn]` | 5000 | How often the standing script is said again. A script lost in transit is repaired within one of these |
 | `presence_linger_ms` | `[brenn]` | 8000 | How long the head stays up after a turn that asked to keep listening, and after a wake that produced no turn at all |
-| `presence_max_engaged_ms` | `[brenn]` | 30000 | The timeout every script carries: the daemon stows this long after receipt whatever else happens. The bound that matters while the brain is still thinking |
+| `presence_max_engaged_ms` | `[brenn]` | 30000 | The floor under the timeout every script carries: the daemon stows this long after receipt whatever else happens. The bound that matters while the brain is still thinking. A turn whose speech reaches further carries a timeout sized from its own timeline instead — a script's timeout is a ceiling on that timeline, never shorter than it. Capped at 600000 (the protocol's own ceiling); a config past that is refused at startup |
 | `presence_stow_margin_ms` | `[brenn]` | 500 | How long after the estimated end of the speech the head starts down. Absorbs playback jitter |
 
 **The daemon's policy** — `firmware/.local/reachy-motiond.toml`. Pushed by
@@ -399,7 +418,7 @@ platforms.
 |---|---|---|
 | `up_duration_s`, `stow_duration_s`, `move_duration_s` | `[motion]` | The head group's clocks — the head pose and the body yaw, which the six legs follow through the IK. What the daemon governs unless it overrides them |
 | `antenna_duration_s` | `[motion]` | The antennas' clock; absent means they ride whichever head-group clock the move is using |
-| `max_step_legs_rad`, `max_step_body_yaw_rad`, `max_step_antennas_rad` | `[motion]` | Not timings — the per-tick bounds a duration has to clear. A step past one is a **fault**, never a clamp, and a fault takes torque off |
+| `max_step_legs_rad`, `max_step_body_yaw_rad`, `max_step_antennas_rad` | `[motion]` | Not timings — the per-tick bounds a duration has to clear. A move whose span will not fit at the duration asked for runs on a clock stretched to fit; the guard past that is a **fault**, never a clamp, and a fault takes torque off |
 | `tick_hz` | `[motion]` | The control period those bounds are per |
 
 Duration floors are the thing to read before shortening a move. Both example TOMLs carry
@@ -407,8 +426,11 @@ them with the arithmetic: a shaped move's peak rate is 1.875 times its average, 
 joint moving linearly the floor is `1.875 × span ÷ (bound × tick_hz)`. At the shipped
 bounds and 50 Hz that is 1.07 s for the head group, 0.79 s for the body yaw from the
 60° cap (1.571 s cap to cap), and 0.81/1.21/1.57 s for the antennas depending on the arc.
-A duration under its floor is not a slow head — it is a move that faults partway and a
-head that settles limp.
+A duration under its floor is a move the library right-sizes before it commands it: the
+path is unchanged and traversed more slowly, and a `motion_clock_stretched` line in the
+capture carries what was asked for beside what it ran on. So a value set too low costs a
+slower move and a line of output. The case this exists for is the startup fold out of a
+machine a hand left most of a turn round, which no configured clock can be sized for.
 
 ## When it does not work
 
@@ -420,7 +442,7 @@ Capture these before changing anything — they are what an investigation needs:
   to the journal too, in service mode — script receipts and refusals, every engage with
   its wall clock, every release with its verdict, and every fault.
 - **`make -C firmware reachy-status`**, which says in one screen which of the ten things
-  a reboot clears is missing.
+  a reboot clears is missing, and what the motion daemon says it is doing.
 - **The host daemon's console output**, and its JSONL file.
 - **The recorded segments** under `host/framelogs/`, if the segment reached the host at
   all.
@@ -453,10 +475,13 @@ And the motion half:
 |---|---|
 | Anything at all is wrong after a reboot | `make -C firmware reachy-status` first, then `make -C firmware reachy-up`. Between them they cover every file a reboot cleared — do not go looking one refusal at a time |
 | The head never moves, and everything else works | `presence_channel` unset in the host config, or set to a channel the daemon does not name. The host says `presence_absent` at startup; the daemon reports every script it receives, so if it reports none the message is not reaching it |
+| Wakes do nothing, the head never moves, and `reachy-status` says the daemon is **parked** | The machine faulted. Torque is off and the daemon commands nothing until a person acts — that is the doctrine, not a bug. The status line names the stage and the fault; read `make -C firmware reachy-motiond-logs` for the run that produced it, decide whether the cause is addressed, then `ssh root@<host> systemctl restart reachy-motiond.service`. A restart is the only way out, and nothing restarts it for you |
+| `reachy-status` says the daemon **cannot read the machine** | The servo bus stopped answering the resting sweeps. The machine is limp and safe, and the daemon keeps sweeping and recovers on its own — but no wake raises the head until it does. Check the serial cabling and the bus node; nothing needs restarting |
 | `reachy-motiond.service` is installed but not running | Its `ConditionPathExists` lines are unmet — one of the three motion files is missing, which is what keeps a half-provisioned device quiet instead of crash-looping. `reachy-status` names which one |
 | The service exits and systemd does not restart it | Exit 6 is a fault: the machine is limp at stow and restarting is noise until someone looks at the journal. Exit 7 is a futile bus attachment — a token, a URL or an ACL. Neither is restarted on purpose |
 | The head stops partway through a move and goes limp | A per-tick step bound faulted the move; the journal names the joint. Almost always a duration under its floor — see the knob map. This is the sanctioned outcome, not a malfunction: the alternative is a clamp that lies about where the machine is |
-| The head comes down late, at a flat ~30 s | That is a hold script running out its `presence_max_engaged_ms`, which means the closing script never went out. The host's JSONL says whether one was published |
+| The head comes down late, at a flat ~30 s | That is a hold script running out its `presence_max_engaged_ms`, which means the closing script never went out. The host's JSONL says whether one was published. Two consecutive losses are needed for this now: the host sends the stow once more at the first refresh past it |
+| The daemon refuses a script and says the timeline outruns its timeout, or the timeout outruns 600000 ms | The publisher is not our scripter, or its arithmetic slipped past the host-side clamp. The script standing before it — and that script's timeout — still governs, so the head is still bounded. The host's `script_horizon_clamped` line names a stow instant that was cut back; its absence points at another publisher on the channel |
 | The head stays up with torque on for a long time after a turn | `rest_delay_ms`. It is the only knob that holds the pinch posture, which is why it is refused above 60 s |
 | A bench command refuses (exit 3 or 4) | The other daemon has the bus. Exit 3 is `brenn-app.service`, exit 4 is `reachy-motiond.service`; stop the one you do not want, or use `make -C firmware reachy-motiond-run`, which refuses for the same reason |
 | The daemon refuses to start on the machine's configuration | The bench file is missing or has no crank datum. The datum is calibration a human measured, not a gate that can be waived |

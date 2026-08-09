@@ -9,11 +9,21 @@
 //! A script is three things: whose head it is about, an ordering number, and a
 //! timeline — zero or more postures at offsets from the moment the script
 //! arrives, plus the timeout after which the head goes back down whether or not
-//! anything else arrives. A timeline running past its own timeout carries the
-//! lapse out to its last step, so the bound is the later of the two;
-//! [`MotionScript::expiry_ms`] is the one place that arithmetic lives. There is
-//! no vocabulary here for a conversation, a lease, or a turn: the daemon
-//! executes timed posture intents and knows nothing else.
+//! anything else arrives. The timeout is an **unconditional ceiling on the
+//! script's own timeline**: every step falls strictly inside it, and a script
+//! that says otherwise is refused whole rather than executed past the bound it
+//! stated. So the number in the message is the number the head is exposed for,
+//! and [`MotionScript::expiry_ms`] is that number with no arithmetic on top.
+//! A second bound applies to the timeout itself — [`MAX_TIMEOUT_MS`] — so no
+//! single message can name an exposure nobody would mean. There is no
+//! vocabulary here for a conversation, a lease, or a turn: the daemon executes
+//! timed posture intents and knows nothing else.
+//!
+//! Both bounds are refusals rather than clamps. A publisher whose timeline
+//! outruns its timeout has miscomputed one of them, and executing the part that
+//! fits would silently drop instructions it asked for; the daemon's rule is
+//! that a script runs entirely or not at all, and the script already standing —
+//! with its own timeout — stays in force.
 //!
 //! Tolerance runs in one direction only. Unknown *fields* are ignored, so a
 //! newer scripter may add one without a lockstep deploy. An unknown *posture* is
@@ -25,6 +35,22 @@ use thiserror::Error;
 
 /// The discriminator every motion script carries.
 pub const MOTION_SCRIPT_TYPE: &str = "motion-script";
+
+/// The largest timeout any script may name: ten minutes.
+///
+/// The per-script ceiling bounds a timeline against the timeout beside it, and
+/// both numbers come from the same publisher — so a slip that inflates one
+/// inflates the other, and the pair stays self-consistent while naming an
+/// exposure of hours. This is the bound the pair is checked against, and it is
+/// deliberately far above any turn a speech interaction produces and far below
+/// the accident: a scripter dating its stow from a horizon in seconds where
+/// milliseconds were meant reaches it, and a real answer does not.
+///
+/// Ten minutes rather than something tighter because the horizon a closing
+/// script carries is one clip's remaining playback plus a tail — a clip that
+/// has not started playing moves no horizon — so reaching this ceiling honestly
+/// takes a single synthesized clip over ten minutes long.
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
 /// A posture the head can be asked to take.
 ///
@@ -109,6 +135,35 @@ pub enum ScriptError {
         after_ms: u64,
         /// The offset it should have exceeded.
         previous_ms: u64,
+    },
+
+    /// The timeline runs to or past the instant the same message calls its
+    /// bound. Whichever of the two numbers is wrong, the message contradicts
+    /// itself about how long the head is up, and the timeout is the one that
+    /// claims to be the answer — so the script is refused and the publisher
+    /// sizes its timeout from its own timeline.
+    ///
+    /// The last step must fall *strictly* inside the timeout: level with it the
+    /// lapse resolves first, and the step it was waiting for would be swallowed
+    /// on every such timeline.
+    #[error(
+        "the last step is at {last_ms} ms, at or past the script's own {timeout_ms} ms timeout"
+    )]
+    TimelinePastTimeout {
+        /// The last step's offset.
+        last_ms: u64,
+        /// The timeout it had to fall inside.
+        timeout_ms: u64,
+    },
+
+    /// The timeout exceeds [`MAX_TIMEOUT_MS`]. The independent bound: a
+    /// publisher that got its own arithmetic wrong keeps the timeline and the
+    /// timeout consistent with each other, so only a number neither of them
+    /// can justify catches it.
+    #[error("`timeout_ms` is {timeout_ms}; no script may exceed {MAX_TIMEOUT_MS} ms")]
+    TimeoutPastCeiling {
+        /// What the script asked for.
+        timeout_ms: u64,
     },
 }
 
@@ -259,28 +314,17 @@ impl MotionScript {
             .map(|step| step.after_ms)
     }
 
-    /// The offset at which this script lapses.
+    /// The offset at which this script lapses: the timeout it named, and
+    /// nothing else.
     ///
-    /// The timeout, except where the timeline outlasts it: a script never
-    /// expires with a step still unexecuted, because a timeline that stopped
-    /// short would be a script whose own instructions never ran. The last step
-    /// therefore stands for at least the millisecond after it comes due — the
-    /// expiry is one past it, not level with it, or the lapse would resolve
-    /// first and swallow the step it was waiting for. The ordinary script's
-    /// last step is the stow that ends it well inside the timeout, and this
-    /// arithmetic never fires for one.
-    ///
-    /// TODO(script-timeout-bound): a timeline that outlasts its own timeout
-    /// carries the head past the instant the timeout named, so the bound on the
-    /// head's exposure is the larger of the two numbers the script chose rather
-    /// than the timeout alone.
+    /// Kept as a method rather than folded into the executor because the
+    /// *concept* is the executor's — "when does this stop being an
+    /// instruction" — and validation is what makes the answer this simple:
+    /// every step is strictly inside the timeout, so no step can be waiting
+    /// when the lapse arrives.
     #[must_use]
     pub fn expiry_ms(&self) -> u64 {
-        let after_last = self
-            .steps
-            .last()
-            .map_or(0, |step| step.after_ms.saturating_add(1));
-        self.timeout_ms.max(after_last)
+        self.timeout_ms
     }
 
     /// This script as the JSON text a bus body carries.
@@ -334,11 +378,14 @@ impl MotionScript {
     }
 }
 
-/// The two rules a timeline has to keep, in one place so the constructor and
+/// The four rules a script has to keep, in one place so the constructor and
 /// the decoder cannot come to different conclusions about the same script.
 fn validate(steps: &[Step], timeout_ms: u64) -> Result<(), ScriptError> {
     if timeout_ms == 0 {
         return Err(ScriptError::TimeoutNotPositive { timeout_ms });
+    }
+    if timeout_ms > MAX_TIMEOUT_MS {
+        return Err(ScriptError::TimeoutPastCeiling { timeout_ms });
     }
     for (index, step) in steps.iter().enumerate().skip(1) {
         let previous_ms = steps[index - 1].after_ms;
@@ -349,6 +396,16 @@ fn validate(steps: &[Step], timeout_ms: u64) -> Result<(), ScriptError> {
                 previous_ms,
             });
         }
+    }
+    // Last, so a timeline that is out of order is reported as out of order:
+    // "the last step" means nothing until the offsets ascend.
+    if let Some(last) = steps.last()
+        && last.after_ms >= timeout_ms
+    {
+        return Err(ScriptError::TimelinePastTimeout {
+            last_ms: last.after_ms,
+            timeout_ms,
+        });
     }
     Ok(())
 }
@@ -591,30 +648,123 @@ mod tests {
         assert_eq!(script.expiry_ms(), 30_000);
     }
 
-    /// A script never lapses with a step still unexecuted: a timeout shorter
-    /// than its own timeline would be a script whose instructions never ran.
-    ///
-    /// The expiry is one millisecond *past* the last step and not level with
-    /// it, because the lapse is checked first: level with it, the step would
-    /// resolve as a lapse rather than as the posture it names, and the script's
-    /// last instruction would be swallowed on every such timeline.
+    /// The expiry is the timeout and nothing else, on every shape of timeline —
+    /// which is what makes the number in the message the number the head is
+    /// exposed for.
     #[test]
-    fn a_timeline_outlasting_its_timeout_still_runs_to_its_end() {
-        let script = script(
-            vec![Step::new(0, Posture::Up), Step::new(9_000, Posture::Stow)],
-            5_000,
-        );
-        assert_eq!(script.expiry_ms(), 9_001);
-        assert_eq!(script.posture_at(9_000), Some(Posture::Stow));
+    fn the_expiry_is_the_timeout_the_script_named() {
+        for steps in [
+            vec![],
+            vec![Step::new(0, Posture::Up)],
+            vec![Step::new(0, Posture::Up), Step::new(29_999, Posture::Stow)],
+        ] {
+            assert_eq!(script(steps, 30_000).expiry_ms(), 30_000);
+        }
     }
 
-    /// The same, for a last step that is not the stow the ordinary script ends
-    /// on: the vocabulary is meant to grow, and a swallowed final step would be
-    /// invisible for as long as every script happened to end in a stow.
+    /// A timeline that runs to or past its own timeout is refused by both
+    /// doors, and the last step has to be *strictly* inside: level with the
+    /// timeout the lapse resolves first, and the step would be swallowed.
     #[test]
-    fn a_final_step_that_is_not_a_stow_survives_a_short_timeout() {
-        let script = script(vec![Step::new(9_000, Posture::Up)], 5_000);
-        assert_eq!(script.expiry_ms(), 9_001);
-        assert_eq!(script.posture_at(9_000), Some(Posture::Up));
+    fn a_timeline_reaching_its_own_timeout_is_refused() {
+        assert_eq!(
+            MotionScript::new(
+                "reachy00",
+                1,
+                vec![Step::new(0, Posture::Up), Step::new(9_000, Posture::Stow)],
+                5_000,
+            )
+            .expect_err("the timeline outruns the bound it states"),
+            ScriptError::TimelinePastTimeout {
+                last_ms: 9_000,
+                timeout_ms: 5_000,
+            }
+        );
+
+        let level = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                        "steps":[{"after_ms":5000,"posture":"stow"}],
+                        "timeout_ms":5000}"#;
+        assert_eq!(
+            MotionScript::decode(level).expect_err("level with the lapse"),
+            DecodeError::Invalid(ScriptError::TimelinePastTimeout {
+                last_ms: 5_000,
+                timeout_ms: 5_000,
+            })
+        );
+
+        // One millisecond inside is lawful, and the step resolves.
+        let inside = script(vec![Step::new(4_999, Posture::Stow)], 5_000);
+        assert_eq!(inside.posture_at(4_999), Some(Posture::Stow));
+
+        // A timeline out of order is reported as out of order rather than as a
+        // timeline past its timeout: "the last step" means nothing until the
+        // offsets ascend.
+        assert_eq!(
+            MotionScript::new(
+                "reachy00",
+                1,
+                vec![Step::new(9_000, Posture::Up), Step::new(10, Posture::Stow)],
+                5_000,
+            )
+            .expect_err("out of order"),
+            ScriptError::StepsNotAscending {
+                index: 1,
+                after_ms: 10,
+                previous_ms: 9_000,
+            }
+        );
+    }
+
+    /// The second bound, which exists for the slip that keeps the timeline and
+    /// the timeout consistent with each other: no message may name an exposure
+    /// past ten minutes, whatever its steps say.
+    #[test]
+    fn a_timeout_past_the_ceiling_is_refused() {
+        assert_eq!(
+            MotionScript::new("reachy00", 1, vec![], MAX_TIMEOUT_MS + 1)
+                .expect_err("past the ceiling"),
+            ScriptError::TimeoutPastCeiling {
+                timeout_ms: MAX_TIMEOUT_MS + 1,
+            }
+        );
+
+        // The seconds-for-milliseconds accident: an hour-long exposure under a
+        // timeline that agrees with it perfectly.
+        let slipped = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                          "steps":[{"after_ms":0,"posture":"up"},
+                                   {"after_ms":3600000,"posture":"stow"}],
+                          "timeout_ms":3605000}"#;
+        assert_eq!(
+            MotionScript::decode(slipped).expect_err("an hour is nobody's turn"),
+            DecodeError::Invalid(ScriptError::TimeoutPastCeiling {
+                timeout_ms: 3_605_000,
+            })
+        );
+
+        // The ceiling itself is lawful; it is a bound, not a limit to stay
+        // under.
+        let at_ceiling = script(vec![Step::new(0, Posture::Up)], MAX_TIMEOUT_MS);
+        assert_eq!(at_ceiling.expiry_ms(), MAX_TIMEOUT_MS);
+    }
+
+    /// The refusals read as sentences carrying both numbers, because the
+    /// operator reading the daemon's refusal line is looking for which of the
+    /// two the publisher got wrong.
+    #[test]
+    fn the_ceiling_refusals_name_their_numbers() {
+        let printed = ScriptError::TimelinePastTimeout {
+            last_ms: 40_500,
+            timeout_ms: 30_000,
+        }
+        .to_string();
+        assert!(printed.contains("40500"), "{printed}");
+        assert!(printed.contains("30000"), "{printed}");
+
+        let printed = ScriptError::TimeoutPastCeiling {
+            timeout_ms: 3_605_000,
+        }
+        .to_string();
+        assert!(printed.contains("3605000"), "{printed}");
+        assert!(printed.contains("600000"), "{printed}");
     }
 }

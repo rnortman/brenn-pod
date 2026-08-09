@@ -20,8 +20,14 @@
 //!   travelling around rather than waiting it out.
 //!
 //! They meet only in [`cells`]: the schedule, a shutdown flag, the engage
-//! refusals owed an alert, a write-once fault, and the note that the machine is
-//! no longer being touched. Nothing else crosses.
+//! refusals and the failing-watch runs owed an alert, a write-once fault, and
+//! the note that the machine is no longer being touched. Nothing else crosses.
+//!
+//! Outward, the motion thread also keeps [`state`]: one file saying which of
+//! starting, resting, active, parked and stopping the daemon is in, and whether
+//! the pre-torque sweeps are answering. A parked daemon deliberately does not
+//! exit, so `systemctl is-active` calls it running; that file is how anything
+//! outside this process can tell the difference.
 //!
 //! What the daemon is told is a timed script, not a stream of commands: a
 //! timeline of postures at offsets from the moment the message landed on this
@@ -42,6 +48,7 @@ pub mod cli;
 pub mod config;
 pub mod motion;
 pub mod report;
+pub mod state;
 
 pub use bus::{Chore, Listener};
 pub use cells::{Delivered, FaultReport, FaultStage, Shared, Stop};
@@ -51,3 +58,4 @@ pub use motion::{
     Active, Clock, Clocks, Machine, Outcome, Refusal, Rest, Source, StartupError, Timing,
 };
 pub use report::{Sink, Streams};
+pub use state::{Phase, Surface, Watching};

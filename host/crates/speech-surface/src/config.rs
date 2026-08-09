@@ -688,7 +688,7 @@ pub struct BrennConfig {
     /// How often the standing script is re-emitted while it still says
     /// something. A script lost in transit is repaired within one of these, and
     /// a hold script is kept clear of its own timeout by them. Must be greater
-    /// than zero.
+    /// than zero and no larger than the protocol's timeout ceiling.
     #[serde(default = "default_presence_refresh_ms")]
     pub presence_refresh_ms: u64,
     /// How long the head stays up after a turn that asked to keep listening, and
@@ -697,10 +697,14 @@ pub struct BrennConfig {
     /// stows and re-raises between answers. Must be greater than zero.
     #[serde(default = "default_presence_linger_ms")]
     pub presence_linger_ms: u64,
-    /// The timeout every emitted script carries: the daemon stows this long
-    /// after receipt whatever else happens. On a closing script it is a pure
-    /// backstop; on a hold script — a turn whose timeline is not known yet — it
-    /// is the bound that matters. Must be greater than zero.
+    /// The floor under the timeout every emitted script carries: the daemon
+    /// stows this long after receipt whatever else happens. On a hold script —
+    /// a turn whose timeline is not known yet — it is the bound that matters;
+    /// on a closing script whose stow falls inside it, it is a backstop past
+    /// the stow. A turn whose speech reaches further carries a timeout sized
+    /// from its own timeline instead, because a script's timeout is a ceiling
+    /// on that timeline and may not be shorter than it. Must be greater than
+    /// zero and no larger than the protocol's timeout ceiling.
     #[serde(default = "default_presence_max_engaged_ms")]
     pub presence_max_engaged_ms: u64,
     /// How long after the estimated end of a closed turn's speech the head
@@ -793,6 +797,23 @@ impl BrennConfig {
         ] {
             if ms == 0 {
                 return Err(format!("brenn.{key} must be greater than 0"));
+            }
+        }
+        // The wire caps a script's timeout, and the scripter builds one from
+        // these two: the ceiling is the floor under every timeout it emits, and
+        // the refresh is the headroom it keeps past the timeline. Either past
+        // the protocol's bound would be a config that can only produce scripts
+        // the daemon refuses, so it is refused here, where the line to fix is
+        // still nameable.
+        for (key, ms) in [
+            ("presence_refresh_ms", self.presence_refresh_ms),
+            ("presence_max_engaged_ms", self.presence_max_engaged_ms),
+        ] {
+            if ms > motion_proto::MAX_TIMEOUT_MS {
+                return Err(format!(
+                    "brenn.{key} is {ms}; no motion script may name a timeout past {} ms",
+                    motion_proto::MAX_TIMEOUT_MS
+                ));
             }
         }
         Ok(())
@@ -2357,6 +2378,35 @@ max_backoff_ms = 9000
                 .unwrap_err();
             assert!(err.contains(key), "expected {key} in message: {err}");
         }
+    }
+
+    /// The two intervals the scripter builds a timeout out of are bounded by
+    /// the protocol's own timeout ceiling: past it, every script the host could
+    /// emit is one the daemon refuses, and the config is where that is still a
+    /// line somebody can fix.
+    #[test]
+    fn brenn_rejects_a_presence_interval_past_the_protocol_ceiling() {
+        let past = motion_proto::MAX_TIMEOUT_MS + 1;
+        for key in ["presence_refresh_ms", "presence_max_engaged_ms"] {
+            let err = Config::parse(&with_addr(&brenn_table(&format!("{key} = {past}"))))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(err.contains(key), "expected {key} in message: {err}");
+            assert!(err.contains("600000"), "the bound is named: {err}");
+        }
+        // The ceiling itself is a lawful setting.
+        Config::parse(&with_addr(&format!(
+            "{}{}",
+            brenn_mode_tables(),
+            brenn_table(&format!(
+                "presence_max_engaged_ms = {}",
+                motion_proto::MAX_TIMEOUT_MS
+            ))
+        )))
+        .expect("parse")
+        .validate()
+        .expect("the ceiling is a bound, not a limit to stay under");
     }
 
     #[test]
