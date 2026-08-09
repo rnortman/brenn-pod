@@ -1,4 +1,4 @@
-//! The daemon's configuration file: which machine, whose intents, and on what
+//! The daemon's configuration file: which machine, whose scripts, and on what
 //! bus.
 //!
 //! One TOML file, named on the command line, `deny_unknown_fields` throughout —
@@ -7,14 +7,22 @@
 //!
 //! The machine half of the configuration is deliberately *not* here.
 //! `motion_config` names the same bench TOML the operator tool reads on this
-//! unit, so the crank datum, the envelope, the bus timing and the move durations
-//! have exactly one source of truth on the machine. Two files describing one
-//! platform is two files to disagree, and the disagreement would be about the
-//! numbers that keep the head out of the linkage's singular configurations.
+//! unit, so the crank datum, the envelope and the bus timing have exactly one
+//! source of truth on the machine. Two files describing one platform is two
+//! files to disagree, and the disagreement would be about the numbers that keep
+//! the head out of the linkage's singular configurations.
 //!
-//! What is here is only what the daemon adds: whose intents to obey, which
-//! channel they arrive on, how long an engaged intent is good for, how often the
-//! motion loop comes up for air, and the bridge's own table nested whole.
+//! The move durations are the one exception, and they are an exception because
+//! they are not a fact about the platform: how briskly a head acknowledges a
+//! wake word is presence policy, tuned by whoever is living with the machine,
+//! while the bench file's values are what an operator watching a single command
+//! wants. The three optional `*_duration_s` keys here override the bench file's
+//! for this daemon only; absent, the bench file governs, so there is still one
+//! number and not two unless somebody deliberately wrote a second.
+//!
+//! What is here otherwise is only what the daemon adds: whose scripts to obey,
+//! which channel they arrive on, how often the motion loop comes up for air, and
+//! the bridge's own table nested whole.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,25 +30,54 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
-/// How long an engaged intent is good for when the file does not say.
+/// The longest the motion loop watches the machine before it looks at the
+/// schedule again, when the file does not say.
 ///
-/// Sized against the publisher's refresh cadence: it must survive two missed
-/// refreshes, so a single dropped message and the reconnect after it do not stow
-/// a head in the middle of a conversation.
-const fn default_lease_ttl_ms() -> u64 {
-    15_000
-}
-
-/// How long the motion loop watches the machine between polls of the lease, when
-/// the file does not say.
-///
-/// This is the daemon's whole reaction latency to an intent, and it is also the
-/// cadence at which the machine is monitored. Short enough that nobody perceives
-/// the lag, long enough that the monitoring is not the dominant traffic on the
-/// wire.
+/// A ceiling and not a period: a dwell is cut short by the running script's next
+/// step or its expiry, so this is what bounds the wait when nothing is
+/// scheduled — the reaction latency to a script arriving, and the cadence at
+/// which an idle machine is monitored for a fault. Short enough that nobody
+/// perceives the lag, long enough that the monitoring is not the dominant
+/// traffic on the wire.
 const fn default_hold_dwell_ms() -> u64 {
     200
 }
+
+/// How often the resting watch sweeps a limp machine, when the file does not
+/// say.
+///
+/// Nine position reads, plus the supply and the error bits on the slower
+/// cadence the bench configuration sets. It bounds two things: how stale the
+/// pose an engage plans from can be when a hand has moved the head, and how
+/// long a script asking for the head up waits before anything happens. Ten a
+/// second is imperceptible on the second and a fraction of the wire's capacity
+/// on the first.
+const fn default_rest_poll_ms() -> u64 {
+    100
+}
+
+/// How long the machine holds at stow before torque comes off, when the file
+/// does not say.
+///
+/// The quick-follow-up window: a wake inside it retargets the head up with no
+/// release and no engage in between. Long enough to cover the gap between one
+/// turn's stow and the next turn's wake in a real conversation, short enough
+/// that the machine is not left torqued at stow — this platform's only pinch
+/// hazard — for any longer than that buys something.
+const fn default_rest_delay_ms() -> u64 {
+    5_000
+}
+
+/// The longest rest delay the daemon will run on.
+///
+/// Every other timing here is refused for being too small, because too small is
+/// what wedges a loop. This one is refused for being too large, because what it
+/// buys — a follow-up wake that costs no release and no engage — is spent within
+/// a couple of seconds of a turn ending, while what it costs is the machine
+/// sitting torqued at stow, which is this platform's only pinch hazard. A minute
+/// is a dozen times the useful window and still well short of a
+/// seconds-versus-milliseconds slip, which is what this exists to catch.
+const MAX_REST_DELAY_MS: u64 = 60_000;
 
 /// The daemon's configuration, as the file is written.
 ///
@@ -48,29 +85,90 @@ const fn default_hold_dwell_ms() -> u64 {
 /// file field by field rather than key by key: the example is what an operator
 /// copies, and a key added here without a default it actually writes is the
 /// failure a file of that shape invites.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The bench configuration for this unit — the one the operator tool reads,
     /// not a copy.
     pub motion_config: PathBuf,
-    /// The pod identity whose intents this daemon obeys. Bodies addressed to any
+    /// The pod identity whose scripts this daemon obeys. Bodies addressed to any
     /// other pod are reported and dropped — the channel is not assumed to carry
     /// one machine's traffic.
     pub pod: String,
-    /// The channel presence intents arrive on. No default: which channel a
+    /// The channel motion scripts arrive on. No default: which channel a
     /// deployment uses is operator topology, and a name invented here would be
     /// a convention two ends could silently disagree about.
     pub channel: String,
-    /// How long an engaged intent stays good for, from the moment it arrived.
-    #[serde(default = "default_lease_ttl_ms")]
-    pub lease_ttl_ms: u64,
-    /// How long the motion loop watches the machine between polls of the lease.
+    /// The longest the motion loop watches an engaged machine before it looks
+    /// at the schedule again.
     #[serde(default = "default_hold_dwell_ms")]
     pub hold_dwell_ms: u64,
+    /// How often the resting watch sweeps a limp machine.
+    #[serde(default = "default_rest_poll_ms")]
+    pub rest_poll_ms: u64,
+    /// How long the machine holds at stow before torque comes off.
+    #[serde(default = "default_rest_delay_ms")]
+    pub rest_delay_ms: u64,
+    /// How long the raise takes, seconds, head group. Absent leaves the bench
+    /// configuration's value governing.
+    #[serde(default)]
+    pub up_duration_s: Option<f64>,
+    /// How long the fold takes, seconds, head group. Absent leaves the bench
+    /// configuration's value governing.
+    #[serde(default)]
+    pub stow_duration_s: Option<f64>,
+    /// How long the antennas take on either move, seconds. Absent leaves the
+    /// bench configuration's value governing — and if that says nothing either,
+    /// the antennas run on whichever head-group clock the move is using.
+    #[serde(default)]
+    pub antenna_duration_s: Option<f64>,
     /// The bus attachment. Nested whole so there is one description of a bridge
     /// and every embedder writes the same table.
     pub bridge: brenn_bridge::Config,
+}
+
+/// The move durations the daemon's file states, absent where it states nothing.
+///
+/// Three answers and not three numbers: what the file says is only half of a
+/// duration, the other half being the bench configuration it overrides, and the
+/// resolution of the two lives with the machine ([`crate::motion::Clocks`]) so
+/// that what a move actually runs at is decided once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Overrides {
+    /// The raise's head-group clock.
+    pub up: Option<Duration>,
+    /// The fold's head-group clock.
+    pub stow: Option<Duration>,
+    /// The antennas' clock, on either move.
+    pub antennas: Option<Duration>,
+}
+
+/// A duration a `*_duration_s` key states, or `None` where it states nothing.
+///
+/// A value no `Duration` can hold answers `None` as well. That case never
+/// reaches a running daemon — [`Config::validate`] refuses it by name, and
+/// [`Config::load`] validates — so the only caller that can see one is holding a
+/// configuration that was parsed and never checked.
+fn stated(secs: Option<f64>) -> Option<Duration> {
+    Duration::try_from_secs_f64(secs?).ok()
+}
+
+/// Refuse a move duration nothing could run on.
+///
+/// Zero is refused here where it is lawful for the rest delay, and for the
+/// opposite reason: a rest delay of nothing means let go at once, while a move
+/// of nothing means carry the head from stow to neutral inside one control
+/// period — a per-tick step the guard faults on rather than trimming, which is a
+/// stopped move and a de-torqued machine.
+fn check_duration(key: &str, secs: Option<f64>) -> Result<(), String> {
+    let Some(secs) = secs else { return Ok(()) };
+    if !secs.is_finite() || secs <= 0.0 || Duration::try_from_secs_f64(secs).is_err() {
+        return Err(format!(
+            "{key} is {secs}; a move duration is a positive number of seconds, and omitting the \
+             key leaves the bench configuration's value governing"
+        ));
+    }
+    Ok(())
 }
 
 /// Why a configuration could not be used.
@@ -135,7 +233,9 @@ impl Config {
     ///
     /// Each one rejects a value whose runtime behaviour is a wedge rather than a
     /// slow daemon: a channel nothing can deliver on, an identity nothing can
-    /// match, a term the loop can never observe held.
+    /// match, a dwell the loop would spin on. The rest delay is refused from the
+    /// other end as well, because too long a one is not slow — it is the machine
+    /// held torqued at its only pinch posture.
     pub fn validate(&self) -> Result<(), String> {
         if self.motion_config.as_os_str().is_empty() {
             return Err(
@@ -144,7 +244,7 @@ impl Config {
         }
         if self.pod.is_empty() {
             return Err(
-                "pod is empty; name the identity whose presence intents this daemon obeys"
+                "pod is empty; name the identity whose motion scripts this daemon obeys"
                     .to_string(),
             );
         }
@@ -153,37 +253,74 @@ impl Config {
         // here and left to drift from the other end's copy.
         brenn_bridge::validate_channel_name(&self.channel)
             .map_err(|refusal| format!("channel {refusal}"))?;
-        if self.lease_ttl_ms == 0 {
+        if self.hold_dwell_ms == 0 {
             return Err(
-                "lease_ttl_ms must be at least 1 (0 expires every intent as it arrives)"
+                "hold_dwell_ms must be at least 1 (0 reads the schedule in a spin loop)"
                     .to_string(),
             );
         }
-        if self.hold_dwell_ms == 0 {
+        if self.rest_poll_ms == 0 {
             return Err(
-                "hold_dwell_ms must be at least 1 (0 polls the lease in a spin loop)".to_string(),
+                "rest_poll_ms must be at least 1 (0 sweeps the servo bus as fast as it will \
+                 answer)"
+                    .to_string(),
             );
         }
-        if self.lease_ttl_ms <= self.hold_dwell_ms {
+        if self.rest_delay_ms > MAX_REST_DELAY_MS {
             return Err(format!(
-                "lease_ttl_ms {} must exceed hold_dwell_ms {}; a term shorter than one dwell can \
-                 lapse between two polls, so the loop would never see a lease held",
-                self.lease_ttl_ms, self.hold_dwell_ms
+                "rest_delay_ms is {}; at most {MAX_REST_DELAY_MS} (it holds the machine torqued \
+                 at stow after every turn, which is this platform's only pinch hazard)",
+                self.rest_delay_ms
             ));
         }
+        // Positive and placeable, and nothing further. A duration under the
+        // per-tick step bound's floor is a move that faults partway and
+        // de-torques, which is bad tuning and not a wedge — the floors are
+        // documented beside the keys in the example, and this daemon does not
+        // hold the numbers they are derived from anyway: the step bounds and the
+        // tick rate are the machine's file, read later and by somebody else.
+        check_duration("up_duration_s", self.up_duration_s)?;
+        check_duration("stow_duration_s", self.stow_duration_s)?;
+        check_duration("antenna_duration_s", self.antenna_duration_s)?;
         self.bridge.validate()
     }
 
-    /// How long an engaged intent stays good for.
-    #[must_use]
-    pub fn lease_ttl(&self) -> Duration {
-        Duration::from_millis(self.lease_ttl_ms)
-    }
-
-    /// How long the motion loop watches the machine between polls of the lease.
+    /// The longest the motion loop watches an engaged machine before it looks
+    /// at the schedule again.
     #[must_use]
     pub fn hold_dwell(&self) -> Duration {
         Duration::from_millis(self.hold_dwell_ms)
+    }
+
+    /// How often the resting watch sweeps a limp machine.
+    #[must_use]
+    pub fn rest_poll(&self) -> Duration {
+        Duration::from_millis(self.rest_poll_ms)
+    }
+
+    /// How long the machine holds at stow before torque comes off.
+    ///
+    /// Zero is lawful: it means let go the moment the head is folded, which is
+    /// a legitimate thing to want on a machine nobody is having a conversation
+    /// with.
+    #[must_use]
+    pub fn rest_delay(&self) -> Duration {
+        Duration::from_millis(self.rest_delay_ms)
+    }
+
+    /// The move durations this file states, absent where it states nothing.
+    ///
+    /// One value rather than three accessors because the three are resolved
+    /// together against the machine's own file, and a caller that picked up two
+    /// of them would run the third at whatever the bench configuration says
+    /// without anything saying so.
+    #[must_use]
+    pub fn durations(&self) -> Overrides {
+        Overrides {
+            up: stated(self.up_duration_s),
+            stow: stated(self.stow_duration_s),
+            antennas: stated(self.antenna_duration_s),
+        }
     }
 }
 
@@ -195,7 +332,7 @@ mod tests {
     const TOP: &str = "\
 motion_config = \"/run/brenn-app/conf/reachy-bench.toml\"
 pod = \"reachy00\"
-channel = \"brenn:reachy.presence\"
+channel = \"brenn:reachy.motion\"
 ";
 
     /// The nested bridge table, which every fixture ends with — TOML puts a
@@ -229,26 +366,114 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
     fn the_minimal_file_carries_the_defaults() {
         let config = minimal();
         assert_eq!(config.pod, "reachy00");
-        assert_eq!(config.channel, "brenn:reachy.presence");
+        assert_eq!(config.channel, "brenn:reachy.motion");
         assert_eq!(
             config.motion_config,
             PathBuf::from("/run/brenn-app/conf/reachy-bench.toml")
         );
-        assert_eq!(config.lease_ttl(), Duration::from_secs(15));
         assert_eq!(config.hold_dwell(), Duration::from_millis(200));
+        assert_eq!(config.rest_poll(), Duration::from_millis(100));
+        // How long the head is left folded with torque still on, which is this
+        // machine's one pinch hazard: a value nothing pins is a value an edit
+        // can move without a red test.
+        assert_eq!(config.rest_delay(), Duration::from_millis(5_000));
+        // Nothing stated is nothing overridden: a file that says nothing about
+        // the durations must leave all three to the machine's own configuration,
+        // which is the only way the two files cannot come to disagree.
+        assert_eq!(config.durations(), Overrides::default());
+    }
+
+    /// The one place presence pace is tunable without touching the machine's
+    /// file — and it has to reach the motion loop as seconds, because that is
+    /// what the file writes and milliseconds is what everything else here uses.
+    #[test]
+    fn the_stated_durations_are_read_as_seconds() {
+        let text = file("up_duration_s = 1.4\nstow_duration_s = 1.25\nantenna_duration_s = 1.5");
+        let config = Config::parse(&text).expect("the file parses");
+        config.validate().expect("the file validates");
+        assert_eq!(
+            config.durations(),
+            Overrides {
+                up: Some(Duration::from_millis(1_400)),
+                stow: Some(Duration::from_millis(1_250)),
+                antennas: Some(Duration::from_millis(1_500)),
+            }
+        );
+    }
+
+    /// Each duration is independent of the other two: overriding the raise must
+    /// not quietly pull the fold or the antennas off the bench file with it.
+    #[test]
+    fn one_stated_duration_leaves_the_other_two_to_the_machine() {
+        for (line, expected) in [
+            (
+                "up_duration_s = 1.4",
+                Overrides {
+                    up: Some(Duration::from_millis(1_400)),
+                    ..Overrides::default()
+                },
+            ),
+            (
+                "stow_duration_s = 1.4",
+                Overrides {
+                    stow: Some(Duration::from_millis(1_400)),
+                    ..Overrides::default()
+                },
+            ),
+            (
+                "antenna_duration_s = 1.4",
+                Overrides {
+                    antennas: Some(Duration::from_millis(1_400)),
+                    ..Overrides::default()
+                },
+            ),
+        ] {
+            let config = Config::parse(&file(line)).expect("the file parses");
+            config.validate().expect("the file validates");
+            assert_eq!(config.durations(), expected, "{line}");
+        }
+    }
+
+    /// A move of no time at all is not a fast head: it is a per-tick step the
+    /// guard faults on, and after the gate audit a fault takes torque off. Same
+    /// for a negative one, and for a number of seconds no clock can hold.
+    #[test]
+    fn a_duration_nothing_could_move_in_is_refused_by_name() {
+        for (key, value) in [
+            ("up_duration_s", "0.0"),
+            ("stow_duration_s", "-1.5"),
+            ("antenna_duration_s", "nan"),
+            ("up_duration_s", "inf"),
+            ("stow_duration_s", "1e300"),
+        ] {
+            let text = file(&format!("{key} = {value}"));
+            let config = Config::parse(&text).expect("the file parses");
+            let message = config.validate().expect_err("a duration nothing can run");
+            assert!(message.contains(key), "{key} = {value}: {message}");
+        }
     }
 
     #[test]
-    fn stated_timings_override_the_defaults() {
-        let text = file("lease_ttl_ms = 9000\nhold_dwell_ms = 50");
+    fn a_stated_dwell_overrides_the_default() {
+        let text = file("hold_dwell_ms = 50");
         let config = Config::parse(&text).expect("the file parses");
         config.validate().expect("the file validates");
-        assert_eq!(config.lease_ttl(), Duration::from_secs(9));
         assert_eq!(config.hold_dwell(), Duration::from_millis(50));
     }
 
+    /// The lease and its term are gone with the presence vocabulary, and the
+    /// configuration is `deny_unknown_fields`: a file still carrying the key
+    /// refuses at startup naming it, which is what sends the operator to the
+    /// one edit that fixes it.
+    #[test]
+    fn the_retired_lease_term_is_refused_by_name() {
+        let text = file("lease_ttl_ms = 15000");
+        let error = Config::parse(&text).expect_err("a retired key is refused");
+        assert!(error.to_string().contains("lease_ttl_ms"), "{error}");
+    }
+
     /// A key nothing reads is a refusal, not a no-op: a misspelled `pod` is a
-    /// daemon obeying nobody's intents with a file that looks right.
+    /// daemon obeying nobody's scripts with a file that looks right.
     #[test]
     fn an_unknown_key_is_refused() {
         let text = file("poll_hz = 5");
@@ -266,19 +491,16 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
     #[test]
     fn an_untransportable_channel_is_refused() {
         let config = with(
-            "channel = \"brenn:reachy.presence\"",
-            "channel = \"local:reachy.presence\"",
+            "channel = \"brenn:reachy.motion\"",
+            "channel = \"local:reachy.motion\"",
         );
         let message = config.validate().expect_err("a local: channel is refused");
-        assert!(message.contains("local:reachy.presence"), "{message}");
+        assert!(message.contains("local:reachy.motion"), "{message}");
     }
 
     #[test]
     fn a_channel_that_is_only_the_prefix_is_refused() {
-        let config = with(
-            "channel = \"brenn:reachy.presence\"",
-            "channel = \"brenn:\"",
-        );
+        let config = with("channel = \"brenn:reachy.motion\"", "channel = \"brenn:\"");
         let message = config.validate().expect_err("a bare prefix is refused");
         assert!(message.contains("names nothing"), "{message}");
     }
@@ -303,14 +525,6 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
     }
 
     #[test]
-    fn a_zero_lease_term_is_refused() {
-        let text = file("lease_ttl_ms = 0");
-        let config = Config::parse(&text).expect("the file parses");
-        let message = config.validate().expect_err("a zero term is refused");
-        assert!(message.contains("lease_ttl_ms"), "{message}");
-    }
-
-    #[test]
     fn a_zero_dwell_is_refused() {
         let text = file("hold_dwell_ms = 0");
         let config = Config::parse(&text).expect("the file parses");
@@ -318,16 +532,35 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
         assert!(message.contains("hold_dwell_ms"), "{message}");
     }
 
-    /// A term inside one dwell can lapse between two polls, so the loop would
-    /// never observe a lease held and the head would never rise.
+    /// The resting sweep's period, which zero turns into a servo bus read as
+    /// fast as nine servos will answer, for as long as the machine rests.
     #[test]
-    fn a_term_no_longer_than_a_dwell_is_refused() {
-        let text = file("lease_ttl_ms = 200\nhold_dwell_ms = 200");
+    fn a_zero_rest_poll_is_refused() {
+        let text = file("rest_poll_ms = 0");
         let config = Config::parse(&text).expect("the file parses");
-        let message = config
-            .validate()
-            .expect_err("a term inside a dwell is refused");
-        assert!(message.contains("must exceed hold_dwell_ms"), "{message}");
+        let message = config.validate().expect_err("a zero rest poll is refused");
+        assert!(message.contains("rest_poll_ms"), "{message}");
+    }
+
+    /// The one knob that decides how long the machine sits torqued at stow.
+    /// Zero is lawful — let go the moment the head is folded — but a
+    /// seconds-versus-milliseconds slip would hold this platform's only pinch
+    /// posture for minutes after every turn, on a machine nobody is watching.
+    #[test]
+    fn a_rest_delay_past_the_ceiling_is_refused_and_the_ceiling_itself_is_not() {
+        let text = file(&format!("rest_delay_ms = {}", MAX_REST_DELAY_MS + 1));
+        let config = Config::parse(&text).expect("the file parses");
+        let message = config.validate().expect_err("too long a rest delay");
+        assert!(message.contains("rest_delay_ms"), "{message}");
+        assert!(message.contains("pinch hazard"), "{message}");
+
+        for lawful in [0, MAX_REST_DELAY_MS] {
+            let text = file(&format!("rest_delay_ms = {lawful}"));
+            Config::parse(&text)
+                .expect("the file parses")
+                .validate()
+                .expect("a rest delay at or under the ceiling runs");
+        }
     }
 
     /// The nested table is validated by its own owner, through this one call, so
@@ -356,8 +589,9 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
     /// The comparison is of the whole value, not a list of keys: the file's own
     /// premise is that this vocabulary grows, and an enumerated comparison would
     /// pass over the next defaulted key written out at whatever the author
-    /// typed. Only the five keys the example's header names as mandatory are
-    /// taken from the example itself; everything else has to be the default.
+    /// typed. Only the five keys the example's header names as mandatory, and
+    /// the one recommendation it deliberately ships, are taken from the example
+    /// itself; everything else has to be the default.
     #[test]
     fn the_shipped_example_parses_validates_and_states_the_defaults() {
         let text = include_str!("../reachy-motiond.example.toml");
@@ -371,6 +605,7 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
                 motion_config: example.motion_config.clone(),
                 pod: example.pod.clone(),
                 channel: example.channel.clone(),
+                antenna_duration_s: example.antenna_duration_s,
                 bridge: brenn_bridge::Config {
                     server_url: example.bridge.server_url.clone(),
                     token_file: example.bridge.token_file.clone(),
@@ -379,6 +614,37 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
                 ..defaults
             },
         );
+    }
+
+    /// The one value the example states rather than restates, and the two it
+    /// deliberately does not.
+    ///
+    /// The antenna clock is a recommendation the file can back: its floor is
+    /// closed-form, and 1.5 s clears by real margin the 1.21 s worst case the
+    /// daemon reaches re-stowing an antenna left inboard of sideways. The two
+    /// head-group clocks stay commented out at the bench file's own values,
+    /// because the shorter ones the raise wants are guesses until the machine has
+    /// been run at them — and a guess below the true floor is presence that
+    /// faults partway and drops the head, shipped to every unit that copies this.
+    #[test]
+    fn the_example_recommends_an_antenna_clock_and_no_head_clock() {
+        let text = include_str!("../reachy-motiond.example.toml");
+        let example = Config::parse(text).expect("the example parses");
+
+        assert_eq!(
+            example.durations(),
+            Overrides {
+                antennas: Some(Duration::from_millis(1_500)),
+                ..Overrides::default()
+            }
+        );
+        for commented in ["\n# up_duration_s = 3.0", "\n# stow_duration_s = 2.0"] {
+            assert!(
+                text.contains(commented),
+                "the example no longer carries `{}` for an operator to uncomment",
+                commented.trim()
+            );
+        }
     }
 
     #[test]

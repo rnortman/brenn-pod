@@ -166,9 +166,28 @@ pub trait Synthesizer: Send + Sync {
     fn synthesize(&self, text: &str) -> BoxStream<'static, Result<PcmChunk, SynthesisError>>;
 }
 
+/// How a turn ended, as anything downstream of the conversation cares about it.
+///
+/// One bit, decided by the brain and nobody else: `Open` means the response asked
+/// to keep listening, so the exchange is expected to continue without another wake
+/// word; `Closed` means the turn is finished. A brain with no notion of holding the
+/// floor answers `Closed` for every turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// The final delivered response asked for the microphone to stay open.
+    Open,
+    /// The turn is over — no tag, or an ending that delivered no final response at
+    /// all (a timeout, a link failure, an empty transcript).
+    Closed,
+}
+
 /// Utterance in → speak/act out; interruptible.
 pub trait Brain: Send + Sync {
-    fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, ()>;
+    /// Answer one utterance, queueing every response through `out`, and report how the
+    /// turn ended. The return is a statement about the conversation, not about
+    /// delivery: a turn whose replies were all refused by a full queue still ends
+    /// `Open` if the response that produced them asked to keep listening.
+    fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, TurnEnd>;
     /// The turn `id` was cut mid-playback; `progress` says how much of the
     /// response clip the user heard. Invoked only with a turn the playback writer
     /// confirmed was the one it was playing when the flush was accepted, so a stale
@@ -224,8 +243,8 @@ mod tests {
     }
 
     impl Brain for NullStages {
-        fn handle(&self, _u: Utterance, _out: ResponseSink) -> BoxFuture<'static, ()> {
-            futures::future::ready(()).boxed()
+        fn handle(&self, _u: Utterance, _out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
+            futures::future::ready(TurnEnd::Closed).boxed()
         }
         fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {}
     }

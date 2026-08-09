@@ -46,10 +46,10 @@ const CONSOLE_INFO: &[&str] = &[
     "brenn_attached",
     "brenn_subscribed",
     "brenn_help_published",
-    // The head going up and coming down. One line per transition, never per
-    // lease refresh. `presence_absent` is its startup sibling: a bus-brain pod
-    // whose head will never move, said once at startup.
-    "presence",
+    // The head's timeline changing. One line per change, never per re-emission
+    // of the standing script. `presence_absent` is its startup sibling: a
+    // bus-brain pod whose head will never move, said once at startup.
+    "motion_script",
     "presence_absent",
     // The listener's utterance lifecycle. All fire at speech-boundary rate (a
     // handful per utterance), never per-chunk, so the console stays bounded.
@@ -442,8 +442,8 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
         "playback_started" => Some(narrate_playback_started(fields)),
         "latency_summary" => Some(narrate_latency_summary(fields)),
         "playback_finished" => Some(narrate_playback_finished(fields)),
-        "presence" => Some(narrate_presence(fields)),
-        "presence_absent" => Some("presence: none".to_string()),
+        "motion_script" => Some(narrate_motion_script(fields)),
+        "presence_absent" => Some("head: unscripted".to_string()),
         "conn_hello" => Some(narrate_conn_hello(fields)),
         "conn_superseded" => Some(narrate_conn_superseded(fields)),
         "conn_closed" => Some(narrate_conn_closed(fields)),
@@ -458,13 +458,27 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
     }
 }
 
-/// The head's posture as prose: `presence engaged (wake) seq=4`. State and cause
-/// degrade to `?` when absent or the wrong type.
-fn narrate_presence(fields: &Value) -> String {
-    let state = fmt_str(fields.get("state"));
+/// The head's new timeline as prose: `head up@0 stow@6740 (closing) seq=17865`.
+/// A script with no steps reads `head -` — lawful, and the timeout is then its
+/// whole effect. Every field degrades to `?` when absent or the wrong type.
+fn narrate_motion_script(fields: &Value) -> String {
+    let steps = match fields.get("steps").and_then(Value::as_array) {
+        Some(steps) if !steps.is_empty() => steps
+            .iter()
+            .map(|step| {
+                format!(
+                    "{}@{}",
+                    fmt_str(step.get("posture")),
+                    fmt_u64(step.get("after_ms"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => "-".to_string(),
+    };
     let cause = fmt_str(fields.get("cause"));
     let seq = fmt_u64(fields.get("seq"));
-    format!("presence {state} ({cause}) seq={seq}")
+    format!("head {steps} ({cause}) seq={seq}")
 }
 
 /// The configured text-to-speech stage as prose:
@@ -1586,36 +1600,49 @@ mod tests {
         );
     }
 
-    /// The console line is the only place a supervised run watches the head
-    /// move, and it reads three field names straight out of the object the
-    /// tracker builds. Renaming or retyping one degrades the prose to `?` with
-    /// nothing else failing.
+    /// The console line is the only place a supervised run watches the head's
+    /// timeline change, and it reads the step array and two scalars straight out
+    /// of the object the script task builds. Renaming or retyping one degrades
+    /// the prose rather than failing anything else.
     #[test]
-    fn presence_narrates() {
+    fn motion_script_narrates() {
         let mut r = Renderer::new(false);
         let line = r
             .render(
                 0,
-                "presence",
-                &json!({ "pod": "pod-a1b2c3", "state": "engaged", "cause": "wake", "seq": 4 }),
+                "motion_script",
+                &json!({
+                    "pod": "pod-a1b2c3",
+                    "seq": 1_786_543_210_123_u64,
+                    "steps": [
+                        { "after_ms": 0, "posture": "up" },
+                        { "after_ms": 6740, "posture": "stow" },
+                    ],
+                    "timeout_ms": 30_000,
+                    "cause": "closing",
+                }),
             )
             .unwrap();
-        assert!(line.ends_with("presence engaged (wake) seq=4"), "{line}");
-        assert!(!line.contains("!!!"), "a transition is calm: {line}");
+        assert!(
+            line.ends_with("head up@0 stow@6740 (closing) seq=1786543210123"),
+            "{line}"
+        );
+        assert!(!line.contains("!!!"), "a change is calm: {line}");
 
-        let stowed = r
+        // The lawful empty timeline: a script whose only effect is its timeout.
+        let empty = r
             .render(
                 0,
-                "presence",
-                &json!({ "pod": "pod-a1b2c3", "state": "idle", "cause": "linger", "seq": 9 }),
+                "motion_script",
+                &json!({ "pod": "pod-a1b2c3", "seq": 2, "steps": [], "cause": "refresh" }),
             )
             .unwrap();
-        assert!(stowed.ends_with("presence idle (linger) seq=9"), "{stowed}");
+        assert!(empty.ends_with("head - (refresh) seq=2"), "{empty}");
 
         // Every field degrades rather than panicking or rendering a plausible
         // wrong value.
-        let bare = r.render(0, "presence", &json!({})).unwrap();
-        assert!(bare.ends_with("presence ? (?) seq=?"), "{bare}");
+        let bare = r.render(0, "motion_script", &json!({})).unwrap();
+        assert!(bare.ends_with("head - (?) seq=?"), "{bare}");
     }
 
     #[test]
@@ -1628,7 +1655,7 @@ mod tests {
                 &json!({ "reason": "no presence_channel" }),
             )
             .unwrap();
-        assert!(line.ends_with("presence: none"), "{line}");
+        assert!(line.ends_with("head: unscripted"), "{line}");
         assert!(!line.contains("!!!"), "a configuration is calm: {line}");
     }
 
@@ -2651,7 +2678,7 @@ mod tests {
         ("brenn_help_published", Class::Calm),
         ("brenn_interruption_dropped", Class::Loud),
         ("brenn_interruption_publish_failed", Class::Loud),
-        ("brenn_presence_publish_failed", Class::Loud),
+        ("brenn_script_publish_failed", Class::Loud),
         ("brenn_subscribed", Class::Calm),
         ("brenn_wake_dropped", Class::Calm),
         ("brenn_wake_publish_failed", Class::Calm),
@@ -2681,10 +2708,13 @@ mod tests {
         ("playback_router_exited", Class::Loud),
         ("playback_started", Class::Calm),
         ("playback_writer_dead", Class::Loud),
-        ("presence", Class::Calm),
+        ("motion_script", Class::Calm),
         ("presence_absent", Class::Calm),
-        ("presence_input_dropped", Class::Loud),
-        ("presence_tracker_exited", Class::Loud),
+        ("script_input_dropped", Class::Loud),
+        // A decided script the next one replaced before the bus took it: normal
+        // under a slow bus, and the newer timeline is what the daemon wanted.
+        ("script_publish_superseded", Class::FileOnly),
+        ("script_task_exited", Class::Loud),
         ("protocol_error", Class::Loud),
         ("prune_delete_error", Class::Loud),
         ("prune_error", Class::Loud),

@@ -11,15 +11,17 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
+use crate::cells::Stop;
 use crate::motion::Outcome;
 use crate::report::Sink;
 
-/// Exit status of a run an operator ended and the machine released cleanly.
+/// Exit status of a run something asked to stop, ending with the machine
+/// folded and torque off.
 pub const RELEASED: u8 = 0;
 
 /// Exit status of a daemon that never took the machine: the configuration did
-/// not resolve, a gate refused, the token file is not readable, or something
-/// else holds the serial port.
+/// not resolve, the token file is not readable, or something else holds the
+/// serial port.
 ///
 /// [`brenn_bridge::exit::HARD_FAILURE`]'s number and its meaning — this process,
 /// as configured, is wrong, and a restart into the same configuration reaches
@@ -27,17 +29,22 @@ pub const RELEASED: u8 = 0;
 pub const STARTUP_REFUSED: u8 = brenn_bridge::exit::HARD_FAILURE;
 
 /// Exit status of a daemon whose machine stopped taking commands. Torque was
-/// left on and the servos are holding where they were; go and look at the
-/// machine before restarting anything.
+/// written off and the head has settled into near-stow — the machine is at the
+/// minimum risk condition — but something is wrong with it: go and look before
+/// restarting anything, which is why a service manager is told not to.
 ///
 /// Deliberately not 1, 3, 4 or 5: those numbers are already spoken for by the
 /// bridge library and by the speech surface's tools, and an operator reading a
 /// code off a unit should not have to ask which binary produced it.
 pub const FAULTED: u8 = 6;
 
-/// Exit status of a daemon that stowed and left torque on because it had nothing
-/// left to obey. Nothing is wrong with the machine; the attachment ended.
-pub const PARKED: u8 = 7;
+/// Exit status of a daemon that folded the head, released torque and exited
+/// because it had nothing left to obey.
+///
+/// Nothing is wrong with the machine; the attachment ended in a way no
+/// reconnection follows, which is an authentication or configuration problem a
+/// restart would only repeat.
+pub const DETACHED: u8 = 7;
 
 /// What this invocation asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,13 +76,14 @@ pub fn describe(out: &mut dyn Write, asked: bool) -> u8 {
         out,
         "usage: reachy-motiond <config.toml>\n\
          \n\
-         The head-presence motion daemon. It runs the same two standing gates the\n\
-         bench does, arms the machine, stows it, and then holds it at whatever\n\
-         posture the presence channel asks for until an operator signals it.\n\
+         The head-presence motion daemon. It commissions the machine once, then\n\
+         rests it — folded, torque off, watched — and takes hold only for as long\n\
+         as a motion script on its channel asks the head to be up.\n\
          \n\
-         Run it in the foreground with somebody watching. SIGINT or SIGTERM stows\n\
-         the head, verifies it is there, and releases torque; every other ending\n\
-         leaves the servos holding."
+         Runs unattended. SIGINT and SIGTERM are the same thing to it: fold the\n\
+         head, take torque off, exit 0. A fault writes torque off immediately and\n\
+         exits 6; a bridge that will never carry another script exits 7. Every\n\
+         ending leaves the motors unpowered."
     );
     if asked { RELEASED } else { STARTUP_REFUSED }
 }
@@ -84,8 +92,8 @@ pub fn describe(out: &mut dyn Write, asked: bool) -> u8 {
 #[must_use]
 pub fn exit_code(outcome: &Outcome) -> u8 {
     match outcome {
-        Outcome::Released => RELEASED,
-        Outcome::Parked => PARKED,
+        Outcome::Released(Stop::Operator) => RELEASED,
+        Outcome::Released(Stop::Detached) => DETACHED,
         Outcome::Faulted(_) => FAULTED,
     }
 }
@@ -173,20 +181,20 @@ mod tests {
     }
 
     #[test]
-    fn every_ending_but_the_released_one_is_a_nonzero_status_of_its_own() {
-        assert_eq!(exit_code(&Outcome::Released), 0);
-        assert_ne!(exit_code(&Outcome::Parked), 0);
+    fn every_ending_but_the_clean_stop_is_a_nonzero_status_of_its_own() {
+        assert_eq!(exit_code(&Outcome::Released(Stop::Operator)), 0);
+        assert_ne!(exit_code(&Outcome::Released(Stop::Detached)), 0);
         assert_ne!(
             exit_code(&Outcome::Faulted(FaultReport::new(
-                FaultStage::Presence,
+                FaultStage::Motion,
                 "read loss"
             ))),
             0
         );
         assert_ne!(
-            exit_code(&Outcome::Parked),
+            exit_code(&Outcome::Released(Stop::Detached)),
             exit_code(&Outcome::Faulted(FaultReport::new(
-                FaultStage::Presence,
+                FaultStage::Motion,
                 "read loss"
             ))),
             "a machine to go and look at is not the same ending as a bus that went away"

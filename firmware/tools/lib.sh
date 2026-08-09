@@ -157,6 +157,21 @@ ensure_builder_image() {
 motion_patch_marker='path = "../../brenn-reachy/'
 container_motion_repo=/brenn-reachy
 
+# The brenn-reachy clone this workspace works against, or a failure when there
+# is none. Beside this repository by default; REACHY_MOTION_REPO names it when
+# it is somewhere else.
+#
+# Two callers with two different reasons: the container builds mount it while
+# the manifest's [patch] table redirects the motion crates at it, and the
+# bring-up pushes the unit's bench configuration out of it. The refusal is each
+# caller's to write — what "there is no clone" means differs — so this answers
+# with a status and says nothing.
+motion_repo_root() {
+	local root=${REACHY_MOTION_REPO:-${repo_root}/../brenn-reachy}
+	[ -d "${root}/crates/reachy-bench" ] || return 1
+	(cd -- "$root" && pwd)
+}
+
 # The volume specification the motion overlay needs, or nothing when the
 # manifest carries no overlay to serve.
 #
@@ -170,12 +185,11 @@ container_motion_repo=/brenn-reachy
 motion_overlay_volume() {
 	grep -qF -- "$motion_patch_marker" "${firmware_root}/Cargo.toml" || return 0
 
-	local root=${REACHY_MOTION_REPO:-${repo_root}/../brenn-reachy}
-	[ -d "${root}/crates/reachy-bench" ] || die \
-		"the workspace manifest redirects the motion crates at a clone beside this repo, and there is none at ${root}." \
+	local root
+	root=$(motion_repo_root) || die \
+		"the workspace manifest redirects the motion crates at a clone beside this repo, and there is none at ${REACHY_MOTION_REPO:-${repo_root}/../brenn-reachy}." \
 		"Clone brenn-reachy beside this repository, or name the clone for this invocation:" \
 		"    REACHY_MOTION_REPO=<path> make <target>"
-	root=$(cd -- "$root" && pwd)
 	echo "${root}:${container_motion_repo}:ro"
 }
 

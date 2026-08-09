@@ -43,13 +43,13 @@ pub use listener::{
 pub use playback::{
     AbortReason, FRAME_MS, FlushRejected, PacerConfig, PlayRejected, PlaybackEvent,
     PlaybackEventFn, PlaybackHandle, PlaybackJob, PlaybackStats, PlaybackStatsSnapshot,
-    PlaybackWriter,
+    PlaybackWriter, audio_ms,
 };
 pub use queue::{DropOldestQueue, QueueStats, Receiver, Sender, StatsHandle};
 pub use tracking::tracking_event;
 pub use traits::{
     Brain, PcmChunk, ResponseSink, SegmentAudio, SynthesisError, Synthesizer, TranscribeError,
-    Transcriber, TranscriptEvent,
+    Transcriber, TranscriptEvent, TurnEnd,
 };
 pub use types::{
     AudioSpan, BargeInContext, Codec, ConfidenceGate, ContextSegment, DoaTrack, EndpointCause,

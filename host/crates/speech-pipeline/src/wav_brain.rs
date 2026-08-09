@@ -13,7 +13,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 
 use crate::brain::{BrainEventFn, BrainStats, send_or_report};
-use crate::traits::{Brain, ResponseSink};
+use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{InterruptProgress, SpeakBody, SpeakCmd, Utterance, UtteranceId};
 
 /// The trivial `Brain`: every utterance is answered by queueing one fixed clip.
@@ -36,7 +36,7 @@ impl WavBrain {
 }
 
 impl Brain for WavBrain {
-    fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, ()> {
+    fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
         let utterance = u.id;
         let cmd = SpeakCmd {
             target: u.pod,
@@ -46,8 +46,9 @@ impl Brain for WavBrain {
             timings: u.timings.clone(),
         };
         send_or_report(&mut out, cmd, utterance, &self.events, &self.stats);
-        // The reply is queued synchronously above; nothing remains to await.
-        futures::future::ready(()).boxed()
+        // One fixed clip is the whole conversation this brain has, so every turn
+        // is over when it is queued.
+        futures::future::ready(TurnEnd::Closed).boxed()
     }
 
     fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {
@@ -109,7 +110,12 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
         let sink = ResponseSink::new(tx);
-        drop(brain.handle(test_utterance(), sink));
+        // One fixed clip is the whole conversation: the turn is over and ready the
+        // moment it is queued, so the future needs no executor to answer.
+        assert_eq!(
+            brain.handle(test_utterance(), sink).now_or_never(),
+            Some(TurnEnd::Closed)
+        );
 
         let cmd = rx.try_recv().expect("a SpeakCmd was queued");
         assert_eq!(cmd.target, PodId("pod-x".into()));

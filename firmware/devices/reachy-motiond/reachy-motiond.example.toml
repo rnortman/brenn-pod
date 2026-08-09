@@ -8,42 +8,102 @@
 # Five keys have no default and must be given: motion_config, pod and channel
 # below, and server_url and token_file in [bridge]. A daemon that guessed at any
 # of them would move a machine on somebody else's word, or reach a bus nobody
-# named. Everything else here — the two timings below, the whole
+# named. Everything else here — the three periods below, the whole
 # [bridge.reconnect] block — is written at its default.
 #
-# What is NOT here is the machine: the servo bus, the crank datum, the envelope,
-# the move durations and the tick rates all live in the bench configuration
-# named below, which is the same file the operator tool reads on this unit.
+# What is NOT here is the machine: the servo bus, the crank datum, the envelope
+# and the tick rates all live in the bench configuration named below, which is
+# the same file the operator tool reads on this unit. The move durations are the
+# one exception, and they are optional: how briskly the head acknowledges a wake
+# word is presence policy, tunable here with `make reachy-motiond-config` and a
+# restart, while the machine's own truth stays in the bench file.
 
-# The bench configuration for this unit, and — beside it, under the name the
-# bench writes — the self-test record. The daemon runs the same two standing
-# gates the bench does before it opens anything: the configuration must resolve
-# to a crank datum a human wrote in, and the record must say a self-test passed.
+# The bench configuration for this unit. The daemon resolves it with the same
+# function the operator tool does, so the two cannot describe different
+# platforms. It must carry a crank datum a human measured and wrote in — that is
+# calibration, not a gate, and nothing else about this file stands between the
+# daemon and a machine that answers.
 motion_config = "/var/lib/brenn-app/reachy-bench.toml"
 
-# The identity whose presence intents this daemon obeys. Bodies addressed to any
+# The identity whose motion scripts this daemon obeys. Bodies addressed to any
 # other pod are reported and dropped: the channel is not assumed to carry one
 # machine's traffic.
 pod = "reachy00"
 
-# The channel the intents arrive on. Both ends have to name the same one, and
-# the publisher's grant on the bus has to allow it.
-channel = "brenn:reachy.presence"
+# The channel the scripts arrive on. Both ends have to name the same one, and
+# the scripter's grant on the bus has to allow it.
+channel = "brenn:reachy.motion"
 
-# How long an engaged intent stays good for, from the moment it arrived, on this
-# daemon's own monotonic clock — nothing here compares clocks across hosts.
-# Sized to survive two missed refreshes at the publisher's five-second cadence,
-# so one dropped message and the reconnect after it do not stow a head in the
-# middle of a conversation. When it lapses the desired posture is stowed: every
-# way this can fail parks the head, which is the safe posture.
-lease_ttl_ms = 15000
-
-# How long the motion loop watches the machine between polls of the lease. This
-# is the whole reaction latency to an intent, and it is also the cadence at which
-# the machine is monitored for a fault. Must be less than lease_ttl_ms, or a
-# lease could be granted and lapse between two polls and the head would never
-# rise.
+# The longest the motion loop watches the machine before it looks at the
+# schedule again. A ceiling, not a period: a dwell is cut short by the running
+# script's next step or by its expiry, so a step at an arbitrary offset lands on
+# the script's own clock rather than at the next multiple of this. What this
+# actually bounds is the reaction latency to a script arriving, and the cadence
+# at which a machine with nothing scheduled is monitored for a fault.
+#
+# There is no separate timeout here: every script carries its own, which is what
+# bounds how long the head can stay up when the scripter dies mid-conversation.
 hold_dwell_ms = 200
+
+# How often the resting watch sweeps a limp machine: nine position reads, plus
+# the supply and the error bits on the slower cadence the bench configuration
+# sets. It bounds how stale the pose an engage plans from can be when a hand has
+# moved the head, and how long a script asking for the head up waits before
+# anything happens. Must be at least 1.
+rest_poll_ms = 100
+
+# How long the head holds at stow, still torqued, before torque comes off. The
+# quick-follow-up window: a wake inside it retargets the head up with no release
+# and no engage in between. Zero is lawful and means let go the moment the head
+# is folded — stowed with torque held is this machine's only pinch hazard, so
+# nothing here should be longer than the follow-up it buys. Refused above 60000
+# for that reason: a seconds-versus-milliseconds slip here holds the pinch
+# posture for minutes after every turn.
+rest_delay_ms = 5000
+
+# The three move durations, in seconds, each optional and each overriding the
+# bench configuration's value for this daemon alone. Omit one and the bench file
+# governs it; omit all three and this daemon moves at exactly the pace the
+# operator tool does.
+#
+# They come in two mechanical groups. The head group is the head pose and the
+# body yaw, which the six legs follow through the inverse kinematics; the
+# antennas are independent of it and sweep much further, which is why they have a
+# clock of their own — a lift tuned to be quick has no business being floored by
+# an antenna arc.
+#
+# FLOORS. A per-tick step past the bound in the bench file is a fault, never a
+# clamp, and after the gate audit a fault takes torque off: a duration under its
+# floor is not a slow head, it is a move that stops partway and a head that
+# settles limp. A shaped move's peak rate is 1.875 times its average, so for a
+# joint that moves linearly in its own coordinate the floor is closed-form —
+# 1.875 x span in radians / (bound x tick rate). At the shipped bounds and 50 Hz:
+#
+#   head group   1.07 s for the stow-to-neutral span. No closed form (the legs
+#                move through the IK); derived by sampling the move at tick rate
+#                and pinned by a reachy-motion unit test, so it moves only when
+#                the geometry, the tick rate or `max_step_legs_rad` does.
+#   body yaw     0.79 s from the 60-degree cap the bench file ships,
+#                and 1.571 s for the widest sweep a command can lawfully ask —
+#                cap to cap. The startup fold is the case to watch: it starts
+#                wherever the machine was physically left, which no cap binds,
+#                and from beyond about 153 degrees round `stow_duration_s = 2.0`
+#                does not clear the bound. TODO(recovery-move-clock) is the fix.
+#   antennas     0.81 s for the 3.23 rad stow-to-neutral arc, 1.21 s to re-stow
+#                an antenna left just inboard of sideways, and 1.57 s for the
+#                widest sweep the bench command can ask for. The daemon only ever
+#                commands the first two.
+#
+# The two head-group lines are commented out — that is, at the bench file's own
+# 3.0 s and 2.0 s. Those values are cautious rather than measured, and the raise
+# is meant to be a quick acknowledgement, so they are the obvious thing to tune;
+# what stops a shorter recommendation shipping here is that nobody has run the
+# machine at one yet. Lower them a step at a time and watch the tracking error in
+# the capture. The antenna clock needs no such trial: its floor is closed-form,
+# and 1.5 s clears the 1.21 s worst case the daemon can reach with real margin.
+# up_duration_s = 3.0
+# stow_duration_s = 2.0
+antenna_duration_s = 1.5
 
 # The bus attachment. The same table every binary here that attaches to the bus
 # writes, nested whole.
@@ -75,5 +135,5 @@ connect_timeout_ms = 15000
 liveness_multiplier = 3
 # How many consecutive futile attachments end the process — an attachment is
 # futile when this end sent something and the peer answered nothing before the
-# socket died. The daemon stows and exits with torque held when they run out.
+# socket died. The daemon stows, releases and exits nonzero when they run out.
 max_futile_attachments = 3

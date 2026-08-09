@@ -12,12 +12,15 @@ pub mod exit;
 pub mod jsonl;
 pub mod pipeline;
 pub mod playback_router;
-pub mod presence;
 pub mod prune;
 pub mod recorder;
 pub mod replay;
+pub mod scripter;
 pub mod server;
+mod time;
 
+/// The ledger reading the scripter schedules from; part of [`scripter::ScriptInput`].
+pub use barge::TurnAudio;
 pub use brenn::driver::{BridgeDriver, DriverIo, DriverTokens};
 pub use brenn::{BridgeLink, NOTICE_QUEUE_DEPTH, Notice};
 pub use clip::{ClipError, SpineFormatViolation, check_spine_format, load_clip};
@@ -26,10 +29,6 @@ pub use config::{
     RecordConfig, RoomLookup, UNMAPPED_ROOM,
 };
 pub use jsonl::{JsonlHandle, emit_line, format_line};
-pub use presence::{
-    PRESENCE_QUEUE_DEPTH, PresenceHandle, PresenceInbox, PresenceInput, PresenceTiming,
-    PresenceTracker,
-};
 pub use prune::{PruneFailure, PruneHalt, PruneOutcome, PruneRequest, PruneTier, PrunedLog, prune};
 /// The link's TLS-PSK parameters, shared with the device clients.
 pub use psk_link as psk;
@@ -38,6 +37,10 @@ pub use recorder::{
     sidecar_path,
 };
 pub use replay::{ReplayError, ReplayListener, ReplaySummary, StopReason, replay_framelog};
+pub use scripter::{
+    Cause, Now, SCRIPT_QUEUE_DEPTH, ScriptHandle, ScriptInbox, ScriptInput, ScriptPublish,
+    ScriptTask, ScriptTiming, Scripter,
+};
 
 /// Shared `Segment` builder for the crate's test modules. `Segment` grows a
 /// field per increment (`StageTimings` especially), so keeping one constructor

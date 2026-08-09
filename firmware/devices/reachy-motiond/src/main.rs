@@ -1,8 +1,9 @@
 //! The head-presence daemon's entry point.
 //!
 //! Everything decidable from text happens before anything is acquired: the
-//! configuration, the two standing gates, and the bridge's token file. Only then
-//! does the serial port open, the bus thread start, and the arm sequence run.
+//! daemon's configuration, the machine's, and the bridge's token file. Only then
+//! does the serial port open, the bus thread start, and the machine get
+//! commissioned.
 //!
 //! What is here is the part that cannot be tested without a machine and a
 //! socket — the ordering, the two threads, and the exit status. The decisions
@@ -19,13 +20,9 @@ use reachy_motiond::bus::{self, Listener};
 use reachy_motiond::cells::Shared;
 use reachy_motiond::cli::{self, Invocation};
 use reachy_motiond::config::Config;
-use reachy_motiond::motion::{self, Machine};
+use reachy_motiond::motion::{self, Machine, Timing};
 use reachy_motiond::report::{Sink, Streams};
 
-// TODO(motiond-service): this daemon is operator-run in the foreground, and the
-// release-on-signal ending below is why. A service manager's SIGTERM is not an
-// operator, so running it supervised means deciding what a supervised stop does
-// to torque — and whether a boot with nobody present may arm at all.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match cli::parse(&args) {
@@ -36,19 +33,19 @@ fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-/// Take the machine and hold it at whatever the presence channel asks for.
+/// Rest the machine, and take hold of it for as long as a script asks the head
+/// to be up.
 fn run(path: &Path) -> u8 {
     let sink = Streams;
 
-    // Text only, and in this order: the daemon's own file, then the machine's
-    // two standing gates, then the token the attachment presents. A refusal here
-    // costs nothing — no port is open, no servo is torqued, and nothing has been
-    // told anything.
+    // Text only, and in this order: the daemon's own file, then the machine's,
+    // then the token the attachment presents. A refusal here costs nothing — no
+    // port is open, no servo is torqued, and nothing has been told anything.
     let config = match Config::load(path) {
         Ok(config) => config,
         Err(error) => return cli::refuse_startup(&sink, &error),
     };
-    let machine = match Machine::gated(&config.motion_config) {
+    let machine = match Machine::resolve(&config.motion_config, config.durations()) {
         Ok(machine) => machine,
         Err(error) => return cli::refuse_startup(&sink, &error),
     };
@@ -57,12 +54,18 @@ fn run(path: &Path) -> u8 {
         Err(error) => return cli::refuse_startup(&sink, &error),
     };
     sink.line(&format!(
-        "gates: passed. machine {} from {}, obeying {} on {}",
+        "resolved: machine {} from {}, obeying {} on {}",
         machine.device(),
         config.motion_config.display(),
         config.pod,
         config.channel
     ));
+    // Both moves and both files, before anything moves. A head that raises at a
+    // pace nobody expects is otherwise a question two configurations and a guess
+    // are needed to answer, and the override is exactly the thing a reader of
+    // the bench file cannot see.
+    sink.line(&format!("durations: {}", machine.clocks()));
+    sink.event("motion_durations", &machine.clocks().json());
 
     // The port before the bus: a second speaker on the servo chain is the one
     // failure that cannot be recovered from by trying again, so the refusal that
@@ -75,20 +78,27 @@ fn run(path: &Path) -> u8 {
     let shared = Arc::new(Shared::new(&config.pod));
     let bus = spawn_bus(bridge, handle, events, &config, Arc::clone(&shared));
 
-    let head = match machine.arm(port, &mut |text| sink.line(text)) {
-        Ok(head) => head,
+    // Commissioning touches no torque in either direction, so a refusal here
+    // leaves the machine exactly as limp as it was found.
+    let resting = match machine.commission(port, &mut |text| sink.line(text)) {
+        Ok(resting) => resting,
         Err(refusal) => {
-            let outcome = motion::arm_failed(&shared, refusal, &sink);
+            let outcome = motion::commission_failed(&shared, refusal, &sink);
             return finish(bus, &sink, &outcome);
         }
     };
 
-    let outcome = motion::run(head, &shared, config.hold_dwell(), &sink);
+    let timing = Timing {
+        dwell: config.hold_dwell(),
+        rest_poll: config.rest_poll(),
+        rest_delay: config.rest_delay(),
+    };
+    let outcome = motion::run(resting, &shared, timing, &sink);
     finish(bus, &sink, &outcome)
 }
 
-/// The bus thread: a current-thread runtime, the attachment, and the fold into
-/// the lease.
+/// The bus thread: a current-thread runtime, the attachment, and the path into
+/// the schedule.
 ///
 /// Its own runtime rather than the main thread's, because the other thread
 /// blocks on a serial port for seconds at a time and an attachment that stopped
@@ -105,7 +115,6 @@ where
     C::Conn: Send,
 {
     let channel = config.channel.clone();
-    let ttl = config.lease_ttl();
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -118,7 +127,7 @@ where
             }
         };
         let sink = Streams;
-        let listener = Listener::new(shared, channel, ttl, &sink);
+        let listener = Listener::new(shared, channel, &sink);
         Some(runtime.block_on(bus::serve(bridge, &handle, events, listener)))
     })
 }
@@ -132,8 +141,8 @@ fn finish(
     match bus.join() {
         Ok(Some(bridge)) => sink.line(&format!("bus: {bridge}")),
         Ok(None) => {}
-        // A panicked bus thread is worth a line of its own: the lease stopped
-        // being refreshed at that moment, which is why the head came down.
+        // A panicked bus thread is worth a line of its own: scripts stopped
+        // arriving at that moment, which is why the head came down.
         Err(_) => sink.line("bus: the bus thread panicked"),
     }
 

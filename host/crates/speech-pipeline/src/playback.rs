@@ -45,6 +45,14 @@ const _: () = assert!(
     "FRAME_MS must equal one AUDIO_SAMPLES_PER_FRAME at the spine sample rate",
 );
 
+/// How long `samples` of spine-format audio plays for, in milliseconds. Nominal:
+/// the count is what the job carries, not what a device has emitted, so this is a
+/// duration of audio rather than a wall span. The one conversion from a sample
+/// count to a playout duration.
+pub const fn audio_ms(samples: u64) -> u64 {
+    samples * 1000 / SPINE_FORMAT.sample_rate_hz as u64
+}
+
 /// `pod_id` the playback `Hello` advertises. Names the sender (the surface), not a
 /// pod; the device keys nothing off it, validating only the format scalars.
 const SENDER_POD_ID: &str = "speech-surface";
@@ -304,7 +312,7 @@ impl JobProgress {
         let written_ms = self.frames_written.load(Ordering::Relaxed) * FRAME_MS;
         InterruptProgress {
             heard_ms: elapsed_ms.min(written_ms),
-            total_ms: job.total_samples * 1000 / SPINE_FORMAT.sample_rate_hz as u64,
+            total_ms: audio_ms(job.total_samples),
         }
     }
 }
@@ -911,6 +919,26 @@ mod tests {
 
     use audio_pipeline::wire::{Codec, decode_frame};
     use tokio::io::{AsyncReadExt, DuplexStream, duplex};
+
+    /// The one sample-count-to-duration conversion, including what it does with
+    /// a count that is not a whole number of milliseconds: it truncates. Both
+    /// callers — the motion scripter's audio horizon and the playback
+    /// narration — are estimating a playout that has already been rounded to
+    /// frames, so a fraction of a millisecond short is the harmless direction,
+    /// but it is a decision and not an accident.
+    #[test]
+    fn audio_ms_is_whole_milliseconds_of_spine_audio() {
+        let rate = u64::from(SPINE_FORMAT.sample_rate_hz);
+        assert_eq!(audio_ms(0), 0);
+        assert_eq!(audio_ms(rate), 1000);
+        assert_eq!(audio_ms(rate / 1000), 1, "one millisecond");
+        assert_eq!(audio_ms(rate / 1000 - 1), 0, "one sample short of it");
+        assert_eq!(
+            audio_ms(rate + rate / 2000),
+            1000,
+            "half a millisecond past a second is still a second"
+        );
+    }
 
     #[test]
     fn build_audio_frame_pads_short_chunk_with_zeros() {

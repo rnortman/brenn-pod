@@ -462,53 +462,107 @@ See `TODO(barge-in-flake)` at
 `barge_in_flushes_playback_and_chains_the_interrupted_turn` in
 `host/crates/speech-surface/tests/barge_integration.rs`.
 
-## `presence-retarget` — a presence move runs to its endpoint before the reverse one starts
 
-The motion daemon commands one move at a time: the tick path refuses a retarget while a
-move is in flight, by design, so an intent that arrives mid-move is applied when that move
-completes. A wake landing halfway through a stow therefore waits out the rest of the stow
-before the head starts back up — at worst one move duration of lag, which at the shipped
-durations is a couple of seconds.
+## `recovery-move-clock` — a stow from far enough round faults partway and drops the head
 
-The upgrade is to interrupt: hold the machine where the move has reached, then issue a
-fresh `MoveTo` from there. The pieces exist — a hold is a command the tick path takes at
-any point — but the shaping starts from rest at the new start point, so an interrupted
-move ends with a visible pause where the reversal happens.
+The daemon's moves run on two durations — `up` and `stow` — sized for the spans a
+presence move covers, and the same two whatever the move is. The body yaw's per-tick
+step bound is what a duration has to clear: at the shipped `stow_duration_s = 2.0` and
+`max_step_body_yaw_rad = 0.05` at 50 Hz, a stow can carry the body about 2.67 rad,
+roughly 153°. A commanded yaw target
+is capped at 60°, so nothing the daemon *asks for* comes near that. Where the machine
+physically stands is not capped: the yaw servo's provisioned range is the full turn,
+and a hand, a crash or a previous fault can leave the body anywhere in it.
 
-Deferred because the one-motion-at-a-time contract is load-bearing for everything else the
-tick path guarantees, and because the lag is only perceptible in the case where somebody
-re-wakes inside the stow that followed their own last turn. Hardware is what should decide
-whether that reads badly.
+The motion library now admits a move out of a pose the envelope refuses — that is the
+recovery, and it is what makes startup normalization work on a machine somebody
+nudged. The step guard is the half that was not fixed: a startup stow from beyond
+~153° faults on `Fault::StepTooLarge` partway through, and a fault de-torques, so the
+head stops and settles wherever it got to. Unattended, which is this daemon's whole
+posture — and a parked fault does not exit, so a restart policy does not clear it.
 
-Done = an intent that changes the desired posture mid-move stops the move in flight and
-starts the reverse one from where the machine actually is, with the interruption tested
-against a scripted machine.
+This entry is the pod half. The fix is a clock a recovering move derives from its own
+span, which lives in the motion library; what the daemon owns is the duration it hands
+in. Its example TOML now documents the yaw floor beside the antenna and head-group
+ones, so an operator lengthening `stow_duration_s` past the case that bites them has
+the number — but that is a caveat and not the fix, because the case that bites is the
+startup fold, which nobody is present for.
 
-See `TODO(presence-retarget)` at the transition site in
+Done = the daemon's startup stow reaches stow from any body angle the servo's range
+allows, or refuses before torque with something an operator can act on.
+
+The brenn-reachy half is filed in that repo's `TODO.md` under this same slug, at the
+step guard in `crates/reachy-motion/src/tick.rs`. The slug is the cross-repo join key
+— move both entries together.
+
+See `TODO(recovery-move-clock)` at `SessionActive` in
 `firmware/devices/reachy-motiond/src/motion.rs`.
 
-## `motiond-service` — the motion daemon is operator-run, not supervised
 
-`reachy-motiond` is started by hand over ssh and runs in the foreground, and its shutdown
-semantics assume that: `SIGTERM` and `SIGINT` mean an operator is standing there, so the
-daemon stows the head, verifies the nine positions against the stow pose, and releases
-torque. That is the only path in the daemon that takes torque off, and it is correct
-exactly while a human is the one sending the signal.
+## `script-timebase` — BLOCKED as of 2026-08-09 (needs the Clockwork port's shared clock)
 
-Running it under a service manager breaks that assumption in both directions. A unit's
-`ExecStop` sends the same `SIGTERM` with nobody present, so the release would drop the
-head if the verify ever passed on a machine that was not really at stow; and a unit that
-starts at boot would arm torque on a machine nobody is looking at, which is a different
-decision again and not one the daemon should make by itself.
+A motion script's step offsets are measured from the moment the daemon *received* the
+script (`firmware/crates/motion-proto/src/schedule.rs`). Speech and motion therefore
+start together only as closely as bridge delivery allows: the scripter emits the script
+as the audio starts streaming, and whatever the delivery takes is added to every offset
+in the timeline. That is well inside the ±500 ms this feature accepts, so the head's
+raise reads as an acknowledgement and the scheduled stow lands over the tail of the
+audio as intended.
 
-Deferred because the supervised-operator posture is deliberate for the first hardware
-milestones: every run of this daemon so far is one somebody is watching, and the value of
-unattended operation is not yet worth deciding the auto-arm question.
+It does not survive tighter coupling. Emote and gaze steps computed against the audio
+timeline — a beat on a word, a tilt at a phrase — want the two timelines to be the same
+timeline, and offsets-from-receipt cannot express that: the daemon has no way to know
+what instant the host meant.
 
-Done = the daemon distinguishes a supervised stop from an operator's signal, a unit file
-exists with an answer to whether boot may arm, and the answer is written down where the
-runbook can find it.
+The schema already reserves the field. A `base` carrying an absolute start instant makes
+every offset absolute too, and what it needs underneath is a timebase both ends share:
+either an NTP-disciplined wall clock on both machines, or a clock-mapping beacon pairing
+the pod's audio sample clock to the device's monotonic clock. After the Clockwork port
+one scheduler owns the audio and motion timelines together and emits scripts against
+that clock, which is the natural moment to pick — the two-binary split survives as long
+as the timebase is shared.
 
-See `TODO(motiond-service)` at `main` in
-`firmware/devices/reachy-motiond/src/main.rs`.
+Deferred rather than dismissed: it is a clock-distribution decision, not a field. Adding
+`base` before there is a clock to interpret it against would put an absolute time on the
+wire that each end reads differently, which is worse than the honest offsets.
+
+Done = scripts carry absolute step times on a timebase both ends agree on, the daemon
+executes against it, and offsets-from-receipt survive only as the fallback when no base
+is present.
+
+See `TODO(script-timebase)` at the wire schema in
+`firmware/crates/motion-proto/src/script.rs`.
+
+## `script-timeout-bound` — a script's timeout is not a ceiling on its own timeline
+
+`MotionScript::expiry_ms` answers the later of the script's `timeout_ms` and its last
+step, so a timeline that runs past its own timeout carries the head to the end of the
+timeline. That is deliberate — a script whose last instruction never ran would be a
+script the daemon half-executed — and it is what lets a turn whose speech outlasts
+`presence_max_engaged_ms` keep the head up while the audio is still playing.
+
+The cost is that `timeout_ms` is not on its own a ceiling on how long the head stays up.
+A scripter arithmetic bug — a stow offset computed from a bad duration, seconds where
+milliseconds were meant — makes the exposure whatever that number says, on a script
+whose stated timeout is 30 s, and any publisher entitled to the channel can do it
+deliberately with one message. The daemon lapses on schedule and reports nothing unusual,
+because as far as it can tell the timeline is the instruction.
+
+The two candidate answers both change the wire contract rather than the arithmetic:
+refuse a script whose last step is at or past its timeout (a third `ScriptError`, which
+makes the scripter responsible for sizing every timeout from its own horizon), or clamp
+the expiry to the timeout and drop the steps past it (which throws away instructions the
+publisher asked for). Bounding the extension by a constant is a third, and picking that
+constant is the same decision in disguise. Not a patch: whichever way it goes, the host
+scripter has to be written against it.
+
+Done = the wire contract says which of the two the timeout is — an unconditional ceiling
+or the later-of-two bound it is today — the crate docs and `expiry_ms` agree with it, and
+the scripter emits timeouts that satisfy it.
+
+See `TODO(script-timeout-bound)` at `MotionScript::expiry_ms` in
+`firmware/crates/motion-proto/src/script.rs`, and the scripter's half of the same
+contract at `a_turn_whose_speech_outlasts_the_ceiling_carries_its_own_stow` in
+`host/crates/speech-surface/src/scripter.rs`, which pins today's answer.
+
 

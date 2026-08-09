@@ -680,31 +680,36 @@ pub struct BrennConfig {
     /// reads the instructions on join instead of needing them re-sent.
     #[serde(default)]
     pub help_channel: Option<String>,
-    /// Optional channel head-presence intents are published on: `engaged` while
-    /// an interaction is live, `idle` when it is over. Absent means no presence
-    /// tracker runs and nothing is published — the state before a motion
-    /// consumer exists on the bus.
+    /// Optional channel motion scripts are published on. Absent means no script
+    /// task runs and nothing is published — the state before a motion consumer
+    /// exists on the bus.
     #[serde(default)]
     pub presence_channel: Option<String>,
-    /// How often an `engaged` intent is republished while the interaction stays
-    /// live. The consumer holds it as a lease, so a refresh well inside that
-    /// lease is what keeps the head up; the lease is the consumer's own config.
-    /// Must be greater than zero.
+    /// How often the standing script is re-emitted while it still says
+    /// something. A script lost in transit is repaired within one of these, and
+    /// a hold script is kept clear of its own timeout by them. Must be greater
+    /// than zero.
     #[serde(default = "default_presence_refresh_ms")]
     pub presence_refresh_ms: u64,
-    /// How long the tracker waits after the last sign of activity before
-    /// publishing `idle`. Long enough to bridge the gap between turns of one
-    /// exchange, so a multi-turn conversation never stows and re-raises between
-    /// answers. Must be greater than zero.
+    /// How long the head stays up after a turn that asked to keep listening, and
+    /// after a raise that produced no turn at all. Long enough to bridge the gap
+    /// between turns of one exchange, so a conversation that continues never
+    /// stows and re-raises between answers. Must be greater than zero.
     #[serde(default = "default_presence_linger_ms")]
     pub presence_linger_ms: u64,
-    /// The ceiling on one engagement: if nothing else settles it, this does.
-    /// It exists because the false-positive-wake path depends on a device
-    /// segment close with no verified wall-clock bound — the tracker carries its
-    /// own clock rather than trusting one it cannot see. Must be greater than
-    /// zero.
+    /// The timeout every emitted script carries: the daemon stows this long
+    /// after receipt whatever else happens. On a closing script it is a pure
+    /// backstop; on a hold script — a turn whose timeline is not known yet — it
+    /// is the bound that matters. Must be greater than zero.
     #[serde(default = "default_presence_max_engaged_ms")]
     pub presence_max_engaged_ms: u64,
+    /// How long after the estimated end of a closed turn's speech the head
+    /// starts down. Absorbs the jitter between an estimate made when playback
+    /// started and what the speaker actually did. Must be greater than zero: a
+    /// closing script raises the head and stows it in one timeline, and the two
+    /// steps have to be at different instants.
+    #[serde(default = "default_presence_stow_margin_ms")]
+    pub presence_stow_margin_ms: u64,
     /// How long a turn waits for the first response message after its utterance
     /// is published. Must be greater than zero.
     #[serde(default = "default_brenn_response_timeout_ms")]
@@ -775,14 +780,16 @@ impl BrennConfig {
         if self.continuation_timeout_ms == 0 {
             return Err("brenn.continuation_timeout_ms must be greater than 0".to_string());
         }
-        // Every presence interval is a timer the tracker arms. A zero would arm
-        // one that is always due: a refresh flooding the bus, a linger that
-        // stows the head between two turns of one exchange, a ceiling that ends
-        // every engagement the instant it begins.
+        // Every presence interval shapes a script. A zero refresh floods the
+        // bus, a zero linger stows the head between two turns of one exchange, a
+        // zero ceiling expires every script the instant it lands, and a zero
+        // margin asks for a raise and a stow at the same offset — which is not a
+        // timeline at all, and the scripter could not emit one.
         for (key, ms) in [
             ("presence_refresh_ms", self.presence_refresh_ms),
             ("presence_linger_ms", self.presence_linger_ms),
             ("presence_max_engaged_ms", self.presence_max_engaged_ms),
+            ("presence_stow_margin_ms", self.presence_stow_margin_ms),
         ] {
             if ms == 0 {
                 return Err(format!("brenn.{key} must be greater than 0"));
@@ -791,12 +798,13 @@ impl BrennConfig {
         Ok(())
     }
 
-    /// The presence timings as durations, for the tracker.
-    pub fn presence_timing(&self) -> crate::presence::PresenceTiming {
-        crate::presence::PresenceTiming {
+    /// The presence timings as the scripter measures them.
+    pub fn script_timing(&self) -> crate::scripter::ScriptTiming {
+        crate::scripter::ScriptTiming {
             refresh: Duration::from_millis(self.presence_refresh_ms),
             linger: Duration::from_millis(self.presence_linger_ms),
             max_engaged: Duration::from_millis(self.presence_max_engaged_ms),
+            stow_margin: Duration::from_millis(self.presence_stow_margin_ms),
         }
     }
 }
@@ -1197,6 +1205,12 @@ fn default_presence_linger_ms() -> u64 {
 // unattended.
 fn default_presence_max_engaged_ms() -> u64 {
     30_000
+}
+// Half a second of slack over the estimated end of the audio: wide enough that
+// the ordinary gap between two of a turn's clips does not dip the head, narrow
+// enough that the stow reads as a response to the speech ending.
+fn default_presence_stow_margin_ms() -> u64 {
+    500
 }
 // Apologetic, short, and content-free: it is spoken when the bus failed, so it
 // must not imply the request was understood.
@@ -2164,6 +2178,7 @@ model = "m"
         assert_eq!(brenn.presence_refresh_ms, 5_000);
         assert_eq!(brenn.presence_linger_ms, 8_000);
         assert_eq!(brenn.presence_max_engaged_ms, 30_000);
+        assert_eq!(brenn.presence_stow_margin_ms, 500);
         assert_eq!(brenn.response_timeout_ms, 30_000);
         assert_eq!(brenn.continuation_timeout_ms, 10_000);
         assert_eq!(brenn.attribution, None);
@@ -2198,6 +2213,7 @@ presence_channel = "brenn:reachy.presence"
 presence_refresh_ms = 4000
 presence_linger_ms = 6000
 presence_max_engaged_ms = 20000
+presence_stow_margin_ms = 750
 response_timeout_ms = 45000
 continuation_timeout_ms = 5000
 attribution = "voice"
@@ -2218,9 +2234,13 @@ max_backoff_ms = 9000
             brenn.presence_channel.as_deref(),
             Some("brenn:reachy.presence")
         );
-        assert_eq!(brenn.presence_timing().refresh, Duration::from_secs(4));
-        assert_eq!(brenn.presence_timing().linger, Duration::from_secs(6));
-        assert_eq!(brenn.presence_timing().max_engaged, Duration::from_secs(20));
+        assert_eq!(brenn.script_timing().refresh, Duration::from_secs(4));
+        assert_eq!(brenn.script_timing().linger, Duration::from_secs(6));
+        assert_eq!(brenn.script_timing().max_engaged, Duration::from_secs(20));
+        assert_eq!(
+            brenn.script_timing().stow_margin,
+            Duration::from_millis(750)
+        );
         assert_eq!(brenn.response_timeout_ms, 45_000);
         assert_eq!(brenn.continuation_timeout_ms, 5_000);
         assert_eq!(brenn.attribution.as_deref(), Some("voice"));
@@ -2321,14 +2341,15 @@ max_backoff_ms = 9000
         assert!(err.contains("distinct"), "message: {err}");
     }
 
-    /// Every presence interval is a timer the tracker arms; a zero arms one
-    /// that is always due.
+    /// Every presence interval shapes a script; a zero makes one that is due the
+    /// instant it lands, or one whose two steps sit at the same offset.
     #[test]
     fn brenn_rejects_a_zero_presence_interval() {
         for key in [
             "presence_refresh_ms",
             "presence_linger_ms",
             "presence_max_engaged_ms",
+            "presence_stow_margin_ms",
         ] {
             let err = Config::parse(&with_addr(&brenn_table(&format!("{key} = 0"))))
                 .expect("parse")

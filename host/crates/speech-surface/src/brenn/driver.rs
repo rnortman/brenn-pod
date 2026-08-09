@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Notice, publish_once};
 use crate::config::BrennConfig;
 use crate::jsonl::JsonlHandle;
+use crate::time::due;
 
 /// Subscription statement for the response channel.
 ///
@@ -181,7 +182,7 @@ impl BridgeDriver {
                     None => break false,
                 },
                 Some(notice) = notices.recv() => self.publish_notice(notice),
-                () = resubscribe_due(self.resubscribe_at) => {
+                () = due(self.resubscribe_at) => {
                     self.resubscribe_at = None;
                     self.subscribe_response().await;
                 }
@@ -423,15 +424,6 @@ impl BridgeDriver {
     }
 }
 
-/// The resubscribe arm's future: the deadline when one is set, never when it is
-/// not. Takes the deadline by value so the arm holds no borrow of the driver.
-async fn resubscribe_due(deadline: Option<Instant>) {
-    match deadline {
-        Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -440,7 +432,7 @@ mod tests {
     use serde_json::Value;
     use speech_pipeline::{
         AudioSpan, Brain, BrainLink, BrainStats, DoaTrack, EndpointCause, PodId, ResponseSink,
-        RoomId, SpeakBody, SpeakCmd, StageTimings, Transcript, Utterance, UtteranceId,
+        RoomId, SpeakBody, SpeakCmd, StageTimings, Transcript, TurnEnd, Utterance, UtteranceId,
     };
 
     use super::*;
@@ -668,7 +660,7 @@ mod tests {
         peer: &mut Peer,
         id: u64,
     ) -> (
-        JoinHandle<()>,
+        JoinHandle<TurnEnd>,
         futures_mpsc::Receiver<SpeakCmd>,
         futures_mpsc::Sender<SpeakCmd>,
     ) {

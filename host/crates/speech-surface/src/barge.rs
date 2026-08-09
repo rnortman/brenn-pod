@@ -23,15 +23,25 @@
 //! clips while the next is still in synthesis. A turn completes cleanly only when
 //! its dispatch has returned, every cmd the tap saw has settled, every settlement
 //! was clean, and nothing interrupted it.
+//!
+//! The same records answer a second, different question — [`TurnAudio`], the
+//! turn's *cmd accounting*: is every cmd accounted for (started playing, or
+//! resolved without ever starting), and when is the speech queued so far
+//! estimated to finish. That answer schedules motion from when playback *starts*
+//! and how long the audio is, which is why it is a separate reading of the same
+//! bookkeeping rather than another use of settlement: settlement is about audio
+//! that has already finished.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use speech_pipeline::{
     BargeInContext, ContextSegment, InterruptProgress, MAX_CONTEXT_SEGMENTS, PodId, UtteranceId,
+    audio_ms,
 };
+use tokio::time::{Duration, Instant};
 
-/// Per-turn settlement accounting: what the tap has sent, what playback has
+/// Per-turn accounting: what the tap has sent, what playback has started and
 /// resolved, and whether the brain is done producing.
 #[derive(Debug, Default)]
 struct TurnSettlement {
@@ -45,6 +55,16 @@ struct TurnSettlement {
     all_clean: bool,
     /// `brain.handle()` has returned, so no further cmds are coming.
     dispatch_done: bool,
+    /// Cmds whose playback began (a `PlaybackEvent::Started`).
+    cmds_started: u64,
+    /// Started and not yet settled — the cmds whose audio is in the speaker.
+    playing: u64,
+    /// Settles that no started-but-unsettled cmd could account for, so they belong
+    /// to cmds that resolved without ever playing (refused by the queue, dropped by
+    /// the router, or dead in synthesis).
+    settled_unstarted: u64,
+    /// The latest instant this turn's started audio is estimated to finish.
+    horizon: Option<Instant>,
 }
 
 impl TurnSettlement {
@@ -65,6 +85,46 @@ impl TurnSettlement {
             && self.cmds_sent > 0
             && self.cmds_settled >= self.cmds_sent
     }
+
+    /// The turn's cmd accounting as it stands.
+    fn audio(&self) -> TurnAudio {
+        TurnAudio {
+            dispatch_done: self.dispatch_done,
+            cmds_sent: self.cmds_sent,
+            awaiting_start: self
+                .cmds_sent
+                .saturating_sub(self.cmds_started + self.settled_unstarted),
+            horizon: self.horizon,
+        }
+    }
+}
+
+/// What a turn's cmds have done, at one instant.
+///
+/// The reading a motion scripter schedules from: it says whether anything is still
+/// to come, and when what has already begun will be over. Deliberately a snapshot
+/// rather than a handle — it is answered by the call that changed the accounting,
+/// so a turn whose records are retired by that same call still reports the state
+/// that retired them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnAudio {
+    /// `brain.handle()` has returned: no further cmds are coming.
+    pub dispatch_done: bool,
+    /// `SpeakCmd`s the tap saw for the turn. Zero at `dispatch_done` is a silent
+    /// turn — the brain answered with nothing to say.
+    pub cmds_sent: u64,
+    /// Cmds that have neither started playing nor resolved without starting.
+    ///
+    /// Conservative in one shape, deliberately: a cmd that resolves without ever
+    /// starting while another is still playing cannot be told apart from that
+    /// playing cmd's own settlement, since nothing downstream carries a per-cmd
+    /// identity — playback events name the turn. Such a turn keeps one cmd awaited
+    /// until the playing one settles, which is the end of its audio. The error is
+    /// always in the direction of waiting.
+    pub awaiting_start: u64,
+    /// When the audio started so far is estimated to finish. `None` when nothing
+    /// has started — including a turn that never will.
+    pub horizon: Option<Instant>,
 }
 
 /// One pod's barge-in state.
@@ -151,7 +211,9 @@ impl TurnLedger {
     }
 
     /// Record one `SpeakCmd` the turn produced, from the sink tap. Every cmd counts
-    /// toward settlement; `text` is `Some` only for a `SpeakBody::Text` body, whose
+    /// toward settlement, and is awaited by the turn's cmd accounting until it
+    /// starts playing or resolves without starting; `text` is `Some` only for a
+    /// `SpeakBody::Text` body, whose
     /// words are what a readback can quote. A turn's later text replaces an earlier
     /// one — the last thing said is what was cut.
     pub(crate) fn record_cmd(&self, pod: &PodId, id: UtteranceId, text: Option<String>) {
@@ -168,14 +230,42 @@ impl TurnLedger {
 
     /// Mark that `brain.handle()` has returned for `id`: no more cmds are coming,
     /// so settlement can complete. Dispatch awaits the brain inline, which is what
-    /// makes this a sound "that's all of them" signal.
-    pub(crate) fn dispatch_done(&self, pod: &PodId, id: UtteranceId) {
+    /// makes this a sound "that's all of them" signal. Answers the turn's cmd
+    /// accounting as it stands with that fact in.
+    pub(crate) fn dispatch_done(&self, pod: &PodId, id: UtteranceId) -> TurnAudio {
         self.with_pod(pod, |p| {
             let s = p.settlement.entry(id).or_insert_with(TurnSettlement::new);
             s.dispatch_done = true;
+            let audio = s.audio();
             // Playback can outrun the brain's return, leaving this the last piece.
             settle_check(p, id);
-        });
+            audio
+        })
+    }
+
+    /// Record that one of the turn's cmds began playing at `at`, carrying `samples`
+    /// of audio. Extends the turn's horizon to the later of what it already knew
+    /// and this clip's own end.
+    ///
+    /// A turn with no records — interrupted, or completed and retired — is not
+    /// resurrected: its cmds are being evicted, and a horizon for a turn nothing is
+    /// waiting on would schedule against speech that is about to stop.
+    pub(crate) fn record_started(
+        &self,
+        pod: &PodId,
+        id: Option<UtteranceId>,
+        samples: u64,
+        at: Instant,
+    ) -> Option<TurnAudio> {
+        let id = id?;
+        self.with_pod(pod, |p| {
+            let s = p.settlement.get_mut(&id)?;
+            s.cmds_started += 1;
+            s.playing += 1;
+            let ends = at + Duration::from_millis(audio_ms(samples));
+            s.horizon = Some(s.horizon.map_or(ends, |h| h.max(ends)));
+            Some(s.audio())
+        })
     }
 
     /// Cut `id` at `progress`: push its context segment, mark it interrupted so the
@@ -237,20 +327,31 @@ impl TurnLedger {
     ///
     /// This is where clean completion fires: the turn's chain — the whole pod's
     /// chain — is cleared once the turn finishes with nothing having cut it.
-    pub(crate) fn settle_job(&self, pod: &PodId, id: Option<UtteranceId>, clean: bool) {
-        let Some(id) = id else {
-            return;
-        };
+    ///
+    /// Answers the turn's cmd accounting with this settle in, or `None` for a turn
+    /// the ledger no longer holds.
+    pub(crate) fn settle_job(
+        &self,
+        pod: &PodId,
+        id: Option<UtteranceId>,
+        clean: bool,
+    ) -> Option<TurnAudio> {
+        let id = id?;
         self.with_pod(pod, |p| {
-            let Some(s) = p.settlement.get_mut(&id) else {
-                // An interrupted or already-completed turn; its accounting is gone
-                // and nothing it does now can complete it cleanly.
-                return;
-            };
+            let s = p.settlement.get_mut(&id)?;
             s.cmds_settled += 1;
             s.all_clean &= clean;
+            // A settle with something playing is that clip's own ending; one with
+            // nothing playing belongs to a cmd that never played.
+            if s.playing > 0 {
+                s.playing -= 1;
+            } else {
+                s.settled_unstarted += 1;
+            }
+            let audio = s.audio();
             settle_check(p, id);
-        });
+            Some(audio)
+        })
     }
 }
 
@@ -591,6 +692,197 @@ mod tests {
         assert!(
             ledger.chain(&p).is_some(),
             "the abandoned turn never completed cleanly, so the chain stands"
+        );
+    }
+
+    /// One second of spine-format audio, in samples.
+    const ONE_SECOND: u64 = 16_000;
+
+    /// A turn with `cmds` commands queued and its dispatch not yet returned.
+    fn dispatched_turn(ledger: &TurnLedger, p: &PodId, id: UtteranceId, cmds: usize) {
+        ledger.record_dispatch(p, id, Some("say something".into()));
+        for _ in 0..cmds {
+            ledger.record_cmd(p, id, Some("a clip".into()));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_started_clip_dates_the_end_of_the_turns_audio() {
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 1);
+        let t0 = Instant::now();
+
+        let audio = ledger
+            .record_started(&p, Some(id), 2 * ONE_SECOND, t0)
+            .expect("the turn is on the books");
+
+        assert_eq!(audio.horizon, Some(t0 + Duration::from_secs(2)));
+        assert_eq!(audio.awaiting_start, 0, "the turn's one cmd is playing");
+        assert!(
+            !audio.dispatch_done,
+            "the brain has not returned, so more cmds may still come"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_horizon_is_the_latest_ending_over_the_turns_clips() {
+        // A second clip starting later extends the turn's audio; a short one
+        // starting inside the first clip's span does not shorten it.
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 3);
+        let t0 = Instant::now();
+
+        ledger.record_started(&p, Some(id), 6 * ONE_SECOND, t0);
+        let extended = ledger
+            .record_started(&p, Some(id), 4 * ONE_SECOND, t0 + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(extended.horizon, Some(t0 + Duration::from_secs(9)));
+
+        let unchanged = ledger
+            .record_started(&p, Some(id), ONE_SECOND, t0 + Duration::from_secs(6))
+            .unwrap();
+        assert_eq!(unchanged.horizon, Some(t0 + Duration::from_secs(9)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_is_accounted_when_its_last_cmd_starts_playing() {
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 2);
+        let t0 = Instant::now();
+
+        let audio = ledger.dispatch_done(&p, id);
+        assert_eq!(audio.awaiting_start, 2, "neither clip has started");
+        assert!(audio.dispatch_done);
+        assert_eq!(audio.cmds_sent, 2);
+
+        ledger.record_started(&p, Some(id), ONE_SECOND, t0);
+        let audio = ledger
+            .record_started(&p, Some(id), ONE_SECOND, t0 + Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(audio.awaiting_start, 0);
+        assert_eq!(audio.horizon, Some(t0 + Duration::from_secs(2)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cmd_that_never_played_stops_being_awaited_when_it_resolves() {
+        // Clip 1 plays out and settles; clip 2 dies in synthesis and is settled by
+        // the router without ever starting. Nothing is left to wait for.
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 2);
+        let t0 = Instant::now();
+
+        ledger.record_started(&p, Some(id), ONE_SECOND, t0);
+        ledger.dispatch_done(&p, id);
+        ledger.settle_job(&p, Some(id), true);
+        let audio = ledger
+            .settle_job(&p, Some(id), false)
+            .expect("the turn is still on the books");
+
+        assert_eq!(audio.awaiting_start, 0);
+        assert_eq!(
+            audio.horizon,
+            Some(t0 + Duration::from_secs(1)),
+            "the clip that never played moves no horizon"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cmd_dying_while_another_plays_is_awaited_until_that_one_ends() {
+        // The conservative shape, asserted rather than left to be discovered: no
+        // per-cmd identity reaches the ledger, so a settle arriving while a clip is
+        // in the speaker is read as that clip's own — and the turn keeps waiting
+        // until the player really does settle.
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 2);
+        let t0 = Instant::now();
+
+        ledger.record_started(&p, Some(id), 6 * ONE_SECOND, t0);
+        ledger.dispatch_done(&p, id);
+        let audio = ledger.settle_job(&p, Some(id), false).unwrap();
+        assert_eq!(audio.awaiting_start, 1, "read as the playing clip's ending");
+
+        let audio = ledger.settle_job(&p, Some(id), true).unwrap();
+        assert_eq!(audio.awaiting_start, 0, "and repaired when it settles");
+        assert_eq!(audio.horizon, Some(t0 + Duration::from_secs(6)));
+    }
+
+    #[tokio::test]
+    async fn a_silent_turn_is_accounted_the_moment_its_dispatch_returns() {
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        ledger.record_dispatch(&p, id, Some("never mind".into()));
+
+        let audio = ledger.dispatch_done(&p, id);
+
+        assert_eq!(audio.cmds_sent, 0);
+        assert_eq!(audio.awaiting_start, 0);
+        assert_eq!(audio.horizon, None, "there is no audio to wait out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clip_starting_for_a_turn_the_ledger_retired_is_ignored() {
+        // The barge pruned the turn and its clips are being evicted; a horizon for
+        // it would schedule against speech that is about to stop.
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 1);
+        ledger.interrupt(&p, id, progress(10));
+
+        assert_eq!(
+            ledger.record_started(&p, Some(id), ONE_SECOND, Instant::now()),
+            None
+        );
+        assert_eq!(ledger.settle_job(&p, Some(id), false), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_settle_that_retires_a_turn_still_reports_its_accounting() {
+        // The clean completion prunes the turn's records inside this very call, so
+        // an answer read afterwards would find nothing — which is why the call
+        // answers.
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 1);
+        let t0 = Instant::now();
+        ledger.record_started(&p, Some(id), ONE_SECOND, t0);
+        ledger.dispatch_done(&p, id);
+
+        let audio = ledger
+            .settle_job(&p, Some(id), true)
+            .expect("the settle that completed the turn answers for it");
+
+        assert_eq!(audio.awaiting_start, 0);
+        assert_eq!(audio.horizon, Some(t0 + Duration::from_secs(1)));
+        assert!(
+            ledger
+                .record_started(&p, Some(id), ONE_SECOND, t0)
+                .is_none(),
+            "and the records are gone by the time it returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_turn_records_no_audio() {
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+
+        assert_eq!(
+            ledger.record_started(&p, None, ONE_SECOND, Instant::now()),
+            None
         );
     }
 

@@ -8,10 +8,10 @@ members = [
     "crates/device-protocol",
     "crates/build-id",
     "crates/hil-host",
+    "crates/motion-proto",
     "crates/pod-jsonl",
     "crates/pod-secrets",
     "crates/pod-streamer",
-    "crates/presence-proto",
     "crates/pod-transport",
     "crates/podctl",
     "crates/psk-link",
@@ -35,7 +35,7 @@ members = [
 # those consumers, and because it is another Pi binary built in a container. pod-jsonl
 # and pod-secrets are in: they are small, pure-Rust, and everything else here can depend
 # on them freely.
-default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/presence-proto", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
+default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/motion-proto", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
 resolver = "2"
 
 [workspace.package]
@@ -48,12 +48,6 @@ license = "Apache-2.0"
 [workspace.dependencies]
 esp-idf-svc = { version = "0.52.1" }
 log = "0.4"
-
-# Uncomment these during development when needed to build against local brenn-reachy.
-# [patch."https://github.com/rnortman/brenn-reachy"]
-# reachy-bench = { path = "../../brenn-reachy/crates/reachy-bench" }
-# reachy-bus = { path = "../../brenn-reachy/crates/reachy-bus" }
-# reachy-motion = { path = "../../brenn-reachy/crates/reachy-motion" }
 
 [profile.release]
 opt-level = "s"

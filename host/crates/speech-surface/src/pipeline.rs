@@ -47,10 +47,10 @@ use tokio::task::AbortHandle;
 
 use crate::barge::TurnLedger;
 use crate::jsonl::JsonlHandle;
-use crate::presence::{PresenceHandle, PresenceInput};
 use crate::recorder::{
     WakeClass, WakeClassUpdate, sanitize_filename, set_wake_class, sidecar_path,
 };
+use crate::scripter::{ScriptHandle, ScriptInput};
 
 /// The pipeline exited on an unrecoverable fault. The server renders this to a
 /// `pipeline_fatal` JSONL line and a nonzero exit.
@@ -115,7 +115,7 @@ pub struct PipelineCtx {
     /// Where the interaction's lifecycle points are reported for the head, or
     /// `None` when no presence channel is configured. Every tap is a
     /// non-blocking send; nothing in this task waits on it.
-    pub(crate) presence: Option<PresenceHandle>,
+    pub(crate) scripter: Option<ScriptHandle>,
 }
 
 /// How many recent segments and wake detections to retain per pod for sidecar
@@ -242,7 +242,7 @@ pub async fn run(
         brain,
         confidence_gate,
         barge,
-        presence,
+        scripter,
     } = ctx;
 
     let mut pods: HashMap<PodId, PodState> = HashMap::new();
@@ -277,7 +277,7 @@ pub async fn run(
                         &mut next_utterance_id,
                         brain.as_ref(),
                         barge.as_ref(),
-                        presence.as_ref(),
+                        scripter.as_ref(),
                         &jsonl,
                     )
                     .await;
@@ -291,7 +291,7 @@ pub async fn run(
                     &confidence_gate,
                     brain.as_ref(),
                     barge.as_ref(),
-                    presence.as_ref(),
+                    scripter.as_ref(),
                     &jsonl,
                 )
                 .await;
@@ -399,7 +399,7 @@ async fn handle_listener(
     next_utterance_id: &mut u64,
     brain: Option<&BrainWiring>,
     barge: Option<&BargeWiring>,
-    presence: Option<&PresenceHandle>,
+    scripter: Option<&ScriptHandle>,
     jsonl: &JsonlHandle,
 ) {
     match ev {
@@ -427,8 +427,8 @@ async fn handle_listener(
             // Past the epoch check for the same reason: a superseded
             // connection's wake is not an interaction, and it must not raise a
             // head.
-            if let Some(presence) = presence {
-                presence.send(PresenceInput::Wake(pod.clone()));
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::Wake(pod.clone()));
             }
             push_bounded(&mut state.recent_wakes, wake_end_sample);
             // Upgrade any already-labeled segment this detection now lands in: the
@@ -533,8 +533,8 @@ async fn handle_listener(
             // Ahead of the playback wiring, like the line above: somebody spoke
             // over the pod, which is a live interaction whether or not there is
             // anything left to cut.
-            if let Some(presence) = presence {
-                presence.send(PresenceInput::Barge(pod.clone()));
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::Barge(pod.clone()));
             }
             let Some(barge) = barge else {
                 return;
@@ -634,8 +634,8 @@ async fn handle_listener(
             );
             // The usual false-positive-wake path: the head goes back down a
             // linger after this, and it does so with or without a brain wired.
-            if let Some(presence) = presence {
-                presence.send(PresenceInput::Unanswered(pod.clone()));
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::Unanswered(pod.clone()));
             }
             // "Wake, no follow": the wake fired but no command followed. Accounted
             // for through the same `WakeCommandAbsent` vocabulary as an empty or
@@ -761,7 +761,7 @@ async fn handle_stt_done(
     confidence_gate: &ConfidenceGate,
     brain: Option<&BrainWiring>,
     barge: Option<&BargeWiring>,
-    presence: Option<&PresenceHandle>,
+    scripter: Option<&ScriptHandle>,
     jsonl: &JsonlHandle,
 ) {
     let Some(state) = pods.get_mut(&done.pod) else {
@@ -894,10 +894,10 @@ async fn handle_stt_done(
     // A decline is a raise that produced no turn: the head is up and nothing
     // will follow, so the settle starts here rather than waiting for the
     // engagement's ceiling.
-    if let Some(presence) = presence
+    if let Some(scripter) = scripter
         && !matches!(gate, GateOutcome::Dispatch)
     {
-        presence.send(PresenceInput::Unanswered(utterance.pod.clone()));
+        scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
     }
     match gate {
         GateOutcome::DeclineWake(wake, reject) => {
@@ -952,19 +952,34 @@ async fn handle_stt_done(
             // Around the await, not inside the barge arm below: a turn is in
             // flight for as long as the brain has it, and that is what keeps
             // the head up through a long think in a pipeline with no playback
-            // path at all.
-            if let Some(presence) = presence {
-                presence.send(PresenceInput::TurnStarted(pod.clone()));
+            // path at all. This is also the turn every later fact names.
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::TurnStarted {
+                    pod: pod.clone(),
+                    turn: id,
+                });
             }
-            wiring.brain.handle(utterance, sink).await;
-            if let Some(presence) = presence {
-                presence.send(PresenceInput::TurnEnded(pod.clone()));
+            let end = wiring.brain.handle(utterance, sink).await;
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::TurnEnded {
+                    pod: pod.clone(),
+                    turn: id,
+                    end,
+                });
             }
             if let Some(barge) = barge {
                 // Dispatch awaits the brain inline, so returning here is the proof
                 // that no further command is coming for this turn — which is what
-                // lets its settlement complete.
-                barge.ledger.dispatch_done(&pod, id);
+                // lets its settlement complete, and one of the three facts the
+                // head's ending is scheduled from.
+                let audio = barge.ledger.dispatch_done(&pod, id);
+                if let Some(scripter) = scripter {
+                    scripter.send(ScriptInput::Audio {
+                        pod: pod.clone(),
+                        turn: id,
+                        audio,
+                    });
+                }
             }
         }
     }
@@ -1188,7 +1203,7 @@ mod tests {
     use speech_pipeline::{
         CarveTiming, DropOldestQueue, EndpointState, EndpointTransition, InterruptProgress,
         ScoreSummary, SegmentEndCause, SegmentEndInfo, SpeakBody, StatsFlushCause, StatsModel,
-        TranscriptConfidence, TranscriptEvent, TransitionCause, WakeConfirmation,
+        TranscriptConfidence, TranscriptEvent, TransitionCause, TurnEnd, WakeConfirmation,
     };
     use std::sync::Mutex;
 
@@ -1284,7 +1299,7 @@ mod tests {
 
     struct EchoTestBrain;
     impl Brain for EchoTestBrain {
-        fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, ()> {
+        fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
             let cmd = SpeakCmd {
                 target: u.pod.clone(),
                 in_reply_to: Some(u.id),
@@ -1293,7 +1308,7 @@ mod tests {
                 timings: u.timings.clone(),
             };
             let _ = out.try_send(cmd);
-            futures::future::ready(()).boxed()
+            futures::future::ready(TurnEnd::Closed).boxed()
         }
         fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {}
     }
@@ -1308,14 +1323,22 @@ mod tests {
     }
 
     /// `EchoTestBrain` plus a record of the two non-dispatch seams, so a test can
-    /// assert what the pipeline nudged without a real link.
+    /// assert what the pipeline nudged without a real link, and the disposition it
+    /// answers every turn with.
     struct RecordingBrain {
         log: Arc<Mutex<NudgeLog>>,
+        end: TurnEnd,
     }
 
     impl Brain for RecordingBrain {
-        fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, ()> {
-            EchoTestBrain.handle(u, out)
+        fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
+            let spoken = EchoTestBrain.handle(u, out);
+            let end = self.end;
+            async move {
+                spoken.await;
+                end
+            }
+            .boxed()
         }
         fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {}
         fn wake(&self, pod: &PodId) {
@@ -1372,7 +1395,8 @@ mod tests {
         stats: Arc<BrainStats>,
         barge: Option<(Arc<TurnLedger>, FlushFn)>,
         nudges: Arc<Mutex<NudgeLog>>,
-        presence: Option<PresenceHandle>,
+        scripter: Option<ScriptHandle>,
+        turn_end: TurnEnd,
     }
 
     impl Harness {
@@ -1386,13 +1410,14 @@ mod tests {
                 stats: Arc::new(BrainStats::default()),
                 barge: None,
                 nudges: Arc::new(Mutex::new(NudgeLog::default())),
-                presence: None,
+                turn_end: TurnEnd::Closed,
+                scripter: None,
             }
         }
-        /// Wire the head-presence taps to `handle`, so a test can read the
-        /// interaction lifecycle as the tracker receives it.
-        fn presence(mut self, handle: PresenceHandle) -> Harness {
-            self.presence = Some(handle);
+        /// Wire the head's taps to `handle`, so a test can read the
+        /// interaction lifecycle as the scripter receives it.
+        fn scripter(mut self, handle: ScriptHandle) -> Harness {
+            self.scripter = Some(handle);
             self
         }
         /// Wire barge-in against `ledger` and a flush entry point that returns
@@ -1413,6 +1438,11 @@ mod tests {
         }
         fn brain(mut self) -> Harness {
             self.brain = true;
+            self
+        }
+        /// How every turn this harness's brain takes ends.
+        fn turn_end(mut self, end: TurnEnd) -> Harness {
+            self.turn_end = end;
             self
         }
         fn gate(mut self, g: ConfidenceGate) -> Harness {
@@ -1438,6 +1468,7 @@ mod tests {
                 Some(BrainWiring {
                     brain: Arc::new(RecordingBrain {
                         log: self.nudges.clone(),
+                        end: self.turn_end,
                     }),
                     speak_tx,
                     events,
@@ -1464,7 +1495,7 @@ mod tests {
                     barge: self
                         .barge
                         .map(|(ledger, flush)| BargeWiring { ledger, flush }),
-                    presence: self.presence.clone(),
+                    scripter: self.scripter.clone(),
                 },
                 jsonl.clone(),
             )
@@ -1704,10 +1735,10 @@ mod tests {
 
     /// Drain everything the taps sent. The handle is dropped first so the
     /// pipeline's own clone is gone and the queue ends.
-    async fn presence_inputs(
-        handle: PresenceHandle,
-        mut inbox: crate::presence::PresenceInbox,
-    ) -> Vec<PresenceInput> {
+    async fn script_inputs(
+        handle: ScriptHandle,
+        mut inbox: crate::scripter::ScriptInbox,
+    ) -> Vec<ScriptInput> {
         drop(handle);
         let mut seen = Vec::new();
         while let Some(input) = inbox.recv().await {
@@ -1722,11 +1753,11 @@ mod tests {
     #[tokio::test]
     async fn a_dispatched_turn_brackets_itself_for_the_head() {
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
-        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
         Harness::new()
             .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
             .brain()
-            .presence(handle.clone())
+            .scripter(handle.clone())
             .run(vec![
                 wake_detected(1, 8),
                 soft_endpoint(carved(1, 0, 16, None)),
@@ -1734,12 +1765,86 @@ mod tests {
             .await;
 
         assert_eq!(
-            presence_inputs(handle, rx).await,
+            script_inputs(handle, rx).await,
             vec![
-                PresenceInput::Wake(pod()),
-                PresenceInput::TurnStarted(pod()),
-                PresenceInput::TurnEnded(pod()),
+                ScriptInput::Wake(pod()),
+                ScriptInput::TurnStarted {
+                    pod: pod(),
+                    turn: UtteranceId(1),
+                },
+                ScriptInput::TurnEnded {
+                    pod: pod(),
+                    turn: UtteranceId(1),
+                    end: TurnEnd::Closed,
+                },
             ]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The third of the closing trigger's facts: dispatch returning is what says
+    /// no further command is coming, and the scripter cannot schedule the head's
+    /// ending without it. It rides the same tap as the other two, dated with the
+    /// accounting the ledger answered.
+    #[tokio::test]
+    async fn a_returned_dispatch_reports_the_turns_accounting_to_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let ledger = Arc::new(TurnLedger::new());
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .barge(ledger, Err(FlushRejected::NotPlaying))
+            .scripter(handle.clone())
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let seen = script_inputs(handle, rx).await;
+        let Some(ScriptInput::Audio {
+            pod: at,
+            turn,
+            audio,
+        }) = seen.last()
+        else {
+            panic!("dispatch reported nothing: {seen:?}");
+        };
+        assert_eq!((at, *turn), (&pod(), UtteranceId(1)));
+        assert!(audio.dispatch_done, "no further cmd is coming");
+        // The echo brain queues one reply, and nothing plays it in this harness.
+        assert_eq!(audio.cmds_sent, 1);
+        assert_eq!(audio.awaiting_start, 1);
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The brain's disposition is the pipeline's to carry, not to decide: a turn
+    /// the response asked to keep listening after reaches the head as `Open`.
+    #[tokio::test]
+    async fn a_turn_left_open_says_so_at_the_tap() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .turn_end(TurnEnd::Open)
+            .scripter(handle.clone())
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await.last(),
+            Some(&ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: UtteranceId(1),
+                end: TurnEnd::Open,
+            })
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -1750,9 +1855,9 @@ mod tests {
     #[tokio::test]
     async fn an_expired_arm_settles_the_head() {
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
-        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
         Harness::new()
-            .presence(handle.clone())
+            .scripter(handle.clone())
             .run(vec![
                 wake_detected(1, 8),
                 PipelineItem::Listener(ListenerEvent::ArmExpired {
@@ -1769,8 +1874,8 @@ mod tests {
             .await;
 
         assert_eq!(
-            presence_inputs(handle, rx).await,
-            vec![PresenceInput::Wake(pod()), PresenceInput::Unanswered(pod())]
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())]
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -1782,7 +1887,7 @@ mod tests {
     #[tokio::test]
     async fn a_gate_decline_settles_the_head() {
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
-        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
         let wake = WakeConfirmation {
             score: 0.9,
             wake_end_sample: 0,
@@ -1798,13 +1903,13 @@ mod tests {
                 no_speech_max: 0.2,
                 avg_logprob_min: None,
             })
-            .presence(handle.clone())
+            .scripter(handle.clone())
             .run(vec![soft_endpoint(carved(1, 0, 16, Some(wake)))])
             .await;
 
         assert_eq!(
-            presence_inputs(handle, rx).await,
-            vec![PresenceInput::Unanswered(pod())]
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Unanswered(pod())]
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -2477,18 +2582,18 @@ mod tests {
         // it, so a tap sunk below the wiring guard loses the head for every
         // interaction on a pod whose writer is gone.
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
-        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
         let (lines, _) = Harness::new()
             .brain()
-            .presence(handle.clone())
+            .scripter(handle.clone())
             .run(vec![barge_in_event()])
             .await;
 
         assert!(lines.iter().any(|v| v["event"] == "barge_in"));
         assert!(!lines.iter().any(|v| v["event"] == "barge_in_stale"));
         assert_eq!(
-            presence_inputs(handle, rx).await,
-            vec![PresenceInput::Barge(pod())]
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Barge(pod())]
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -2698,16 +2803,16 @@ mod tests {
     #[tokio::test]
     async fn a_stale_epoch_wake_does_not_raise_the_head() {
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
-        let (handle, rx) = crate::presence::channel(jsonl.clone());
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
         Harness::new()
             .brain()
-            .presence(handle.clone())
+            .scripter(handle.clone())
             .run(vec![wake_detected(2, 8), wake_detected(1, 8)])
             .await;
 
         assert_eq!(
-            presence_inputs(handle, rx).await,
-            vec![PresenceInput::Wake(pod())],
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod())],
             "the live epoch's wake raises, the superseded one does not"
         );
         drop(jsonl);

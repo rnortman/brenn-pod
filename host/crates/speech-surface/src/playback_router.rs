@@ -11,6 +11,11 @@
 //! path) and is a counted `speak_unsupported` rejection when one is not — an
 //! explicit seam, not a panic. The task exits when the channel closes (pipeline
 //! ended) or the shutdown token fires.
+//!
+//! Every way a command ends without reaching a writer settles it against the turn
+//! ledger and reports the turn's accounting to the motion scripter. A command a
+//! writer took is settled by the playback event that ends it; one no writer took
+//! has no such event, so nothing else would ever account for it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,9 +36,9 @@ use speech_pipeline::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::barge::TurnLedger;
+use crate::barge::{TurnAudio, TurnLedger};
 use crate::jsonl::JsonlHandle;
-use crate::presence::{PresenceHandle, PresenceInput};
+use crate::scripter::{ScriptHandle, ScriptInput};
 use crate::server::{PlaybackRegistry, playback_try_play};
 
 /// Router-side counters, atomics-only with a `Copy` snapshot for `stage_health`
@@ -98,6 +103,11 @@ pub(crate) struct Router {
     cancel: CancellationToken,
     synthesizer: Option<Arc<dyn Synthesizer>>,
     ledger: Arc<TurnLedger>,
+    /// The motion scripter, when a presence channel is configured. The head's
+    /// ending is scheduled from the turn accounting this router changes every
+    /// time it gives up on a command, so the tap belongs here as much as on the
+    /// playback fan-out.
+    scripter: Option<ScriptHandle>,
 }
 
 impl Router {
@@ -108,6 +118,7 @@ impl Router {
         cancel: CancellationToken,
         synthesizer: Option<Arc<dyn Synthesizer>>,
         ledger: Arc<TurnLedger>,
+        scripter: Option<ScriptHandle>,
     ) -> Self {
         Self {
             registry,
@@ -116,6 +127,7 @@ impl Router {
             cancel,
             synthesizer,
             ledger,
+            scripter,
         }
     }
 
@@ -143,6 +155,11 @@ impl Router {
     /// during the synthesis await, and once more after it returns — because an
     /// interrupt can land at any of those moments and the response of a turn the
     /// user cut off should never reach the pod.
+    ///
+    /// Every way out of here that is not a delivered job goes through
+    /// [`Router::abandon`]: the command is settled and the turn's accounting
+    /// reported, so a turn whose speech partly played still gets its ending
+    /// scheduled from the part that did.
     async fn route(&self, cmd: SpeakCmd) {
         let speak_rx = HostMicros::now();
         let mut timings = cmd.timings;
@@ -174,6 +191,7 @@ impl Router {
                         "speak_unsupported",
                         &json!({ "pod": cmd.target, "utterance": cmd.in_reply_to }),
                     );
+                    self.abandon(&cmd.target, cmd.in_reply_to);
                     return;
                 };
                 let started = Instant::now();
@@ -189,6 +207,11 @@ impl Router {
                         self.drop_interrupted(&cmd.target, cmd.in_reply_to, "synth");
                         return;
                     }
+                    // Process shutdown: the loop breaks next, and the commands
+                    // still in the channel are abandoned unsettled with it.
+                    // Settling this one alone would say nothing about the turn,
+                    // and no head is waiting on the answer — the daemon's own
+                    // script timeout stows it.
                     SynthOutcome::Cancelled => return,
                 };
                 let synth_us = started.elapsed().as_micros() as u64;
@@ -217,6 +240,7 @@ impl Router {
                                 "elapsed_us": synth_us,
                             }),
                         );
+                        self.abandon(&cmd.target, cmd.in_reply_to);
                         return;
                     }
                 }
@@ -236,13 +260,37 @@ impl Router {
             speak_rx,
         };
         let outcome = playback_try_play(&self.registry, &cmd.target, job);
-        emit_outcome(
+        let delivered = emit_outcome(
             &cmd.target,
             cmd.in_reply_to,
             outcome,
             &self.stats,
             &self.jsonl,
         );
+        if !delivered {
+            self.abandon(&cmd.target, cmd.in_reply_to);
+        }
+    }
+
+    /// Give up on one command that will never play: settle it against the turn
+    /// ledger and report the turn's accounting to the scripter.
+    ///
+    /// A command a writer accepted is settled by the playback event that ends it.
+    /// One no writer accepted — no synthesizer for a `Text` body, a synthesis
+    /// failure, an absent pod, a full or dead writer — produces no playback event
+    /// at all, so without this the turn's `awaiting_start` never falls to zero:
+    /// the closing script never goes out and the head waits out the hold script's
+    /// timeout instead of stowing after the speech that did play.
+    ///
+    /// `clean` is false on every one of these paths — nothing reached the user,
+    /// so the pod's barge chain must not clear on them.
+    ///
+    /// A turn the ledger no longer holds answers `None` and reports nothing; a
+    /// barged turn is exactly that case, and the barge has already raised the head
+    /// on its own account.
+    fn abandon(&self, pod: &PodId, turn: Option<UtteranceId>) {
+        let audio = self.ledger.settle_job(pod, turn, false);
+        tell_scripter(self.scripter.as_ref(), pod, turn, audio);
     }
 
     /// Synthesize `text`, racing the interrupt of `turn` and process shutdown. The
@@ -274,16 +322,16 @@ impl Router {
         }
     }
 
-    /// Drop one command for a barged-in turn: the line, the counter, and the
-    /// settle that keeps the turn's accounting converging even though this command
-    /// will never play. `during` names which of the three checks caught it.
+    /// Drop one command for a barged-in turn: the line, the counter, and the same
+    /// give-up ending every other unplayable command takes. `during` names which
+    /// of the three checks caught it.
     fn drop_interrupted(&self, pod: &PodId, turn: Option<UtteranceId>, during: &str) {
         self.stats.record_interrupted();
         self.jsonl.emit(
             "speak_interrupted",
             &json!({ "pod": pod, "utterance": turn, "during": during }),
         );
-        self.ledger.settle_job(pod, turn, false);
+        self.abandon(pod, turn);
     }
 }
 
@@ -348,19 +396,27 @@ async fn synthesize_text(
     Ok(Arc::from(samples))
 }
 
-/// Emit the JSONL line and bump the counter for one resolution result. `Delivered`
-/// is silent on the wire — the writer emits the playback-lifecycle lines from
-/// there; the `QueueFull`/`WriterDead` counters are already bumped inside
-/// `try_play`, so here only their lines are the router's half.
+/// Emit the JSONL line and bump the counter for one resolution result, and answer
+/// whether a writer took the job. `Delivered` is silent on the wire — the writer
+/// emits the playback-lifecycle lines from there; the `QueueFull`/`WriterDead`
+/// counters are already bumped inside `try_play`, so here only their lines are the
+/// router's half.
+///
+/// The answer is what tells the caller whether any playback event will ever name
+/// this job: a refused one produces none, and its turn has to be settled here
+/// instead.
 fn emit_outcome(
     target: &PodId,
     in_reply_to: Option<UtteranceId>,
     outcome: Option<Result<(), PlayRejected>>,
     stats: &RouterStats,
     jsonl: &JsonlHandle,
-) {
+) -> bool {
     match outcome {
-        Some(Ok(())) => stats.record_delivered(),
+        Some(Ok(())) => {
+            stats.record_delivered();
+            return true;
+        }
         None => {
             stats.record_no_pod();
             jsonl.emit(
@@ -377,6 +433,7 @@ fn emit_outcome(
             &json!({ "pod": target, "utterance": in_reply_to }),
         ),
     }
+    false
 }
 
 /// Hands one `Feed` to the listener. A closure rather than the `ListenerHandle`
@@ -397,10 +454,10 @@ pub(crate) struct PlaybackFanout {
     pub(crate) feed: FeedFn,
     pub(crate) reserve: ReserveFn,
     pub(crate) ledger: Arc<TurnLedger>,
-    /// The head-presence tracker, when a presence channel is configured. It
-    /// wants the same lifecycle the ledger settles on: a pod that is speaking
-    /// is a pod mid-interaction.
-    pub(crate) presence: Option<PresenceHandle>,
+    /// The motion scripter, when a presence channel is configured. It reads the
+    /// same accounting the ledger keeps: when a turn's speech started and how
+    /// long it is, which is what schedules the head's ending.
+    pub(crate) scripter: Option<ScriptHandle>,
     /// The pacer's lead, which is how long the floor stays open past the last
     /// write. See [`schedule_floor_close`].
     pub(crate) lead_ms: u64,
@@ -450,15 +507,29 @@ pub(crate) fn playback_event_adapter(
     })
 }
 
-/// Report a playback state change to the presence tracker. Tapped at the event
-/// rather than at the listener floor's `lead_ms` delay: the head's timings are
-/// seconds, so a second of pacer lead is noise, and a job that ends and is
-/// immediately followed by another simply re-opens.
-fn tell_presence(fanout: &PlaybackFanout, pod: &PodId, speaking: bool) {
-    if let Some(presence) = &fanout.presence {
-        presence.send(PresenceInput::Playback {
+/// Report a turn's cmd accounting to the scripter, as the ledger call that
+/// changed it answered. The one home for that report: the playback fan-out uses
+/// it for every terminal event, and the router for every command it gives up on.
+///
+/// Tapped at the event rather than at the listener floor's `lead_ms` delay: the
+/// head's timings are seconds and a second of pacer lead is noise, and the
+/// horizon this carries is dated from when the clip started, not from when
+/// anybody heard about it.
+///
+/// A turn the ledger no longer holds — interrupted, or completed and retired —
+/// answers nothing, and there is nothing to say about it: the barge that cut it
+/// has already raised the head on its own account.
+fn tell_scripter(
+    scripter: Option<&ScriptHandle>,
+    pod: &PodId,
+    turn: Option<UtteranceId>,
+    audio: Option<TurnAudio>,
+) {
+    if let (Some(scripter), Some(turn), Some(audio)) = (scripter, turn, audio) {
+        scripter.send(ScriptInput::Audio {
             pod: pod.clone(),
-            speaking,
+            turn,
+            audio,
         });
     }
 }
@@ -469,13 +540,27 @@ fn tell_presence(fanout: &PlaybackFanout, pod: &PodId, speaking: bool) {
 /// barge trigger. It opens at `Started` and closes on every way a job can end. The
 /// ledger settles every terminal event, so a turn's cmds account for themselves
 /// whatever became of them; `clean` is true only for a job that played out and
-/// wrote its end-of-audio marker.
+/// wrote its end-of-audio marker. `Started` is recorded there too, with the job's
+/// sample count: that is what dates the end of the turn's audio while it is still
+/// playing, rather than at the `Finished` that reports it after the fact.
 async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout, gens: &FloorGens) {
     match event {
         PlaybackEvent::Started {
-            pod, interruptible, ..
+            pod,
+            in_reply_to,
+            samples,
+            interruptible,
+            ..
         } => {
-            tell_presence(fanout, pod, true);
+            // The tokio clock, not the std one this module measures spans with: the
+            // horizon this dates is a deadline something will later sleep until.
+            let audio = fanout.ledger.record_started(
+                pod,
+                *in_reply_to,
+                *samples,
+                tokio::time::Instant::now(),
+            );
+            tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
             cancel_floor_close(gens, pod);
             (fanout.feed)(
                 pod.clone(),
@@ -501,15 +586,15 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout, 
             // no `Aborted` follows, its queue may be empty), or the floor stays open
             // until the next reconnect and sustained room speech mints a wake-less
             // dispatch.
-            fanout.ledger.settle_job(pod, *in_reply_to, !*writer_dying);
-            tell_presence(fanout, pod, false);
+            let audio = fanout.ledger.settle_job(pod, *in_reply_to, !*writer_dying);
+            tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
             schedule_floor_close(fanout, gens, pod);
         }
         PlaybackEvent::Aborted {
             pod, in_reply_to, ..
         } => {
-            fanout.ledger.settle_job(pod, *in_reply_to, false);
-            tell_presence(fanout, pod, false);
+            let audio = fanout.ledger.settle_job(pod, *in_reply_to, false);
+            tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
             schedule_floor_close(fanout, gens, pod);
         }
         PlaybackEvent::Flushed {
@@ -518,12 +603,12 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout, 
             was_playing,
             ..
         } => {
-            fanout.ledger.settle_job(pod, *in_reply_to, false);
+            let audio = fanout.ledger.settle_job(pod, *in_reply_to, false);
+            tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
             if *was_playing {
                 // The barge already happened and the device has discarded its bank;
                 // nothing is audible, so the floor closes now rather than on the
                 // lead delay a natural ending needs.
-                tell_presence(fanout, pod, false);
                 cancel_floor_close(gens, pod);
                 close_floor(fanout, pod).await;
             }
@@ -829,6 +914,18 @@ mod tests {
         synthesizer: Option<Arc<dyn Synthesizer>>,
         ledger: Arc<TurnLedger>,
     ) -> (Vec<Value>, RouterStatsSnapshot) {
+        run_router_scripted(registry, cmds, synthesizer, ledger, None).await
+    }
+
+    /// Like [`run_router_full`] but with the scripter tap the server wires in, so
+    /// a test can watch what a give-up path tells the head.
+    async fn run_router_scripted(
+        registry: PlaybackRegistry,
+        cmds: Vec<SpeakCmd>,
+        synthesizer: Option<Arc<dyn Synthesizer>>,
+        ledger: Arc<TurnLedger>,
+        scripter: Option<ScriptHandle>,
+    ) -> (Vec<Value>, RouterStatsSnapshot) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let (jsonl, writer_join) = crate::jsonl::spawn_quiet(&JsonlSink::File(path.clone()))
@@ -849,6 +946,7 @@ mod tests {
             CancellationToken::new(),
             synthesizer,
             ledger,
+            scripter,
         )
         .run(rx)
         .await;
@@ -1107,6 +1205,7 @@ mod tests {
                 cancel.clone(),
                 Some(synth),
                 Arc::new(TurnLedger::new()),
+                None,
             )
             .run(rx),
         );
@@ -1263,6 +1362,7 @@ mod tests {
                 cancel,
                 None,
                 Arc::new(TurnLedger::new()),
+                None,
             )
             .run(rx),
         )
@@ -1755,6 +1855,7 @@ mod tests {
                 CancellationToken::new(),
                 Some(synth),
                 Arc::clone(&ledger),
+                None,
             )
             .run(rx),
         );
@@ -1843,6 +1944,248 @@ mod tests {
         assert_eq!(dropped["during"], "post_synth");
     }
 
+    /// One way a command can end up unplayable without a barge having cut it.
+    /// Each is a separate return out of `route`, and each has to settle its
+    /// command and report the turn: no playback event will ever name it.
+    #[derive(Debug, Clone, Copy)]
+    enum GiveUp {
+        /// A `Text` body with no synthesizer wired.
+        NoSynthesizer,
+        /// The synthesizer answered with an error.
+        SynthesisFailure,
+        /// The target pod has no registered writer.
+        NoPod,
+        /// The pod's writer queue is full.
+        QueueFull,
+        /// The pod's writer has exited.
+        DeadWriter,
+    }
+
+    /// Every shape, so the two tests below cannot drift apart or fall behind the
+    /// enum.
+    const GIVE_UP_SHAPES: [GiveUp; 5] = [
+        GiveUp::NoSynthesizer,
+        GiveUp::SynthesisFailure,
+        GiveUp::NoPod,
+        GiveUp::QueueFull,
+        GiveUp::DeadWriter,
+    ];
+
+    /// Everything one give-up shape needs routed.
+    ///
+    /// The last command is the one that gives up; anything before it is setup the
+    /// shape needs on the wire, and it names a turn the ledger never heard of so
+    /// the accounting the shape reports is the give-up turn's alone.
+    struct GiveUpWiring {
+        registry: PlaybackRegistry,
+        synthesizer: Option<Arc<dyn Synthesizer>>,
+        cmds: Vec<SpeakCmd>,
+        /// A duplex peer the shape needs kept open. Dropping it fails the
+        /// writer's eager `Hello` write, which turns a parked writer into a dead
+        /// one — a different shape.
+        _peer: Option<tokio::io::DuplexStream>,
+    }
+
+    /// The registry, synthesizer and commands that produce one give-up shape.
+    async fn give_up_wiring(shape: GiveUp) -> GiveUpWiring {
+        let plain = |registry, synthesizer, cmds| GiveUpWiring {
+            registry,
+            synthesizer,
+            cmds,
+            _peer: None,
+        };
+        match shape {
+            GiveUp::NoSynthesizer => plain(empty_registry(), None, vec![text_cmd("pod-x", 1)]),
+            GiveUp::SynthesisFailure => plain(
+                empty_registry(),
+                Some(Arc::new(FakeSynth::Fail) as Arc<dyn Synthesizer>),
+                vec![text_cmd("pod-x", 1)],
+            ),
+            GiveUp::NoPod => plain(
+                empty_registry(),
+                None,
+                vec![pcm_cmd("pod-x", 1, &[1, 2, 3])],
+            ),
+            GiveUp::QueueFull => {
+                // A writer whose peer never reads parks on the eager Hello write
+                // (an 8-byte duplex the frame overflows), so it never drains its
+                // job queue; with a depth of one, the command ahead fills it and
+                // the turn's own command overflows.
+                let (peer, device) = tokio::io::duplex(8);
+                let cfg = PacerConfig {
+                    lead_ms: 250,
+                    write_timeout_ms: 60_000,
+                    job_queue_depth: 1,
+                };
+                let noop: PlaybackEventFn = Arc::new(|_| Box::pin(std::future::ready(())));
+                let handle = PlaybackWriter::spawn(
+                    device,
+                    PodId("pod-x".into()),
+                    cfg,
+                    Arc::new(PlaybackStats::default()),
+                    noop,
+                    CancellationToken::new(),
+                );
+                let registry = empty_registry();
+                playback_register(&registry, "pod-x".into(), 1, handle);
+                GiveUpWiring {
+                    registry,
+                    synthesizer: None,
+                    cmds: vec![
+                        pcm_cmd("pod-x", 99, &[1, 2, 3]),
+                        pcm_cmd("pod-x", 1, &[4, 5, 6]),
+                    ],
+                    _peer: Some(peer),
+                }
+            }
+            GiveUp::DeadWriter => {
+                // The peer is dropped, so the writer's eager Hello write errors and
+                // the task exits; wait for it before routing.
+                let (peer, device) = tokio::io::duplex(64 * 1024);
+                drop(peer);
+                let noop: PlaybackEventFn = Arc::new(|_| Box::pin(std::future::ready(())));
+                let handle = PlaybackWriter::spawn(
+                    device,
+                    PodId("pod-x".into()),
+                    PacerConfig::default(),
+                    Arc::new(PlaybackStats::default()),
+                    noop,
+                    CancellationToken::new(),
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if matches!(handle.try_play(dummy_job()), Err(PlayRejected::WriterDead)) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the writer becomes dead");
+                let registry = empty_registry();
+                playback_register(&registry, "pod-x".into(), 1, handle);
+                plain(registry, None, vec![pcm_cmd("pod-x", 1, &[1, 2, 3])])
+            }
+        }
+    }
+
+    /// Route one command that cannot play, against a ledger already told the turn
+    /// dispatched it and finished, and hand back everything the scripter tap saw.
+    /// Production wiring: the same ledger the router settles into and the same
+    /// scripter handle.
+    async fn give_up_reports(shape: GiveUp) -> Vec<ScriptInput> {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
+            .await
+            .unwrap();
+        let (handle, mut inbox) = crate::scripter::channel(jsonl.clone());
+        let ledger = Arc::new(TurnLedger::new());
+        let pod = PodId("pod-x".into());
+        ledger.record_dispatch(&pod, UtteranceId(1), None);
+        ledger.record_cmd(&pod, UtteranceId(1), None);
+        ledger.dispatch_done(&pod, UtteranceId(1));
+
+        let wiring = give_up_wiring(shape).await;
+        run_router_scripted(
+            wiring.registry,
+            wiring.cmds,
+            wiring.synthesizer,
+            Arc::clone(&ledger),
+            Some(handle.clone()),
+        )
+        .await;
+
+        drop(handle);
+        drop(jsonl);
+        join.await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(input) = inbox.recv().await {
+            seen.push(input);
+        }
+        seen
+    }
+
+    /// Every way the router gives up on a command that is not a barge settles it
+    /// and reports the turn. Without the report the turn keeps awaiting a start
+    /// that will never come, and the head's ending is never scheduled.
+    #[tokio::test]
+    async fn every_give_up_path_resolves_its_turn() {
+        for shape in GIVE_UP_SHAPES {
+            let seen = give_up_reports(shape).await;
+            let [
+                ScriptInput::Audio {
+                    pod: at,
+                    turn,
+                    audio,
+                },
+            ] = &seen[..]
+            else {
+                panic!("{shape:?} said {seen:?}");
+            };
+            assert_eq!(
+                (at, *turn),
+                (&PodId("pod-x".into()), UtteranceId(1)),
+                "{shape:?}"
+            );
+            assert_eq!(audio.cmds_sent, 1, "{shape:?}");
+            assert!(audio.dispatch_done, "{shape:?}");
+            assert_eq!(
+                audio.awaiting_start, 0,
+                "the command resolved without starting: {shape:?}"
+            );
+            assert!(audio.horizon.is_none(), "nothing ever played: {shape:?}");
+        }
+    }
+
+    /// The consequence, end to end: the same reports drive a real scripter, and
+    /// the turn's closing script goes out. Without the report, the head would
+    /// wait out the hold script's timeout instead.
+    #[tokio::test]
+    async fn a_turn_the_router_gave_up_on_still_gets_its_closing_script() {
+        use crate::scripter::{Cause, Now, ScriptTiming, Scripter};
+        use speech_pipeline::TurnEnd;
+        use std::time::Duration;
+
+        let timing = ScriptTiming {
+            refresh: Duration::from_secs(5),
+            linger: Duration::from_secs(8),
+            max_engaged: Duration::from_secs(30),
+            stow_margin: Duration::from_millis(500),
+        };
+        for shape in GIVE_UP_SHAPES {
+            let mut scripter = Scripter::new(timing);
+            let pod = PodId("pod-x".into());
+            scripter.apply(
+                ScriptInput::TurnStarted {
+                    pod: pod.clone(),
+                    turn: UtteranceId(1),
+                },
+                Now::read(),
+            );
+            scripter.apply(
+                ScriptInput::TurnEnded {
+                    pod: pod.clone(),
+                    turn: UtteranceId(1),
+                    end: TurnEnd::Closed,
+                },
+                Now::read(),
+            );
+            let mut closing = None;
+            for input in give_up_reports(shape).await {
+                closing = scripter.apply(input, Now::read()).or(closing);
+            }
+            let publish = closing.unwrap_or_else(|| panic!("{shape:?} scheduled no ending"));
+            assert_eq!(publish.cause, Cause::Closing, "{shape:?}");
+            let steps = publish.script.steps();
+            assert_eq!(steps.len(), 2, "{shape:?}: up now, down at the margin");
+            assert_eq!(steps[1].posture, motion_proto::Posture::Stow, "{shape:?}");
+            assert_eq!(
+                steps[1].after_ms, 500,
+                "{shape:?}: nothing played, so the margin runs from now"
+            );
+        }
+    }
+
     /// A fanout whose feed and reserve hooks are supplied by the caller, for the
     /// floor-close timer paths that never reach the adapter.
     fn fanout_with(feed: FeedFn, reserve: ReserveFn, lead_ms: u64) -> PlaybackFanout {
@@ -1850,7 +2193,7 @@ mod tests {
             feed,
             reserve,
             ledger: Arc::new(TurnLedger::new()),
-            presence: None,
+            scripter: None,
             lead_ms,
         }
     }
@@ -1962,7 +2305,7 @@ mod tests {
                 feed,
                 reserve,
                 ledger: Arc::clone(&ledger),
-                presence: None,
+                scripter: None,
                 lead_ms,
             }),
         );
@@ -1975,24 +2318,35 @@ mod tests {
         (rx, ledger)
     }
 
-    /// Feed `events` through an adapter whose fanout has a presence tap, and
+    /// Feed `events` through an adapter whose fanout has a scripter tap, and
     /// hand back everything that tap sent. The floor and the ledger are wired
-    /// as ever, so what reaches presence is what reaches it in production.
-    async fn presence_from_fanout(events: Vec<PlaybackEvent>) -> Vec<PresenceInput> {
+    /// as ever, so what reaches the scripter is what reaches it in production.
+    ///
+    /// `cmds` is how many commands the turn's sink tap saw before any of this,
+    /// because the ledger answers nothing about a turn it holds no records for
+    /// — which is a case of its own, driven by passing zero.
+    async fn script_inputs_from_fanout(
+        events: Vec<PlaybackEvent>,
+        cmds: usize,
+    ) -> Vec<ScriptInput> {
         let dir = tempfile::tempdir().unwrap();
         let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
             .await
             .unwrap();
-        let (handle, mut inbox) = crate::presence::channel(jsonl.clone());
+        let (handle, mut inbox) = crate::scripter::channel(jsonl.clone());
         let (feed, reserve, _rx) = spy_feed();
+        let ledger = Arc::new(TurnLedger::new());
+        for _ in 0..cmds {
+            ledger.record_cmd(&PodId("pod-x".into()), UtteranceId(1), None);
+        }
         let adapter = playback_event_adapter(
             jsonl.clone(),
             Arc::new(AtomicU64::new(0)),
             Some(PlaybackFanout {
                 feed,
                 reserve,
-                ledger: Arc::new(TurnLedger::new()),
-                presence: Some(handle.clone()),
+                ledger,
+                scripter: Some(handle.clone()),
                 lead_ms: 1,
             }),
         );
@@ -2011,69 +2365,115 @@ mod tests {
         seen
     }
 
-    /// The head is held up through a spoken answer by this tap and nothing
-    /// else, so every arm's polarity is load-bearing: a `Started` reporting
-    /// silence stows the head mid-answer, and a terminal event reporting speech
-    /// leaves it up until a ceiling forfeits a flag nothing ever cleared.
-    #[tokio::test]
-    async fn every_playback_arm_tells_the_head_which_way_the_floor_moved() {
-        let pod = PodId("pod-x".into());
-        let cases = [
-            (started_event(full_timings()), true),
-            (finished(1, true), false),
-            (finished_writer_dying(1), false),
-            (
-                PlaybackEvent::Aborted {
-                    pod: pod.clone(),
-                    in_reply_to: Some(UtteranceId(1)),
-                    reason: AbortReason::WriteError,
-                },
-                false,
-            ),
-            (
-                PlaybackEvent::Flushed {
-                    pod: pod.clone(),
-                    in_reply_to: Some(UtteranceId(1)),
-                    was_playing: true,
-                    frames_written: 4,
-                    progress: InterruptProgress {
-                        heard_ms: 80,
-                        total_ms: 900,
-                    },
-                },
-                false,
-            ),
-        ];
-        for (event, speaking) in cases {
-            let label = format!("{event:?}");
-            assert_eq!(
-                presence_from_fanout(vec![event]).await,
-                vec![PresenceInput::Playback {
-                    pod: pod.clone(),
-                    speaking,
-                }],
-                "{label}"
-            );
+    /// The fixture's `Started`, re-addressed to the turn the scripter tests
+    /// account for.
+    fn started_for(turn: u64) -> PlaybackEvent {
+        let PlaybackEvent::Started {
+            pod,
+            timings,
+            speak_rx,
+            first_write,
+            samples,
+            interruptible,
+            ..
+        } = started_event(full_timings())
+        else {
+            unreachable!("started_event builds a Started")
+        };
+        PlaybackEvent::Started {
+            pod,
+            in_reply_to: Some(UtteranceId(turn)),
+            timings,
+            speak_rx,
+            first_write,
+            samples,
+            interruptible,
         }
     }
 
-    /// A queued job flushed behind the playing one was never audible. It has
-    /// nothing to say about whether the pod is speaking, and saying it anyway
-    /// would end an engagement the audible job is still holding.
+    /// The head's ending is scheduled from this tap and nothing else, so every
+    /// arm is load-bearing: an arm that says nothing leaves a cmd awaiting a
+    /// start that has already happened, and the closing script never goes out.
+    /// Each case drives one cmd of a two-cmd turn, so what comes back is the
+    /// accounting with that one event in and the other cmd still to come.
     #[tokio::test]
-    async fn an_evicted_job_says_nothing_to_the_head() {
-        let seen = presence_from_fanout(vec![PlaybackEvent::Flushed {
-            pod: PodId("pod-x".into()),
-            in_reply_to: Some(UtteranceId(1)),
-            was_playing: false,
-            frames_written: 0,
-            progress: InterruptProgress {
-                heard_ms: 0,
-                total_ms: 0,
+    async fn every_playback_arm_reports_the_turns_accounting() {
+        let pod = PodId("pod-x".into());
+        let cases = [
+            started_for(1),
+            finished(1, true),
+            finished_writer_dying(1),
+            PlaybackEvent::Aborted {
+                pod: pod.clone(),
+                in_reply_to: Some(UtteranceId(1)),
+                reason: AbortReason::WriteError,
             },
-        }])
-        .await;
+            PlaybackEvent::Flushed {
+                pod: pod.clone(),
+                in_reply_to: Some(UtteranceId(1)),
+                was_playing: true,
+                frames_written: 4,
+                progress: InterruptProgress {
+                    heard_ms: 80,
+                    total_ms: 900,
+                },
+            },
+            PlaybackEvent::Flushed {
+                pod: pod.clone(),
+                in_reply_to: Some(UtteranceId(1)),
+                was_playing: false,
+                frames_written: 0,
+                progress: InterruptProgress {
+                    heard_ms: 0,
+                    total_ms: 0,
+                },
+            },
+        ];
+        for event in cases {
+            let label = format!("{event:?}");
+            let seen = script_inputs_from_fanout(vec![event], 2).await;
+            let [
+                ScriptInput::Audio {
+                    pod: at,
+                    turn,
+                    audio,
+                },
+            ] = &seen[..]
+            else {
+                panic!("{label} said {seen:?}");
+            };
+            assert_eq!((at, *turn), (&pod, UtteranceId(1)), "{label}");
+            assert_eq!(audio.cmds_sent, 2, "{label}");
+            assert_eq!(audio.awaiting_start, 1, "one cmd is still to come: {label}");
+        }
+    }
 
+    /// A `Started` is the one arm that dates the turn's audio, which is what the
+    /// stow is scheduled from. The rest resolve the awaited set and leave the
+    /// horizon where it stands.
+    #[tokio::test]
+    async fn only_a_started_dates_the_turns_audio() {
+        let started = script_inputs_from_fanout(vec![started_for(1)], 1).await;
+        let [ScriptInput::Audio { audio, .. }] = &started[..] else {
+            panic!("{started:?}");
+        };
+        assert!(audio.horizon.is_some(), "the clip's own end");
+        assert_eq!(audio.awaiting_start, 0, "the turn's only cmd started");
+
+        let settled = script_inputs_from_fanout(vec![finished(1, true)], 1).await;
+        let [ScriptInput::Audio { audio, .. }] = &settled[..] else {
+            panic!("{settled:?}");
+        };
+        assert!(audio.horizon.is_none(), "nothing ever played");
+        assert_eq!(audio.awaiting_start, 0, "the cmd resolved without starting");
+    }
+
+    /// A turn the ledger no longer holds — interrupted, or completed and retired
+    /// — answers nothing, and there is nothing to say about it either: the barge
+    /// that cut it has already raised the head on its own account.
+    #[tokio::test]
+    async fn a_retired_turn_says_nothing_to_the_head() {
+        let seen = script_inputs_from_fanout(vec![finished(1, true)], 0).await;
         assert!(seen.is_empty(), "{seen:?}");
     }
 
@@ -2351,7 +2751,7 @@ mod tests {
                     feed,
                     reserve,
                     ledger: Arc::clone(&ledger),
-                    presence: None,
+                    scripter: None,
                     lead_ms: 1,
                 }),
             );
@@ -2366,5 +2766,55 @@ mod tests {
                 "{label} settles clean={clean}"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_started_job_dates_the_turns_audio_from_its_sample_count() {
+        // The turn's audio is dated when it *starts*, from how much of it there is
+        // — the whole reason `Started` carries the count.
+        let pod = PodId("pod-x".into());
+        let ledger = Arc::new(TurnLedger::new());
+        ledger.record_dispatch(&pod, UtteranceId(2), None);
+        ledger.record_cmd(&pod, UtteranceId(2), None);
+        let t0 = tokio::time::Instant::now();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
+            .await
+            .unwrap();
+        let (feed, reserve, _rx) = spy_feed();
+        let adapter = playback_event_adapter(
+            jsonl.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Some(PlaybackFanout {
+                feed,
+                reserve,
+                ledger: Arc::clone(&ledger),
+                scripter: None,
+                lead_ms: 1,
+            }),
+        );
+        adapter(PlaybackEvent::Started {
+            pod: pod.clone(),
+            in_reply_to: Some(UtteranceId(2)),
+            timings: Box::new(full_timings()),
+            speak_rx: at_ms(1_740).unwrap(),
+            first_write: at_ms(2_101).unwrap(),
+            // Three seconds at the spine rate.
+            samples: 48_000,
+            interruptible: true,
+        })
+        .await;
+        drop(adapter);
+        drop(jsonl);
+        join.await.unwrap();
+
+        let audio = ledger.dispatch_done(&pod, UtteranceId(2));
+        assert_eq!(audio.awaiting_start, 0, "the turn's one clip is playing");
+        assert_eq!(
+            audio.horizon,
+            Some(t0 + std::time::Duration::from_secs(3)),
+            "the clip's own end, not the event's arrival"
+        );
     }
 }

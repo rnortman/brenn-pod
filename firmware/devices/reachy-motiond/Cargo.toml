@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 # The head-presence motion daemon: an aarch64 binary that holds the Reachy's servo
-# bus open, subscribes to the presence channel on the brenn bus, and moves the head
-# between stow and neutral to match the desired posture it is told.
+# bus open, subscribes to the motion channel on the brenn bus, and moves the head
+# between stow and neutral to match the timed script it is running.
 #
 # A library plus a thin binary, the same shape reachy-pod takes: the modules are the
 # crate's public surface, which is what lets `cargo test -p reachy-motiond` exercise
@@ -22,19 +22,19 @@ license.workspace = true
 # neutral and stow postures. A git dependency because the dependency arrow runs
 # this way and never the reverse — the motion crates know nothing of a bus, a pod
 # identity or a presence channel.
-reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "fe6745d127b3cace49df42c1ebb861d59de2aa96" }
+reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "b4274b28a3c7f66484ac8ea3678049da7ce60c8b" }
 # The serial port and the typed refusal when something else already holds it.
 # Named directly because opening the port and classifying that refusal is the
 # daemon's; everything after the open goes through the session.
-reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "fe6745d127b3cace49df42c1ebb861d59de2aa96" }
+reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "b4274b28a3c7f66484ac8ea3678049da7ce60c8b" }
 # The joint-target type the two postures are expressed in. Named so the
 # posture-to-pose mapping can be a function of this daemon's own, with the type in
 # its signature, instead of living inside a trait implementation that needs a
 # servo bus to reach.
-reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "fe6745d127b3cace49df42c1ebb861d59de2aa96" }
-# The presence vocabulary and the lease reducer, shared with the publisher on the
-# speech host so neither end carries protocol logic of its own.
-presence-proto = { path = "../../crates/presence-proto" }
+reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "b4274b28a3c7f66484ac8ea3678049da7ce60c8b" }
+# The motion-script schema and the executor state that runs one, shared with the
+# scripter on the speech host so neither end carries protocol logic of its own.
+motion-proto = { path = "../../crates/motion-proto" }
 # The bus attachment: the dial, the token, the reconnect supervision, and the
 # subscription the daemon's intents arrive on. Its `Config` is nested whole into
 # this daemon's own configuration file.

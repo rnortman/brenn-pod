@@ -23,7 +23,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::brain::{BrainEvent, BrainEventFn, BrainStats, send_or_report};
-use crate::traits::{Brain, ResponseSink};
+use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{
     ContextSegment, InterruptProgress, PodId, RoomId, SpeakBody, SpeakCmd, Utterance, UtteranceId,
 };
@@ -481,6 +481,9 @@ struct ParsedResponse {
     text: String,
     /// The message promised a follow-up.
     continued: bool,
+    /// The message asked for the microphone to stay open. Read only as the turn's
+    /// disposition; nothing here holds the floor open.
+    listen: bool,
 }
 
 /// What [`BrennBrain::deliver`] did with a response message. Everything but
@@ -578,6 +581,7 @@ impl BrennBrain {
         let parsed = ParsedResponse {
             text,
             continued: tags.iter().any(|(tag, _)| *tag == Tag::Continued),
+            listen: tags.iter().any(|(tag, _)| *tag == Tag::Listen),
         };
         // The queue push comes before the per-marker events on purpose. A message the
         // turn never receives has had none of its markers acted on, and events saying
@@ -694,6 +698,11 @@ impl Brain for BrennBrain {
     /// Publish the turn, then speak each response segment as it arrives, returning
     /// only when the peer stops promising more.
     ///
+    /// The turn ends [`TurnEnd::Open`] exactly when the message that ended the chain
+    /// carried `<listen/>`; every other ending — no transcript, a refused publish, a
+    /// window that timed out, the continuation cap — is [`TurnEnd::Closed`], because
+    /// none of them delivered a final response at all.
+    ///
     /// The pipeline awaits this inline, and the turn ledger's settlement rests on the
     /// return being the proof that no further command is coming for this turn — which
     /// the segment loop preserves: nothing is queued after it returns. What the loop
@@ -704,7 +713,7 @@ impl Brain for BrennBrain {
     /// aborted task — ends the turn with whatever was already spoken. The pending
     /// slot is released on the drop ([`SlotGuard`]), so the next turn arms a free
     /// slot and messages for the abandoned one are refused rather than queued.
-    fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, ()> {
+    fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
         let link = Arc::clone(&self.link);
         let events = Arc::clone(&self.events);
         let stats = Arc::clone(&self.stats);
@@ -729,7 +738,7 @@ impl Brain for BrennBrain {
                 }
                 (events)(BrainEvent::NoTranscript { utterance });
                 stats.record_no_transcript();
-                return;
+                return TurnEnd::Closed;
             };
             let body = utterance_body(&u, text);
             let (tx, mut rx) = mpsc::channel::<ParsedResponse>(SLOT_CAPACITY);
@@ -747,7 +756,7 @@ impl Brain for BrennBrain {
                 // behind the refusal finds no turn to join.
                 drop(slot);
                 speak(&mut out, &u, failure_message, &events, &stats);
-                return;
+                return TurnEnd::Closed;
             }
             let mut window = response_timeout;
             let mut continuation = false;
@@ -766,13 +775,21 @@ impl Brain for BrennBrain {
                         stats.record_link_response_timeout();
                         drop(slot);
                         speak(&mut out, &u, failure_message, &events, &stats);
-                        return;
+                        return TurnEnd::Closed;
                     }
                     Ok(Some(parsed)) => {
                         let promised = parsed.continued;
+                        // The turn's disposition is the *final* message's: a
+                        // `<listen/>` on a segment that promised a follow-up is
+                        // superseded by whatever ends the chain.
+                        let listen = parsed.listen;
                         speak(&mut out, &u, parsed.text, &events, &stats);
                         if !promised {
-                            return;
+                            return if listen {
+                                TurnEnd::Open
+                            } else {
+                                TurnEnd::Closed
+                            };
                         }
                         segments += 1;
                         if segments >= MAX_CONTINUATIONS {
@@ -783,7 +800,10 @@ impl Brain for BrennBrain {
                                 segments,
                             });
                             stats.record_link_continuation_capped();
-                            return;
+                            // The peer was still promising more when the cap cut it
+                            // off, so no message ever ended the turn: nothing asked
+                            // to keep listening.
+                            return TurnEnd::Closed;
                         }
                         window = continuation_timeout;
                         continuation = true;
@@ -793,7 +813,7 @@ impl Brain for BrennBrain {
                             false,
                             "the slot holds the only sender, so the channel cannot close here"
                         );
-                        return;
+                        return TurnEnd::Closed;
                     }
                 }
             }
@@ -1316,7 +1336,7 @@ mod tests {
 
         /// Dispatch `u` the way the pipeline does — awaited concurrently, so the test
         /// can play the peer while the turn is parked.
-        fn dispatch(&self, u: Utterance) -> tokio::task::JoinHandle<()> {
+        fn dispatch(&self, u: Utterance) -> tokio::task::JoinHandle<TurnEnd> {
             let sink = ResponseSink::new(self.speak_tx.clone());
             tokio::spawn(self.brain.handle(u, sink))
         }
@@ -1455,7 +1475,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_response_at_all_times_out_and_apologizes() {
         let mut f = Fixture::new();
-        f.dispatch(test_utterance()).await.unwrap();
+        // A turn nobody answered delivered no final response, so it is closed.
+        assert_eq!(f.dispatch(test_utterance()).await.unwrap(), TurnEnd::Closed);
 
         assert_eq!(
             f.events(),
@@ -1479,7 +1500,7 @@ mod tests {
         let turn = f.dispatch(test_utterance());
         f.deliver_armed("<reply to=\"42\"/>Let me check.<continued/>")
             .await;
-        turn.await.unwrap();
+        assert_eq!(turn.await.unwrap(), TurnEnd::Closed);
 
         assert_eq!(
             f.events(),
@@ -1531,7 +1552,7 @@ mod tests {
     async fn a_publish_failure_apologizes_without_awaiting_a_response() {
         let mut f = Fixture::with(Err(LinkError::new("bridge gone")), FAILURE_MESSAGE);
         // No timeout is needed to complete: the turn never waits for a response.
-        f.dispatch(test_utterance()).await.unwrap();
+        assert_eq!(f.dispatch(test_utterance()).await.unwrap(), TurnEnd::Closed);
 
         assert_eq!(
             f.events(),
@@ -1642,6 +1663,70 @@ mod tests {
         );
         assert_eq!(f.stats.snapshot().link_tags_stripped, 1);
         assert_eq!(f.stats.snapshot().link_listen_unsupported, 1);
+    }
+
+    // --- how the turn ended ---
+
+    #[tokio::test]
+    async fn a_plain_final_response_closes_the_turn() {
+        let f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/>Sixty-eight and clear.")
+            .await;
+
+        assert_eq!(turn.await.unwrap(), TurnEnd::Closed);
+    }
+
+    #[tokio::test]
+    async fn a_final_response_that_asks_to_listen_leaves_the_turn_open() {
+        // The marker still holds no microphone open — `TODO(brenn-brain-listen)` —
+        // but the turn's disposition is read off it, which is what tells a head
+        // that the exchange is expected to continue.
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/>Which one did you mean?<listen/>")
+            .await;
+
+        assert_eq!(turn.await.unwrap(), TurnEnd::Open);
+        assert_eq!(f.spoken(), ["Which one did you mean?"]);
+    }
+
+    #[tokio::test]
+    async fn a_continuation_chain_takes_its_disposition_from_the_message_that_ends_it() {
+        // The mid-chain `<listen/>` is spent by the segment that carried it: the peer
+        // promised more in the same breath, and what it says at the end is the answer.
+        let f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/>Let me check.<listen/><continued/>")
+            .await;
+        f.deliver_armed("<reply to=\"42\" continued=\"true\"/>Sixty-eight and clear.")
+            .await;
+
+        assert_eq!(turn.await.unwrap(), TurnEnd::Closed);
+
+        let f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/>Let me check.<continued/>")
+            .await;
+        f.deliver_armed("<reply to=\"42\" continued=\"true\"/>Which city?<listen/>")
+            .await;
+
+        assert_eq!(turn.await.unwrap(), TurnEnd::Open);
+    }
+
+    #[tokio::test]
+    async fn a_capped_chain_closes_the_turn_whatever_its_last_segment_asked_for() {
+        // Nothing ended this turn — the bound did — so no message spoke for it.
+        let f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        for n in 0..MAX_CONTINUATIONS {
+            f.deliver_armed(&format!("<reply to=\"42\"/>part {n}<listen/><continued/>"))
+                .await;
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(turn.await.unwrap(), TurnEnd::Closed);
+        assert_eq!(f.stats.snapshot().link_continuations_capped, 1);
     }
 
     #[tokio::test]
@@ -1778,7 +1863,7 @@ mod tests {
             transcript: None,
             ..test_utterance()
         };
-        f.dispatch(u).await.unwrap();
+        assert_eq!(f.dispatch(u).await.unwrap(), TurnEnd::Closed);
 
         assert!(f.published().is_empty(), "nothing to say to the peer");
         assert!(f.log.lock().unwrap().interruptions.is_empty());

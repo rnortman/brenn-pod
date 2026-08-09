@@ -17,7 +17,7 @@ use futures::future::BoxFuture;
 use std::sync::Arc;
 
 use crate::brain::{BrainEvent, BrainEventFn, BrainStats, WakeCommandReason, send_or_report};
-use crate::traits::{Brain, ResponseSink};
+use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{
     ContextSegment, InterruptProgress, SpeakBody, SpeakCmd, Utterance, UtteranceId,
 };
@@ -70,7 +70,7 @@ fn barge_tail(seg: &ContextSegment) -> Option<String> {
 }
 
 impl Brain for EchoBrain {
-    fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, ()> {
+    fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
         let utterance = u.id;
         let text = u
             .transcript
@@ -118,8 +118,8 @@ impl Brain for EchoBrain {
                 }
             },
         }
-        // The reply is queued synchronously above; nothing remains to await.
-        futures::future::ready(()).boxed()
+        // A parrot never asks to be answered, so every turn it takes is closed.
+        futures::future::ready(TurnEnd::Closed).boxed()
     }
 
     fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {
@@ -193,7 +193,14 @@ mod tests {
         let brain = EchoBrain::new(events, Arc::clone(&stats));
 
         let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
-        drop(brain.handle(utterance_with(Some("hello there")), ResponseSink::new(tx)));
+        // A parrot never asks to be answered, so every turn it takes is closed —
+        // and closed synchronously, with nothing left to await.
+        assert_eq!(
+            brain
+                .handle(utterance_with(Some("hello there")), ResponseSink::new(tx))
+                .now_or_never(),
+            Some(TurnEnd::Closed)
+        );
 
         let cmd = rx.try_recv().expect("a SpeakCmd was queued");
         assert_eq!(cmd.target, PodId("pod-x".into()));

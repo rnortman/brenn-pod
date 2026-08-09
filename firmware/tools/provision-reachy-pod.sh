@@ -2,12 +2,17 @@
 #
 # Give one Reachy pod the configuration it needs to reach the audio host.
 #
-#   tools/provision-reachy-pod.sh <host>
+#   tools/provision-reachy-pod.sh <host> [speech-config]
 #
 # Everything is derived; the operator types nothing but the unit. The pod id is
 # the device's own hostname, which is also its TLS-PSK identity. The address it
-# dials and the key table it is filed in come from the host daemon's config
-# (host/config/parrot.toml), so the two sides cannot be told different things.
+# dials and the key table it is filed in come from the speech daemon's config,
+# so the two sides cannot be told different things — which holds only if the
+# file named here is the file that daemon is actually started with. That is why
+# the source is an argument and not a constant: SPEECH_CONFIG in
+# firmware/Makefile names it, defaulting to the rung example a fresh checkout
+# can run, and a workstation running a config from somewhere else sets it in
+# .local/reachy.conf. A relative path is taken from the repository root.
 #
 # The key itself is generated once and reused on every later run: this command is
 # idempotent, and a re-run after a reboot is the whole re-provisioning story. To
@@ -27,9 +32,10 @@ set -euo pipefail
 # shellcheck source=lib.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
-# The host daemon's configuration is the source of truth for both the address the
-# pod dials and the key table it is filed in.
-host_config="${repo_root}/host/config/parrot.toml"
+# The speech daemon's configuration is the source of truth for both the address
+# the pod dials and the key table it is filed in. Resolved below, once the
+# arguments are read.
+default_speech_config=host/config/parrot.toml
 
 # Optional local tuning fragment, appended verbatim: CHANNEL, VAD_THRESHOLD,
 # VAD_HANGOVER_MS. Gitignored — it is one workstation's opinion about one unit.
@@ -42,7 +48,15 @@ conf_dir="${store_mount}/conf"
 conf_file="${conf_dir}/audio.conf"
 
 host=${1:-}
-[ -n "$host" ] || die "usage: ${prog} <host>"
+[ -n "$host" ] || die "usage: ${prog} <host> [speech-config]"
+
+# An absolute path stands; a relative one is from the repository root, so the
+# Makefile variable reads the way a path in this repository is written.
+host_config=${2:-$default_speech_config}
+case "$host_config" in
+	/*) ;;
+	*) host_config="${repo_root}/${host_config}" ;;
+esac
 
 ssh_root() {
 	ssh -o BatchMode=yes "root@${host}" "$@"
@@ -117,9 +131,11 @@ toml_top_level_value() {
 # ── What the host daemon says, checked before the device is touched ───────────
 
 [ -f "$host_config" ] || die \
-	"no host daemon config at ${host_config}" \
-	"That file is where the pod's address and the key table come from." \
-	"Write it first: docs/runbooks/reachy-end-to-end.md, step 1."
+	"no speech daemon config at ${host_config}" \
+	"That file is where the pod's address and the key table come from, and it has to be" \
+	"the one speech-surface is started with. Name it in firmware/.local/reachy.conf:" \
+	"    SPEECH_CONFIG=<path>" \
+	"or write the default: docs/runbooks/reachy-end-to-end.md, step 1."
 
 listen_addr=$(toml_top_level_value "$host_config" listen_addr)
 psk_file=$(toml_top_level_value "$host_config" pod_psk_file)

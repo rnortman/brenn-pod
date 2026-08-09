@@ -7,18 +7,22 @@
 # text processing, and two of the decisions are expensive to get wrong:
 #
 #   * the exit status. The daemon's whole fault signal to an operator is its
-#     verdict — 0 released, 6 faulted with torque held, 7 parked with torque
-#     held — and this script's contract is to pass it through. A machine that
-#     faulted holding torque reported as a clean release is a head left up with
-#     nobody told.
+#     verdict — 0 released, 6 faulted and released at the minimum risk
+#     condition, 7 detached and released — and this script's contract is to pass
+#     it through. A fault reported as a clean stop is a machine nobody goes to
+#     look at.
 #   * the overlay mount. While the workspace manifest redirects the motion
 #     crates at a sibling clone, that mount is what makes *every* container
 #     build in this repository resolve. A marker that stops matching drops it
 #     silently, and the refusal written to say "clone brenn-reachy beside this
 #     repository" is replaced by a cargo resolution failure deep inside an
 #     emulated arm64 container.
+#   * the unit. It is composed here and written to the device's tmpfs, so its
+#     text is the only place the restart policy, the conditions that keep a
+#     half-provisioned device quiet, and the stop budget that lets the head fold
+#     are written down. A device is what would otherwise read them first.
 #
-# Neither needs a device, a container or a network, so both are asserted here,
+# None of it needs a device, a container or a network, so all of it is asserted here,
 # in the shape provision-reachy-pod.test.sh established: the function on its
 # own, then the whole script out of a scratch tree with `ssh` and `rsync`
 # stubbed on PATH.
@@ -31,25 +35,8 @@ TOOL="${TOOL:-$HERE/deploy-reachy-motiond.sh}" # overridable to run the suite ag
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-failures=0
-casenum=0
-
-fail() {
-	echo "FAIL [$1]: $2"
-	failures=$((failures + 1))
-}
-
-pass() { echo "ok   [$1]"; }
-
-# check <name> <0-or-1> <what-went-wrong> — assert a condition the caller ran.
-check() {
-	casenum=$((casenum + 1))
-	if [ "$2" = 0 ]; then pass "$1"; else fail "$1" "$3"; fi
-}
-
-# The two spellings of a condition, so an assertion reads as what it asserts.
-yes_no() { if "$@"; then echo 0; else echo 1; fi; }
-no_yes() { if "$@"; then echo 1; else echo 0; fi; }
+# shellcheck source=test-lib.sh
+. "$HERE/test-lib.sh"
 
 # ── Layer 1: the overlay mount, on its own ────────────────────────────────────
 
@@ -170,6 +157,12 @@ fi
 case "$*" in
 *install*) cat >"$STUB_SSH_STDIN" ;;
 esac
+# One remote command scripted to fail, named by a substring of its argv. The
+# deploy path asks several questions over separate connections and what it does
+# with a `no` differs per question, so a single scripted code cannot express it.
+if [ -n "${STUB_SSH_FAIL:-}" ] && [[ $* == *"$STUB_SSH_FAIL"* ]]; then
+	exit "${STUB_SSH_FAIL_RC:-1}"
+fi
 exit 0
 SSH_EOF
 
@@ -209,7 +202,8 @@ new_tree() {
 	: >"$SSH_STDIN"
 	export STUB_SSH_ARGV="$SSH_ARGV" STUB_SSH_RUN="$SSH_RUN"
 	export STUB_SSH_STDIN="$SSH_STDIN" STUB_RSYNC_ARGV="$RSYNC_ARGV"
-	unset STUB_SSH_RC
+	unset STUB_SSH_RC STUB_SSH_FAIL STUB_SSH_FAIL_RC
+	MOTION_REPO=""
 }
 
 # The binary the --run path insists on having built.
@@ -218,39 +212,17 @@ build_binary() {
 	chmod +x "$BINARY"
 }
 
-OUT=""
-EC=0
+# Where the tool should look for the brenn-reachy clone, empty for "wherever it
+# looks by default". Handed to the run rather than exported by a case, so the
+# overlay layer above — which sets the same variable inside a subshell — cannot
+# be read as the source of this one.
+MOTION_REPO=""
 run_tool() {
 	set +e
-	OUT=$(PATH="$STUBS:$PATH" "$TREE/firmware/tools/$(basename -- "$TOOL")" "$@" 2>&1)
+	OUT=$(PATH="$STUBS:$PATH" REACHY_MOTION_REPO="$MOTION_REPO" \
+		"$TREE/firmware/tools/$(basename -- "$TOOL")" "$@" 2>&1)
 	EC=$?
 	set -e
-}
-
-# expect_die <name> <substring> — the tool refuses and says why.
-expect_die() {
-	casenum=$((casenum + 1))
-	local name=$1 want=$2
-	if [ "$EC" = 0 ]; then
-		fail "$name" "expected a non-zero exit; output: $OUT"
-		return
-	fi
-	if [[ $OUT != *"$want"* ]]; then
-		fail "$name" "output missing '${want}'; output: $OUT"
-		return
-	fi
-	pass "$name"
-}
-
-# expect_exit <name> <code>
-expect_exit() {
-	casenum=$((casenum + 1))
-	local name=$1 want=$2
-	if [ "$EC" != "$want" ]; then
-		fail "$name" "exit ${EC}, wanted ${want}; output: $OUT"
-		return
-	fi
-	pass "$name"
 }
 
 # ── mode dispatch ─────────────────────────────────────────────────────────────
@@ -358,8 +330,8 @@ check "run-with-arguments-does-not-add-the-default" \
 	"remote command was: $(cat -- "$SSH_RUN")"
 
 # The passthrough. The daemon's verdict is the only thing that tells an operator
-# — or a Make lane — that a machine is holding torque, and this script is the
-# whole of the path it travels.
+# — or a Make lane — that a machine faulted rather than stopped cleanly, and this
+# script is the whole of the path it travels.
 for rc in 6 7 1; do
 	new_tree
 	build_binary
@@ -369,16 +341,154 @@ for rc in 6 7 1; do
 done
 
 # 255 is ssh's own, not the daemon's: it says the run never happened, which is a
-# different thing to report than a machine that faulted holding torque.
+# different thing to report than a machine that faulted.
 new_tree
 build_binary
 STUB_SSH_RC=255 run_tool reachy-dev --run
 unset STUB_SSH_RC
 expect_die "run-ssh-failure-is-not-the-daemons-verdict" "did not run"
 
-echo "----"
-if [ "$failures" -ne 0 ]; then
-	echo "deploy-reachy-motiond.test.sh: FAIL — ${failures} case(s) failed"
-	exit 1
-fi
-echo "deploy-reachy-motiond.test.sh: OK — ${casenum} cases passed"
+# A supervised run beside the service is two processes for one serial port. The
+# flock refuses it either way; what this is for is saying which process holds it
+# and how to stop that one.
+new_tree
+build_binary
+run_tool reachy-dev --run
+check "run-refuses-while-the-service-is-up" \
+	"$(yes_no grep -q 'systemctl is-active --quiet reachy-motiond.service && exit 3' -- "$SSH_RUN")" \
+	"remote command was: $(cat -- "$SSH_RUN")"
+
+new_tree
+build_binary
+STUB_SSH_RC=3 run_tool reachy-dev --run
+unset STUB_SSH_RC
+expect_die "run-beside-the-service-names-the-unit" "reachy-motiond.service is running"
+
+# ── the deploy ────────────────────────────────────────────────────────────────
+
+new_tree
+run_tool reachy-dev --deploy
+expect_die "deploy-without-a-build-refused" "no device binary at"
+check "deploy-without-a-build-touches-nothing" \
+	"$(yes_no [ ! -s "$SSH_ARGV" ])" "ssh was called: $(cat -- "$SSH_ARGV")"
+
+new_tree
+build_binary
+run_tool reachy-dev --deploy
+expect_exit "deploy-returns" 0
+check "deploy-pushes-the-binary-it-checked" \
+	"$(yes_no grep -qF -- "${BINARY} root@reachy-dev:/run/brenn-app/releases/motiond/reachy-motiond" "$RSYNC_ARGV")" \
+	"rsync argv was: $(cat -- "$RSYNC_ARGV")"
+# The whole point of the target: it returns, and the daemon keeps running. A
+# terminal anywhere in this path is the thing being removed.
+check "deploy-holds-no-terminal" \
+	"$(no_yes grep -q '^-t ' -- "$SSH_ARGV")" "argv was: $(cat -- "$SSH_ARGV")"
+check "deploy-installs-the-unit-in-tmpfs" \
+	"$(yes_no grep -q 'install -m 0644 /dev/stdin /run/systemd/system/reachy-motiond.service' -- "$SSH_ARGV")" \
+	"argv was: $(cat -- "$SSH_ARGV")"
+# A unit written but never reloaded is a file systemd has not read, and a reload
+# without a restart leaves the old binary running. One invocation, so neither
+# half can be the one that got interrupted.
+check "deploy-reloads-and-restarts-in-one-invocation" \
+	"$(yes_no grep -q 'systemctl daemon-reload && systemctl restart reachy-motiond.service' -- "$SSH_ARGV")" \
+	"argv was: $(cat -- "$SSH_ARGV")"
+check "deploy-asks-systemd-whether-it-came-up" \
+	"$(yes_no grep -q 'systemctl is-active --quiet reachy-motiond.service' -- "$SSH_ARGV")" \
+	"argv was: $(cat -- "$SSH_ARGV")"
+
+# The unit itself, as installed. Read off the stdin the install call was given,
+# which is the same file the device gets.
+UNIT="$SSH_STDIN"
+unit_says() {
+	check "unit-$1" "$(yes_no grep -qF -- "$2" "$UNIT")" \
+		"the unit was: $(cat -- "$UNIT")"
+}
+unit_says "runs-the-pushed-binary-with-the-pushed-config" \
+	"ExecStart=/run/brenn-app/releases/motiond/reachy-motiond /var/lib/brenn-app/reachy-motiond.toml"
+unit_says "runs-as-the-account-that-holds-the-port" "User=app"
+unit_says "leaves-the-device-nodes-visible" "PrivateDevices=no"
+# The three files a reboot clears. Without these a half-provisioned device
+# crash-loops against a missing file instead of waiting for `make reachy-up`.
+unit_says "waits-for-the-binary" \
+	"ConditionPathExists=/run/brenn-app/releases/motiond/reachy-motiond"
+unit_says "waits-for-the-configuration" \
+	"ConditionPathExists=/var/lib/brenn-app/reachy-motiond.toml"
+unit_says "waits-for-the-token" "ConditionPathExists=/var/lib/brenn-app/motiond-token"
+# The fault doctrine in unit form: a crash restarts (commissioning and the
+# startup fold re-run, which is safe), a fault and a futile bridge do not.
+unit_says "restarts-a-crash" "Restart=on-failure"
+unit_says "never-restarts-a-fault-or-a-futile-bridge" "RestartPreventExitStatus=6 7"
+# The orderly stop is a stow move, a dwell, a verify sweep and the release.
+unit_says "gives-the-stop-time-to-fold-the-head" "TimeoutStopSec=30"
+
+# A restart whose ConditionPathExists lines are unmet succeeds and leaves the
+# unit inactive. Reported as "installed but not running" rather than as a
+# successful deploy — this is the half-provisioned device the whole bring-up
+# story exists for.
+new_tree
+build_binary
+STUB_SSH_FAIL="is-active" run_tool reachy-dev --deploy
+unset STUB_SSH_FAIL
+expect_die "deploy-that-does-not-come-up-refuses" "not running"
+check "deploy-that-does-not-come-up-names-the-fix" \
+	"$(yes_no grep -q 'make reachy-up' <<<"$OUT")" "output was: $OUT"
+check "deploy-that-does-not-come-up-shows-the-status" \
+	"$(yes_no grep -q 'systemctl --no-pager --lines=20 status reachy-motiond.service' -- "$SSH_ARGV")" \
+	"argv was: $(cat -- "$SSH_ARGV")"
+
+# ── the machine's own configuration ───────────────────────────────────────────
+
+new_tree
+printf '[bus]\ndevice = "/dev/ttyAMA3"\n' >"$TREE/bench.toml"
+run_tool reachy-dev --bench-config "$TREE/bench.toml"
+expect_exit "bench-config-push-succeeds" 0
+check "bench-config-push-sends-the-file-over-stdin" \
+	"$(yes_no cmp -s -- "$TREE/bench.toml" "$SSH_STDIN")" \
+	"stdin was: $(cat -- "$SSH_STDIN")"
+check "bench-config-push-lands-where-the-daemon-reads-it" \
+	"$(yes_no grep -q 'install -m 0600 -o app -g app /dev/stdin /var/lib/brenn-app/reachy-bench.toml' -- "$SSH_ARGV")" \
+	"argv was: $(cat -- "$SSH_ARGV")"
+
+# With no file named, the reviewed copy in the clone that authors it. That is
+# what makes one command in this repository bring the whole robot back.
+new_tree
+CLONE="$TREE/brenn-reachy"
+mkdir -p "$CLONE/crates/reachy-bench" "$CLONE/.local"
+printf '[bus]\ndevice = "/dev/ttyAMA3"\n' >"$CLONE/.local/reachy-bench.toml"
+MOTION_REPO="$CLONE"
+run_tool reachy-dev --bench-config
+expect_exit "bench-config-default-takes-the-clones-copy" 0
+check "bench-config-default-sends-the-clones-file" \
+	"$(yes_no cmp -s -- "$CLONE/.local/reachy-bench.toml" "$SSH_STDIN")" \
+	"stdin was: $(cat -- "$SSH_STDIN")"
+
+# A clone with no reviewed copy in it: refused naming both the file it wanted
+# and the way to name another, rather than pushing nothing and reporting success.
+rm -f -- "$CLONE/.local/reachy-bench.toml"
+new_tree
+MOTION_REPO="$CLONE"
+run_tool reachy-dev --bench-config
+expect_die "bench-config-default-missing-file-refuses" "no machine configuration at"
+check "bench-config-default-missing-file-names-the-override" \
+	"$(yes_no grep -q BENCH_CONFIG <<<"$OUT")" "output was: $OUT"
+
+new_tree
+MOTION_REPO="$WORK/no-clone-here"
+run_tool reachy-dev --bench-config
+MOTION_REPO=""
+expect_die "bench-config-without-a-clone-refuses" "no brenn-reachy clone"
+check "bench-config-without-a-clone-touches-nothing" \
+	"$(yes_no [ ! -s "$SSH_ARGV" ])" "ssh was called: $(cat -- "$SSH_ARGV")"
+
+# ── the journal ───────────────────────────────────────────────────────────────
+
+new_tree
+run_tool reachy-dev --logs
+expect_exit "logs-succeeds" 0
+check "logs-follows-the-units-journal" \
+	"$(yes_no grep -q 'journalctl -u reachy-motiond.service -f' -- "$SSH_ARGV")" \
+	"argv was: $(cat -- "$SSH_ARGV")"
+check "logs-pushes-nothing" \
+	"$(yes_no [ ! -s "$RSYNC_ARGV" ])" "rsync was called: $(cat -- "$RSYNC_ARGV")"
+
+test_summary deploy-reachy-motiond.test.sh

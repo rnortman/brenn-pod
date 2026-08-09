@@ -28,15 +28,8 @@ TOOL="${TOOL:-$HERE/provision-reachy-pod.sh}" # overridable to run the suite aga
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-failures=0
-casenum=0
-
-fail() {
-	echo "FAIL [$1]: $2"
-	failures=$((failures + 1))
-}
-
-pass() { echo "ok   [$1]"; }
+# shellcheck source=test-lib.sh
+. "$HERE/test-lib.sh"
 
 # ── Layer 1: the TOML reader, on its own ──────────────────────────────────────
 
@@ -181,58 +174,62 @@ new_tree() {
 	unset STUB_NO_MOUNT STUB_PUSH_FAIL
 }
 
-OUT=""
-EC=0
 run_tool() {
 	set +e
-	OUT=$(PATH="$STUBS:$PATH" "$TREE/firmware/tools/$(basename -- "$TOOL")" reachy-dev 2>&1)
+	OUT=$(PATH="$STUBS:$PATH" "$TREE/firmware/tools/$(basename -- "$TOOL")" reachy-dev "$@" 2>&1)
 	EC=$?
 	set -e
 }
 
-# expect_die <name> <substring> — the tool refuses and says why.
-expect_die() {
-	casenum=$((casenum + 1))
-	local name=$1 want=$2
-	if [ "$EC" = 0 ]; then
-		fail "$name" "expected a non-zero exit; output: $OUT"
-		return
-	fi
-	if [[ $OUT != *"$want"* ]]; then
-		fail "$name" "output missing '${want}'; output: $OUT"
-		return
-	fi
-	pass "$name"
-}
-
-# expect_ok <name> [substring]
-expect_ok() {
-	casenum=$((casenum + 1))
-	local name=$1 want=${2:-}
-	if [ "$EC" != 0 ]; then
-		fail "$name" "expected success, got exit ${EC}; output: $OUT"
-		return
-	fi
-	if [ -n "$want" ] && [[ $OUT != *"$want"* ]]; then
-		fail "$name" "output missing '${want}'; output: $OUT"
-		return
-	fi
-	pass "$name"
-}
-
-# check <name> <0-or-1> <what-went-wrong> — assert a condition the caller ran.
-check() {
-	casenum=$((casenum + 1))
-	if [ "$2" = 0 ]; then pass "$1"; else fail "$1" "$3"; fi
-}
-
-yes_no() { if "$@"; then echo 0; else echo 1; fi; }
-
 new_tree
 rm -f -- "$TREE/host/config/parrot.toml"
 run_tool
-expect_die "gate-no-host-config" "no host daemon config at"
-check "gate-no-host-config-device-untouched" "$(yes_no [ ! -e "$PUSHED" ])" "something was pushed"
+expect_die "gate-no-speech-config" "no speech daemon config at"
+check "gate-no-speech-config-device-untouched" "$(yes_no [ ! -e "$PUSHED" ])" "something was pushed"
+# The file this reads has to be the one speech-surface is started with, and on
+# this maintainer's workstation that is not the rung example. The refusal names
+# the variable rather than leaving the reader to find the default in a Makefile.
+check "gate-no-speech-config-names-the-variable" \
+	"$(yes_no grep -q SPEECH_CONFIG <<<"$OUT")" "output was: $OUT"
+
+# ── the speech config is an argument, not a constant ──────────────────────────
+
+# An absolute path stands as written: what the live config's path looks like is
+# the operator's business, and it is usually in another checkout entirely.
+new_tree
+mkdir -p "$TREE/elsewhere"
+{
+	printf 'listen_addr = "192.168.1.99:7380"\n'
+	printf 'pod_psk_file = "%s"\n' "$PSK_FILE"
+} >"$TREE/elsewhere/live.toml"
+run_tool "$TREE/elsewhere/live.toml"
+expect_ok "speech-config-absolute-path-is-read"
+check "speech-config-absolute-path-is-what-was-pushed" \
+	"$(yes_no grep -q 'ADDR=192.168.1.99:7380' -- "$PUSHED")" \
+	"pushed: $(cat -- "$PUSHED")"
+
+# A relative one is from the repository root, so the Makefile variable reads the
+# way a path in this repository is written.
+new_tree
+mkdir -p "$TREE/elsewhere"
+{
+	printf 'listen_addr = "192.168.1.98:7380"\n'
+	printf 'pod_psk_file = "%s"\n' "$PSK_FILE"
+} >"$TREE/elsewhere/live.toml"
+run_tool elsewhere/live.toml
+expect_ok "speech-config-relative-path-is-from-the-repo-root"
+check "speech-config-relative-path-is-what-was-pushed" \
+	"$(yes_no grep -q 'ADDR=192.168.1.98:7380' -- "$PUSHED")" \
+	"pushed: $(cat -- "$PUSHED")"
+
+# With no argument, the default the Makefile ships — the rung example a fresh
+# checkout can run.
+new_tree
+run_tool
+expect_ok "speech-config-default-is-the-rung-example"
+check "speech-config-default-is-what-was-pushed" \
+	"$(yes_no grep -q 'ADDR=192.168.1.20:7380' -- "$PUSHED")" \
+	"pushed: $(cat -- "$PUSHED")"
 
 new_tree
 host_config "pod_psk_file = \"${PSK_FILE}\""
@@ -441,9 +438,4 @@ check "hash-in-table-path-no-truncated-sibling" \
 	"$(yes_no [ ! -e "$TREE/keys/psk" ])" \
 	"a table was created at the truncated path"
 
-echo "----"
-if [ "$failures" -ne 0 ]; then
-	echo "provision-reachy-pod.test.sh: FAIL — ${failures} case(s) failed"
-	exit 1
-fi
-echo "provision-reachy-pod.test.sh: OK — ${casenum} cases passed"
+test_summary provision-reachy-pod.test.sh

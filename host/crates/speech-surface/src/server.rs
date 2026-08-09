@@ -45,7 +45,7 @@ use speech_pipeline::{
     PlaybackWriter, PodId, QueueStats, RoomId, SPINE_FORMAT, Segment, SegmentAssembler,
     SegmentEndCause, Sender, SileroModel, SpeakCmd, StageTimings, StatsHandle, SttParams, SttStats,
     SttStatsSnapshot, Synthesizer, Transcriber, TtsParams, TtsStats, TtsStatsSnapshot, UtteranceId,
-    WakeCommandReason, WakeError, WavBrain, stage_delta_us,
+    WakeCommandReason, WakeError, WavBrain, audio_ms, stage_delta_us,
 };
 
 use crate::barge::TurnLedger;
@@ -59,9 +59,9 @@ use crate::pipeline::{BargeWiring, BrainWiring, PipelineFatal};
 use crate::playback_router::{
     self, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
 };
-use crate::presence::{PresenceHandle, PresenceInbox};
 use crate::prune::{PruneOutcome, PruneRequest, prune};
 use crate::recorder::{OpenLogs, Recorder, RecorderShared};
+use crate::scripter::{ScriptHandle, ScriptInbox};
 
 /// Deadline for an accepted connection to send its first decodable frame. Until
 /// a valid `Hello` lands a connection holds an accept-gate permit but cannot be
@@ -570,9 +570,9 @@ impl Server {
         // utterance).
         let turn_ledger = Arc::new(TurnLedger::new());
 
-        // The head-presence taps, on the one condition that also decides
-        // whether the task owning the queue's other end is spawned.
-        let (presence_channel, presence_handle, presence_inbox) = build_presence(&config, &jsonl);
+        // The head's taps, on the one condition that also decides whether the
+        // task owning the queue's other end is spawned.
+        let (script_channel, script_handle, script_inbox) = build_scripter(&config, &jsonl);
 
         // Turns each writer's `PlaybackEvent`s into JSONL lines, and fans the same
         // events out to the listener's playback floor and the ledger. Built once
@@ -601,7 +601,7 @@ impl Server {
                     })
                 },
                 ledger: turn_ledger.clone(),
-                presence: presence_handle.clone(),
+                scripter: script_handle.clone(),
                 lead_ms: config.playback.lead_ms,
             }),
         );
@@ -693,6 +693,10 @@ impl Server {
                         // rejection.
                         synthesizer.clone(),
                         turn_ledger.clone(),
+                        // The same tap the playback fan-out holds: a command the
+                        // router gives up on changes the turn's accounting and
+                        // nothing downstream will ever report it.
+                        script_handle.clone(),
                     )
                     .run(speak_rx),
                 );
@@ -733,21 +737,21 @@ impl Server {
         // The subscription plane holds subscriptions across attachments, so
         // no subscribe call is needed here.
         //
-        // The presence tracker rides the same bridge and stops on the same
-        // teardown token: it publishes intents and subscribes to nothing, so it
-        // needs the handle and no part of the driver's loop.
-        let mut presence_join: Option<tokio::task::JoinHandle<()>> = None;
+        // The script task rides the same bridge and stops on the same teardown
+        // token: it publishes scripts and subscribes to nothing, so it needs the
+        // handle and no part of the driver's loop.
+        let mut script_join: Option<tokio::task::JoinHandle<()>> = None;
         let driver_join = match (brenn_parts, brenn_brain) {
             (Some(parts), Some(brain)) => {
-                if let (Some(inbox), Some(channel)) = (presence_inbox, presence_channel) {
-                    let tracker = crate::presence::PresenceTracker::new(
+                if let (Some(inbox), Some(channel)) = (script_inbox, script_channel) {
+                    let task = crate::scripter::ScriptTask::new(
                         parts.config,
                         channel,
                         parts.bridge.handle.clone(),
                         inbox,
                         jsonl.clone(),
                     );
-                    presence_join = Some(tokio::spawn(tracker.run(bridge_teardown.clone())));
+                    script_join = Some(tokio::spawn(task.run(bridge_teardown.clone())));
                 }
                 let driver = BridgeDriver::new(
                     parts.config,
@@ -810,7 +814,7 @@ impl Server {
                         Arc::new(move |pod: &PodId| playback_flush(&reg, pod))
                     },
                 }),
-                presence: presence_handle.clone(),
+                scripter: script_handle.clone(),
             },
             jsonl.clone(),
         ));
@@ -1057,10 +1061,10 @@ impl Server {
         // immediately.
         bridge_teardown.cancel();
         // Before the driver's join, because the driver is what tells the bridge
-        // to shut down: a tracker still holding a publish open past that point
-        // would only earn itself a failure line.
-        if let Some(join) = presence_join {
-            handle_presence_exit(join.await, &jsonl);
+        // to shut down: a script task still holding a publish open past that
+        // point would only earn itself a failure line.
+        if let Some(join) = script_join {
+            handle_scripter_exit(join.await, &jsonl);
         }
         if !driver_joined && let Some(join) = driver_join {
             handle_driver_exit(join.await, &jsonl);
@@ -1121,26 +1125,22 @@ fn listener_absent_reason(config: &Config) -> &'static str {
     }
 }
 
-/// The head-presence pieces the server wires. All three come from the single
+/// The head's scripting pieces. All three come from the single
 /// [`presence_channel`] answer, so the site that mints the queue and the site
 /// that spawns its drain cannot disagree.
 ///
 /// The `None` path emits `presence_absent` when the bus brain is configured
-/// without a channel — without it, head presence is silently absent and a
+/// without a channel — without it, the head is silently unscripted and a
 /// bring-up bench gives no clue why. No line when `[brenn]` is absent
 /// entirely: the pod's own absence lines already cover that.
-fn build_presence(
+fn build_scripter(
     config: &Config,
     jsonl: &JsonlHandle,
-) -> (
-    Option<String>,
-    Option<PresenceHandle>,
-    Option<PresenceInbox>,
-) {
+) -> (Option<String>, Option<ScriptHandle>, Option<ScriptInbox>) {
     match presence_channel(config) {
         Some(channel) => {
             let channel = channel.to_owned();
-            let (handle, inbox) = crate::presence::channel(jsonl.clone());
+            let (handle, inbox) = crate::scripter::channel(jsonl.clone());
             (Some(channel), Some(handle), Some(inbox))
         }
         None => {
@@ -1155,16 +1155,16 @@ fn build_presence(
     }
 }
 
-/// The channel head-presence intents are published on, or `None` when no
-/// tracker runs.
+/// The channel motion scripts are published on, or `None` when the head is not
+/// scripted.
 ///
 /// One derivation, read by both the site that mints the taps' queue and the
 /// site — a couple of hundred lines away, inside the bus-brain arm — that
 /// spawns the task owning its other end. Two derivations of the same condition
 /// can drift, and drift here is silent: a queue whose receiver was never
-/// spawned turns every tap into a `presence_input_dropped` line, for every wake
+/// spawned turns every tap into a `script_input_dropped` line, for every wake
 /// and every playback event, for the life of the process. The brenn-mode
-/// condition is part of it because the tracker publishes over the bus brain's
+/// condition is part of it because the task publishes over the bus brain's
 /// bridge, and nothing else builds one.
 fn presence_channel(config: &Config) -> Option<&str> {
     if config.brain.as_ref().map(|brain| brain.mode) != Some(BrainMode::Brenn) {
@@ -1288,7 +1288,7 @@ fn build_brain(
                 let path = brain.clip.clone().ok_or(ClipError::MissingPath)?;
                 let clip = load_clip(&path)?;
                 let samples = clip.len();
-                let duration_ms = (samples as u64) * 1000 / u64::from(SPINE_FORMAT.sample_rate_hz);
+                let duration_ms = audio_ms(samples as u64);
                 jsonl.emit(
                     "brain_clip_loaded",
                     &json!({
@@ -1641,17 +1641,17 @@ fn handle_driver_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlH
     }
 }
 
-/// Report a presence tracker that did not exit cleanly.
+/// Report a script task that did not exit cleanly.
 ///
-/// A dead tracker degrades to a head that never rises again — safe, because the
-/// consumer's lease lapses to stow — but the degradation is silent otherwise:
-/// the taps' `presence_input_dropped` lines are the only trace, and only if
-/// somebody interacts afterwards. Whoever is diagnosing a head that stopped
-/// answering needs the death named.
-fn handle_presence_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
+/// A dead task degrades to a head that never rises again — safe, because the
+/// standing script's timeout stows it — but the degradation is silent
+/// otherwise: the taps' `script_input_dropped` lines are the only trace, and
+/// only if somebody interacts afterwards. Whoever is diagnosing a head that
+/// stopped answering needs the death named.
+fn handle_scripter_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
     if let Err(e) = result {
         jsonl.emit(
-            "presence_tracker_exited",
+            "script_task_exited",
             &json!({ "reason": driver_exit_reason(&e), "detail": e.to_string() }),
         );
     }
@@ -3705,21 +3705,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_presence_exit_reports_a_dead_tracker() {
+    async fn handle_scripter_exit_reports_a_dead_task() {
         let dir = tempfile::tempdir().unwrap();
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
-        // A tracker that stops on its teardown token returns cleanly and says
-        // nothing. One that died takes the head's only intent source with it,
+        // A task that stops on its teardown token returns cleanly and says
+        // nothing. One that died takes the head's only script source with it,
         // and the taps' drop lines are not a diagnosis.
-        handle_presence_exit(Ok(()), &handle);
-        let panicker = tokio::spawn(async { panic!("presence boom") });
-        handle_presence_exit(panicker.await, &handle);
+        handle_scripter_exit(Ok(()), &handle);
+        let panicker = tokio::spawn(async { panic!("scripter boom") });
+        handle_scripter_exit(panicker.await, &handle);
 
         drop(handle);
         join.await.unwrap();
         let lines = read_lines(&path);
-        let exited = events_named(&lines, "presence_tracker_exited");
+        let exited = events_named(&lines, "script_task_exited");
         assert_eq!(exited.len(), 1);
         assert_eq!(exited[0]["reason"], "panic");
         assert!(
@@ -3782,17 +3782,17 @@ mod tests {
             "presence_channel = \"brenn:head\"\n",
         ))
         .expect("config parses");
-        let (channel, taps, inbox) = build_presence(&with, &handle);
+        let (channel, taps, inbox) = build_scripter(&with, &handle);
         assert_eq!(channel.as_deref(), Some("brenn:head"));
         assert!(taps.is_some() && inbox.is_some());
         drop((taps, inbox));
 
         let without = test_config(&brenn_text(dir.path(), &token, "")).expect("config parses");
-        let (channel, taps, inbox) = build_presence(&without, &handle);
+        let (channel, taps, inbox) = build_scripter(&without, &handle);
         assert!(channel.is_none() && taps.is_none() && inbox.is_none());
 
         let no_brenn = config(&dir.path().join("store"), false);
-        let (channel, taps, inbox) = build_presence(&no_brenn, &handle);
+        let (channel, taps, inbox) = build_scripter(&no_brenn, &handle);
         assert!(channel.is_none() && taps.is_none() && inbox.is_none());
 
         // The fourth shape, and the premise the reason above rests on: a

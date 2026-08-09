@@ -99,6 +99,20 @@ impl Collect {
             .find(|(name, _)| name == event)
             .map(|(_, fields)| fields.clone())
     }
+
+    /// The fields of every event of this name, in order.
+    ///
+    /// What [`Collect::fields`] cannot answer: whether a run emitted an event
+    /// once or several times, and what the later ones said. A move that
+    /// replaces another is exactly that shape.
+    pub fn all_fields(&self, event: &str) -> Vec<Value> {
+        self.said()
+            .events
+            .iter()
+            .filter(|(name, _)| name == event)
+            .map(|(_, fields)| fields.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
