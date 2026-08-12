@@ -61,9 +61,9 @@ rest_poll_ms = 100
 # posture for minutes after every turn.
 rest_delay_ms = 5000
 
-# The three move durations, in seconds, each optional and each overriding the
-# bench configuration's value for this daemon alone. Omit one and the bench file
-# governs it; omit all three and this daemon moves at exactly the pace the
+# The move durations, in seconds, each optional and each overriding the bench
+# configuration's value for this daemon alone. Omit one and the bench file
+# governs it; omit all of them and this daemon moves at exactly the pace the
 # operator tool does.
 #
 # They come in two mechanical groups. The head group is the head pose and the
@@ -71,6 +71,16 @@ rest_delay_ms = 5000
 # antennas are independent of it and sweep much further, which is why they have a
 # clock of their own — a lift tuned to be quick has no business being floored by
 # an antenna arc.
+#
+# The antennas take three keys, not one: a shared clock and one per side. The
+# two tips cross inboard of the head, and a pair sweeping mirror-symmetrically
+# arrives at that crossing together — which is how two antenna servos latched
+# their overloads on the bench. Two clocks part them. Setting these keys is not
+# what makes the pair safe: whatever they resolve to, the move resolver measures
+# the pair at the crossing and lengthens the later side until the tips clear
+# each other, saying so in the capture. What they buy is choosing the pace at
+# which that happens rather than being handed it. A side's own key wins over the
+# shared one; the shared one wins over the head group's clock.
 #
 # FLOORS. These durations are a nominal policy rather than a promise: a move
 # whose span will not fit inside the per-tick step bounds at the duration named
@@ -97,24 +107,30 @@ rest_delay_ms = 5000
 #                binds, and folding from beyond about 153 degrees round takes
 #                longer than `stow_duration_s = 2.0`. It runs on the longer clock
 #                and lands, rather than being refused or dropped.
-#   antennas     0.81 s for the 3.23 rad stow-to-neutral arc, 1.21 s to re-stow
-#                an antenna left just inboard of sideways, and 1.57 s for the
+#   antennas     0.19 s for the 3.23 rad stow-to-neutral arc, 0.28 s to re-stow
+#                an antenna left just inboard of sideways, and 0.36 s for the
 #                widest sweep the bench command can ask for. The daemon only ever
 #                commands the first two.
 #
-# The two head-group lines are commented out — that is, at the bench file's own
-# 3.0 s and 2.0 s. Those values are cautious rather than measured, and the raise
-# is meant to be a quick acknowledgement, so they are the obvious thing to tune;
-# what stops a shorter recommendation shipping here is that nobody has run the
-# machine at one yet. Lower them a step at a time and watch the tracking error in
-# the capture; a value under the floor is not a hazard to hand-check, it is a
-# stretch line in the capture saying the clock this file asked for was not the
-# one the move ran on. The antenna clock needs no such trial: its floor is
-# closed-form, and 1.5 s clears the 1.21 s worst case the daemon can reach with
-# real margin.
-# up_duration_s = 3.0
+# The two head-group lines are commented out — that is, the daemon runs on
+# whatever the machine's own bench file says, and the values below are that
+# file's, restated so uncommenting one changes nothing until you edit it. The
+# raise is the gesture that was measured on the machine: 0.8 s, arriving with
+# no settling period after the last goal went out. Tune either a step at a time
+# and watch the tracking error in the capture; a value under the floor is not a
+# hazard to hand-check, it is a stretch line in the capture saying the clock
+# this file asked for was not the one the move ran on. The antenna clock needs
+# no such trial: its floor is closed-form, and 1.5 s clears the 0.28 s worst
+# case the daemon can reach with real margin.
+# up_duration_s = 0.8
 # stow_duration_s = 2.0
 antenna_duration_s = 1.5
+# The two per-side clocks are commented out — that is, both antennas ride the
+# shared clock above and the resolver parts them at the crossing. Uncomment them
+# to choose the stagger yourself; the side you give the longer clock is the one
+# that reaches the crossing second.
+# antenna_duration_right_s = 1.5
+# antenna_duration_left_s = 1.5
 
 # The bus attachment. The same table every binary here that attaches to the bus
 # writes, nested whole.

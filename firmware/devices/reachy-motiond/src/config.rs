@@ -16,7 +16,7 @@
 //! they are not a fact about the platform: how briskly a head acknowledges a
 //! wake word is presence policy, tuned by whoever is living with the machine,
 //! while the bench file's values are what an operator watching a single command
-//! wants. The three optional `*_duration_s` keys here override the bench file's
+//! wants. The five optional `*_duration_s` keys here override the bench file's
 //! for this daemon only; absent, the bench file governs, so there is still one
 //! number and not two unless somebody deliberately wrote a second.
 //!
@@ -122,6 +122,19 @@ pub struct Config {
     /// the antennas run on whichever head-group clock the move is using.
     #[serde(default)]
     pub antenna_duration_s: Option<f64>,
+    /// The right antenna's own clock, seconds, taking precedence over
+    /// `antenna_duration_s` for that side alone.
+    ///
+    /// The pair is the one place on this machine where two joints can reach the
+    /// same piece of air: their tips cross inboard, and a pair sweeping
+    /// mirror-symmetrically meets there. Two clocks is how they are parted.
+    #[serde(default)]
+    pub antenna_duration_right_s: Option<f64>,
+    /// The left antenna's own clock, seconds, taking precedence over
+    /// `antenna_duration_s` for that side alone. See
+    /// `antenna_duration_right_s`.
+    #[serde(default)]
+    pub antenna_duration_left_s: Option<f64>,
     /// The bus attachment. Nested whole so there is one description of a bridge
     /// and every embedder writes the same table.
     pub bridge: brenn_bridge::Config,
@@ -129,18 +142,21 @@ pub struct Config {
 
 /// The move durations the daemon's file states, absent where it states nothing.
 ///
-/// Three answers and not three numbers: what the file says is only half of a
-/// duration, the other half being the bench configuration it overrides, and the
-/// resolution of the two lives with the machine ([`crate::motion::Clocks`]) so
-/// that what a move actually runs at is decided once.
+/// Answers and not numbers: what the file says is only half of a duration, the
+/// other half being the bench configuration it overrides, and the resolution of
+/// the two lives with the machine ([`crate::motion::Clocks`]) so that what a
+/// move actually runs at is decided once.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Overrides {
     /// The raise's head-group clock.
     pub up: Option<Duration>,
     /// The fold's head-group clock.
     pub stow: Option<Duration>,
-    /// The antennas' clock, on either move.
+    /// The antennas' shared clock, on either move.
     pub antennas: Option<Duration>,
+    /// Each antenna's own clock, right then left, taking precedence over the
+    /// shared one for that side.
+    pub antenna_sides: [Option<Duration>; 2],
 }
 
 /// A duration a `*_duration_s` key states, or `None` where it states nothing.
@@ -282,6 +298,8 @@ impl Config {
         check_duration("up_duration_s", self.up_duration_s)?;
         check_duration("stow_duration_s", self.stow_duration_s)?;
         check_duration("antenna_duration_s", self.antenna_duration_s)?;
+        check_duration("antenna_duration_right_s", self.antenna_duration_right_s)?;
+        check_duration("antenna_duration_left_s", self.antenna_duration_left_s)?;
         self.bridge.validate()
     }
 
@@ -310,9 +328,9 @@ impl Config {
 
     /// The move durations this file states, absent where it states nothing.
     ///
-    /// One value rather than three accessors because the three are resolved
-    /// together against the machine's own file, and a caller that picked up two
-    /// of them would run the third at whatever the bench configuration says
+    /// One value rather than an accessor apiece because they are resolved
+    /// together against the machine's own file, and a caller that picked up
+    /// some of them would run the rest at whatever the bench configuration says
     /// without anything saying so.
     #[must_use]
     pub fn durations(&self) -> Overrides {
@@ -320,6 +338,10 @@ impl Config {
             up: stated(self.up_duration_s),
             stow: stated(self.stow_duration_s),
             antennas: stated(self.antenna_duration_s),
+            antenna_sides: [
+                stated(self.antenna_duration_right_s),
+                stated(self.antenna_duration_left_s),
+            ],
         }
     }
 }
@@ -388,7 +410,10 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
     /// what the file writes and milliseconds is what everything else here uses.
     #[test]
     fn the_stated_durations_are_read_as_seconds() {
-        let text = file("up_duration_s = 1.4\nstow_duration_s = 1.25\nantenna_duration_s = 1.5");
+        let text = file(
+            "up_duration_s = 1.4\nstow_duration_s = 1.25\nantenna_duration_s = 1.5\n\
+             antenna_duration_right_s = 0.7\nantenna_duration_left_s = 0.3",
+        );
         let config = Config::parse(&text).expect("the file parses");
         config.validate().expect("the file validates");
         assert_eq!(
@@ -397,14 +422,19 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
                 up: Some(Duration::from_millis(1_400)),
                 stow: Some(Duration::from_millis(1_250)),
                 antennas: Some(Duration::from_millis(1_500)),
+                antenna_sides: [
+                    Some(Duration::from_millis(700)),
+                    Some(Duration::from_millis(300)),
+                ],
             }
         );
     }
 
-    /// Each duration is independent of the other two: overriding the raise must
-    /// not quietly pull the fold or the antennas off the bench file with it.
+    /// Each duration is independent of the others: overriding the raise must
+    /// not quietly pull the fold or either antenna off the bench file with it,
+    /// and one antenna's own clock must not answer for the other side.
     #[test]
-    fn one_stated_duration_leaves_the_other_two_to_the_machine() {
+    fn one_stated_duration_leaves_the_others_to_the_machine() {
         for (line, expected) in [
             (
                 "up_duration_s = 1.4",
@@ -427,6 +457,20 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
                     ..Overrides::default()
                 },
             ),
+            (
+                "antenna_duration_right_s = 1.4",
+                Overrides {
+                    antenna_sides: [Some(Duration::from_millis(1_400)), None],
+                    ..Overrides::default()
+                },
+            ),
+            (
+                "antenna_duration_left_s = 1.4",
+                Overrides {
+                    antenna_sides: [None, Some(Duration::from_millis(1_400))],
+                    ..Overrides::default()
+                },
+            ),
         ] {
             let config = Config::parse(&file(line)).expect("the file parses");
             config.validate().expect("the file validates");
@@ -445,6 +489,8 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
             ("antenna_duration_s", "nan"),
             ("up_duration_s", "inf"),
             ("stow_duration_s", "1e300"),
+            ("antenna_duration_right_s", "0.0"),
+            ("antenna_duration_left_s", "-0.3"),
         ] {
             let text = file(&format!("{key} = {value}"));
             let config = Config::parse(&text).expect("the file parses");
@@ -616,18 +662,26 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
         );
     }
 
-    /// The one value the example states rather than restates, and the two it
+    /// The one value the example states rather than restates, and the four it
     /// deliberately does not.
     ///
-    /// The antenna clock is a recommendation the file can back: its floor is
-    /// closed-form, and 1.5 s clears by real margin the 1.21 s worst case the
+    /// The shared antenna clock is a recommendation the file can back: its floor
+    /// is closed-form, and 1.5 s clears by real margin the 0.28 s worst case the
     /// daemon reaches re-stowing an antenna left inboard of sideways. The two
-    /// head-group clocks stay commented out at the bench file's own values,
-    /// because the shorter ones the raise wants are guesses until the machine has
-    /// been run at them — and a guess below the true floor is presence that
-    /// faults partway and drops the head, shipped to every unit that copies this.
+    /// head-group clocks stay commented out at the bench file's own values —
+    /// read off that file's defaults below rather than transcribed, because a
+    /// restated number is one that goes stale the first time the measured one
+    /// moves, which is what happened to the raise when the machine was finally
+    /// run at it. The two per-side clocks stay commented out because a stagger nobody chose
+    /// is not one this file should ship: the pair is parted at its crossing by
+    /// the resolver whatever these say, so what they change is the pace, and
+    /// pace is the operator's.
+    ///
+    /// That every key is present as a line either way is this file's premise,
+    /// and it is checked against the struct itself by the test below; what is
+    /// checked here is the handful of values those lines carry.
     #[test]
-    fn the_example_recommends_an_antenna_clock_and_no_head_clock() {
+    fn the_example_recommends_an_antenna_clock_and_no_other() {
         let text = include_str!("../reachy-motiond.example.toml");
         let example = Config::parse(text).expect("the example parses");
 
@@ -638,11 +692,70 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
                 ..Overrides::default()
             }
         );
-        for commented in ["\n# up_duration_s = 3.0", "\n# stow_duration_s = 2.0"] {
+        // The head-group lines restate the machine's own file, and the per-side
+        // lines restate the shared clock above them, so both are asked for as
+        // what they restate rather than as literals this file would have to
+        // chase.
+        let machine = reachy_bench::config::MotionSection::default();
+        let shared = example
+            .durations()
+            .antennas
+            .expect("the file recommends a shared antenna clock")
+            .as_secs_f64();
+        for commented in [
+            format!("\n# up_duration_s = {:.1}", machine.up_duration_s),
+            format!("\n# stow_duration_s = {:.1}", machine.stow_duration_s),
+            format!("\n# antenna_duration_right_s = {shared:.1}"),
+            format!("\n# antenna_duration_left_s = {shared:.1}"),
+        ] {
             assert!(
-                text.contains(commented),
+                text.contains(&commented),
                 "the example no longer carries `{}` for an operator to uncomment",
                 commented.trim()
+            );
+        }
+    }
+
+    /// Every key the daemon reads is a line in the example, live or commented.
+    ///
+    /// The file's premise, asked of the struct rather than of a list somebody
+    /// has to remember to extend. A key added to `Config` with no line here is
+    /// a knob nobody copying this file can find, and it slips past everything
+    /// else in this module by construction: an unstated optional key is `None`
+    /// in the example and `None` in the default, so nothing compares unequal.
+    ///
+    /// The key set comes out of the parser's own refusal. `deny_unknown_fields`
+    /// makes serde name every field it knows when it meets one it does not, so
+    /// the enumeration is the deserializer's and cannot drift from the struct.
+    #[test]
+    fn every_key_the_daemon_reads_is_a_line_in_the_example() {
+        let refusal = Config::parse(&file("a_key_no_daemon_reads = 1"))
+            .expect_err("a key nothing reads is refused")
+            .to_string();
+        let (_, listed) = refusal
+            .split_once("expected one of ")
+            .expect("the refusal names the fields it knows");
+        let keys: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        assert!(
+            keys.len() > 5,
+            "no key names were read out of the refusal, so this test is checking nothing: \
+             {refusal}"
+        );
+
+        let text = include_str!("../reachy-motiond.example.toml");
+        for key in keys {
+            // Live, commented out, or — for the table nested whole — its own
+            // header. The leading newline is what keeps `duration_s` from
+            // matching inside `antenna_duration_s`.
+            let forms = [
+                format!("\n{key} = "),
+                format!("\n# {key} = "),
+                format!("\n[{key}]"),
+            ];
+            assert!(
+                forms.iter().any(|form| text.contains(form)),
+                "the example carries no line for `{key}`, so it is a knob nobody copying the \
+                 file can find"
             );
         }
     }

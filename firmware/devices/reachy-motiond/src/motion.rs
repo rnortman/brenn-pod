@@ -71,7 +71,7 @@ use reachy_bench::commands::{
     Commissioned, Engaged, commission, neutral_targets, stow_pose_targets,
 };
 use reachy_bench::config::{self, Resolved, resolve_for_commanding};
-use reachy_bench::pump::{MonotonicClock, PumpError, TickEvent};
+use reachy_bench::pump::{ErrorClass, MonotonicClock, Phase as TorquePhase, PumpError, TickEvent};
 use reachy_bus::{BusPort, OpenError, SerialBusPort};
 use reachy_motion::{JointTargets, MoveDurations, PollCadence, at_stow};
 use serde_json::json;
@@ -257,7 +257,9 @@ pub struct Clock {
 /// The head group — the head pose and the body yaw, which the legs follow — and
 /// the antennas are independent joints, so they carry independent clocks: a lift
 /// tuned to be quick has no business being floored by an antenna arc long enough
-/// to stay inside its own per-tick step bound.
+/// to stay inside its own per-tick step bound. The antennas carry a clock each,
+/// because the pair's two tips cross inboard of the head and what parts them
+/// there is one side reaching the crossing ahead of the other.
 ///
 /// Resolved once, at startup, from two files. Narrated at startup too, sources
 /// included, because a head moving at a pace nobody expects is otherwise a
@@ -268,9 +270,9 @@ pub struct Clocks {
     pub up: Clock,
     /// The fold's head group.
     pub stow: Clock,
-    /// The antennas, or `None` when neither file gives them one and they run on
-    /// whichever head-group clock the move is using.
-    pub antennas: Option<Clock>,
+    /// Each antenna, right then left; `None` for a side neither file gives a
+    /// clock, which runs on whichever head-group clock the move is using.
+    pub antennas: [Option<Clock>; 2],
 }
 
 impl Clocks {
@@ -281,12 +283,12 @@ impl Clocks {
             resolved.up_duration,
             resolved.stow_duration,
             resolved.antenna_duration,
+            resolved.antenna_durations,
             overrides,
         )
     }
 
-    /// The resolution itself, in the three numbers the machine's file
-    /// contributes.
+    /// The resolution itself, in the numbers the machine's file contributes.
     ///
     /// Split out from [`Clocks::resolve`] because a `Resolved` is a whole bench
     /// configuration — a servo map, an envelope and a measured datum — and what
@@ -296,22 +298,18 @@ impl Clocks {
         bench_up: Duration,
         bench_stow: Duration,
         bench_antennas: Option<Duration>,
+        bench_sides: [Option<Duration>; 2],
         overrides: Overrides,
     ) -> Self {
         Self {
             up: pick(bench_up, overrides.up),
             stow: pick(bench_stow, overrides.stow),
-            antennas: match (overrides.antennas, bench_antennas) {
-                (Some(duration), _) => Some(Clock {
-                    duration,
-                    from: Source::Daemon,
-                }),
-                (None, Some(duration)) => Some(Clock {
-                    duration,
-                    from: Source::Bench,
-                }),
-                (None, None) => None,
-            },
+            antennas: [0, 1].map(|side| {
+                antenna(
+                    overrides.antenna_sides[side].or(overrides.antennas),
+                    bench_sides[side].or(bench_antennas),
+                )
+            }),
         }
     }
 
@@ -327,24 +325,35 @@ impl Clocks {
         self.durations(self.stow.duration)
     }
 
-    /// `head` for the head group, and the antennas' own clock beside it.
+    /// `head` for the head group, and each antenna's own clock beside it.
+    ///
+    /// Where a side is unstated the library decides what it runs on, asked
+    /// rather than restated: what an absent antenna clock means is the same
+    /// question for this daemon and for the operator tool, and two answers to
+    /// it would be two staggers.
     fn durations(&self, head: Duration) -> MoveDurations {
-        MoveDurations {
+        // Both shared keys are already folded into the two sides, with the file
+        // each came from recorded, so there is no shared clock left to state.
+        MoveDurations::resolved(
             head,
-            antennas: self.antennas.map_or(head, |clock| clock.duration),
-        }
+            None,
+            self.antennas.map(|side| side.map(|c| c.duration)),
+        )
     }
 
     /// The resolved durations, for the capture.
     #[must_use]
     pub fn json(&self) -> serde_json::Value {
+        let [right, left] = self.antennas;
         json!({
             "up_ms": millis(self.up.duration),
             "up_from": self.up.from.as_str(),
             "stow_ms": millis(self.stow.duration),
             "stow_from": self.stow.from.as_str(),
-            "antenna_ms": self.antennas.map(|clock| millis(clock.duration)),
-            "antenna_from": self.antennas.map(|clock| clock.from.as_str()),
+            "antenna_right_ms": right.map(|clock| millis(clock.duration)),
+            "antenna_right_from": right.map(|clock| clock.from.as_str()),
+            "antenna_left_ms": left.map(|clock| millis(clock.duration)),
+            "antenna_left_from": left.map(|clock| clock.from.as_str()),
         })
     }
 }
@@ -360,14 +369,44 @@ impl fmt::Display for Clocks {
             self.stow.from.as_str()
         )?;
         match self.antennas {
-            Some(clock) => write!(
+            [None, None] => f.write_str(", antennas on the head group's clock"),
+            [right, left] => write!(
                 f,
-                ", antennas {} ({})",
-                secs(clock.duration),
-                clock.from.as_str()
+                ", antennas right {}, left {}",
+                antenna_text(right),
+                antenna_text(left)
             ),
-            None => f.write_str(", antennas on the head group's clock"),
         }
+    }
+}
+
+/// One antenna's clock as the startup line words it.
+fn antenna_text(clock: Option<Clock>) -> String {
+    match clock {
+        Some(clock) => format!("{} ({})", secs(clock.duration), clock.from.as_str()),
+        None => "on the head group's clock".to_string(),
+    }
+}
+
+/// One antenna's clock: the first file to state one for that side, and which
+/// file that was.
+///
+/// Each file has already been asked for the side's own key before its shared
+/// one, so what arrives here is what each file has to say about *this* antenna.
+/// The daemon's answer wins, the same way round as every other duration —
+/// otherwise an operator moving one number would get a different answer
+/// depending on which number it was. `None` for a side neither file spoke for.
+fn antenna(stated: Option<Duration>, bench: Option<Duration>) -> Option<Clock> {
+    match (stated, bench) {
+        (Some(duration), _) => Some(Clock {
+            duration,
+            from: Source::Daemon,
+        }),
+        (None, Some(duration)) => Some(Clock {
+            duration,
+            from: Source::Bench,
+        }),
+        (None, None) => None,
     }
 }
 
@@ -541,7 +580,14 @@ pub enum EngageFailed {
 
 impl From<PumpError> for EngageFailed {
     fn from(error: PumpError) -> Self {
-        if error.is_gate_refusal() {
+        // Classified as though torque were on, which is the honest question to
+        // ask of an engage: the drive is the one path that crosses the torque
+        // line mid-run, and by the time an ending reaches this daemon the
+        // library has already released a machine it half-enabled. What answers
+        // `Refuse` under torque is what is judged before any transaction writes
+        // torque — the two gates among them — so nothing was written and the
+        // next script may ask again.
+        if error.class(TorquePhase::UnderTorque) == ErrorClass::Refuse {
             Self::Gate(error.into())
         } else {
             Self::Fault(error.into())
@@ -1033,16 +1079,26 @@ fn dedup_key(event: &TickEvent) -> TickEvent {
         },
         TickEvent::ReadRestored { .. } => TickEvent::ReadRestored { after: 0 },
         TickEvent::HealthRestored { .. } => TickEvent::HealthRestored { after: 0 },
-        // A stretch is a move's event, so it never reaches a dwell's filter at
-        // all. Keyed whole for the day that changes: two right-sizings of the
-        // same clock are two facts about the configuration, and a key that
-        // dropped the durations would swallow the second one.
+        // A stretch, a settle verdict and a filled trace buffer are a move's
+        // events, so they never reach a dwell's filter at all. Keyed whole for
+        // the day that changes: two right-sizings of the same clock are two
+        // facts about the configuration, and a key that dropped the durations
+        // would swallow the second one.
+        //
+        // The two endings a move can carry — a pair taken out of service, a
+        // move abandoned — are keyed whole for the reason a fault is: what they
+        // name is the condition, and two of them are two incidents.
         event @ (TickEvent::Command(_)
         | TickEvent::ReadLost { .. }
         | TickEvent::HealthLost { .. }
         | TickEvent::Health(_)
         | TickEvent::Stretched(_)
         | TickEvent::Completed
+        | TickEvent::Settled { .. }
+        | TickEvent::Unsettled { .. }
+        | TickEvent::TraceFull { .. }
+        | TickEvent::AntennasDegraded(_)
+        | TickEvent::Aborted(_)
         | TickEvent::Faulted(_)) => event,
     }
 }
@@ -1663,6 +1719,11 @@ fn reached(sink: &dyn Sink, posture: Posture) {
 /// commanded, because its timestamp is what a capture measures wake-to-motion
 /// against, and the stretch is not known until the command is accepted.
 ///
+/// An antenna clock lengthened to part the pair at their crossing arrives the
+/// same way and is recorded with the same fields, `dephased` telling the two
+/// apart: one says a configured value never fitted its span, the other says the
+/// pair as configured would have swept mirrored through the contact band.
+///
 /// Everything else a move reports is already on the console through the
 /// library's own words.
 fn moving(sink: &dyn Sink, event: TickEvent) {
@@ -1672,11 +1733,23 @@ fn moving(sink: &dyn Sink, event: TickEvent) {
             &json!({
                 "requested_head_s": stretch.requested.head.as_secs_f64(),
                 "effective_head_s": stretch.effective.head.as_secs_f64(),
-                "requested_antennas_s": stretch.requested.antennas.as_secs_f64(),
-                "effective_antennas_s": stretch.effective.antennas.as_secs_f64(),
+                "requested_antennas_s": secs_each(stretch.requested.antennas),
+                "effective_antennas_s": secs_each(stretch.effective.antennas),
+                "dephased": stretch.dephased,
+                "separation_rad": stretch.separation.map(|pair| pair.offset),
+                // What that separation was judged against, because the bar is
+                // configuration: the measurement alone says nothing about
+                // whether the pair cleared it.
+                "separation_required_rad": stretch.separation_required,
             }),
         );
     }
+}
+
+/// A pair of antenna clocks as the capture writes them: right then left, the
+/// order every per-side value in this daemon and in the motion library takes.
+fn secs_each(durations: [Duration; 2]) -> [f64; 2] {
+    durations.map(|duration| duration.as_secs_f64())
 }
 
 /// Fold the head if it is not folded, then release: the expected ending, and
@@ -1881,8 +1954,8 @@ mod tests {
     use reachy_bench::pump::ReadFailures;
     use reachy_bus::IdOutcome;
     use reachy_motion::{
-        ClockStretch, CommandDisposition, Fault, JointId, RegId, SeqError, SeqStep, ServoHealth,
-        StepContext,
+        AntennaPhaseConfig, ClockStretch, CommandDisposition, Fault, JointId, PhaseSeparation,
+        RegId, SeqError, SeqStep, ServoHealth, StepContext,
     };
 
     use super::*;
@@ -4184,8 +4257,15 @@ mod tests {
     /// stopped answering *during* an engage is a fault, not a gate refusal: the
     /// machine may be part way through taking torque, and "nothing was written"
     /// would be a lie about it.
+    ///
+    /// What is expected is everything the library judges before a transaction
+    /// writes torque — the supply gate, the health gate, and the voltage poll
+    /// behind them. Nothing was written for any of the three, the machine is
+    /// limp exactly where it stood, and the next script's engage may ask again;
+    /// parking a daemon over an unreadable rail is a person's evening for a
+    /// condition that clears itself.
     #[test]
-    fn only_a_torque_on_gate_makes_an_engage_failure_expected() {
+    fn only_a_pre_torque_refusal_makes_an_engage_failure_expected() {
         let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
         let mid_flight = EngageFailed::from(PumpError::Sequence(SeqError::NoAnswer { context }));
         assert!(
@@ -4193,13 +4273,123 @@ mod tests {
             "{mid_flight:?}"
         );
 
-        let gate = EngageFailed::from(PumpError::Sequence(SeqError::SupplyBelowFloor {
-            context,
-            readings: [5.5; JointId::COUNT],
-            lowest: 5.5,
-            limit: 6.0,
-        }));
-        assert!(matches!(gate, EngageFailed::Gate(_)), "{gate:?}");
+        for (what, refusal) in [
+            (
+                "the supply gate",
+                SeqError::SupplyBelowFloor {
+                    context,
+                    readings: [5.5; JointId::COUNT],
+                    lowest: 5.5,
+                    limit: 6.0,
+                },
+            ),
+            (
+                "the health gate",
+                SeqError::UnhealthyServo {
+                    context,
+                    bits: 0x20,
+                },
+            ),
+            (
+                "the voltage poll behind them",
+                SeqError::VoltageLow {
+                    context,
+                    readings: [5.5; JointId::COUNT],
+                    lowest: 5.5,
+                    limit: 6.0,
+                    waited: Duration::from_secs(30),
+                },
+            ),
+        ] {
+            let refused = EngageFailed::from(PumpError::Sequence(refusal));
+            assert!(
+                matches!(refused, EngageFailed::Gate(_)),
+                "{what}: {refused:?}"
+            );
+        }
+    }
+
+    /// Which side of the Gate/Fault split each ending class falls on, asked of
+    /// the whole class vocabulary rather than of a hand-picked few.
+    ///
+    /// The predicate this daemon routes on belongs to the library — Gate
+    /// exactly when the ending classifies as `Refuse` with torque on — so what
+    /// has to be pinned here is the split itself and the classification of the
+    /// endings an engage can produce. A sixth `ErrorClass` stops `class_slot`
+    /// below from compiling rather than quietly landing every ending it covers
+    /// on the Fault side, and an ending reclassified across the line fails its
+    /// own row.
+    #[test]
+    fn every_ending_class_falls_on_the_side_of_the_split_it_belongs_to() {
+        let context = StepContext::reg(SeqStep::PinAndEnable, 13, RegId::TorqueEnable);
+        // One ending per class. The rest-class immediate torque-off is the one
+        // class no `PumpError` carries today: every fault that asks for an
+        // immediate release asks for the park with it, and there is nothing to
+        // route until one does not.
+        let table: [(ErrorClass, Option<PumpError>); 5] = [
+            (
+                ErrorClass::Refuse,
+                Some(PumpError::Sequence(SeqError::SupplyBelowFloor {
+                    context,
+                    readings: [5.5; JointId::COUNT],
+                    lowest: 5.5,
+                    limit: 6.0,
+                })),
+            ),
+            (
+                ErrorClass::SlowStowToRest,
+                Some(PumpError::Fault(Fault::HeadObstructed {
+                    joint: JointId::Leg(0),
+                    error: 0.5,
+                })),
+            ),
+            (ErrorClass::ImmediateAllTorqueOffToRest, None),
+            (
+                ErrorClass::MaskedSlowStowToPark,
+                Some(PumpError::Fault(Fault::HeadServoFault {
+                    joint: JointId::Leg(0),
+                    id: 13,
+                    bits: 0x20,
+                })),
+            ),
+            (
+                ErrorClass::ImmediateAllTorqueOffToPark,
+                Some(PumpError::TorqueOffUnacked { id: 13 }),
+            ),
+        ];
+
+        let mut judged = [false; 5];
+        for (class, ending) in table {
+            judged[class_slot(class)] = true;
+            let Some(ending) = ending else { continue };
+            let carried = ending.class(TorquePhase::UnderTorque);
+            let named = ending.to_string();
+            assert_eq!(carried, class, "{named}");
+            assert_eq!(
+                matches!(EngageFailed::from(ending), EngageFailed::Gate(_)),
+                class == ErrorClass::Refuse,
+                "{named} classifies as {class:?}, and an engage put it on the wrong side of \
+                 nothing-was-written"
+            );
+        }
+        assert!(
+            judged.iter().all(|seen| *seen),
+            "an ending class named no representative: {judged:?}"
+        );
+    }
+
+    /// Which class this is, as a slot in the coverage above.
+    ///
+    /// Wildcard-free, so a class added to the doctrine cannot be left out of
+    /// the table by the table simply not mentioning it.
+    fn class_slot(class: ErrorClass) -> usize {
+        match class {
+            ErrorClass::Refuse => 0,
+            ErrorClass::SlowStowToRest => 1,
+            ErrorClass::ImmediateAllTorqueOffToRest => 2,
+            ErrorClass::MaskedSlowStowToPark => 3,
+            ErrorClass::ImmediateAllTorqueOffToPark => 4,
+        }
     }
 
     /// Nothing is acquired before the configuration resolves: a file that is not
@@ -4221,11 +4411,38 @@ mod tests {
         );
     }
 
-    /// The three numbers a bench configuration contributes, as the shipped
-    /// example resolves them: a three-second raise, a two-second fold, and no
-    /// antenna clock of its own.
-    fn bench() -> (Duration, Duration, Option<Duration>) {
-        (Duration::from_secs(3), Duration::from_secs(2), None)
+    /// The head-group numbers a bench configuration contributes, read off the
+    /// bench's own defaults rather than restated here — the raise moved once
+    /// already when the machine was measured, and a fixture that transcribes it
+    /// is a fixture describing a file it no longer matches.
+    fn bench() -> (Duration, Duration) {
+        let machine = config::MotionSection::default();
+        (
+            Duration::from_secs_f64(machine.up_duration_s),
+            Duration::from_secs_f64(machine.stow_duration_s),
+        )
+    }
+
+    /// Neither antenna named by the file being spoken of.
+    const NEITHER: [Option<Duration>; 2] = [None, None];
+
+    /// The two files' antenna keys laid over each other, on the bench head-group
+    /// clocks above — the only thing these cases vary.
+    fn laid(
+        bench_antennas: Option<Duration>,
+        bench_sides: [Option<Duration>; 2],
+        overrides: Overrides,
+    ) -> Clocks {
+        let (up, stow) = bench();
+        Clocks::lay_over(up, stow, bench_antennas, bench_sides, overrides)
+    }
+
+    /// One antenna clock, stated by one file.
+    fn from(duration: Duration, source: Source) -> Option<Clock> {
+        Some(Clock {
+            duration,
+            from: source,
+        })
     }
 
     /// A daemon whose file says nothing about the durations moves at exactly the
@@ -4233,8 +4450,8 @@ mod tests {
     /// having two descriptions of itself.
     #[test]
     fn nothing_stated_leaves_every_clock_to_the_machine() {
-        let (up, stow, antennas) = bench();
-        let clocks = Clocks::lay_over(up, stow, antennas, Overrides::default());
+        let (up, stow) = bench();
+        let clocks = laid(None, NEITHER, Overrides::default());
 
         assert_eq!(
             clocks.up,
@@ -4253,23 +4470,23 @@ mod tests {
         // No antenna clock anywhere is the antennas running on whichever head
         // group clock the move is using — so the two moves differ, which is what
         // one scalar warp for everything amounts to.
-        assert_eq!(clocks.antennas, None);
+        assert_eq!(clocks.antennas, NEITHER.map(|_| None));
         assert_eq!(clocks.up_durations(), MoveDurations::uniform(up));
         assert_eq!(clocks.stow_durations(), MoveDurations::uniform(stow));
     }
 
-    /// Each of the three is overridden alone. Presence pace is what this file
-    /// exists to tune, and a daemon that took the raise and quietly moved the
-    /// fold with it would be tuning the machine behind the bench file's back.
+    /// Each of the head-group clocks is overridden alone. Presence pace is what
+    /// this file exists to tune, and a daemon that took the raise and quietly
+    /// moved the fold with it would be tuning the machine behind the bench
+    /// file's back.
     #[test]
     fn a_stated_clock_overrides_the_machines_and_the_others_stand() {
-        let (up, stow, antennas) = bench();
+        let (up, stow) = bench();
         let stated = Duration::from_millis(1_400);
 
-        let raised = Clocks::lay_over(
-            up,
-            stow,
-            antennas,
+        let raised = laid(
+            None,
+            NEITHER,
             Overrides {
                 up: Some(stated),
                 ..Overrides::default()
@@ -4285,10 +4502,9 @@ mod tests {
         assert_eq!(raised.stow.duration, stow);
         assert_eq!(raised.stow.from, Source::Bench);
 
-        let folded = Clocks::lay_over(
-            up,
-            stow,
-            antennas,
+        let folded = laid(
+            None,
+            NEITHER,
             Overrides {
                 stow: Some(stated),
                 ..Overrides::default()
@@ -4306,17 +4522,17 @@ mod tests {
     }
 
     /// The antennas are mechanically independent of the head and sweep much
-    /// further, so their clock is independent too: one number, the same on both
-    /// moves, leaving each head group at its own pace. This is the whole point of
-    /// the split — a raise tuned to be quick is not floored by an antenna arc.
+    /// further, so their clocks are independent too: a shared number reaches
+    /// both sides on both moves and floors neither head group. This is the whole
+    /// point of the split — a raise tuned to be quick is not floored by an
+    /// antenna arc.
     #[test]
-    fn the_antenna_clock_is_the_same_on_both_moves_and_floors_neither_head_group() {
-        let (up, stow, _) = bench();
+    fn a_shared_antenna_clock_reaches_both_sides_of_both_moves() {
+        let (up, stow) = bench();
         let stated = Duration::from_millis(1_500);
-        let clocks = Clocks::lay_over(
-            up,
-            stow,
+        let clocks = laid(
             None,
+            NEITHER,
             Overrides {
                 antennas: Some(stated),
                 ..Overrides::default()
@@ -4325,90 +4541,163 @@ mod tests {
 
         assert_eq!(
             clocks.antennas,
-            Some(Clock {
-                duration: stated,
-                from: Source::Daemon
-            })
+            [from(stated, Source::Daemon), from(stated, Source::Daemon)]
         );
         assert_eq!(
             clocks.up_durations(),
             MoveDurations {
                 head: up,
-                antennas: stated
+                antennas: [stated; 2]
             }
         );
         assert_eq!(
             clocks.stow_durations(),
             MoveDurations {
                 head: stow,
-                antennas: stated
+                antennas: [stated; 2]
             }
+        );
+    }
+
+    /// The pair's two tips cross inboard of the head, and a pair sweeping
+    /// mirror-symmetrically meets there — so each side takes its own clock, and
+    /// a side stated alone must not pull the other side with it. The stated one
+    /// runs at what this file says; the other runs at what the pair's shared key
+    /// says, and where there is none, at the head group's clock.
+    #[test]
+    fn each_antenna_takes_its_own_clock_and_leaves_the_other_side_alone() {
+        let (up, _) = bench();
+        let right = Duration::from_millis(700);
+        let left = Duration::from_millis(300);
+
+        let one_side = laid(
+            None,
+            NEITHER,
+            Overrides {
+                antenna_sides: [Some(right), None],
+                ..Overrides::default()
+            },
+        );
+        assert_eq!(one_side.antennas, [from(right, Source::Daemon), None]);
+        assert_eq!(
+            one_side.up_durations(),
+            MoveDurations {
+                head: up,
+                antennas: [right, up]
+            }
+        );
+
+        let staggered = laid(
+            None,
+            NEITHER,
+            Overrides {
+                antenna_sides: [Some(right), Some(left)],
+                ..Overrides::default()
+            },
+        );
+        assert_eq!(
+            staggered.antennas,
+            [from(right, Source::Daemon), from(left, Source::Daemon)]
+        );
+        assert_eq!(
+            staggered.up_durations(),
+            MoveDurations {
+                head: up,
+                antennas: [right, left]
+            }
+        );
+    }
+
+    /// Within one file, a side's own key beats that file's shared one — the
+    /// chain the motion library resolves for the operator tool, which is where
+    /// it is stated and where it stays stated.
+    #[test]
+    fn a_sides_own_key_beats_the_shared_one_in_the_file_that_states_both() {
+        let side = Duration::from_millis(300);
+        let shared = Duration::from_millis(1_500);
+
+        let daemon = laid(
+            None,
+            NEITHER,
+            Overrides {
+                antennas: Some(shared),
+                antenna_sides: [None, Some(side)],
+                ..Overrides::default()
+            },
+        );
+        assert_eq!(
+            daemon.antennas,
+            [from(shared, Source::Daemon), from(side, Source::Daemon)]
+        );
+
+        let machine = laid(Some(shared), [None, Some(side)], Overrides::default());
+        assert_eq!(
+            machine.antennas,
+            [from(shared, Source::Bench), from(side, Source::Bench)]
         );
     }
 
     /// Where both files state an antenna clock, this one wins — the same rule as
     /// the head group's, and it has to be the same rule or an operator tuning one
-    /// number would get a different answer depending on which one it was.
+    /// number would get a different answer depending on which one it was. A
+    /// daemon that states a pace for the pair states it for the pair: its shared
+    /// key answers for a side the machine's file named, because otherwise the
+    /// tuning an operator wrote here would silently reach one antenna only.
     #[test]
     fn a_stated_antenna_clock_beats_the_machines_own() {
-        let (up, stow, _) = bench();
-        let clocks = Clocks::lay_over(
-            up,
-            stow,
+        let stated = Duration::from_millis(1_500);
+        let clocks = laid(
             Some(Duration::from_secs(1)),
+            [Some(Duration::from_millis(700)), None],
             Overrides {
-                antennas: Some(Duration::from_millis(1_500)),
+                antennas: Some(stated),
                 ..Overrides::default()
             },
         );
 
         assert_eq!(
             clocks.antennas,
-            Some(Clock {
-                duration: Duration::from_millis(1_500),
-                from: Source::Daemon
-            })
+            [from(stated, Source::Daemon), from(stated, Source::Daemon)]
         );
     }
 
-    /// The machine's own antenna clock reaches the moves, and is reported as the
-    /// machine's. A bench file that already split the two groups is not a file
-    /// this daemon has to be told about twice.
+    /// The machine's own antenna clocks reach the moves, and are reported as the
+    /// machine's. A bench file that already split the two groups — or the pair —
+    /// is not a file this daemon has to be told about twice.
     #[test]
-    fn the_machines_antenna_clock_is_used_and_attributed() {
-        let (up, stow, _) = bench();
-        let clocks = Clocks::lay_over(up, stow, Some(Duration::from_secs(1)), Overrides::default());
+    fn the_machines_antenna_clocks_are_used_and_attributed() {
+        let shared = Duration::from_secs(1);
+        let left = Duration::from_millis(300);
+        let clocks = laid(Some(shared), [None, Some(left)], Overrides::default());
 
         assert_eq!(
             clocks.antennas,
-            Some(Clock {
-                duration: Duration::from_secs(1),
-                from: Source::Bench
-            })
+            [from(shared, Source::Bench), from(left, Source::Bench)]
         );
-        assert_eq!(clocks.up_durations().antennas, Duration::from_secs(1));
+        assert_eq!(clocks.up_durations().antennas, [shared, left]);
     }
 
-    /// What the startup line and the capture say. Both numbers and both files:
-    /// the override is invisible in the bench configuration, so a head moving at
-    /// a pace nobody expects is otherwise two files and a guess to explain.
+    /// What the startup line and the capture say. Every number and the file
+    /// each came from: the override is invisible in the bench configuration, so
+    /// a head moving at a pace nobody expects is otherwise two files and a guess
+    /// to explain — and which side of the pair is running slow is a question the
+    /// crossing makes worth asking.
     #[test]
     fn the_startup_line_names_every_clock_and_the_file_it_came_from() {
-        let (up, stow, _) = bench();
-        let clocks = Clocks::lay_over(
-            up,
-            stow,
-            None,
+        let clocks = laid(
+            Some(Duration::from_millis(1_500)),
+            NEITHER,
             Overrides {
                 up: Some(Duration::from_millis(1_400)),
-                antennas: Some(Duration::from_millis(1_500)),
+                antenna_sides: [None, Some(Duration::from_millis(300))],
                 ..Overrides::default()
             },
         );
 
         assert_eq!(
             clocks.to_string(),
-            "up 1.400 s (daemon), stow 2.000 s (bench), antennas 1.500 s (daemon)"
+            "up 1.400 s (daemon), stow 2.000 s (bench), \
+             antennas right 1.500 s (bench), left 0.300 s (daemon)"
         );
         assert_eq!(
             clocks.json(),
@@ -4417,20 +4706,54 @@ mod tests {
                 "up_from": "daemon",
                 "stow_ms": 2_000,
                 "stow_from": "bench",
-                "antenna_ms": 1_500,
-                "antenna_from": "daemon",
+                "antenna_right_ms": 1_500,
+                "antenna_right_from": "bench",
+                "antenna_left_ms": 300,
+                "antenna_left_from": "daemon",
             })
         );
 
         // And with no antenna clock anywhere, the line says what the antennas do
         // instead rather than leaving a number out.
-        let plain = Clocks::lay_over(up, stow, None, Overrides::default());
+        let plain = laid(None, NEITHER, Overrides::default());
+        let (up, stow) = bench();
         assert_eq!(
             plain.to_string(),
-            "up 3.000 s (bench), stow 2.000 s (bench), antennas on the head group's clock"
+            format!(
+                "up {:.3} s (bench), stow {:.3} s (bench), antennas on the head group's clock",
+                up.as_secs_f64(),
+                stow.as_secs_f64()
+            )
         );
-        assert_eq!(plain.json()["antenna_ms"], serde_json::Value::Null);
-        assert_eq!(plain.json()["antenna_from"], serde_json::Value::Null);
+        for absent in [
+            "antenna_right_ms",
+            "antenna_right_from",
+            "antenna_left_ms",
+            "antenna_left_from",
+        ] {
+            assert_eq!(plain.json()[absent], serde_json::Value::Null, "{absent}");
+        }
+
+        // One side stated and the other not is the line saying both, because a
+        // pair reported as one number is the mirrored sweep this daemon is
+        // meant to make visible.
+        let half = laid(
+            None,
+            NEITHER,
+            Overrides {
+                antenna_sides: [Some(Duration::from_millis(700)), None],
+                ..Overrides::default()
+            },
+        );
+        assert_eq!(
+            half.to_string(),
+            format!(
+                "up {:.3} s (bench), stow {:.3} s (bench), \
+                 antennas right 0.700 s (daemon), left on the head group's clock",
+                up.as_secs_f64(),
+                stow.as_secs_f64()
+            )
+        );
     }
 
     /// The only place a script's posture becomes a pose. Swapping the arms
@@ -4635,7 +4958,7 @@ mod tests {
     /// about.
     #[test]
     fn a_fault_is_printed_even_in_the_middle_of_an_episode() {
-        let faulted = TickEvent::Faulted(Fault::ReadLoss { misses: 12 });
+        let faulted = TickEvent::Faulted(Fault::PositionFeedbackLost { misses: 12 });
         let said = through([
             vec![lost()],
             vec![lost()],
@@ -4941,14 +5264,14 @@ mod tests {
     fn a_stretched_clock_is_recorded_with_both_durations() {
         let shared = Arc::new(Shared::new(POD));
         let stretch = ClockStretch {
-            requested: MoveDurations {
-                head: Duration::from_millis(2_000),
-                antennas: Duration::from_millis(2_000),
-            },
+            requested: MoveDurations::uniform(Duration::from_millis(2_000)),
             effective: MoveDurations {
                 head: Duration::from_millis(3_400),
-                antennas: Duration::from_millis(2_000),
+                antennas: [Duration::from_millis(2_000); 2],
             },
+            separation: None,
+            separation_required: AntennaPhaseConfig::default().separation_rad,
+            dephased: false,
         };
         let head = Fake::new(&shared, [Event::Stop(Stop::Operator)])
             // Left most of a turn round, so the boot folds it: the move whose
@@ -4967,11 +5290,120 @@ mod tests {
         );
         assert_eq!(stretches[0]["requested_head_s"], json!(2.0));
         assert_eq!(stretches[0]["effective_head_s"], json!(3.4));
-        assert_eq!(stretches[0]["requested_antennas_s"], json!(2.0));
+        assert_eq!(stretches[0]["requested_antennas_s"], json!([2.0, 2.0]));
         assert_eq!(
             stretches[0]["effective_antennas_s"],
-            json!(2.0),
+            json!([2.0, 2.0]),
             "the group that fitted is reported as it was asked for: {stretches:?}"
+        );
+        assert_eq!(stretches[0]["dephased"], json!(false));
+        assert_eq!(stretches[0]["separation_rad"], serde_json::Value::Null);
+    }
+
+    /// A clock lengthened to part the antennas at their crossing is the same
+    /// event and is told apart by its own field.
+    ///
+    /// The two are different facts about a configuration: one says a duration
+    /// was never sized for the span it met, the other says the pair as
+    /// configured would have swept mirror-symmetrically through the band where
+    /// the tips can touch — the collision that latched two antenna servos on
+    /// the bench. A capture that reported them alike would leave the second
+    /// looking like an over-cautious floor.
+    #[test]
+    fn a_de_phased_pair_says_which_side_was_held_and_what_it_bought() {
+        let shared = Arc::new(Shared::new(POD));
+        let asked = Duration::from_millis(800);
+        let stretch = ClockStretch {
+            requested: MoveDurations::uniform(asked),
+            effective: MoveDurations {
+                head: asked,
+                antennas: [Duration::from_millis(970), asked],
+            },
+            separation: Some(PhaseSeparation {
+                offset: 0.63,
+                later: JointId::AntennaRight,
+                at: Duration::from_millis(410),
+                leader_rate: 4.5,
+            }),
+            separation_required: 0.6,
+            dephased: true,
+        };
+        let head = Fake::new(&shared, [Event::Raise, Event::Stop(Stop::Operator)])
+            .reporting_moving([vec![TickEvent::Stretched(stretch)]]);
+
+        let (outcome, _, sink) = driven(&shared, head);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        let stretches = sink.all_fields("motion_clock_stretched");
+        assert_eq!(stretches.len(), 1, "{stretches:?}");
+        assert_eq!(stretches[0]["dephased"], json!(true));
+        assert_eq!(stretches[0]["separation_rad"], json!(0.63));
+        assert_eq!(
+            stretches[0]["separation_required_rad"],
+            json!(0.6),
+            "the measurement is read against the bar it was judged by: {stretches:?}"
+        );
+        assert_eq!(
+            stretches[0]["effective_antennas_s"],
+            json!([0.97, 0.8]),
+            "the side that was held is readable off the pair: {stretches:?}"
+        );
+        assert_eq!(
+            stretches[0]["effective_head_s"],
+            json!(0.8),
+            "de-phasing the pair never touches the head's clock: {stretches:?}"
+        );
+    }
+
+    /// A pair the resolver could not part is recorded too, on clocks it left
+    /// exactly as they were asked for.
+    ///
+    /// The third shape of this event and the only one that is not about a
+    /// duration changing: the move swept both tips through the crossing under
+    /// the bar, and no delay would have parted them — a leader already stopped,
+    /// a crossing at the very start of the path, a side already at its cap. The
+    /// clocks are the answer to nothing, so the row is the whole record that it
+    /// happened, and on a fielded pod the capture is the only place it lands.
+    /// Suppressing the event when the clocks come back unchanged would delete
+    /// every converging sweep from that record.
+    #[test]
+    fn a_pair_nothing_could_part_is_recorded_on_the_clocks_it_ran() {
+        let shared = Arc::new(Shared::new(POD));
+        let asked = Duration::from_millis(800);
+        let stretch = ClockStretch {
+            requested: MoveDurations::uniform(asked),
+            effective: MoveDurations::uniform(asked),
+            separation: Some(PhaseSeparation {
+                offset: 0.09,
+                later: JointId::AntennaLeft,
+                at: Duration::from_millis(120),
+                leader_rate: 0.0,
+            }),
+            separation_required: 0.6,
+            dephased: false,
+        };
+        let head = Fake::new(&shared, [Event::Raise, Event::Stop(Stop::Operator)])
+            .reporting_moving([vec![TickEvent::Stretched(stretch)]]);
+
+        let (outcome, _, sink) = driven(&shared, head);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        let stretches = sink.all_fields("motion_clock_stretched");
+        assert_eq!(
+            stretches.len(),
+            1,
+            "a sweep that ran under the bar left no record of it: {stretches:?}"
+        );
+        assert_eq!(stretches[0]["separation_rad"], json!(0.09));
+        assert_eq!(stretches[0]["separation_required_rad"], json!(0.6));
+        assert_eq!(
+            stretches[0]["dephased"],
+            json!(false),
+            "nothing was de-phased, and the row must not read as though it was: {stretches:?}"
+        );
+        assert_eq!(
+            stretches[0]["effective_antennas_s"], stretches[0]["requested_antennas_s"],
+            "the pair ran on the clocks it was asked for: {stretches:?}"
         );
     }
 

@@ -20,11 +20,13 @@ The fault-management doctrine for the Reachy motion stack (including
 `reachy-motiond` in this repo) lives at `docs/fault-management.md` in the
 sibling `brenn-reachy` checkout (`../brenn-reachy/docs/fault-management.md`).
 Read it before touching anything that arms, disarms, or handles a motion
-fault. The short form: the Minimum Risk Condition is *stowed and de-torqued*;
-a fault response de-torques the motors (controlled stow first when control is
-trusted, immediate best-effort torque-off when it is not); **nothing ever
-gates de-torquing**; holding torque is never a fault response — stowed with
-torque held is that machine's only pinch hazard.
+fault. Only the two invariants that hold whatever the response are restated
+here: the Minimum Risk Condition is *stowed and de-torqued*, **nothing ever
+gates de-torquing**, and holding torque is never a fault response — stowed
+with torque held is that machine's only pinch hazard. Which motors a given
+response covers, what latches, and how a session recovers are in that
+document and only there; a second summary of them in this repo is a copy that
+drifts.
 
 ## Device Deployment Doctrine (dev cycles)
 
