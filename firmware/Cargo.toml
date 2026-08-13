@@ -49,26 +49,17 @@ license = "Apache-2.0"
 esp-idf-svc = { version = "0.52.1" }
 log = "0.4"
 
-# Build the motion crates out of the clone beside this repository instead of the
-# revision the daemon's manifest pins.
+# Uncomment to build the motion crates out of the clone beside this repository
+# instead of the revisions devices/reachy-motiond/Cargo.toml pins. For local work
+# on the pod and the motion library together; a machine without the clone then
+# fails to resolve, and public CI cannot see it, so the table stays commented out
+# on anything that is pushed. Re-pin the three `rev =` values and regenerate
+# Cargo.lock before commenting it back out.
 #
-# Not a convenience: the daemon reads `Commissioned::fresh()` to decide whether
-# it may enable torque, and it refuses an engage rather than parking when a
-# position sweep fails. That refusal is only correct against a library whose
-# failed sweep clears the freshness flag, which the pinned revision's does not —
-# built against it, a wake after a failed sweep would pin nine goal registers at
-# a posture measured before the outage and then enable torque. So while this
-# table stands, every build of this workspace is the coherent pair, and a
-# machine without the clone fails to resolve rather than compiling that hazard.
-#
-# The pins move at the ship gate, once the motion clone is pushed: bump the three
-# `rev =` values in devices/reachy-motiond/Cargo.toml to the pushed revision,
-# comment this table out, regenerate Cargo.lock. Public CI cannot see the clone,
-# so it stays red until that runs.
-[patch."https://github.com/rnortman/brenn-reachy"]
-reachy-bench = { path = "../../brenn-reachy/crates/reachy-bench" }
-reachy-bus = { path = "../../brenn-reachy/crates/reachy-bus" }
-reachy-motion = { path = "../../brenn-reachy/crates/reachy-motion" }
+# [patch."https://github.com/rnortman/brenn-reachy"]
+# reachy-bench = { path = "../../brenn-reachy/crates/reachy-bench" }
+# reachy-bus = { path = "../../brenn-reachy/crates/reachy-bus" }
+# reachy-motion = { path = "../../brenn-reachy/crates/reachy-motion" }
 
 [profile.release]
 opt-level = "s"

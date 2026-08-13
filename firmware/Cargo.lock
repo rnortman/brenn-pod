@@ -661,6 +661,7 @@ dependencies = [
 [[package]]
 name = "dxl-proto"
 version = "0.1.0"
+source = "git+https://github.com/rnortman/brenn-reachy?rev=ace6065cb7cc01679a72c27a803270d1a9cd3a32#ace6065cb7cc01679a72c27a803270d1a9cd3a32"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -1933,6 +1934,7 @@ checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
 [[package]]
 name = "reachy-bench"
 version = "0.1.0"
+source = "git+https://github.com/rnortman/brenn-reachy?rev=ace6065cb7cc01679a72c27a803270d1a9cd3a32#ace6065cb7cc01679a72c27a803270d1a9cd3a32"
 dependencies = [
  "anyhow",
  "dxl-proto",
@@ -1947,6 +1949,7 @@ dependencies = [
 [[package]]
 name = "reachy-bus"
 version = "0.1.0"
+source = "git+https://github.com/rnortman/brenn-reachy?rev=ace6065cb7cc01679a72c27a803270d1a9cd3a32#ace6065cb7cc01679a72c27a803270d1a9cd3a32"
 dependencies = [
  "dxl-proto",
  "libc",
@@ -1958,6 +1961,7 @@ dependencies = [
 [[package]]
 name = "reachy-kin"
 version = "0.1.0"
+source = "git+https://github.com/rnortman/brenn-reachy?rev=ace6065cb7cc01679a72c27a803270d1a9cd3a32#ace6065cb7cc01679a72c27a803270d1a9cd3a32"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.18",
@@ -1966,6 +1970,7 @@ dependencies = [
 [[package]]
 name = "reachy-motion"
 version = "0.1.0"
+source = "git+https://github.com/rnortman/brenn-reachy?rev=ace6065cb7cc01679a72c27a803270d1a9cd3a32#ace6065cb7cc01679a72c27a803270d1a9cd3a32"
 dependencies = [
  "nalgebra",
  "reachy-kin",

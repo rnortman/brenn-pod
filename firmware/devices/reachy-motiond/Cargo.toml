@@ -17,27 +17,27 @@ license.workspace = true
 # clippy and tests cover it.
 
 [dependencies]
-# The three `rev =` pins below are stale on purpose: the revision this daemon
-# needs is not pushed yet, and the workspace manifest's [patch] table redirects
-# all three at the clone beside this repository until it is. Read that table
-# before touching them — built against the pinned revision alone, this daemon
-# would enable torque at a posture it never measured.
+# The three `rev =` pins below move together: they are one motion revision, and
+# this daemon's refusal to engage after a failed position sweep is only correct
+# against a library whose failed sweep clears the freshness flag. Bump all three
+# or none. The workspace manifest carries a commented-out [patch] table that
+# redirects them at a local clone for joint work on both repositories.
 #
 # The motion repository's bring-up host, library half: the two standing gates (a
 # resolved crank datum and a green self-test record), the armed session, and the
 # neutral and stow postures. A git dependency because the dependency arrow runs
 # this way and never the reverse — the motion crates know nothing of a bus, a pod
 # identity or a presence channel.
-reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "b4274b28a3c7f66484ac8ea3678049da7ce60c8b" }
+reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "ace6065cb7cc01679a72c27a803270d1a9cd3a32" }
 # The serial port and the typed refusal when something else already holds it.
 # Named directly because opening the port and classifying that refusal is the
 # daemon's; everything after the open goes through the session.
-reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "b4274b28a3c7f66484ac8ea3678049da7ce60c8b" }
+reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "ace6065cb7cc01679a72c27a803270d1a9cd3a32" }
 # The joint-target type the two postures are expressed in. Named so the
 # posture-to-pose mapping can be a function of this daemon's own, with the type in
 # its signature, instead of living inside a trait implementation that needs a
 # servo bus to reach.
-reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "b4274b28a3c7f66484ac8ea3678049da7ce60c8b" }
+reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "ace6065cb7cc01679a72c27a803270d1a9cd3a32" }
 # The motion-script schema and the executor state that runs one, shared with the
 # scripter on the speech host so neither end carries protocol logic of its own.
 motion-proto = { path = "../../crates/motion-proto" }
