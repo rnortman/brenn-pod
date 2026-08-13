@@ -55,7 +55,7 @@ pub use cells::{Delivered, FaultReport, FaultStage, Shared, Stop};
 pub use cli::{Invocation, exit_code};
 pub use config::{Config, ConfigError, Overrides};
 pub use motion::{
-    Active, Clock, Clocks, Machine, Outcome, Refusal, Rest, Source, StartupError, Timing,
+    Active, Clock, Clocks, Incident, Machine, Outcome, Refusal, Rest, Source, StartupError, Timing,
 };
 pub use report::{Sink, Streams};
 pub use state::{Phase, Surface, Watching};

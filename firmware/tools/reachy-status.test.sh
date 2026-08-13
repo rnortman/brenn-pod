@@ -282,6 +282,43 @@ check "a-stopping-daemon-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $O
 says "a-stopping-daemon-says-so" 'MISSING.*shutting down'
 silent_about "a-stopping-daemon-is-not-called-ready" '^reachy-status.*: ready'
 
+# Two limp antennas on a robot holding a conversation perfectly well. Reported,
+# because nothing else about the machine looks any different; not counted,
+# because the head has its presence and no push or restart is the answer — the
+# next raise retries the pair.
+new_tree
+provision_all
+daemon_says state=active watch=ok antennas=degraded
+run_tool reachy-dev
+check "degraded-antennas-are-still-ready" "$(yes_no [ "$EC" = 0 ])" "exit ${EC}: $OUT"
+says "degraded-antennas-are-reported" '\-\-.*antennas are out of service'
+says "degraded-antennas-say-the-head-is-fine" 'head is unaffected'
+says "degraded-antennas-say-what-retries-them" 'next raise retries them'
+says "degraded-antennas-are-still-called-ready" '^reachy-status.*: ready'
+
+# The same field on a whole machine says nothing at all: a line per healthy
+# antenna pair is a line nobody reads, on the output an operator scans for the
+# one thing that is wrong.
+new_tree
+provision_all
+daemon_says state=active watch=ok antennas=ok
+run_tool reachy-dev
+silent_about "healthy-antennas-are-not-mentioned" 'antennas'
+
+# A parked daemon whose fault detail carries the separator this probe packs its
+# answer with. The detail is the motion libraries' own wording, so it is the one
+# field that can contain anything; it goes last for exactly this reason.
+new_tree
+provision_all
+daemon_says state=parked watch=ok antennas=ok \
+	'fault_stage=the motion loop' 'fault_detail=servo 4: timed out|and 5 too'
+run_tool reachy-dev
+check "a-detail-with-a-separator-is-still-parked" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
+# Bracketed, because `says` matches an extended regex: an unescaped `|` here
+# would be an alternation, and the case would pass on either half alone — which
+# is every truncation it exists to catch.
+says "a-detail-with-a-separator-is-read-whole" 'servo 4: timed out[|]and 5 too'
+
 # A phase this script predates. Host and daemon are pushed separately, so the
 # skew is a state this command will meet — and the answer that must never come
 # out of it is `ready`.

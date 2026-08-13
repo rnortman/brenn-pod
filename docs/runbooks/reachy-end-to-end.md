@@ -301,8 +301,8 @@ would let systemd's restart policy re-torque a machine nobody has looked at. So
 `systemctl is-active` calls a parked daemon running. It writes `starting`, `resting`,
 `active`, `parked` or `stopping` to `/run/reachy-motiond/state` — its unit's
 `RuntimeDirectory`, so the file goes away with the service and can never be stale — along
-with whether its pre-torque sweeps are answering. `reachy-status` reads that file and says
-so:
+with whether its pre-torque sweeps are answering and whether the antennas are still in the
+moves. `reachy-status` reads that file and says so:
 
 - `resting` or `active`, sweeps answering → `OK`.
 - `parked` → `MISSING`, printing the fault's stage and detail. Read
@@ -310,6 +310,9 @@ so:
   clear a fault and the report says as much.
 - sweeps failing → `MISSING`. The machine is limp and safe, and no wake will raise the
   head until the servo bus answers again; it recovers by itself when it does.
+- the antennas out of service → an informational `--` line, never counted against
+  readiness. The head keeps its presence and every script still runs, so this is news
+  rather than unreadiness; the symptom table below says what to do with it.
 - no file while the unit is running → `MISSING`: the daemon has only just started, or the
   deployed binary predates the state file. Re-run, then redeploy if it persists.
 
@@ -406,8 +409,9 @@ reads its configuration once, so follow it with `make -C firmware reachy-motiond
 | `rest_poll_ms` | 100 | How often the resting watch sweeps a limp machine. Bounds how stale the pose an engage plans from can be, and how long a script asking for the head up waits |
 | `rest_delay_ms` | 5000 | How long the head holds at stow, still torqued, before torque comes off. The quick-follow-up window. Refused above 60000 |
 | `up_duration_s` | unset | Overrides the machine's own raise duration for this daemon alone |
-| `stow_duration_s` | unset | The same for the fold |
-| `antenna_duration_s` | 1.5 in the example | The antennas' own clock. They are mechanically independent of the head group, which is why a quick lift is not floored by an antenna arc |
+| `stow_duration_s` | unset | The same for the fold. The budget a *defeated* stow gets comes from the machine's file, not from here, so setting this longer than the machine's own value spends that budget inside this daemon's leisurely controlled stow: a stow a grabbed head defeats then escalates straight to torque off instead of through the masked stow. Torque comes off sooner, with the head not yet stowed |
+| `antenna_duration_s` | 1.5 in the example | The antennas' shared clock. They are mechanically independent of the head group, which is why a quick lift is not floored by an antenna arc. The two tips cross inboard over the head, and the resolver measures every commanded pair at that crossing and lengthens the later side until they clear it — whatever this key resolves to. So what a value here buys is the pace at which the pair is parted, never the parting itself |
+| `antenna_duration_right_s`, `antenna_duration_left_s` | unset | One clock per antenna, overriding the shared key for that side alone. What they are for is choosing the stagger yourself: the side given the longer clock is the one that reaches the crossing second. Left unset — as the example ships them — both sides ride the shared clock and the resolver stands the pair apart, saying in the capture which side it lengthened |
 
 **The machine** — brenn-reachy `.local/reachy-bench.toml`. Pushed by
 `make -C firmware reachy-bench-config` (or brenn-reachy's own `make bench-config`), and
@@ -418,19 +422,22 @@ platforms.
 |---|---|---|
 | `up_duration_s`, `stow_duration_s`, `move_duration_s` | `[motion]` | The head group's clocks — the head pose and the body yaw, which the six legs follow through the IK. What the daemon governs unless it overrides them |
 | `antenna_duration_s` | `[motion]` | The antennas' clock; absent means they ride whichever head-group clock the move is using |
-| `max_step_legs_rad`, `max_step_body_yaw_rad`, `max_step_antennas_rad` | `[motion]` | Not timings — the per-tick bounds a duration has to clear. A move whose span will not fit at the duration asked for runs on a clock stretched to fit; the guard past that is a **fault**, never a clamp, and a fault takes torque off |
+| `max_step_legs_rad`, `max_step_body_yaw_rad`, `max_step_antennas_rad` | `[motion]` | Not timings — the per-tick bounds a duration has to clear. A move whose span will not fit at the duration asked for runs on a clock stretched to fit. The guard past that abandons the move where it stands and is **never** a clamp: the wide goal is not sent at all, and the machine keeps its torque, so the head comes down under control and ends at rest rather than dropping where it was |
 | `tick_hz` | `[motion]` | The control period those bounds are per |
 
-Duration floors are the thing to read before shortening a move. Both example TOMLs carry
-them with the arithmetic: a shaped move's peak rate is 1.875 times its average, so for a
-joint moving linearly the floor is `1.875 × span ÷ (bound × tick_hz)`. At the shipped
-bounds and 50 Hz that is 1.07 s for the head group, 0.79 s for the body yaw from the
-60° cap (1.571 s cap to cap), and 0.81/1.21/1.57 s for the antennas depending on the arc.
-A duration under its floor is a move the library right-sizes before it commands it: the
-path is unchanged and traversed more slowly, and a `motion_clock_stretched` line in the
-capture carries what was asked for beside what it ran on. So a value set too low costs a
-slower move and a line of output. The case this exists for is the startup fold out of a
-machine a hand left most of a turn round, which no configured clock can be sized for.
+Duration floors are the thing to read before shortening a move, and they are stated where
+you edit a duration: the FLOORS comment of `crates/reachy-bench/reachy-bench.example.toml` in
+the sibling brenn-reachy checkout carries the per-joint seconds, where they come from, and
+what the effective clock carries on top of them. The daemon's example restates the seconds beside its own keys. This document does not
+repeat either, because a floor moves with the bounds and the tick rate and a third copy of
+it is a copy that goes stale.
+
+What matters here is the consequence. A duration under its floor is a move the library
+right-sizes before it commands it: the path is unchanged and traversed more slowly, and a
+`motion_clock_stretched` line in the capture carries what was asked for beside what it ran
+on. So a value set too low costs a slower move and a line of output, never a move that stops
+partway or a head that settles limp — and that, a configured clock under the floor for the
+span being asked for, is the everyday case the stretch exists for.
 
 ## When it does not work
 
@@ -479,7 +486,8 @@ And the motion half:
 | `reachy-status` says the daemon **cannot read the machine** | The servo bus stopped answering the resting sweeps. The machine is limp and safe, and the daemon keeps sweeping and recovers on its own — but no wake raises the head until it does. Check the serial cabling and the bus node; nothing needs restarting |
 | `reachy-motiond.service` is installed but not running | Its `ConditionPathExists` lines are unmet — one of the three motion files is missing, which is what keeps a half-provisioned device quiet instead of crash-looping. `reachy-status` names which one |
 | The service exits and systemd does not restart it | Exit 6 is a fault: the machine is limp at stow and restarting is noise until someone looks at the journal. Exit 7 is a futile bus attachment — a token, a URL or an ACL. Neither is restarted on purpose |
-| The head stops partway through a move and goes limp | A per-tick step bound faulted the move; the journal names the joint. Almost always a duration under its floor — see the knob map. This is the sanctioned outcome, not a malfunction: the alternative is a clamp that lies about where the machine is |
+| A script stops partway through, the journal names a joint and a step, and `reachy-status` still says the daemon is ready | A per-tick step bound abandoned the move: the goal past the bound is never clamped and sent. The head then comes down under control, the daemon returns to `resting` and takes the next script, and nothing latches — which is why it also raises an alert, since from outside a daemon that stopped a script and one that had a quiet hour look the same. A duration under its floor is *not* a plausible cause any more: the library right-sizes such a clock before commanding it. This means a planner defect, so keep the journal and report it |
+| `reachy-status` prints a `--` line saying the antennas are out of service | The pair was taken out of the moves — torque off on the two antennas, the head untouched. One of three things: an antenna stopped tracking its goal mid-sweep (a hand, a snag, or two tips meeting at the crossing), an antenna's hardware-error byte came up on the health poll, or the engage's own health gate found such a byte already latched and started the session without the pair. Nothing is unready: the head keeps its presence and every script still runs, so no push and no restart is the answer, and the status line is informational and uncounted on purpose. One Warning alert goes out when it starts, not one per wake; the state file carries `antennas=degraded` for as long as it stands, and the next engage retries the pair — so look the two antennas over for a snag before it does. `reachy-bench reboot` clears a latch the retry cannot |
 | The head comes down late, at a flat ~30 s | That is a hold script running out its `presence_max_engaged_ms`, which means the closing script never went out. The host's JSONL says whether one was published. Two consecutive losses are needed for this now: the host sends the stow once more at the first refresh past it |
 | The daemon refuses a script and says the timeline outruns its timeout, or the timeout outruns 600000 ms | The publisher is not our scripter, or its arithmetic slipped past the host-side clamp. The script standing before it — and that script's timeout — still governs, so the head is still bounded. The host's `script_horizon_clamped` line names a stow instant that was cut back; its absence points at another publisher on the channel |
 | The head stays up with torque on for a long time after a turn | `rest_delay_ms`. It is the only knob that holds the pinch posture, which is why it is refused above 60 s |

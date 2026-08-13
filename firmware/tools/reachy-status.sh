@@ -97,7 +97,10 @@ active motiond_service ${motiond_service}
 # side, like everything else.
 if [ -f ${motiond_state} ]; then
 	field() { sed -n "s/^\$1=//p" ${motiond_state} | head -n 1; }
-	say motiond_state "\$(field state)|\$(field watch)|\$(field fault_stage)|\$(field fault_detail)"
+	# The fault detail goes last on purpose: it is the one field carrying text
+	# the motion libraries wrote, so anything appended after it would be read as
+	# part of it by a detail that happens to contain the separator.
+	say motiond_state "\$(field state)|\$(field watch)|\$(field antennas)|\$(field fault_stage)|\$(field fault_detail)"
 else
 	say motiond_state absent
 fi
@@ -207,8 +210,8 @@ done <<<"$answers"
 # A parked or degraded daemon counts against readiness but not against the
 # `make reachy-up` tally, so the closing advice stays true.
 judge_daemon() {
-	local packed=$1 state watch stage detail
-	IFS='|' read -r state watch stage detail <<<"$packed"
+	local packed=$1 state watch antennas stage detail
+	IFS='|' read -r state watch antennas stage detail <<<"$packed"
 
 	# An inactive unit is already a MISSING line of its own, and a state file
 	# that outlived its service says nothing trustworthy: RuntimeDirectory
@@ -230,6 +233,16 @@ judge_daemon() {
 			"$state"
 		unready=$((unready + 1))
 		return
+	fi
+
+	# The antennas being out of service is reported and never counted. The head
+	# keeps its presence, every script still runs, and the next raise retries the
+	# pair — so this is not a machine that is unready, and calling it one would
+	# hand back an exit status for something no push and no restart improves. It
+	# is still worth a line: two limp antennas are invisible on a robot holding a
+	# conversation perfectly well.
+	if [ "$antennas" = degraded ]; then
+		printf '  --       the antennas are out of service (the head is unaffected and keeps its presence). The last session left them limp; the next raise retries them — check the two antennas for a snag before it does\n'
 	fi
 
 	case "$state" in

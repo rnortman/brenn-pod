@@ -386,81 +386,122 @@ ASR tuning is the expected pick for a host-side wake-word/STT consumer).
 See `TODO(reachy-beam-mapping)` at `beam_energy_speech` in
 `firmware/devices/reachy-pod/src/beam.rs`.
 
-## `barge-in-flake` — BLOCKED as of 2026-08-02 (needs a stress campaign; not reproducible on demand)
+## `barge-in-flake` — not blocked as of 2026-08-13 (un-reproduced; the next failing gate run is the sample)
 
-During unrelated firmware work in 2026-08,
 `barge_in_flushes_playback_and_chains_the_interrupted_turn`
-(`host/crates/speech-surface/tests/barge_integration.rs`) failed once and rejected a
-commit. It did not reproduce: 15 solo re-runs plus 6 full host-workspace runs were all
-green, roughly a one-in-21 event. The captured tail showed the barge firing and the
-second turn already minted before the panic, which leans toward a race in the daemon
-rather than test timing — but the evidence is not conclusive, and a slow-host timing
-flake is not ruled out.
+(`host/crates/speech-surface/tests/barge_integration.rs`) fails when the machine it runs
+on is busy or has recently been busy, and passes when the machine is quiet. It has been
+rejecting commits in both workspaces since 2026-08-02, always green on an immediate
+re-run of the same tree with nothing disabled and no `--no-verify`.
 
-Both branches have stakes. A flaky test rejects commits at random in either workspace
-and trains everyone to re-run rather than read the failure. A daemon race means
-barge-in occasionally misbehaves on live hardware, where nothing re-runs it.
+**What has reproduced it, and what no longer does.** Every failure on the record is a
+failure of a workspace-parallel test run: the first two `make -C firmware check-host`
+runs that competed with a cold firmware build (the third passed, against zero failures in
+~18 warm or solo runs at the same HEAD), and later four consecutive failures of `cargo
+test -p speech-surface --test barge_integration` immediately after a full `make -C
+firmware check` on a docs-only tree, with `-- --nocapture` passing once and five plain
+runs a minute later green.
 
-Deferred because a one-in-21 irreproducible failure is a stress-campaign problem, not a
-read-the-code problem, and no work in flight touches the code it implicates.
+A deliberate localization run on 2026-08-13 reproduced nothing: 26 runs on that same
+workstation, all green, across three shapes — the recipe as it was written here, a
+corrected variant that generated real load (target directories wiped, 3.5 G rebuilt), and
+six cycles of the gate's own shape, including one from a cold 239-crate target directory
+(brenn-ops
+`docs/adr/2026/08/12-multi--head-presence-safety-gate-convergence-contd/barge-localization/results.md`).
+The run also found two defects in the recipe: on a clean tree the warm-up step is a
+16-second cache hit that generates no load — warming from clean means deleting the target
+directories first — and the standalone `cargo test -p speech-surface` invocation is not
+the shape any failure has ever occurred in. Any future attempt runs in gate shape, `make
+-C host check`.
 
-Next action: loop the test a few hundred times on a deliberately loaded host and capture
-the daemon JSONL plus the wire log on the first failure. Corollary from the note below:
-solo looping alone is insufficient — 29 cumulative clean isolated runs (15 at the original
-incident, 14 at the 2026-08-03 re-check) have produced nothing. Reproduce under
-load/contention resembling the judge's environment: whole-suite `speech-surface` runs on a
-loaded host.
+So the flake is not available on demand, and the ordinary gate is the only instrument
+known to produce a failing sample. **Next action: when the gate next rejects on this
+test, save that run's full output before any re-run** and file it in the ADR of whatever
+work tripped it. The failure carries its own evidence — every assertion interpolates
+`daemon.diagnostics()` (the daemon's JSONL, stdout and stderr, printed in the panic) and
+the pod tally covers the wire side.
 
-Done = the root cause found and fixed with a pinning test, **or** a recorded stress
-campaign (≥ 500 iterations under load) with zero failures, at which point this entry
-closes as unreproducible with that evidence attached.
+**What is ruled out.** Any diff of ours: the two reproductions above were on trees whose
+`host/` workspace was byte-identical to a green base, one of them docs-only. And solo
+looping on an idle machine — about 29 cumulative clean isolated runs have produced
+nothing, so the several-hundred-iteration idle loop this entry used to ask for is the
+wrong instrument.
 
-Note (2026-08-03, brenn brain/bridge integration round 2): newer and stronger evidence
-than the paragraph above records, with fact and inference kept distinct.
+**The two open readings.** (a) A daemon race: a judge attributed a ~1-in-12 reproduction
+to the `playback_no_pod` path when the client disconnects before synthesis lands, i.e.
+the `None` arm of `emit_outcome` at
+`host/crates/speech-surface/src/playback_router.rs:408` (the arm itself at `:420-426`).
+(b) A harness-side timing race: the `-- --nocapture` contrast puts libtest's own output capture in the timing,
+which (a) does not explain. Neither is established. Whatever slips, it slips by a lot —
+every wait in the test rests on an observed wire or JSONL event with a 20 s deadline,
+not on a sleep.
 
-*Fact.* The round-2 judge reports the test "failed once and reproduced ~1-in-12 reruns
-(`playback_no_pod` race when the client disconnects before synthesis lands)" —
-implicating the `None` arm of `emit_outcome` at
-`host/crates/speech-surface/src/playback_router.rs:361-369`. Source: brenn-ops
-`docs/adr/2026/08/03-multi--brenn-brain-bridge-integration/judge-verdict-deep-r2-a1.md`,
-respond-commit scan, final bullet. The judge did not record its rerun mode. So the
-observed rate is roughly double the one-in-21 above, and there is now a named suspect
-mechanism rather than none.
+**Stakes.** Under (b) the cost is commits rejected at random and everyone trained to
+re-run a red gate rather than read it — observed a fourth time in 2026-08, where a full
+`make check` failed here and was re-run to green. That reflex is how a genuine
+`speech-surface` regression gets waved through, because "green on a re-run" looks
+identical. Under (a) barge-in occasionally misbehaves on live hardware, where nothing
+re-runs it.
 
-*Inference (not established).* Reproduction may require suite contention: the judge saw
-the failure while running the full `speech-surface` suite, and 14 clean isolated runs at
-that HEAD are consistent with that reading. Counter-evidence that must not be dropped —
-the original incident's 6 full host-workspace runs were also green. Suite contention is
-the leading hypothesis, not a confirmed trigger.
+**The gate keeps this test.** Quarantining it behind a lane carrying this slug was
+considered and rejected twice: while a reproduction looked cheap, because under reading
+(a) this test failing is the only signal the project has of a barge-in defect that would
+misbehave on live hardware, where nothing re-runs anything; and again once the
+reproduction vanished, because the gate is then also the only collector of failing
+samples, and quarantining would retire it. The accelerant available on request, and the
+one instrument never yet tried in the shape that fails, is a several-hundred-cycle
+overnight `make -C host check` loop.
 
-Note (2026-08-08, wake-driven head presence): three gate rejections in one feature,
-two of them mute. Fact and inference kept distinct as above.
+Done = the slip localized to the daemon or to the harness, fixed, with a pinning test
+for whichever it was; the test running in the ordinary gate; and a post-fix soak in gate
+shape — a multi-cycle `make -C host check` loop — green, with the test riding the
+ordinary gate without a rejection.
 
-*Fact.* During the head-presence work the pre-commit gate rejected three commits, all
-green on an immediate re-run of the same tree with nothing disabled and no
-`--no-verify`. The first (increment 4) named
-`barge_in_flushes_playback_and_chains_the_interrupted_turn` — this flake, in a crate
-that increment did not touch. The other two (increment 5; the pre-pass response in
-round 3) exited non-zero somewhere in the `host` workspace suite with **no failure
-line surviving in the captured output**, and in both cases the standalone `make`
-lane run immediately afterwards on the same tree was green end to end. Source:
-brenn-ops `docs/adr/2026/08/07-multi--wake-driven-head-presence/implementation-log.md`,
-increments 4 and 5 and the round-3 pre-pass response.
-
-*Inference (not established).* The two mute rejections are **unattributed**. This
-flake fails by naming its test, which the first rejection did and they did not, so
-they are not evidence of it; the gate lanes are unwrapped `cargo fmt/clippy/test`
-(`host/Makefile:21-24`, `firmware/Makefile:68-71`) and nothing in the repo swallows
-output, so the loss may equally be in how a long run was captured rather than in what
-ran. Recorded here because the evidence otherwise lives only in a workflow artifact,
-and because a gate that rejects without saying why is precisely the
-re-run-instead-of-read cost this entry predicted, now observed three times in one
-feature. It raises the priority of the stress campaign; it does not change what the
-campaign is.
+History: the five dated fact/inference notes this entry accreted between 2026-08-02 and
+2026-08-12 are archived in the ADR implementation logs and judge verdicts they came from
+— brenn-ops `docs/adr/2026/08/03-multi--brenn-brain-bridge-integration/` (the
+`playback_no_pod` attribution), `2026/08/07-multi--wake-driven-head-presence/` (three
+gate rejections in one feature, two of them mute and still unattributed to anything, so
+not evidence for this flake either way), and
+`2026/08/12-multi--head-presence-safety-gate-convergence-contd/` (both reproductions
+above). The account in this entry is the current one.
 
 See `TODO(barge-in-flake)` at
 `barge_in_flushes_playback_and_chains_the_interrupted_turn` in
 `host/crates/speech-surface/tests/barge_integration.rs`.
+
+
+## `stow-budget-source-unpinned` — BLOCKED as of 2026-08-13 (needs a servo fixture the daemon's tests can reach)
+
+`reachy-motiond` opens the deadline a defeated stow escalates on from the *machine's* file:
+`SessionActive::stow_deadline` (`firmware/devices/reachy-motiond/src/motion.rs`) adds
+`Engaged::stow_budget()`, which is the bench-resolved stow durations plus the settle
+timeout (brenn-reachy `crates/reachy-bench/src/commands.rs`). The daemon's own
+`stow_duration_s` override never reaches it — deliberately: a policy file may command a
+longer controlled stow, but it may not lengthen how long a stow a person has defeated
+keeps driving the head. That is the double-window defect this cycle removed, and the
+runbook's `stow_duration_s` row now states the property to operators.
+
+Nothing in this repo holds that line. The one test in the area,
+`a_defeated_stow_escalates_on_the_clock_it_started_with`, runs against the `Fake`, whose
+`stow_deadline` is a stub, so it pins that *one* window is opened and is blind to which
+file sized it. A refactor to `self.stow.longest()` — the daemon already owns those
+durations for the moves it commands — passes the whole gate and makes the runbook
+sentence false.
+
+Deferred rather than dismissed: pinning the seam needs a real `Engaged`, and this repo
+has no `BusPort` fake at all. The two ways to get one are a decision, not a line — export
+brenn-reachy's test-only scripted-servo fixture (`crates/reachy-bench/src/testutil.rs`,
+`mod testutil;` today) as public test support, which changes a sibling crate's public
+surface; or write a second scripted servo here, which is a second answer to what a servo
+does with a write, the duplication that fixture exists to prevent.
+
+Done = a test in this repo drives a session whose bench stow duration and daemon
+`stow_duration_s` override differ, and asserts the deadline the escalation runs on comes
+from the bench value — failing if the deadline is ever routed through `Clocks`.
+
+See `TODO(stow-budget-source-unpinned)` at `SessionActive::stow_deadline` in
+`firmware/devices/reachy-motiond/src/motion.rs`.
 
 
 ## `script-timebase` — BLOCKED as of 2026-08-09 (needs the Clockwork port's shared clock)

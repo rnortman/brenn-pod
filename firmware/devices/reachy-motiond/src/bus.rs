@@ -34,7 +34,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use crate::cells::{Collapsed, Delivered, Shared, Stop};
+use crate::cells::{Antennas, Collapsed, Delivered, Shared, Stop};
 use crate::report::Sink;
 
 #[cfg(test)]
@@ -353,11 +353,19 @@ impl<'a> Listener<'a> {
 
         match self.shared.accept(&script, Instant::now()) {
             Delivered::Faulted => {
-                self.ignored(
-                    "faulted",
-                    "the machine has faulted and takes no commands",
-                    &delivery,
+                // What the scripter is told is which condition took the machine
+                // out of service, not merely that something did: the slug is the
+                // word its own logs can be searched for, and the record says how
+                // the machine got there.
+                let named = self.shared.fault().map_or_else(
+                    || "the machine has faulted and takes no commands".to_owned(),
+                    |report| {
+                        let slug = report.slug.unwrap_or("no condition named");
+                        let story = report.story().unwrap_or_else(|| report.detail.clone());
+                        format!("the machine has faulted ({slug}) and takes no commands: {story}")
+                    },
                 );
+                self.ignored("faulted", &named, &delivery);
             }
             Delivered::Scheduled(Acceptance::Foreign) => {
                 self.ignored(
@@ -376,8 +384,24 @@ impl<'a> Listener<'a> {
             }
             Delivered::Scheduled(Acceptance::Accepted) => {
                 self.stale_run = 0;
+                // What the machine will execute this with, said on the answer
+                // rather than left in a journal somewhere: every posture is the
+                // head *and* the antennas, so a scripter asking for one is asking
+                // for a pair this machine may not be moving. The head is
+                // unaffected either way, which is the other half of the news.
+                // Read here, where the answer is worded, because that is the one
+                // place it is needed and the standing is the antenna cell's fact
+                // rather than the schedule's.
+                let antennas = self.shared.antennas();
+                let short = match antennas {
+                    Antennas::Ok => String::new(),
+                    Antennas::Degraded => {
+                        " — the antennas are out of service this session; the head is unaffected"
+                            .to_owned()
+                    }
+                };
                 self.sink.line(&format!(
-                    "script seq {}: {}, timeout {} ms",
+                    "script seq {}: {}, timeout {} ms{short}",
                     script.seq(),
                     timeline(&script),
                     script.timeout_ms()
@@ -392,6 +416,7 @@ impl<'a> Listener<'a> {
                             "posture": step.posture.as_str(),
                         })).collect::<Vec<_>>(),
                         "timeout_ms": script.timeout_ms(),
+                        "antennas": antennas.as_str(),
                         "sender": delivery.envelope.sender,
                     }),
                 );
@@ -491,14 +516,25 @@ impl<'a> Listener<'a> {
         {
             if self.attached {
                 self.alerted = true;
+                // The slug first, because it is what an alert rule keys on, and
+                // the whole story after the sentence, because it is what the
+                // person the rule woke up then has to read.
+                let named = report
+                    .slug
+                    .map(|slug| format!(" [{slug}]"))
+                    .unwrap_or_default();
+                let story = report
+                    .story()
+                    .map(|story| format!(" the incident: {story}."))
+                    .unwrap_or_default();
                 return Some(Chore::Alert {
                     severity: AlertSeverity::Critical,
                     title: "reachy head motion stopped".to_owned(),
                     body: format!(
-                        "{report}. commanding has stopped and torque is off: the head has \
+                        "{report}{named}. commanding has stopped and torque is off: the head has \
                          settled into near-stow and the machine is at the minimum risk \
                          condition. nothing will move again until an operator restarts the \
-                         daemon."
+                         daemon.{story}"
                     ),
                 });
             }
@@ -548,6 +584,56 @@ impl<'a> Listener<'a> {
                      until a script arrives above that mark, or until the daemon is restarted — \
                      a restart forgets the mark. the likeliest cause is a scripter that emitted \
                      one script while its clock read the wrong time."
+                ),
+            });
+        }
+
+        // An ending that took the head down and latched nothing. Nothing latched
+        // is exactly why this is an alert: from outside, a daemon that stowed a
+        // grabbed head under control and one that had a quiet hour are the same
+        // daemon. Every occurrence, like the stow misses — a hand on the head at
+        // each of three wakes is three things that happened.
+        //
+        // What the head did on the way down is quoted from the record rather than
+        // stated here: most of these are the controlled stow, but a class that
+        // takes torque off where the machine stands reaches the same rest, and an
+        // operator told the head came down under control will not go looking for
+        // where it actually fell.
+        if self.attached
+            && let Some((detail, count)) = self.shared.take_incident()
+        {
+            return Some(Chore::Alert {
+                severity: AlertSeverity::Critical,
+                title: "reachy head stopped a script".to_owned(),
+                body: format!(
+                    "{count} script(s) did not finish; the most recent: {detail}. torque is off \
+                     and nothing latched, so there is nothing for an operator to clear before \
+                     this machine is asked again — the record above is what says how the head \
+                     came down. what it means is that something stopped a move: a hand or a snag \
+                     on the head, or a plan of ours the machine would not run."
+                ),
+            });
+        }
+
+        // The antennas leaving the moves. A warning and not a fault: the head
+        // keeps its presence, the script runs, and the next engage retries the
+        // pair — so nothing has to be done to the machine tonight. Once per flip
+        // into degraded and not once per wake: a latch the pair carries across an
+        // evening is one standing condition, and the state file is what reports a
+        // standing condition.
+        if self.attached
+            && let Some(detail) = self.shared.take_antennas_alarm()
+        {
+            return Some(Chore::Alert {
+                severity: AlertSeverity::Warning,
+                title: "reachy antennas are out of service".to_owned(),
+                body: format!(
+                    "the antenna pair has been torqued off and left out of the moves: {detail}. \
+                     the head is unaffected and keeps its presence, and the next engage retries \
+                     the pair — so this is one alert about a standing condition rather than one \
+                     per wake. `reachy-status` shows it as `antennas=degraded` for as long as it \
+                     stands. worth a look at the two antennas before they are asked to sweep \
+                     again."
                 ),
             });
         }
@@ -878,6 +964,7 @@ fn timeline(script: &MotionScript) -> String {
 mod tests {
     use brenn_bridge::MessageEnvelope;
     use motion_proto::{Desired, Posture, Step};
+    use reachy_motion::{Entry, Fault, JointId, Maneuver, Outcome as TimelineOutcome};
 
     use super::*;
     use crate::cells::{FaultReport, FaultStage};
@@ -1152,6 +1239,69 @@ mod tests {
         );
     }
 
+    /// What a scripter is told when its script is dropped: which condition took
+    /// the machine out of service, and how it got there.
+    ///
+    /// "The machine has faulted" on its own sends whoever reads the scripter's
+    /// log to this daemon's journal to find out what happened. The slug is the
+    /// word they can search for, and the record is the answer.
+    #[test]
+    fn a_dropped_script_is_told_which_condition_took_the_machine() {
+        let sink = Collect::default();
+        let (shared, mut listener) = fixture(&sink);
+        shared.set_fault(FaultReport::recorded(
+            FaultStage::Motion,
+            "leg 3 is 0.4000 rad from its goal and not closing",
+            vec![
+                Entry::Fault {
+                    fault: Fault::HeadServoFault {
+                        joint: JointId::Leg(3),
+                        id: 13,
+                        bits: 0x20,
+                    },
+                    at: Duration::from_millis(10),
+                },
+                Entry::Response {
+                    maneuver: Maneuver::MaskedSlowStow,
+                    outcome: TimelineOutcome::Completed,
+                    at: Duration::from_millis(900),
+                },
+            ],
+        ));
+
+        listener.on_event(delivered(&nominal(1)));
+
+        let fields = sink.fields("motion_script_ignored").expect("reported");
+        assert_eq!(fields["reason"], json!("faulted"));
+        let detail = fields["detail"].as_str().expect("a detail");
+        assert!(detail.contains("head_servo_fault"), "{detail}");
+        assert!(
+            detail.contains("masked_slow_stow completed"),
+            "the story, not just the word: {detail}"
+        );
+    }
+
+    /// A park that named no condition — nothing was ever engaged — says so
+    /// rather than inventing a word or dropping the sentence.
+    #[test]
+    fn a_dropped_script_says_when_no_condition_was_named() {
+        let sink = Collect::default();
+        let (shared, mut listener) = fixture(&sink);
+        shared.set_fault(FaultReport::new(
+            FaultStage::Commission,
+            "servo 7 answered nothing",
+        ));
+
+        listener.on_event(delivered(&nominal(1)));
+
+        let detail = sink.fields("motion_script_ignored").expect("reported")["detail"]
+            .as_str()
+            .expect("a detail")
+            .to_owned();
+        assert!(detail.contains("no condition named"), "{detail}");
+        assert!(detail.contains("servo 7 answered nothing"), "{detail}");
+    }
+
     #[test]
     fn a_fault_becomes_one_alert_and_never_a_second() {
         let sink = Collect::default();
@@ -1368,6 +1518,134 @@ mod tests {
         assert!(body.contains("14.5"), "{body}");
         assert_eq!(listener.chore(now), None, "alerted on twice");
         assert!(!shared.faulted(), "a stow miss parked the daemon");
+    }
+
+    /// A script that did not finish is the one thing this daemon carries no
+    /// other trace of: the fault cell is untouched, the daemon is resting, and
+    /// the next script is taken. Every occurrence, because a hand on the head at
+    /// three wakes is three things that happened.
+    ///
+    /// And it says only what is true of every ending that reaches it. Most of
+    /// them stowed under control, but a class that takes torque off where the
+    /// machine stands ends at the same rest, and an engage that failed before it
+    /// took the machine never stowed at all — so the maneuver is quoted from the
+    /// record in the detail rather than asserted in the fixed prose.
+    #[test]
+    fn a_script_that_did_not_finish_becomes_an_alert_every_time() {
+        let sink = Collect::default();
+        let (shared, mut listener) = fixture(&sink);
+        let now = Instant::now();
+        assert_eq!(listener.chore(now), None);
+
+        shared.note_incident("at the motion loop: leg 3 is not closing [head_obstructed]");
+
+        let Some(Chore::Alert {
+            severity,
+            title,
+            body,
+        }) = listener.chore(now)
+        else {
+            panic!("a wind-down back to rest owes an alert");
+        };
+        assert_eq!(severity, AlertSeverity::Critical);
+        assert!(title.contains("stopped a script"), "{title}");
+        assert!(
+            !title.contains("stow"),
+            "a title claiming the maneuver claims it for the routes that ran another one: {title}"
+        );
+        assert!(body.contains("head_obstructed"), "{body}");
+        assert!(body.contains("nothing latched"), "{body}");
+        assert!(
+            !body.contains("stowed under control"),
+            "how the head came down is the record's to say: {body}"
+        );
+        assert_eq!(listener.chore(now), None, "alerted on twice");
+        assert!(!shared.faulted(), "a wind-down parked the daemon");
+
+        shared.note_incident("at the motion loop: leg 3 is not closing again [head_obstructed]");
+        assert!(
+            matches!(listener.chore(now), Some(Chore::Alert { .. })),
+            "the next one is its own news"
+        );
+    }
+
+    /// Two limp antennas are a warning and not a fault: the head keeps its
+    /// presence, the script runs, and the next engage retries the pair. One alert
+    /// for the standing condition — the state file is what says it is still
+    /// standing — and the pair going out again after coming back is news again.
+    #[test]
+    fn antennas_leaving_the_moves_are_a_warning_once_per_flip() {
+        let sink = Collect::default();
+        let (shared, mut listener) = fixture(&sink);
+        let now = Instant::now();
+        assert_eq!(listener.chore(now), None);
+
+        shared.note_antennas(
+            Antennas::Degraded,
+            "right antenna is 0.4000 rad from its goal",
+        );
+
+        let Some(Chore::Alert {
+            severity,
+            title,
+            body,
+        }) = listener.chore(now)
+        else {
+            panic!("the pair leaving the moves owes an alert");
+        };
+        assert_eq!(severity, AlertSeverity::Warning);
+        assert!(title.contains("antennas"), "{title}");
+        assert!(body.contains("right antenna"), "{body}");
+        assert!(body.contains("head is unaffected"), "{body}");
+        assert!(body.contains("antennas=degraded"), "{body}");
+        assert_eq!(listener.chore(now), None, "alerted on twice");
+        assert!(!shared.faulted(), "a degraded pair parked the daemon");
+
+        shared.note_antennas(Antennas::Degraded, "still snagged");
+        assert_eq!(
+            listener.chore(now),
+            None,
+            "a standing condition re-stated is not a second alert"
+        );
+
+        shared.note_antennas(Antennas::Ok, "both answered the engage");
+        shared.note_antennas(Antennas::Degraded, "left antenna reports hardware error");
+        let Some(Chore::Alert { body, .. }) = listener.chore(now) else {
+            panic!("a pair that went out again owes another alert");
+        };
+        assert!(body.contains("left antenna"), "{body}");
+    }
+
+    /// The sender of a script is told what the machine will execute it with. Every
+    /// posture is the head and the antennas, so a degraded pair is exactly the
+    /// news the one asking for antenna motion is owed — with the other half of it,
+    /// that the head is unaffected.
+    #[test]
+    fn a_script_taken_by_a_degraded_machine_is_answered_with_that() {
+        let sink = Collect::default();
+        let (shared, mut listener) = fixture(&sink);
+
+        listener.on_event(delivered(&nominal(1)));
+        assert_eq!(
+            sink.fields("motion_script")
+                .expect("the script is captured")["antennas"],
+            json!("ok")
+        );
+
+        shared.note_antennas(Antennas::Degraded, "right antenna is not closing");
+        listener.on_event(delivered(&nominal(2)));
+
+        let taken = sink.all_fields("motion_script");
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        assert_eq!(taken[1]["antennas"], json!("degraded"));
+        let lines = sink.said().lines;
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("antennas are out of service")
+                    && line.contains("head is unaffected")),
+            "{lines:?}"
+        );
     }
 
     /// The high-water mark only rises, so one script carrying a number from a

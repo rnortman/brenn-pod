@@ -2,7 +2,7 @@
 //!
 //! The bus thread is async and owns the attachment; the motion thread blocks and
 //! owns the port. Neither can call into the other, and neither shares a data
-//! structure with the other beyond what is here. Seven cells, and each one goes
+//! structure with the other beyond what is here. Nine cells, and each one goes
 //! in a single direction:
 //!
 //! - **The schedule** — written by the bus thread as scripts arrive, read by the
@@ -29,6 +29,16 @@
 //!   Also not a fault: torque came off, which is the whole doctrine, and the
 //!   daemon carries on. What it is, is the one thing an operator has to know
 //!   before putting a hand near a head that has been left alone for hours.
+//! - **The antenna pair's standing** — written by the motion thread every time
+//!   it judges which joints the session has out of service, read by the bus
+//!   thread to answer a delivered script with and to alert on the moment the
+//!   pair goes out. Not a fault either: the head is unaffected, the session
+//!   carries on, and the next engage retries the pair.
+//! - **The incidents** — written by the motion thread when an ending wound the
+//!   head down and handed the loop back to rest, drained by the bus thread to
+//!   alert on. Nothing is latched and the next script is taken, which is
+//!   exactly why it needs a cell: the daemon looks identical to one that never
+//!   had the head grabbed at all.
 //! - **The fault** — written once by the motion thread when the machine stops
 //!   taking commands, read by the bus thread so it can alert. Write-once because
 //!   a fault is not a state that improves: the first thing that went wrong is
@@ -52,6 +62,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use motion_proto::{Acceptance, Desired, MotionScript, Schedule};
+use reachy_motion::{Entry, Fault, Story, last_fault};
 
 /// Why the motion thread is being asked to stop.
 ///
@@ -119,27 +130,84 @@ impl fmt::Display for FaultStage {
     }
 }
 
-/// What the motion thread stopped on.
+/// What the motion thread stopped on: where it was, what condition the machine
+/// is in, how the libraries worded it, and the whole story behind it.
 ///
-/// The detail is text rather than the motion libraries' own error type, and
-/// deliberately: the only consumer is an alert and a log line, and rendering at
-/// the site that has the error keeps this cell — the one thing both threads
-/// touch — free of the machine's vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The detail stays text — the site that has the error is the one that can word
+/// it, and the consumers are an alert and a log line. The slug and the record
+/// are not: an alert rule keys on one word for a condition, and a story assembled
+/// out of prose is one nobody can query. So both arrive typed and are rendered at
+/// the sink, never parsed back out of a sentence.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FaultReport {
     /// Where the daemon was.
     pub stage: FaultStage,
+    /// The condition the machine was left in, as the doctrine names it, when the
+    /// ending named one. A refusal names none: nothing about the platform was
+    /// found wanting.
+    pub slug: Option<&'static str>,
     /// What the motion libraries refused, as they rendered it.
     pub detail: String,
+    /// Everything the session raised and everything done about it, in order.
+    pub record: Vec<Entry>,
 }
 
 impl FaultReport {
+    /// A report of an ending that left no record — nothing was ever engaged, so
+    /// there was no session to keep one.
     pub fn new(stage: FaultStage, detail: impl Into<String>) -> Self {
         Self {
             stage,
+            slug: None,
             detail: detail.into(),
+            record: Vec::new(),
         }
     }
+
+    /// A report of an ending a session recorded, named by the last condition in
+    /// that record.
+    ///
+    /// The last and not the first: a wind-down that began over a grabbed head and
+    /// latched because a servo dropped out on the way down is an incident about
+    /// the servo, which is the word an operator is looking for and the one an
+    /// alert rule keys on.
+    pub fn recorded(stage: FaultStage, detail: impl Into<String>, record: Vec<Entry>) -> Self {
+        Self {
+            stage,
+            slug: condition(&record),
+            detail: detail.into(),
+            record,
+        }
+    }
+
+    /// The session's record as one line, or `None` when there is nothing in it.
+    #[must_use]
+    pub fn story(&self) -> Option<String> {
+        story(&self.record)
+    }
+}
+
+/// The condition a record ends on, if it names one.
+///
+/// The motion library's own reverse scan, not a second one: which entry names an
+/// incident is a fact about the record's shape, and this daemon reading it
+/// differently from the session that wrote it is how two surfaces of one machine
+/// come to call one event by two names.
+#[must_use]
+pub fn condition(record: &[Entry]) -> Option<&'static str> {
+    last_fault(record).as_ref().map(Fault::slug)
+}
+
+/// A record as the one line an operator quotes, or `None` when nothing went
+/// wrong at all.
+///
+/// The words are made of the entries once, at this end, for whoever is going to
+/// read words — and by the library's own rendering, because the line a session
+/// prints as it ends and the report this daemon attaches afterwards are greppable
+/// as one format or as neither.
+#[must_use]
+pub fn story(record: &[Entry]) -> Option<String> {
+    (!record.is_empty()).then(|| Story(record).to_string())
 }
 
 impl fmt::Display for FaultReport {
@@ -148,7 +216,49 @@ impl fmt::Display for FaultReport {
     }
 }
 
+/// Whether the antenna pair is being commanded.
+///
+/// One word for one predicate. The motion thread judges it from the joints the
+/// live session has out of service, and every surface that reports it — the
+/// state file, the alert, the answer a delivered script gets — reads that
+/// judgement instead of making one of its own. Two surfaces judging separately
+/// would sooner or later disagree about a pair that is either being commanded or
+/// is not, and the one asking us to move the antennas would be the last to know.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Antennas {
+    /// Both antennas are in service.
+    #[default]
+    Ok,
+    /// The pair has been torqued off and left out of the moves for the rest of
+    /// this session. The head is unaffected; the next engage retries the pair.
+    Degraded,
+}
+
+impl Antennas {
+    /// The standing as the state file and the capture spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    /// Whether the pair is out of service.
+    #[must_use]
+    pub fn degraded(self) -> bool {
+        matches!(self, Self::Degraded)
+    }
+}
+
 /// What a delivery did.
+///
+/// The schedule's verdict and nothing else. Whatever else a sender is owed about
+/// the machine — that the antennas are out of service this session, that a leg is
+/// masked — is read from the cell that holds it, where the answer is built:
+/// welding a second cell onto this one buys no snapshot (two locks taken in
+/// sequence are two reads whichever value carries them) and makes the schedule's
+/// answer impossible to construct without a machine standing behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivered {
     /// Offered to the schedule, with what the schedule made of it.
@@ -240,6 +350,40 @@ impl WatchNotice {
     }
 }
 
+/// The antenna pair's standing, and what took it out of service if something
+/// has.
+///
+/// The standing is a level: a delivered script is answered from whatever it says
+/// at the moment it arrives. The alert is an edge — a pair left out of service
+/// across three wakes is one standing condition, and an alert per wake would
+/// bury the one that said something new. So every judgement writes the level and
+/// only the judgement that changed it leaves an alert owed.
+#[derive(Debug, Default)]
+struct AntennaNotice {
+    /// What the motion thread last judged.
+    standing: Antennas,
+    /// What the pair went out of service over, until an alert has taken it.
+    degraded_by: Option<String>,
+}
+
+impl AntennaNotice {
+    /// Judge the pair, and answer whether this judgement took it out of service.
+    fn judged(&mut self, standing: Antennas, detail: &str) -> bool {
+        let flipped = standing.degraded() && !self.standing.degraded();
+        self.standing = standing;
+        if flipped {
+            self.degraded_by = Some(detail.to_owned());
+        }
+        flipped
+    }
+
+    /// Take what the flip owes an alert, or `None` when the standing has not
+    /// changed into degraded since this last answered.
+    fn take(&mut self) -> Option<String> {
+        self.degraded_by.take()
+    }
+}
+
 /// What a drained [`WatchNotice`] owes an alert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchAlarm {
@@ -253,7 +397,7 @@ pub struct WatchAlarm {
     pub failing: bool,
 }
 
-/// The seven cells, held behind one handle both threads clone.
+/// The nine cells, held behind one handle both threads clone.
 #[derive(Debug)]
 pub struct Shared {
     schedule: Mutex<Schedule>,
@@ -283,6 +427,25 @@ pub struct Shared {
     /// picture lost and not control lost. The daemon keeps sweeping and
     /// recovers by itself; this is how somebody hears about the wire meanwhile.
     watch: Mutex<WatchNotice>,
+    /// The antenna pair's standing, as the motion thread last judged the joints
+    /// the session has out of service.
+    ///
+    /// Not the fault cell and not a refusal: the head keeps its presence and the
+    /// script runs, so parking over it would cost a conversation to save two
+    /// antennas that are already limp. The next engage retries the pair, which is
+    /// what makes this a level worth reading rather than a verdict worth
+    /// latching.
+    antennas: Mutex<AntennaNotice>,
+    /// Endings that wound the head down and handed the loop back to rest, which
+    /// the bus thread has not alerted on yet.
+    ///
+    /// Collapsed for the same reason the stow misses are: a hand on the head at
+    /// every wake is the same news each time and the latest is the one that
+    /// describes the machine. Not the fault cell, deliberately — nothing latched
+    /// and the next script is taken — which is exactly why somebody has to be
+    /// told: a daemon that wound down over an obstruction and one that had a
+    /// quiet afternoon look identical from outside.
+    incidents: Mutex<Collapsed>,
     stop: OnceLock<Stop>,
     fault: OnceLock<FaultReport>,
     ended: OnceLock<()>,
@@ -300,6 +463,8 @@ impl Shared {
             engage_refusals: Mutex::new(Collapsed::default()),
             stow_misses: Mutex::new(Collapsed::default()),
             watch: Mutex::new(WatchNotice::default()),
+            antennas: Mutex::new(AntennaNotice::default()),
+            incidents: Mutex::new(Collapsed::default()),
             stop: OnceLock::new(),
             fault: OnceLock::new(),
             ended: OnceLock::new(),
@@ -352,6 +517,41 @@ impl Shared {
     /// has begun since this last answered.
     pub fn take_watch_alarm(&self) -> Option<WatchAlarm> {
         self.watch().take()
+    }
+
+    /// State the antenna pair's standing, with what took it out of service if
+    /// something did, and answer whether this is the judgement that took it out.
+    ///
+    /// Written in both directions by every engage, so a pair that came back is
+    /// reported as being back: the answer is what the joints out of service say
+    /// now, not the worst they have ever said.
+    pub fn note_antennas(&self, standing: Antennas, detail: &str) -> bool {
+        self.antenna_notice().judged(standing, detail)
+    }
+
+    /// The antenna pair's standing, for whoever is being answered about it.
+    pub fn antennas(&self) -> Antennas {
+        self.antenna_notice().standing
+    }
+
+    /// Take what the pair going out of service owes an alert, or `None` when
+    /// nothing has taken it out since this last answered.
+    pub fn take_antennas_alarm(&self) -> Option<String> {
+        self.antenna_notice().take()
+    }
+
+    /// Note an ending that wound the head down and left the daemon resting.
+    ///
+    /// Written by the motion thread after torque is off: this describes a
+    /// machine that has recovered by itself, and the report is the only sign it
+    /// ever happened.
+    pub fn note_incident(&self, detail: impl Into<String>) {
+        self.incidents().note(detail);
+    }
+
+    /// Take the wind-downs owed an alert, the most recent and the count.
+    pub fn take_incident(&self) -> Option<(String, u64)> {
+        self.incidents().take()
     }
 
     /// Offer one script to the schedule, arriving at `now`.
@@ -478,6 +678,20 @@ impl Shared {
     fn watch(&self) -> std::sync::MutexGuard<'_, WatchNotice> {
         self.watch.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// The antenna notice, recovered the same way: a level and an edge written
+    /// together, never half written.
+    fn antenna_notice(&self) -> std::sync::MutexGuard<'_, AntennaNotice> {
+        self.antennas.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The wind-down reports, recovered the same way and for the same reason as
+    /// the other [`Collapsed`] cells.
+    fn incidents(&self) -> std::sync::MutexGuard<'_, Collapsed> {
+        self.incidents
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 #[cfg(test)]
@@ -487,6 +701,7 @@ mod tests {
     use std::time::Duration;
 
     use motion_proto::{Posture, Step};
+    use reachy_motion::{Fault, JointId, Maneuver, Outcome};
 
     use super::*;
 
@@ -511,6 +726,11 @@ mod tests {
         Duration::from_millis(count)
     }
 
+    /// What a delivery the schedule saw comes back as.
+    fn taken(acceptance: Acceptance) -> Delivered {
+        Delivered::Scheduled(acceptance)
+    }
+
     /// A daemon that has heard nothing asks for no posture change. Resting is
     /// the default state of the machine, so silence is not an instruction and
     /// does not need to be one.
@@ -533,10 +753,7 @@ mod tests {
         let shared = shared();
         let now = Instant::now();
 
-        assert_eq!(
-            shared.accept(&script(1), now),
-            Delivered::Scheduled(Acceptance::Accepted)
-        );
+        assert_eq!(shared.accept(&script(1), now), taken(Acceptance::Accepted));
         assert_eq!(shared.accepted_seq(), Some(1));
         assert_eq!(shared.desired(now), Desired::Posture(Posture::Up));
         assert_eq!(
@@ -561,15 +778,12 @@ mod tests {
         shared.accept(&script(7), now);
         let stow_now = MotionScript::new(POD, 9, vec![Step::new(0, Posture::Stow)], 30_000)
             .expect("a lawful script");
-        assert_eq!(
-            shared.accept(&stow_now, now),
-            Delivered::Scheduled(Acceptance::Accepted)
-        );
+        assert_eq!(shared.accept(&stow_now, now), taken(Acceptance::Accepted));
         assert_eq!(shared.desired(now), Desired::Posture(Posture::Stow));
 
         assert_eq!(
             shared.accept(&script(7), now),
-            Delivered::Scheduled(Acceptance::Stale {
+            taken(Acceptance::Stale {
                 seq: 7,
                 accepted: 9
             })
@@ -586,10 +800,7 @@ mod tests {
         let elsewhere = MotionScript::new("reachy01", 1, vec![Step::new(0, Posture::Up)], 30_000)
             .expect("a lawful script");
 
-        assert_eq!(
-            shared.accept(&elsewhere, now),
-            Delivered::Scheduled(Acceptance::Foreign)
-        );
+        assert_eq!(shared.accept(&elsewhere, now), taken(Acceptance::Foreign));
         assert_eq!(shared.desired(now), Desired::Unchanged);
         assert_eq!(shared.accepted_seq(), None);
     }
@@ -671,6 +882,52 @@ mod tests {
             report.to_string(),
             "commissioning stopped at servo 7 answered nothing"
         );
+        assert_eq!(report.slug, None, "nothing about the platform was found");
+        assert_eq!(report.story(), None);
+    }
+
+    /// A report is named by the last condition its record holds, not the first.
+    ///
+    /// A wind-down that began over a grabbed head and latched because a servo
+    /// dropped out on the way down is an incident about the servo: naming it by
+    /// the grab would send an operator looking for a hand that is long gone, and
+    /// would key the alert on a condition the doctrine does not latch.
+    #[test]
+    fn a_report_is_named_by_the_last_condition_in_its_record() {
+        let grabbed = Entry::Fault {
+            fault: Fault::HeadObstructed {
+                joint: JointId::Leg(1),
+                error: 0.4,
+            },
+            at: Duration::from_millis(10),
+        };
+        let dropped_out = Entry::Fault {
+            fault: Fault::HeadServoFault {
+                joint: JointId::Leg(3),
+                id: 13,
+                bits: 0x20,
+            },
+            at: Duration::from_millis(300),
+        };
+        let stowed = Entry::Response {
+            maneuver: Maneuver::MaskedSlowStow,
+            outcome: Outcome::Completed,
+            at: Duration::from_millis(900),
+        };
+
+        let report = FaultReport::recorded(
+            FaultStage::Motion,
+            "leg 3 (servo 13) reports hardware error 0x20",
+            vec![grabbed, dropped_out, stowed],
+        );
+
+        assert_eq!(report.slug, Some("head_servo_fault"));
+        let told = report.story().expect("three entries");
+        assert_eq!(told.matches(" → ").count(), 2, "{told}");
+        assert!(told.starts_with("head_obstructed: "), "{told}");
+        assert!(told.ends_with("masked_slow_stow completed"), "{told}");
+        assert_eq!(condition(&[stowed]), None, "a maneuver is not a condition");
+        assert_eq!(story(&[]), None, "nothing went wrong, so there is no story");
     }
 
     /// A refused engage is told to the bus thread without touching the fault:
@@ -738,6 +995,134 @@ mod tests {
         assert_eq!(alarm.detail, "servo 12: timed out");
         assert_eq!((alarm.runs, alarm.restores), (2, 2));
         assert!(!alarm.failing, "the second run ended in reads coming back");
+    }
+
+    /// The pair going out of service is one alert, however many wakes it stands
+    /// for, and the standing itself is readable the whole time.
+    ///
+    /// A latch that survives three wakes is one condition: alerting on each of
+    /// them would bury the alert that said something. What every one of those
+    /// wakes *does* owe is a true answer to the script it is executing, which is
+    /// what the level is for.
+    #[test]
+    fn the_pair_going_out_of_service_is_one_alert_and_a_standing_answer() {
+        let shared = shared();
+        assert_eq!(shared.antennas(), Antennas::Ok);
+        assert_eq!(shared.take_antennas_alarm(), None);
+
+        assert!(shared.note_antennas(Antennas::Degraded, "right antenna: snagged"));
+        assert_eq!(shared.antennas(), Antennas::Degraded);
+        assert!(!shared.faulted(), "a degraded pair is not a fault");
+        assert_eq!(
+            shared.take_antennas_alarm().as_deref(),
+            Some("right antenna: snagged")
+        );
+        assert_eq!(
+            shared.take_antennas_alarm(),
+            None,
+            "one flip is not alerted on twice"
+        );
+
+        assert!(
+            !shared.note_antennas(Antennas::Degraded, "right antenna: snagged again"),
+            "the pair was already out of service, so nothing changed"
+        );
+        assert_eq!(shared.take_antennas_alarm(), None);
+        assert_eq!(shared.antennas(), Antennas::Degraded);
+    }
+
+    /// A pair that came back is reported as being back, and going out again is
+    /// news again: the next engage retries the antennas, so the standing is what
+    /// they are doing now and not the worst they have ever done.
+    #[test]
+    fn a_pair_that_came_back_is_said_to_be_back() {
+        let shared = shared();
+        shared.note_antennas(Antennas::Degraded, "right antenna: snagged");
+        shared.take_antennas_alarm();
+
+        assert!(!shared.note_antennas(Antennas::Ok, "both answered the engage"));
+        assert_eq!(shared.antennas(), Antennas::Ok);
+        assert_eq!(
+            shared.take_antennas_alarm(),
+            None,
+            "coming back is not itself an alert"
+        );
+
+        assert!(shared.note_antennas(Antennas::Degraded, "left antenna: hardware error 0x20"));
+        assert_eq!(
+            shared.take_antennas_alarm().as_deref(),
+            Some("left antenna: hardware error 0x20")
+        );
+    }
+
+    /// Offering a script to the schedule neither reads the antenna cell nor
+    /// disturbs it.
+    ///
+    /// The two are deliberately not welded together: the schedule's verdict is
+    /// about sequence numbers and timeouts, and what the sender is owed about the
+    /// machine — that this session will move the head alone — is read from the
+    /// cell where the answer is worded, one lock at a time. So the acceptance a
+    /// delivery comes back with must not depend on the standing, and a delivery
+    /// must not become a judgement of the pair: the standing is the motion
+    /// thread's to write. (What a delivered script is *answered* with is
+    /// asserted where that answer is built, in `bus`.)
+    #[test]
+    fn accepting_a_script_neither_reads_nor_writes_the_pairs_standing() {
+        let shared = shared();
+        let now = Instant::now();
+
+        shared.note_antennas(Antennas::Degraded, "right antenna: snagged");
+        assert!(
+            shared.take_antennas_alarm().is_some(),
+            "the flip owes an alert before the deliveries below"
+        );
+
+        assert_eq!(
+            shared.accept(&script(2), now),
+            taken(Acceptance::Accepted),
+            "a degraded pair is not the schedule's business: the head still moves"
+        );
+        assert_eq!(shared.antennas(), Antennas::Degraded);
+        assert_eq!(
+            shared.accept(&script(1), now),
+            taken(Acceptance::Stale {
+                seq: 1,
+                accepted: 2
+            }),
+            "and a refused delivery is refused for the schedule's own reason"
+        );
+        assert_eq!(
+            shared.antennas(),
+            Antennas::Degraded,
+            "a delivery judged the pair"
+        );
+        assert_eq!(
+            shared.take_antennas_alarm(),
+            None,
+            "a delivery left an alert owed about a standing nothing changed"
+        );
+    }
+
+    /// A wind-down is told to the bus thread without touching the fault cell:
+    /// the daemon is resting and taking scripts, which is why somebody has to be
+    /// told at all — from outside, nothing about it looks different from a quiet
+    /// afternoon.
+    #[test]
+    fn wind_downs_are_drained_with_their_count_and_are_not_faults() {
+        let shared = shared();
+        assert_eq!(shared.take_incident(), None);
+
+        shared.note_incident("head_obstructed: leg 3 is 0.4000 rad from its goal");
+        shared.note_incident("head_obstructed: leg 3 is 0.5000 rad from its goal");
+        assert!(!shared.faulted(), "a wind-down back to rest is not a fault");
+
+        let (detail, count) = shared.take_incident().expect("two wind-downs stand");
+        assert!(
+            detail.contains("0.5000"),
+            "the latest describes the machine"
+        );
+        assert_eq!(count, 2);
+        assert_eq!(shared.take_incident(), None);
     }
 
     /// The whole point of the type: one handle, two threads, no other contact

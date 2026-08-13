@@ -91,22 +91,25 @@ rest_delay_ms = 5000
 # settles limp.
 #
 # What the floors are still for is knowing when a stretch is about to be the
-# ordinary case rather than the exception. A shaped move's peak rate is 1.875
-# times its average, so for a joint that moves linearly in its own coordinate the
-# floor is closed-form — 1.875 x span in radians / (bound x tick rate). At the
-# shipped bounds and 50 Hz:
+# ordinary case rather than the exception — and for this daemon that case is a
+# duration written here that is under the floor for the span it asks for, because
+# nothing else it commands reaches one. Where these numbers come from — the
+# closed form, what the effective clock carries on top of it, and why — is stated
+# once, in the FLOORS comment of `crates/reachy-bench/reachy-bench.example.toml`
+# in the sibling brenn-reachy checkout.
+# At the bounds and tick rate that file ships:
 #
-#   head group   1.07 s for the stow-to-neutral span. No closed form (the legs
-#                move through the IK); derived by sampling the move at tick rate
-#                and pinned by a reachy-motion unit test, so it moves only when
-#                the geometry, the tick rate or `max_step_legs_rad` does.
-#   body yaw     0.79 s from the 60-degree cap the bench file ships,
-#                and 1.571 s for the widest sweep a command can lawfully ask —
-#                cap to cap. The startup fold is the case the stretch exists for:
-#                it starts wherever the machine was physically left, which no cap
-#                binds, and folding from beyond about 153 degrees round takes
-#                longer than `stow_duration_s = 2.0`. It runs on the longer clock
-#                and lands, rather than being refused or dropped.
+#   head group   0.36 s for the stow-to-neutral span. No closed form (the legs
+#                move through the IK); derived by walking the planned path and
+#                pinned by a reachy-motion unit test, so it moves only when the
+#                geometry, the tick rate or `max_step_legs_rad` does.
+#   body yaw     0.26 s from the 60-degree cap the bench file ships, and 0.52 s
+#                for the widest sweep a command can lawfully ask — cap to cap.
+#                Where the machine physically stands is not capped, though: the
+#                startup fold out of a body a hand spun to the half turn while it
+#                lay limp needs 0.79 s of yaw. `stow_duration_s = 2.0` carries
+#                that outright, and a fold configured quicker than it is what the
+#                stretch would lengthen back.
 #   antennas     0.19 s for the 3.23 rad stow-to-neutral arc, 0.28 s to re-stow
 #                an antenna left just inboard of sideways, and 0.36 s for the
 #                widest sweep the bench command can ask for. The daemon only ever

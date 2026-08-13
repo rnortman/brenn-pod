@@ -12,7 +12,9 @@
 //! ```text
 //! state=starting|resting|active|parked|stopping
 //! watch=ok|failing
+//! antennas=ok|degraded
 //! fault_stage=the motion loop     # parked only
+//! fault_slug=bus_failure          # parked only, and only when one was named
 //! fault_detail=servo 4: timed out # parked only
 //! updated_unix=1765238400
 //! ```
@@ -46,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bus::one_line;
-use crate::cells::FaultStage;
+use crate::cells::{Antennas, FaultReport, FaultStage};
 use crate::report::Sink;
 
 /// Where the daemon writes its state under systemd.
@@ -122,9 +124,32 @@ impl Watching {
 struct Stated {
     phase: Phase,
     watching: Watching,
+    /// Whether the antennas are being commanded. Its own field for the same
+    /// reason the watch flag is one: a machine with two limp antennas is
+    /// resting, or active, and fully able to hold a conversation with its head —
+    /// so the loss is real, is not a phase, and has to be visible to a probe
+    /// without being inferred from a journal line.
+    antennas: Antennas,
     /// The fault, once there is one: present only while parked, because it is
     /// the one thing an operator needs before deciding anything.
-    fault: Option<(FaultStage, String)>,
+    fault: Option<ParkedFault>,
+}
+
+/// The fault a parked record states, as the file carries it.
+///
+/// Named fields because the slug and the detail are both stringish: nothing
+/// louder than a reader would ever catch the two arriving the other way round —
+/// the file would simply carry a sentence as `fault_slug=`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParkedFault {
+    /// Where the daemon was when it stopped commanding.
+    stage: FaultStage,
+    /// The condition the doctrine names, so a probe can key on one word instead
+    /// of matching a sentence. Absent when the ending named no condition of the
+    /// machine.
+    slug: Option<&'static str>,
+    /// How the libraries worded it, flattened to one line.
+    detail: String,
 }
 
 /// The state file, and the daemon's own copy of what is in it.
@@ -190,15 +215,31 @@ impl Surface {
         self.transition(sink, |stated| stated.watching = watching);
     }
 
+    /// The antenna pair is being commanded, or has been left out of the moves.
+    ///
+    /// Stated in both directions and from one judgement of the joints out of
+    /// service, so a record saying `degraded` means the pair was out of service
+    /// the last time anybody looked — never that it once was.
+    pub fn antennas(&self, antennas: Antennas, sink: &dyn Sink) {
+        self.transition(sink, |stated| stated.antennas = antennas);
+    }
+
     /// The machine stopped taking commands and the daemon has parked.
     ///
     /// Called after torque is already off, never before: reaching the minimum
     /// risk condition is what happens first, and saying so is what happens
     /// after.
-    pub fn parked(&self, stage: FaultStage, detail: &str, sink: &dyn Sink) {
+    ///
+    /// Takes the report whole: a field added to it belongs in the file by naming
+    /// it here.
+    pub fn parked(&self, report: &FaultReport, sink: &dyn Sink) {
         self.transition(sink, |stated| {
             stated.phase = Phase::Parked;
-            stated.fault = Some((stage, one_line(detail)));
+            stated.fault = Some(ParkedFault {
+                stage: report.stage,
+                slug: report.slug,
+                detail: one_line(&report.detail),
+            });
         });
     }
 
@@ -210,6 +251,7 @@ impl Surface {
             let stated = held.get_or_insert(Stated {
                 phase: Phase::Starting,
                 watching: Watching::Ok,
+                antennas: Antennas::Ok,
                 fault: None,
             });
             change(stated);
@@ -245,15 +287,20 @@ impl Surface {
 /// is the one format it needs no tooling to read.
 fn render(stated: &Stated, updated_unix: u64) -> String {
     let mut text = format!(
-        "state={}\nwatch={}\n",
+        "state={}\nwatch={}\nantennas={}\n",
         stated.phase.as_str(),
-        stated.watching.as_str()
+        stated.watching.as_str(),
+        stated.antennas.as_str()
     );
-    if let Some((stage, detail)) = &stated.fault {
-        // Through the narration sanitizer: a fault detail carries whatever the
-        // motion libraries rendered, and a newline in it would forge a key in a
-        // file whose reader splits on lines.
-        text.push_str(&format!("fault_stage={stage}\nfault_detail={detail}\n"));
+    if let Some(fault) = &stated.fault {
+        // The detail came through the narration sanitizer: it carries whatever
+        // the motion libraries rendered, and a newline in it would forge a key in
+        // a file whose reader splits on lines.
+        text.push_str(&format!("fault_stage={}\n", fault.stage));
+        if let Some(slug) = fault.slug {
+            text.push_str(&format!("fault_slug={slug}\n"));
+        }
+        text.push_str(&format!("fault_detail={}\n", fault.detail));
     }
     text.push_str(&format!("updated_unix={updated_unix}\n"));
     text
@@ -326,6 +373,17 @@ mod tests {
 
     fn state(path: &Path) -> Option<String> {
         value_of(path, "state")
+    }
+
+    /// The report a park is published from: where it stopped, what it named, and
+    /// how the libraries worded it.
+    fn report(stage: FaultStage, slug: Option<&'static str>, detail: &str) -> FaultReport {
+        FaultReport {
+            stage,
+            slug,
+            detail: detail.to_owned(),
+            record: Vec::new(),
+        }
     }
 
     /// The ordinary sequence, and the property that makes the file worth
@@ -410,7 +468,14 @@ mod tests {
         let surface = Surface::at(&path);
 
         surface.phase(Phase::Active, &sink);
-        surface.parked(FaultStage::Motion, "servo 4: timed out", &sink);
+        surface.parked(
+            &report(
+                FaultStage::Motion,
+                Some("position_feedback_lost"),
+                "servo 4: timed out",
+            ),
+            &sink,
+        );
 
         assert_eq!(state(&path).as_deref(), Some("parked"));
         assert_eq!(
@@ -418,8 +483,36 @@ mod tests {
             Some("the motion loop")
         );
         assert_eq!(
+            value_of(&path, "fault_slug").as_deref(),
+            Some("position_feedback_lost"),
+            "the one word a probe keys on"
+        );
+        assert_eq!(
             value_of(&path, "fault_detail").as_deref(),
             Some("servo 4: timed out")
+        );
+    }
+
+    /// An ending that named no condition of the machine — a commissioning that
+    /// refused, where nothing was ever taken hold of — writes no slug rather
+    /// than an empty one or an invented word.
+    #[test]
+    fn a_park_that_names_no_condition_writes_no_slug() {
+        let dir = temp_dir();
+        let path = state_in(&dir);
+        let sink = Collect::default();
+        let surface = Surface::at(&path);
+
+        surface.parked(
+            &report(FaultStage::Commission, None, "servo 7 answered nothing"),
+            &sink,
+        );
+
+        assert_eq!(state(&path).as_deref(), Some("parked"));
+        assert_eq!(value_of(&path, "fault_slug"), None);
+        assert_eq!(
+            value_of(&path, "fault_detail").as_deref(),
+            Some("servo 7 answered nothing")
         );
     }
 
@@ -432,7 +525,14 @@ mod tests {
         let sink = Collect::default();
         let surface = Surface::at(&path);
 
-        surface.parked(FaultStage::Engage, "servo 4 said\nstate=resting", &sink);
+        surface.parked(
+            &report(
+                FaultStage::Engage,
+                Some("bus_failure"),
+                "servo 4 said\nstate=resting",
+            ),
+            &sink,
+        );
 
         assert_eq!(state(&path).as_deref(), Some("parked"));
         assert_eq!(
@@ -459,6 +559,34 @@ mod tests {
         surface.watching(Watching::Ok, &sink);
         assert_eq!(state(&path).as_deref(), Some("resting"));
         assert_eq!(value_of(&path, "watch").as_deref(), Some("ok"));
+    }
+
+    /// Two limp antennas are a loss and not a phase: the machine is active, the
+    /// head is holding its conversation, and the pair is out of the moves. Both
+    /// facts are in one record, and the pair coming back is in it too — the next
+    /// engage retries them, so a record that could only ever say `degraded`
+    /// would be a probe's reason to send somebody to a machine that is whole.
+    #[test]
+    fn the_antenna_flag_flips_both_ways_without_disturbing_the_phase() {
+        let dir = temp_dir();
+        let path = state_in(&dir);
+        let sink = Collect::default();
+        let surface = Surface::at(&path);
+
+        surface.phase(Phase::Active, &sink);
+        assert_eq!(
+            value_of(&path, "antennas").as_deref(),
+            Some("ok"),
+            "the pair rides every record"
+        );
+
+        surface.antennas(Antennas::Degraded, &sink);
+        assert_eq!(state(&path).as_deref(), Some("active"));
+        assert_eq!(value_of(&path, "antennas").as_deref(), Some("degraded"));
+
+        surface.antennas(Antennas::Ok, &sink);
+        assert_eq!(state(&path).as_deref(), Some("active"));
+        assert_eq!(value_of(&path, "antennas").as_deref(), Some("ok"));
     }
 
     /// The resting loop passes the same phase every `rest_poll`. A file rewritten
@@ -542,7 +670,14 @@ mod tests {
         surface.phase(Phase::Resting, &sink);
         surface.watching(Watching::Failing, &sink);
         surface.phase(Phase::Active, &sink);
-        surface.parked(FaultStage::Motion, "servo 4: timed out", &sink);
+        surface.parked(
+            &report(
+                FaultStage::Motion,
+                Some("bus_failure"),
+                "servo 4: timed out",
+            ),
+            &sink,
+        );
 
         let lines = sink.said().lines;
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -574,22 +709,30 @@ mod tests {
         let resting = Stated {
             phase: Phase::Resting,
             watching: Watching::Ok,
+            antennas: Antennas::Ok,
             fault: None,
         };
         assert_eq!(
             render(&resting, 1_765_238_400),
-            "state=resting\nwatch=ok\nupdated_unix=1765238400\n"
+            "state=resting\nwatch=ok\nantennas=ok\nupdated_unix=1765238400\n"
         );
 
         let parked = Stated {
             phase: Phase::Parked,
             watching: Watching::Failing,
-            fault: Some((FaultStage::Startup, "servo 4: timed out".to_owned())),
+            antennas: Antennas::Degraded,
+            fault: Some(ParkedFault {
+                stage: FaultStage::Startup,
+                slug: Some("head_obstructed"),
+                detail: "servo 4: timed out".to_owned(),
+            }),
         };
         assert_eq!(
             render(&parked, 1_765_238_401),
-            "state=parked\nwatch=failing\nfault_stage=startup normalisation\n\
-             fault_detail=servo 4: timed out\nupdated_unix=1765238401\n"
+            "state=parked\nwatch=failing\nantennas=degraded\n\
+             fault_stage=startup normalisation\n\
+             fault_slug=head_obstructed\nfault_detail=servo 4: timed out\n\
+             updated_unix=1765238401\n"
         );
     }
 }

@@ -63,21 +63,27 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use motion_proto::{Desired, Posture};
 use reachy_bench::commands::{
-    Commissioned, Engaged, commission, neutral_targets, stow_pose_targets,
+    Commissioned, Engaged, commission, neutral_targets, stow_pose_targets, wind_down,
 };
 use reachy_bench::config::{self, Resolved, resolve_for_commanding};
-use reachy_bench::pump::{ErrorClass, MonotonicClock, Phase as TorquePhase, PumpError, TickEvent};
+use reachy_bench::pump::{
+    Disposition, ErrorClass, MonotonicClock, Phase as TorquePhase, PumpError, TickEvent,
+};
 use reachy_bus::{BusPort, OpenError, SerialBusPort};
-use reachy_motion::{JointTargets, MoveDurations, PollCadence, at_stow};
+use reachy_motion::{
+    Entry, Fault, JointGroup, JointSet, JointTargets, Maneuver, MoveDurations,
+    Outcome as TimelineOutcome, PollCadence, at_stow,
+};
 use serde_json::json;
 use thiserror::Error;
 
-use crate::cells::{FaultReport, FaultStage, Shared, Stop};
+use crate::cells::{Antennas, FaultReport, FaultStage, Shared, Stop, condition, story};
 use crate::config::Overrides;
 use crate::report::Sink;
 use crate::state::{Phase, Surface, Watching};
@@ -100,27 +106,202 @@ const MIN_DWELL: Duration = Duration::from_millis(20);
 /// a machine that may sit parked for hours.
 const PARK_POLL: Duration = Duration::from_millis(100);
 
-/// What the motion libraries refused, as they rendered it.
+/// What the motion libraries refused: what it asks of the machine, the
+/// condition it names, and how they worded it.
 ///
-/// Text rather than the libraries' own error type, and for the same reason the
-/// fault cell carries text: the consumers are a log line and an alert, and the
+/// The class is derived here and nowhere else. It is the whole of what decides
+/// whether this daemon stows the head under control, takes torque off on the
+/// spot, or parks and waits for a person — so deriving it twice is two answers
+/// to that question, and deriving it from the wording is an answer that changes
+/// when somebody rewords an error. The text is still text, for the same reason
+/// as ever: the consumers are a log line and an alert, and the libraries'
 /// refusals already name the phase, the servo, the register and both values.
-/// Rendering at the site that has the error keeps the daemon's own vocabulary
-/// free of the machine's.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0}")]
-pub struct Refusal(String);
+#[derive(Debug, Clone, PartialEq, Error)]
+#[error("{text}")]
+pub struct Refusal {
+    /// What answering this ending asks of the machine.
+    class: ErrorClass,
+    /// The condition of the machine the ending names, when it names one. A
+    /// refusal, a planner defect and an exhausted budget all name none: they
+    /// are statements about what was asked for, not about the platform.
+    ///
+    /// Behind a pointer: a `Fault` carrying a sequencer verdict is an order of
+    /// magnitude wider than the rest of this struct, it is absent on the
+    /// ordinary refusals, and a refusal is returned as the error arm of most of
+    /// this module's calls.
+    fault: Option<Box<Fault>>,
+    /// Whether the session's own record already carries that condition. The
+    /// tick records what it raises; a bus that stopped carrying is seen by the
+    /// layer holding the wire, and the record owes an entry for it.
+    recorded: bool,
+    /// The libraries' own rendering.
+    text: String,
+}
 
 impl Refusal {
-    /// A refusal from whatever produced it.
-    pub fn new(detail: impl Into<String>) -> Self {
-        Self(detail.into())
+    /// A refusal of `class`, worded by whatever produced it.
+    pub fn new(class: ErrorClass, detail: impl Into<String>) -> Self {
+        Self {
+            class,
+            fault: None,
+            recorded: true,
+            text: detail.into(),
+        }
+    }
+
+    /// A refusal of `class` naming `condition`, which the session's record does
+    /// not have yet.
+    ///
+    /// The shape of an ending the layer holding the wire found rather than the
+    /// tick: a bus that stopped carrying, a torque-off nobody acknowledged.
+    /// Whoever answers it is what puts the condition into the record.
+    pub fn naming(class: ErrorClass, condition: Fault, detail: impl Into<String>) -> Self {
+        Self {
+            class,
+            fault: Some(Box::new(condition)),
+            recorded: false,
+            text: detail.into(),
+        }
+    }
+
+    /// A library ending classified as though torque were on.
+    ///
+    /// The honest question to ask of anything the drive raised: the engage is
+    /// the one path that crosses the torque line mid-run, and by the time an
+    /// ending reaches this daemon the library has already released a machine it
+    /// half-enabled.
+    #[must_use]
+    pub fn under_torque(error: &PumpError) -> Self {
+        Self::classified(error, TorquePhase::UnderTorque)
+    }
+
+    /// A library ending from a path where torque is off by construction —
+    /// commissioning, and the sweeps a limp machine is measured by.
+    ///
+    /// Nothing was energized, so the machine is exactly as safe as it was and
+    /// asking again later is the whole of the answer.
+    #[must_use]
+    pub fn pre_torque(error: &PumpError) -> Self {
+        Self::classified(error, TorquePhase::PreTorque)
+    }
+
+    fn classified(error: &PumpError, phase: TorquePhase) -> Self {
+        let fault = error.fault(phase);
+        Self {
+            class: error.class(phase),
+            fault: fault.map(Box::new),
+            // Everything the tick raises arrives already recorded; what the
+            // wire-holding layer found does not.
+            recorded: fault.is_some() && error.unrecorded_fault(phase).is_none(),
+            text: error.to_string(),
+        }
+    }
+
+    /// What answering this ending asks of the machine.
+    #[must_use]
+    pub fn class(&self) -> ErrorClass {
+        self.class
+    }
+
+    /// The condition the session's record does not have yet, if any.
+    #[must_use]
+    pub fn unrecorded(&self) -> Option<Fault> {
+        (!self.recorded)
+            .then_some(self.fault.as_deref().copied())
+            .flatten()
+    }
+
+    /// The same ending, with its condition now in the record.
+    ///
+    /// What putting it there earns: an ending whose condition has been noted
+    /// once must not be noted again when a further ending folds in beside it and
+    /// names nothing of its own.
+    #[must_use]
+    fn noted(mut self) -> Self {
+        self.recorded = true;
+        self
+    }
+
+    /// This ending with what happened next folded into it.
+    ///
+    /// The disposition is the sticky maximum: a stow defeated by a servo
+    /// dropping out, or a torque-off nobody acknowledged, latches an ending
+    /// that would otherwise have rested. The condition named is the later one
+    /// when it named one, because that is the one an operator is looking for.
+    #[must_use]
+    fn and(self, next: Self) -> Self {
+        let named_by_next = next.fault.is_some();
+        Self {
+            // The doctrine's own ranking, from the crate that owns the classes:
+            // which of two endings the machine is judged by is not a question
+            // this daemon gets a second opinion about.
+            class: self.class.worse(next.class),
+            fault: next.fault.or(self.fault),
+            recorded: if named_by_next {
+                next.recorded
+            } else {
+                self.recorded
+            },
+            text: format!("{} — and then: {}", self.text, next.text),
+        }
     }
 }
 
 impl From<PumpError> for Refusal {
     fn from(error: PumpError) -> Self {
-        Self(error.to_string())
+        Self::under_torque(&error)
+    }
+}
+
+/// The session's record as it happens, pushed by the motion libraries.
+///
+/// Held beside the engagement rather than inside it, and for one reason: the
+/// last entries of an incident are appended by the release that consumes the
+/// engagement — the maneuver completing, a servo that never acknowledged its
+/// torque-off — so a reader living on the engagement would miss exactly the
+/// ending it exists to report.
+///
+/// Typed entries, never parsed back out of a rendered line: what reaches the
+/// fault cell and the capture is this record, and the words are made of it at
+/// the sink and nowhere earlier.
+#[derive(Debug)]
+pub struct Incident {
+    /// What has been taken off the channel so far, oldest first.
+    kept: Vec<Entry>,
+    pushed: Receiver<Entry>,
+}
+
+impl Incident {
+    /// A record fed by `pushed`.
+    #[must_use]
+    pub fn new(pushed: Receiver<Entry>) -> Self {
+        Self {
+            kept: Vec::new(),
+            pushed,
+        }
+    }
+
+    /// The record of a session there never was, which stays empty.
+    ///
+    /// What an ending before the first torque write is answered with: a
+    /// commissioning that refused, an engage that never completed. Nothing ever
+    /// held the machine, so nothing ever recorded anything about it — and a
+    /// response reads the record the same way whether or not there was a session
+    /// behind it.
+    #[must_use]
+    pub fn unrecorded() -> Self {
+        let (_, pushed) = channel();
+        Self::new(pushed)
+    }
+
+    /// Everything the session has recorded so far, oldest first.
+    ///
+    /// Accumulating rather than draining: a mid-session condition is read out
+    /// while the head is still up, and the ending that follows it has to report
+    /// the whole story and not the tail of it.
+    pub fn entries(&mut self) -> &[Entry] {
+        self.kept.extend(self.pushed.try_iter());
+        &self.kept
     }
 }
 
@@ -210,7 +391,11 @@ impl Machine {
         line: &mut dyn FnMut(&str),
     ) -> Result<SessionRest<'_, P>, Refusal> {
         let mut clock = MonotonicClock::new();
-        let machine = commission(&self.resolved, port, &mut clock, line)?;
+        // Pre-torque by construction: commissioning reads presence, identity,
+        // the provisioned registers, the supply and the gains, and writes torque
+        // in neither direction.
+        let machine = commission(&self.resolved, port, &mut clock, line)
+            .map_err(|error| Refusal::pre_torque(&error))?;
         Ok(SessionRest {
             machine,
             resolved: &self.resolved,
@@ -562,7 +747,7 @@ impl Verdict {
 /// The distinction the whole unattended lifecycle turns on: one of these leaves
 /// a machine to bring back to the minimum risk condition and the other does
 /// not.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Error)]
 pub enum EngageFailed {
     /// A refusal from before torque: one of the two torque-on gates — the
     /// supply below its floor, or a latched hardware error — or a remedial
@@ -580,17 +765,15 @@ pub enum EngageFailed {
 
 impl From<PumpError> for EngageFailed {
     fn from(error: PumpError) -> Self {
-        // Classified as though torque were on, which is the honest question to
-        // ask of an engage: the drive is the one path that crosses the torque
-        // line mid-run, and by the time an ending reaches this daemon the
-        // library has already released a machine it half-enabled. What answers
-        // `Refuse` under torque is what is judged before any transaction writes
-        // torque — the two gates among them — so nothing was written and the
-        // next script may ask again.
-        if error.class(TorquePhase::UnderTorque) == ErrorClass::Refuse {
-            Self::Gate(error.into())
+        // The one derivation, read rather than repeated: what answers `Refuse`
+        // under torque is what is judged before any transaction writes torque —
+        // the two gates among them — so nothing was written and the next script
+        // may ask again.
+        let refusal = Refusal::under_torque(&error);
+        if refusal.class() == ErrorClass::Refuse {
+            Self::Gate(refusal)
         } else {
-            Self::Fault(error.into())
+            Self::Fault(refusal)
         }
     }
 }
@@ -618,7 +801,14 @@ pub trait Rest {
     /// a limp head at where it *was* is the slam that measurement prevents. A
     /// machine that cannot be measured refuses the engage rather than faulting
     /// — torque is still off, so there is nothing to undo.
-    fn engage(&mut self, line: &mut dyn FnMut(&str)) -> Result<Self::Active<'_>, EngageFailed>;
+    ///
+    /// The record comes back beside the engagement rather than inside it: a
+    /// session's story ends with the release that consumes the engagement, so
+    /// whatever reads it has to outlive that.
+    fn engage(
+        &mut self,
+        line: &mut dyn FnMut(&str),
+    ) -> Result<(Self::Active<'_>, Incident), EngageFailed>;
 }
 
 /// The machine holding torque: the postures, the moves between them, and the
@@ -675,14 +865,96 @@ pub trait Active {
 
     /// Write torque off to all nine servos now, and do nothing else.
     ///
-    /// The fault ending. No settle and no measurement: the head falls gently
-    /// into near-stow under gearbox resistance from wherever it is. An `Err`
-    /// says what the release itself had to report — a servo that never
-    /// acknowledged its own torque-off — and never that the release did not
-    /// happen.
+    /// The fault ending for a machine that can no longer be trusted to command.
+    /// No settle and no measurement: the head falls gently into near-stow under
+    /// gearbox resistance from wherever it is. An `Err` says what the release
+    /// itself had to report — a servo that never acknowledged its own torque-off
+    /// — and never that the release did not happen.
     fn disengage_now(self, line: &mut dyn FnMut(&str)) -> Result<(), Refusal>
     where
         Self: Sized;
+
+    /// Stow on what still commands, then release everything.
+    ///
+    /// The answer to a servo that dropped out mid-move: it is already torqued
+    /// off and out of every check by the time this is reached, so the head comes
+    /// down on the five that are left rather than going limp on the spot. A
+    /// further servo going expands the maneuver instead of ending it, on what is
+    /// left of the one stow clock this started with.
+    ///
+    /// What comes back is what the machine is left waiting for, as the maneuver
+    /// itself reported it. This daemon routes on that answer rather than
+    /// deriving one of its own: how far the mask grew is a fact of the maneuver,
+    /// and a second derivation up here is a second answer that can disagree with
+    /// the record.
+    ///
+    /// `deadline` is when the one stow clock this maneuver is part of is spent,
+    /// on the session's own scale ([`Self::stow_deadline`] opens one). Handed in
+    /// rather than opened here, because a stow this daemon commanded itself and
+    /// had defeated is the *same* maneuver expanding: a fresh clock would drive
+    /// the head for a second whole stow window against whatever defeated the
+    /// first, and the window is sized so that a person holding the head is not
+    /// pushed indefinitely.
+    ///
+    /// `event` gets the stow's tick events as values, as [`Self::move_to`] does
+    /// for the moves this daemon commands: the pair leaving the moves on the way
+    /// down reaches the cells that answer for it from here or from nowhere.
+    fn masked_stow(
+        self,
+        deadline: Duration,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+    ) -> Disposition
+    where
+        Self: Sized;
+
+    /// When one stow maneuver started now would be out of clock.
+    ///
+    /// Read at the moment a controlled response begins and carried through every
+    /// escalation of it, so however many servos drop out the head is commanded
+    /// for one stow window and not one per attempt.
+    fn stow_deadline(&self) -> Duration;
+
+    /// The maneuver already answering this session, if one is.
+    ///
+    /// The escalation ladder's rule as a question, asked of the session's own
+    /// record: a maneuver still open is the one that absorbs whatever happens
+    /// next, and nothing starts a second answer to a machine already being
+    /// answered.
+    fn open_maneuver(&self) -> Option<Maneuver>;
+
+    /// The joints this session is no longer commanding.
+    ///
+    /// One set, whichever way a joint got into it: the engage-time health gate
+    /// seeds it with servos that were already flagging, and a condition raised
+    /// mid-session inserts into the same set. What the daemon reports about a
+    /// degraded machine is read from here rather than from the event that
+    /// happened to announce it, because only one of those two is true at every
+    /// instant of a session.
+    fn out_of_service(&self) -> JointSet;
+
+    /// Put a condition only this layer could have seen into the session's
+    /// record.
+    ///
+    /// The tick records what it raises. A bus that stopped carrying commands is
+    /// found by the layer holding the wire, and the record owes an entry for it
+    /// wherever the ending is answered — otherwise the one incident an operator
+    /// is sent to read has no condition in it at all.
+    fn note(&mut self, fault: Fault);
+
+    /// Put how far a maneuver this daemon commanded itself has got into the
+    /// session's record.
+    ///
+    /// The other half of [`Self::note`], and the record is only a story with
+    /// both: a condition is what happened and a maneuver is what answered it. The
+    /// controlled stow the unattended daemon runs is commanded here rather than
+    /// inside the library, so this is the only layer that can say it started and
+    /// how it ended — and the one place the same event on the bench is a full
+    /// story while here it is half of one.
+    ///
+    /// Which maneuver it is comes from the ending's own class, never from a
+    /// caller's opinion of it.
+    fn note_response(&mut self, maneuver: Maneuver, outcome: TimelineOutcome);
 }
 
 /// The commissioned machine at rest, as the loop sees it.
@@ -785,7 +1057,7 @@ fn remedial_sweep<T>(
     sweep: impl FnOnce(PollCadence) -> Result<T, PumpError>,
 ) -> Result<T, EngageFailed> {
     pre_torque_sweep(rail, now, PollCadence::PositionsAndRail, sweep)
-        .map_err(|error| EngageFailed::Gate(error.into()))
+        .map_err(|error| EngageFailed::Gate(Refusal::pre_torque(&error)))
 }
 
 impl<'a, P: BusPort> Rest for SessionRest<'a, P> {
@@ -800,7 +1072,8 @@ impl<'a, P: BusPort> Rest for SessionRest<'a, P> {
         let (machine, clock) = (&mut self.machine, &mut self.clock);
         let sweep = pre_torque_sweep(&mut self.rail, now, cadence, |cadence| {
             machine.poll(cadence, clock, line)
-        })?;
+        })
+        .map_err(|error| Refusal::pre_torque(&error))?;
         Ok(if at_stow(&self.resolved.disarm, &sweep.present) {
             Standing::AtStow
         } else {
@@ -808,7 +1081,10 @@ impl<'a, P: BusPort> Rest for SessionRest<'a, P> {
         })
     }
 
-    fn engage(&mut self, line: &mut dyn FnMut(&str)) -> Result<Self::Active<'_>, EngageFailed> {
+    fn engage(
+        &mut self,
+        line: &mut dyn FnMut(&str),
+    ) -> Result<(Self::Active<'_>, Incident), EngageFailed> {
         let (up, stow) = (self.up, self.stow);
         let mut clock = self.clock;
         if !self.machine.fresh() {
@@ -817,13 +1093,19 @@ impl<'a, P: BusPort> Rest for SessionRest<'a, P> {
                 machine.poll(cadence, &mut clock, line)
             })?;
         }
-        let engaged = self.machine.engage(&mut clock, line)?;
-        Ok(SessionActive {
-            engaged,
-            clock,
-            up,
-            stow,
-        })
+        let mut engaged = self.machine.engage(&mut clock, line)?;
+        // Subscribed before the first goal goes out, so nothing a session raises
+        // can be raised before there is anywhere for it to arrive.
+        let incident = Incident::new(engaged.subscribe_timeline());
+        Ok((
+            SessionActive {
+                engaged,
+                clock,
+                up,
+                stow,
+            },
+            incident,
+        ))
     }
 }
 
@@ -880,13 +1162,72 @@ impl<P: BusPort> Active for SessionActive<'_, '_, P> {
         engaged.disengage_now(&mut clock, line)?;
         Ok(())
     }
+
+    fn masked_stow(
+        self,
+        deadline: Duration,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+    ) -> Disposition {
+        let Self {
+            engaged, mut clock, ..
+        } = self;
+        // The library's own maneuver, on the library's own state and on the clock
+        // the response started with: the record it hands back is already on this
+        // session's channel, so what is taken from here is the disposition alone.
+        let (_, disposition) = wind_down(
+            engaged,
+            ErrorClass::MaskedSlowStowToPark,
+            deadline,
+            &mut clock,
+            line,
+            event,
+        );
+        disposition
+    }
+
+    fn stow_deadline(&self) -> Duration {
+        // The budget is the machine's own, never this daemon's `stow` clock: a
+        // policy file may command a longer stow, but it may not lengthen how
+        // long a *defeated* one keeps driving a head somebody is holding.
+        // TODO(stow-budget-source-unpinned): no test here holds that source.
+        self.now().saturating_add(self.engaged.stow_budget())
+    }
+
+    fn open_maneuver(&self) -> Option<Maneuver> {
+        self.engaged.timeline().open_maneuver()
+    }
+
+    fn out_of_service(&self) -> JointSet {
+        self.engaged.out_of_service()
+    }
+
+    fn note(&mut self, fault: Fault) {
+        let at = self.now();
+        self.engaged.record_fault(fault, at);
+    }
+
+    fn note_response(&mut self, maneuver: Maneuver, outcome: TimelineOutcome) {
+        let at = self.now();
+        self.engaged.record_response(maneuver, outcome, at);
+    }
+}
+
+impl<P: BusPort> SessionActive<'_, '_, P> {
+    /// The session clock's reading, for the record and for a maneuver's deadline.
+    ///
+    /// Named through the library's own trait: this crate has a `Clock` of its own
+    /// and it is a configured duration, not a source of time.
+    fn now(&self) -> Duration {
+        reachy_bench::pump::Clock::now(&self.clock)
+    }
 }
 
 /// How the motion thread ended.
 ///
 /// Two endings, because there are two states a machine can be left in and both
 /// of them are limp. What differs is whether the daemon got there on purpose.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     /// Stowed and released, on an ending the daemon was asked for. The reason
     /// rides along because it is what the exit status distinguishes: a stop is
@@ -1130,13 +1471,22 @@ struct Watch {
     /// at every boundary from then until a new script lands, and a run that
     /// said so each time would bury the one line that matters.
     lapse_reported: Option<u64>,
-    /// The script whose engage a torque-on gate refused.
+    /// The script whose ask for the head up has already been answered — by a
+    /// torque-on gate refusing the engage, or by an ending that answered the
+    /// raise itself and put the machine back down.
     ///
-    /// The refusal is retried by the *next* script rather than at the next
-    /// resting sweep: a chronically sagging rail against a script asking for
-    /// the head up would otherwise be ten refusals a second, and the accepted
-    /// rate is one per script.
-    engage_refused_for: Option<u64>,
+    /// One field for both because the rule is one rule: a condition that ended
+    /// one raise ends the next, so only a *new* ask changes the answer. The
+    /// retry is therefore the next script's rather than the next resting sweep's
+    /// — a chronically sagging rail, or a hand on the head, against a script
+    /// asking for the head up would otherwise be ten refusals a second, or a
+    /// machine cycling torque against the hand for the whole of the script's
+    /// window.
+    ///
+    /// This is the gate on nine servos taking torque ([`wants_up`] is its only
+    /// reader), so clearing it on anything other than a new ask re-enables
+    /// exactly that cycling.
+    raise_answered_for: Option<u64>,
     /// The run of pre-torque sweeps that are failing, if any are.
     sweeps: SweepRun,
 }
@@ -1172,13 +1522,46 @@ impl SweepRun {
 ///
 /// Both endings leave the machine limp. What differs is whether the daemon put
 /// it there deliberately, and therefore whether the process exits or parks.
+///
+/// Not every ending under torque is one of these: a condition the machine
+/// recovers from by itself — an obstruction met, a plan of ours the tick would
+/// not run — winds the head down and hands the loop back to Resting, which is
+/// an `Ok` and not an ending at all.
 #[derive(Debug)]
 enum Ending {
     /// Something asked the daemon to stop, and the machine has been released.
     Stopped(Stop),
-    /// The machine stopped taking commands. Torque has been written off; the
-    /// daemon parks holding the port.
-    Faulted(FaultStage, Refusal),
+    /// The machine stopped taking commands, and nothing engages it again until
+    /// an operator has been. Torque has been written off; the daemon parks
+    /// holding the port, carrying the session's own record of what happened.
+    Faulted(FaultStage, Refusal, Vec<Entry>),
+}
+
+/// Whether a controlled stow is still worth commanding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    /// The head is somewhere a stow would bring it down from, and nothing has
+    /// tried yet.
+    Owed,
+    /// Already folded, or a fold has just been defeated. Nothing controlled is
+    /// attempted twice: a machine that would not stow once is not asked again,
+    /// it is released.
+    Spent,
+}
+
+impl Fold {
+    /// What a machine holding `posture` still owes.
+    ///
+    /// Named for the question rather than as a conversion: `from` in this module
+    /// is the narration's word for the posture a move is leaving, and two things
+    /// of that name taking the same argument type would each read as the other.
+    fn owed_by(posture: Option<Posture>) -> Self {
+        if posture == Some(Posture::Stow) {
+            Self::Spent
+        } else {
+            Self::Owed
+        }
+    }
 }
 
 /// Keep the head where the running script asks for it until something stops the
@@ -1231,7 +1614,9 @@ fn cycle<R: Rest>(
             ));
             Outcome::Released(stop)
         }
-        Ending::Faulted(stage, refusal) => park(machine, shared, stage, refusal, sink, surface),
+        Ending::Faulted(stage, refusal, record) => {
+            park(machine, shared, stage, refusal, record, sink, surface)
+        }
     }
 }
 
@@ -1307,15 +1692,35 @@ fn normalise<R: Rest>(
     }
 
     sink.line("startup: the machine is not at stow. taking hold to fold it, then letting go.");
-    let mut head = match take_hold(machine, shared, watch, sink, surface) {
-        Ok(head) => head,
+    let (mut head, mut incident) = match take_hold(machine, shared, watch, sink, surface) {
+        Ok(held) => held,
         // Limp and crooked is still limp: the gate wrote nothing, the machine
         // is at no more risk than it was, and the next script's engage plans
         // from wherever it is standing — which is what the answer says.
         Err(EngageFailed::Gate(_)) => return Ok(Standing::Elsewhere),
+        // The engage path takes the machine limp on its way out, so there is no
+        // maneuver left to run: what is left is where the ending leaves the
+        // daemon.
         Err(EngageFailed::Fault(refusal)) => {
-            return Err(Ending::Faulted(FaultStage::Engage, refusal));
+            let mut unheld = Incident::unrecorded();
+            return already_limp(
+                refusal,
+                &mut Responding {
+                    incident: &mut unheld,
+                    stage: FaultStage::Engage,
+                    shared,
+                    sink,
+                    surface,
+                },
+            );
         }
+    };
+    let mut ctx = Responding {
+        incident: &mut incident,
+        stage: FaultStage::Startup,
+        shared,
+        sink,
+        surface,
     };
     started(sink, None, Posture::Stow, "startup");
     // Not steered: normalisation is one sequence with one ending, and a machine
@@ -1325,14 +1730,16 @@ fn normalise<R: Rest>(
     let folded = head.move_to(
         Posture::Stow,
         &mut |text| sink.line(text),
-        &mut |event| moving(sink, event),
+        &mut |event| ticked(event, shared, sink, surface),
         &mut || None,
     );
     if let Err(refusal) = folded {
-        return Err(fault_now(head, FaultStage::Startup, refusal, sink));
+        // The fold that just failed *was* the controlled stow: it is not asked
+        // for twice.
+        return respond(head, Fold::Spent, refusal, &mut ctx);
     }
     reached(sink, Posture::Stow);
-    fold_and_rest(head, shared, FaultStage::Startup, Some("startup"), sink)
+    fold_and_rest(head, Some("startup"), &mut ctx)
 }
 
 /// The minimum risk condition, watched.
@@ -1356,6 +1763,10 @@ fn resting<R: Rest>(
         &json!({ "poll_ms": millis(timing.rest_poll) }),
     );
     surface.phase(Phase::Resting, sink);
+    // The last word on the session that just ended: a pair taken out of service
+    // during a wind-down is the case the motion loop's own passes cannot cover,
+    // and it stands until the next engage retries the antennas.
+    state_antennas(shared, sink, surface);
     let mut standing = entered;
     loop {
         if let Some(stop) = shared.stopping() {
@@ -1453,7 +1864,7 @@ fn wants_up(shared: &Shared, watch: &Watch) -> bool {
     matches!(
         shared.desired(Instant::now()),
         Desired::Posture(Posture::Up)
-    ) && watch.engage_refused_for != shared.accepted_seq()
+    ) && watch.raise_answered_for != shared.accepted_seq()
 }
 
 /// Torque on: execute the running script until it is spent, the daemon is
@@ -1469,17 +1880,37 @@ fn active<R: Rest>(
     surface: &Surface,
     standing: Standing,
 ) -> Result<Standing, Ending> {
-    let mut head = match take_hold(machine, shared, watch, sink, surface) {
-        Ok(head) => head,
+    let (mut head, mut incident) = match take_hold(machine, shared, watch, sink, surface) {
+        Ok(held) => held,
         Err(EngageFailed::Gate(_)) => return Ok(standing),
         Err(EngageFailed::Fault(refusal)) => {
-            return Err(Ending::Faulted(FaultStage::Engage, refusal));
+            let mut unheld = Incident::unrecorded();
+            return already_limp(
+                refusal,
+                &mut Responding {
+                    incident: &mut unheld,
+                    stage: FaultStage::Engage,
+                    shared,
+                    sink,
+                    surface,
+                },
+            );
         }
     };
     // Said once torque is on and not before: a refused engage leaves the machine
     // resting, and a surface that had already claimed active would have to be
     // taken back.
     surface.phase(Phase::Active, sink);
+    // Everything a response to an ending from this session needs. Built once and
+    // handed whole to whatever answers, so where the state line or the record is
+    // written is decided by what the response does.
+    let mut ctx = Responding {
+        incident: &mut incident,
+        stage: FaultStage::Motion,
+        shared,
+        sink,
+        surface,
+    };
 
     // Engaging pins the machine where the resting watch found it, so the
     // posture the loop starts from is that measurement and not an assumption. A
@@ -1498,7 +1929,7 @@ fn active<R: Rest>(
         if let Some(stop) = shared.stopping() {
             watch.dwells.flush(&mut |text| sink.line(text));
             surface.phase(Phase::Stopping, sink);
-            return Err(release_for(head, posture, stop, shared, sink));
+            return Err(release_for(head, posture, stop, &mut ctx));
         }
 
         let (desired, reason) = match wanted(shared, watch, sink) {
@@ -1519,7 +1950,7 @@ fn active<R: Rest>(
             let outcome = head.move_to(
                 desired,
                 &mut |text| sink.line(text),
-                &mut |event| moving(sink, event),
+                &mut |event| ticked(event, shared, sink, surface),
                 &mut || {
                     let (next, reason) = retarget_to(shared, watch, sink, in_flight)?;
                     sink.line(&format!("motion: {in_flight} -> {next}, mid-move"));
@@ -1530,7 +1961,12 @@ fn active<R: Rest>(
             );
             let arrived = match outcome {
                 Ok(arrived) => arrived,
-                Err(refusal) => return Err(fault_now(head, FaultStage::Motion, refusal, sink)),
+                // Wherever the move had got to, the head is not folded: a
+                // controlled stow is owed if the class asks for one.
+                Err(refusal) => {
+                    script_answered(shared, watch);
+                    return respond(head, Fold::Owed, refusal, &mut ctx);
+                }
             };
             posture = Some(arrived);
             settled = None;
@@ -1545,20 +1981,36 @@ fn active<R: Rest>(
             let since = *settled.get_or_insert_with(Instant::now);
             let ends_at = since + timing.rest_delay;
             if Instant::now() >= ends_at {
-                return fold_and_rest(head, shared, FaultStage::Release, Some(reason), sink);
+                ctx.stage = FaultStage::Release;
+                return fold_and_rest(head, Some(reason), &mut ctx);
             }
             until = Some(ends_at);
         }
 
         let held = head.hold(dwell_for(shared, timing.dwell, until), &mut |event| {
+            ticked(event, shared, sink, surface);
             watch.dwells.observe(&event);
         });
         watch.dwells.end_dwell(&mut |text| sink.line(text));
         if let Err(refusal) = held {
             watch.dwells.flush(&mut |text| sink.line(text));
-            return Err(fault_now(head, FaultStage::Motion, refusal, sink));
+            script_answered(shared, watch);
+            return respond(head, Fold::owed_by(posture), refusal, &mut ctx);
         }
     }
+}
+
+/// Mark the running script as answered, so a wind-down back to Resting does not
+/// raise the head again for the script that has just failed.
+///
+/// The same mark a refused engage leaves, and for the same reason: a condition
+/// that ended one raise will end the next one, and without this the loop would
+/// re-engage at the top of every pass for as long as the script asks for the
+/// head up — a machine cycling torque on and off against a hand instead of
+/// waiting for the ask to change. Read before the response, which takes seconds:
+/// a script that lands during the wind-down is a fresh ask and is tried.
+fn script_answered(shared: &Shared, watch: &mut Watch) {
+    watch.raise_answered_for = shared.accepted_seq();
 }
 
 /// The posture a move is leaving, in the narration's words.
@@ -1581,7 +2033,7 @@ fn take_hold<'e, R: Rest>(
     watch: &mut Watch,
     sink: &dyn Sink,
     surface: &Surface,
-) -> Result<R::Active<'e>, EngageFailed> {
+) -> Result<(R::Active<'e>, Incident), EngageFailed> {
     // Read before the attempt, not after it. An engage takes tens of
     // milliseconds and the bus thread writes the schedule the whole time, so a
     // script that lands during the attempt would otherwise have this refusal —
@@ -1592,18 +2044,32 @@ fn take_hold<'e, R: Rest>(
     let outcome = machine.engage(&mut |text| sink.line(text));
     let took = millis(began.elapsed());
     match outcome {
-        Ok(head) => {
+        Ok(held) => {
             sink.line(&format!("engaged: torque on, {took} ms"));
             sink.event("motion_engaged", &json!({ "ms": took }));
             watch_answered(watch, shared, sink, surface);
-            Ok(head)
+            // Judged here because this is where a session begins: the health
+            // gate lets a machine engage on antenna bits alone rather than
+            // refusing the wake over them, so a session can start with the pair
+            // already out of service and no event will ever announce it. Stated
+            // in both directions, so the engage that gets both antennas back
+            // says so.
+            let out = held.0.out_of_service();
+            antennas_now(
+                antennas_of(out),
+                &format!("out of service when torque went on: {out}"),
+                shared,
+                sink,
+            );
+            state_antennas(shared, sink, surface);
+            Ok(held)
         }
         Err(EngageFailed::Gate(refusal)) => {
             // Not a fault: nothing was written, so there is nothing to undo and
             // nothing to park for. It is still worth waking somebody up about —
             // a machine that cannot take torque is a machine that will not
             // answer the next wake word either.
-            watch.engage_refused_for = asking;
+            watch.raise_answered_for = asking;
             sink.line(&format!(
                 "engage refused: {refusal}. torque was not written; the machine is limp where \
                  it stands and the next script tries again."
@@ -1708,25 +2174,37 @@ fn reached(sink: &dyn Sink, posture: Posture) {
     sink.event("motion_posture", &json!({ "state": posture.as_str() }));
 }
 
-/// What a move says while it runs, as this daemon records it.
+/// What a move or a dwell says while it runs, as this daemon records it beyond
+/// the words.
 ///
-/// One event is worth more than its line. A clock too short for the span the
-/// move actually covers is right-sized before the move is commanded — the head
-/// travels slower than the configuration asked for rather than stepping past
-/// the guard and dropping — and the pair of durations is the only sign that a
-/// configured value never fitted the case it met. It is its own line rather
-/// than a field on [`started`]'s: that one is emitted before the move is
-/// commanded, because its timestamp is what a capture measures wake-to-motion
-/// against, and the stretch is not known until the command is accepted.
+/// Two events are worth more than their line, and both of them reach the console
+/// already: a move narrates every event the library reports, and a dwell's go
+/// through [`DwellNarration`]. What is added here is the part prose cannot carry.
 ///
-/// An antenna clock lengthened to part the pair at their crossing arrives the
-/// same way and is recorded with the same fields, `dephased` telling the two
-/// apart: one says a configured value never fitted its span, the other says the
-/// pair as configured would have swept mirrored through the contact band.
+/// A clock too short for the span the move actually covers is right-sized before
+/// the move is commanded — the head travels slower than the configuration asked
+/// for rather than stepping past the guard and dropping — and the pair of
+/// durations is the only sign that a configured value never fitted the case it
+/// met. It is its own capture line rather than a field on [`started`]'s: that one
+/// is emitted before the move is commanded, because its timestamp is what a
+/// capture measures wake-to-motion against, and the stretch is not known until
+/// the command is accepted. An antenna clock lengthened to part the pair at their
+/// crossing arrives the same way and is recorded with the same fields, `dephased`
+/// telling the two apart: one says a configured value never fitted its span, the
+/// other says the pair as configured would have swept mirrored through the
+/// contact band.
 ///
-/// Everything else a move reports is already on the console through the
-/// library's own words.
-fn moving(sink: &dyn Sink, event: TickEvent) {
+/// The antennas leaving the moves is the other one, and it is a change of what
+/// the machine can do rather than a remark about a clock: it goes into the cell
+/// every surface answers from, and the flip into degraded is what the capture and
+/// the operator's alert are keyed on. The state file is written from here, where
+/// the change happens, so a probe reads it as soon as the pair leaves the moves
+/// rather than whenever the loop next passes a boundary holding a surface.
+fn ticked(event: TickEvent, shared: &Shared, sink: &dyn Sink, surface: &Surface) {
+    if let TickEvent::AntennasDegraded(fault) = event {
+        antennas_now(Antennas::Degraded, &fault.to_string(), shared, sink);
+        state_antennas(shared, sink, surface);
+    }
     if let TickEvent::Stretched(stretch) = event {
         sink.event(
             "motion_clock_stretched",
@@ -1752,42 +2230,104 @@ fn secs_each(durations: [Duration; 2]) -> [f64; 2] {
     durations.map(|duration| duration.as_secs_f64())
 }
 
+/// Whether the antenna pair is being commanded, from the joints a session has
+/// taken out of service.
+///
+/// The one predicate behind every degraded surface. Membership and not
+/// emptiness: a head servo on its way to a park-class fault lands in the same
+/// set, and painting the antennas degraded over it would send an operator to the
+/// two joints that are fine. Asked of the group rather than of two named joints,
+/// so which bus rows are antennas has one owner.
+fn antennas_of(out_of_service: JointSet) -> Antennas {
+    let degraded = JointGroup::Antennas
+        .joints()
+        .iter()
+        .any(|antenna| out_of_service.contains(antenna));
+    if degraded {
+        Antennas::Degraded
+    } else {
+        Antennas::Ok
+    }
+}
+
+/// Record what the antennas are doing, and say so once when they stop doing it.
+///
+/// The cell is the record: a delivered script, the state file and the alert all
+/// answer from it, so there is one judgement rather than three that can drift
+/// apart. What the flip into degraded adds is the capture line — the pair going
+/// out of service is an event of the session — and the alert the bus thread
+/// raises from the same cell. Both fire once per flip, whichever source flipped
+/// it: a latch the machine carries across three wakes is one standing condition,
+/// and the state file is what reports a standing condition.
+///
+/// No narration line: the tick's own words are already on the console, through a
+/// move's narration or through a dwell's.
+fn antennas_now(standing: Antennas, detail: &str, shared: &Shared, sink: &dyn Sink) {
+    if !shared.note_antennas(standing, detail) {
+        return;
+    }
+    sink.event("antennas_degraded", &json!({ "detail": detail }));
+}
+
+/// Mirror the antenna standing into the state file.
+///
+/// Taken from the cell and not judged again: a probe reading `antennas=` has to
+/// be reading the same answer a delivered script gets, not a second judgement
+/// taken on a different clock. Written wherever the standing can change — an
+/// engage, the tick event that takes the pair out mid-session, the return to
+/// rest, a park — and a write that says nothing new writes nothing.
+fn state_antennas(shared: &Shared, sink: &dyn Sink, surface: &Surface) {
+    surface.antennas(shared.antennas(), sink);
+}
+
 /// Fold the head if it is not folded, then release: the expected ending, and
 /// the one every stop takes.
 ///
 /// The stow is commanded while this thread still owns the port and the machine
 /// still has torque, because a head released where it stands is a head that
 /// falls the rest of the way. A refusal on the way down does not keep torque
-/// on — it takes the immediate release instead.
+/// on — the ending's own class decides what does come off and how, and a stop
+/// that got the machine to rest is still the stop it was asked for.
 fn release_for<A: Active>(
     mut head: A,
     posture: Option<Posture>,
     stop: Stop,
-    shared: &Shared,
-    sink: &dyn Sink,
+    ctx: &mut Responding,
 ) -> Ending {
-    sink.line(&format!("stopping on {stop}"));
+    // Whatever the loop was doing, an ending from here is the shutdown's.
+    ctx.stage = FaultStage::Shutdown;
+    ctx.line(&format!("stopping on {stop}"));
     if posture != Some(Posture::Stow) {
-        started(sink, posture, Posture::Stow, "shutdown");
+        started(ctx.sink, posture, Posture::Stow, "shutdown");
         // Nothing may divert this one: the daemon is on its way out and the
         // fold is the last thing it owes the machine.
         let folded = head.move_to(
             Posture::Stow,
-            &mut |text| sink.line(text),
-            &mut |event| moving(sink, event),
+            &mut |text| ctx.sink.line(text),
+            &mut |event| ticked(event, ctx.shared, ctx.sink, ctx.surface),
             &mut || None,
         );
         if let Err(refusal) = folded {
-            return fault_now(head, FaultStage::Shutdown, refusal, sink);
+            // The fold that just failed was this ending's controlled stow, so
+            // nothing asks for a second one.
+            return match respond(head, Fold::Spent, refusal, ctx) {
+                // Limp at rest is where the stop was trying to get the machine:
+                // it arrived, by a route nobody asked for.
+                Ok(_) => Ending::Stopped(stop),
+                Err(ending) => ending,
+            };
         }
-        reached(sink, Posture::Stow);
+        reached(ctx.sink, Posture::Stow);
     }
-    match head.disengage(&mut |text| sink.line(text)) {
+    match head.disengage(&mut |text| ctx.sink.line(text)) {
         Ok(verdict) => {
-            released(shared, sink, Some("shutdown"), verdict);
+            released(ctx.shared, ctx.sink, Some("shutdown"), verdict);
             Ending::Stopped(stop)
         }
-        Err(refusal) => Ending::Faulted(FaultStage::Shutdown, refusal),
+        Err(refusal) => match already_limp(refusal, ctx) {
+            Ok(_) => Ending::Stopped(stop),
+            Err(ending) => ending,
+        },
     }
 }
 
@@ -1798,17 +2338,18 @@ fn release_for<A: Active>(
 /// different things to read in a capture.
 fn fold_and_rest<A: Active>(
     head: A,
-    shared: &Shared,
-    stage: FaultStage,
     reason: Option<&str>,
-    sink: &dyn Sink,
+    ctx: &mut Responding,
 ) -> Result<Standing, Ending> {
-    match head.disengage(&mut |text| sink.line(text)) {
+    match head.disengage(&mut |text| ctx.sink.line(text)) {
         Ok(verdict) => {
-            released(shared, sink, reason, verdict);
+            released(ctx.shared, ctx.sink, reason, verdict);
             Ok(verdict.standing())
         }
-        Err(refusal) => Err(Ending::Faulted(stage, refusal)),
+        // Torque came off inside the library whatever this says, so there is no
+        // maneuver left: what remains is whether the machine may be engaged
+        // again.
+        Err(refusal) => already_limp(refusal, ctx),
     }
 }
 
@@ -1843,21 +2384,343 @@ fn released(shared: &Shared, sink: &dyn Sink, reason: Option<&str>, verdict: Ver
     );
 }
 
-/// The fault response: torque off now, and nothing else.
+/// Everything a response needs that is the same at every step of it.
+struct Responding<'a> {
+    /// The session's record, which the response both reads and adds to.
+    incident: &'a mut Incident,
+    /// Where the daemon was when the ending arrived.
+    stage: FaultStage,
+    shared: &'a Shared,
+    sink: &'a dyn Sink,
+    /// The state file, so the antenna standing can be stated from wherever it
+    /// changes rather than mirrored from somewhere that still holds a surface.
+    surface: &'a Surface,
+}
+
+impl Responding<'_> {
+    /// One narration line.
+    fn line(&self, text: &str) {
+        self.sink.line(text);
+    }
+
+    /// The record as an ending carries it: owned, because it outlives the
+    /// session it came from.
+    fn record(&mut self) -> Vec<Entry> {
+        self.incident.entries().to_vec()
+    }
+}
+
+/// Answer an ending that arrived with the machine holding torque, and say where
+/// it leaves the daemon.
 ///
-/// No stow attempt first. A fault means motor control or position feedback is
-/// no longer trusted, so a commanded move is exactly what cannot be relied on;
-/// the head falls gently into near-stow under gearbox resistance instead. What
-/// the release has to say about itself — a servo that never acknowledged its
-/// own torque-off — is carried into the fault report, because that is the one
-/// thing that decides whether a hand can go on the head.
-fn fault_now<A: Active>(head: A, stage: FaultStage, refusal: Refusal, sink: &dyn Sink) -> Ending {
-    sink.line("fault: writing torque off now; the head settles into near-stow on its own");
-    let detail = match head.disengage_now(&mut |text| sink.line(text)) {
-        Ok(()) => refusal.to_string(),
-        Err(unacked) => format!("{refusal} — and the release reported: {unacked}"),
+/// The one place an ending's class decides anything. Every response terminates
+/// at torque off; what the class chooses between is how the head gets there —
+/// stowed under control by motors that still command, stowed on what is left of
+/// them, or limp on the spot where control is no longer trusted — and whether
+/// the next script may ask again or a person has to look first. Nothing here
+/// reads the wording of an error, and nothing outside here decides a response.
+///
+/// `fold` says whether a controlled stow is still owed: a head already folded,
+/// or one whose fold has just been defeated, is released rather than commanded
+/// again.
+fn respond<A: Active>(
+    mut head: A,
+    fold: Fold,
+    refusal: Refusal,
+    ctx: &mut Responding,
+) -> Result<Standing, Ending> {
+    // Before the response, because the response is what the record is about: a
+    // bus that stopped carrying is seen by the layer holding the wire, and this
+    // is where the session's story gets the condition that ends it.
+    let refusal = note_condition(&mut head, refusal);
+    match refusal.class() {
+        // The machine is healthy and still commanding: a declined ask, or a plan
+        // of ours the tick would not run. It goes down the way every ordinary
+        // ending goes down.
+        ErrorClass::Refuse | ErrorClass::SlowStowToRest => {
+            stow_and_release(head, fold, refusal, ctx)
+        }
+        ErrorClass::MaskedSlowStowToPark => {
+            let deadline = head.stow_deadline();
+            masked_stow(head, refusal, deadline, ctx)
+        }
+        ErrorClass::ImmediateAllTorqueOffToRest | ErrorClass::ImmediateAllTorqueOffToPark => {
+            torque_off_now(head, refusal, ctx)
+        }
+    }
+}
+
+/// Put an ending's condition into the session's record, if it is not there
+/// already, and say so on the ending.
+///
+/// Every ending this layer answers passes through here once. What is left for it
+/// to do is narrow and load-bearing: the tick records what it raises, and the
+/// library records what it consumes inside a call of its own — a release, a
+/// masked wind-down — so the conditions that would otherwise reach no record at
+/// all are the ones the layer holding the wire hands *back*, out of a move this
+/// daemon commanded itself. A record missing the condition that ended the
+/// incident is published under the name of whatever condition preceded it.
+fn note_condition<A: Active>(head: &mut A, ending: Refusal) -> Refusal {
+    match ending.unrecorded() {
+        Some(fault) => {
+            head.note(fault);
+            ending.noted()
+        }
+        None => ending,
+    }
+}
+
+/// Stow under control, then take the measured release.
+///
+/// The response for every ending that leaves the motors commanding. The stow is
+/// commanded on the same live state the ending left — the tick abandoned its
+/// move and holds at the last goal it emitted — so this is a wind-down and not a
+/// fresh engage of a machine nobody has looked at. A hand pushing the head down
+/// is met by this and not by going limp.
+///
+/// The release at the end of it is the orderly one, which is what makes this
+/// worth commanding at all: it measures where the machine came to rest and says
+/// so, and that measurement is what the next engage plans from.
+///
+/// The stow is bracketed into the session's record — started, then completed —
+/// because this is the layer that commands it and so the only one that can say
+/// how far it got. A record with the condition and no maneuver beside it is half
+/// the story, on the one machine nobody is watching.
+///
+/// The maneuver also opens the clock every escalation of it shares: what is left
+/// of one stow window is what a defeated stow gets, never a second window.
+fn stow_and_release<A: Active>(
+    mut head: A,
+    fold: Fold,
+    refusal: Refusal,
+    ctx: &mut Responding,
+) -> Result<Standing, Ending> {
+    let deadline = head.stow_deadline();
+    if fold == Fold::Owed {
+        ctx.line(&format!(
+            "winding down under control: {refusal}. the motors still command, so the head is \
+             stowed rather than dropped."
+        ));
+        started(ctx.sink, None, Posture::Stow, "wind-down");
+        // Whose maneuver this is belongs to the class, not to this caller — and
+        // only if nothing has one open already: the ladder never begins a second
+        // answer to a machine already being answered.
+        let maneuver = head
+            .open_maneuver()
+            .is_none()
+            .then(|| refusal.class().maneuver())
+            .flatten();
+        if let Some(maneuver) = maneuver {
+            head.note_response(maneuver, TimelineOutcome::Started);
+        }
+        // Nothing may divert this one: it is the response to an ending, and a
+        // script arriving mid-way does not get to turn a wind-down around.
+        let folded = head.move_to(
+            Posture::Stow,
+            &mut |text| ctx.sink.line(text),
+            &mut |event| ticked(event, ctx.shared, ctx.sink, ctx.surface),
+            &mut || None,
+        );
+        if let Err(defeated) = folded {
+            // A wire that stopped carrying under this stow is a condition of the
+            // machine that nothing else will record: the tick did not raise it
+            // and the library handed it back rather than consuming it. Noted
+            // here or the incident is published under the condition the stow was
+            // answering, which is over.
+            let ended = note_condition(&mut head, refusal.and(defeated));
+            // The maneuver stays open: whatever answers next is this one
+            // expanding, and it is that answer which closes the entry.
+            return defeated_stow(head, ended, deadline, ctx);
+        }
+        if let Some(maneuver) = maneuver {
+            head.note_response(maneuver, TimelineOutcome::Completed);
+        }
+        reached(ctx.sink, Posture::Stow);
+    }
+    match head.disengage(&mut |text| ctx.sink.line(text)) {
+        Ok(verdict) => {
+            released(ctx.shared, ctx.sink, Some("wind-down"), verdict);
+            let disposition = refusal.class().disposition();
+            settled(disposition, refusal, verdict.standing(), ctx)
+        }
+        // Torque is off on every path out of `disengage`, so what is left is
+        // what it had to report, and whether that latches. Nothing is noted from
+        // here: the release consumed the engagement, and a condition found
+        // inside a call that consumes it is recorded by that call — a torque-off
+        // nobody acknowledged is already on this session's record by the time it
+        // is handed back.
+        Err(unacked) => {
+            let ended = refusal.and(unacked);
+            let disposition = ended.class().disposition();
+            settled(disposition, ended, Standing::Elsewhere, ctx)
+        }
+    }
+}
+
+/// What a defeated wind-down becomes.
+///
+/// One escalation and never a second wind-down: a servo that dropped out is
+/// already off and out of every check, so the stow carries on without it and the
+/// ending latches; anything else that defeated the stow gets the immediate
+/// release. Wildcard-free, so a class added to the doctrine is answered here or
+/// does not compile.
+///
+/// `deadline` is the defeated stow's own, carried in: the expansion is the same
+/// maneuver continuing, so it gets what is left of that clock.
+fn defeated_stow<A: Active>(
+    head: A,
+    ended: Refusal,
+    deadline: Duration,
+    ctx: &mut Responding,
+) -> Result<Standing, Ending> {
+    match ended.class() {
+        ErrorClass::MaskedSlowStowToPark => masked_stow(head, ended, deadline, ctx),
+        ErrorClass::Refuse
+        | ErrorClass::SlowStowToRest
+        | ErrorClass::ImmediateAllTorqueOffToRest
+        | ErrorClass::ImmediateAllTorqueOffToPark => torque_off_now(head, ended, ctx),
+    }
+}
+
+/// Stow on what still commands, then release everything.
+///
+/// The answer to a servo that dropped out: it is already torqued off and out of
+/// every check, so the head comes down on the joints that are left rather than
+/// going limp all at once. What the machine is left waiting for is the
+/// maneuver's own answer — the mask growing latches — and this daemon carries it
+/// rather than deriving a second one.
+///
+/// The stow reports itself the way the daemon's own moves do: a pair leaving the
+/// moves on the way down is a change of what the machine can do, and the surfaces
+/// that answer from that have to be written wherever it happens.
+fn masked_stow<A: Active>(
+    head: A,
+    refusal: Refusal,
+    deadline: Duration,
+    ctx: &mut Responding,
+) -> Result<Standing, Ending> {
+    ctx.line(&format!(
+        "a servo has dropped out: {refusal}. it is off already; stowing on what still commands."
+    ));
+    let disposition = head.masked_stow(deadline, &mut |text| ctx.sink.line(text), &mut |event| {
+        ticked(event, ctx.shared, ctx.sink, ctx.surface)
+    });
+    settled(
+        disposition,
+        refusal,
+        // Nothing measured where the head came to rest, and a joint is out of
+        // service: the next engage plans from a fresh sweep, not from this.
+        Standing::Elsewhere,
+        ctx,
+    )
+}
+
+/// Torque off now, and nothing else.
+///
+/// The response where motor control or position feedback is no longer trusted,
+/// so a commanded move is exactly what cannot be relied on; the head falls
+/// gently into near-stow under gearbox resistance instead. What the release has
+/// to say about itself — a servo that never acknowledged its own torque-off — is
+/// folded in, because that is the one thing that decides whether a hand can go
+/// on the head. Folded in and not noted: the release consumed the engagement, and
+/// a condition found inside a call that consumes it is recorded by that call.
+fn torque_off_now<A: Active>(
+    head: A,
+    refusal: Refusal,
+    ctx: &mut Responding,
+) -> Result<Standing, Ending> {
+    ctx.line(&format!(
+        "{refusal}. writing torque off now; the head settles into near-stow on its own."
+    ));
+    let ended = match head.disengage_now(&mut |text| ctx.sink.line(text)) {
+        Ok(()) => refusal,
+        Err(unacked) => refusal.and(unacked),
     };
-    Ending::Faulted(stage, Refusal::new(detail))
+    let disposition = ended.class().disposition();
+    settled(disposition, ended, Standing::Elsewhere, ctx)
+}
+
+/// Where an ending leaves the daemon once torque is off and no maneuver is left.
+///
+/// Torque is already off on every path here — an engage that failed after its
+/// first enable, a release that reported something about itself — so there is
+/// nothing to command and nothing to choose but whether the next script may ask
+/// again.
+fn already_limp(refusal: Refusal, ctx: &mut Responding) -> Result<Standing, Ending> {
+    let disposition = refusal.class().disposition();
+    settled(disposition, refusal, Standing::Elsewhere, ctx)
+}
+
+/// The last question every response answers: may the next script engage this
+/// machine, or does a person have to look first.
+///
+/// The disposition and nothing else decides it, and it arrives from whatever ran
+/// the maneuver. A rest disposition writes no fault cell — a daemon that stops
+/// taking scripts because a hand met the head is an outage over an event the
+/// machine recovers from by itself — and the loop goes back to Resting with the
+/// record in the capture. A park writes the cell, once, and the daemon waits.
+fn settled(
+    disposition: Disposition,
+    refusal: Refusal,
+    standing: Standing,
+    ctx: &mut Responding,
+) -> Result<Standing, Ending> {
+    let record = ctx.record();
+    match disposition {
+        Disposition::Rest => {
+            wound_down(&refusal, &record, ctx);
+            Ok(standing)
+        }
+        Disposition::Park => Err(Ending::Faulted(ctx.stage, refusal, record)),
+    }
+}
+
+/// The report a wind-down back to rest owes: what happened, what it named, and
+/// that the machine is at the minimum risk condition with nothing latched.
+///
+/// Its own event rather than `motion_fault`: that one says a daemon has parked
+/// and nothing will move again, and a capture that used one word for both would
+/// make the difference unreadable exactly where it matters most.
+///
+/// What is said about the head is the record's to say and not this function's.
+/// Every rest-class ending arrives here — the controlled stow that finished, a
+/// stow on what was left of the joints, a machine dropped limp where it stood,
+/// and an engage that never took the machine at all — and the one thing true of
+/// all of them is that torque is off and nothing latched. Which maneuver brought
+/// the head down is in the entries, so the entries go out with the report.
+fn wound_down(refusal: &Refusal, record: &[Entry], ctx: &Responding) {
+    let stage = ctx.stage;
+    let sink = ctx.sink;
+    let slug = condition(record);
+    sink.event(
+        "motion_incident",
+        &json!({
+            "stage": stage.to_string(),
+            "slug": slug,
+            "detail": refusal.to_string(),
+            "incident": story(record),
+            "disposition": "rest",
+        }),
+    );
+    sink.line(&format!(
+        "the run did not finish: {refusal}. torque is off and nothing is latched, so nothing has \
+         to be cleared before the next script."
+    ));
+    // Alerted on as well as narrated, and this is the reason: nothing latched,
+    // so from outside the daemon this is indistinguishable from a run in which
+    // nothing ever went wrong. The one thing that says a hand met the head, or
+    // that a plan of ours would not run, is somebody being told.
+    //
+    // With the record, because this alert is the whole of the evidence anybody
+    // gets: it is what says whether the head was stowed under control, stowed on
+    // what was left of it, or dropped where it stood.
+    ctx.shared.note_incident(format!(
+        "at {stage}: {refusal}{}{}",
+        slug.map(|slug| format!(" [{slug}]")).unwrap_or_default(),
+        story(record)
+            .map(|story| format!(". the record: {story}"))
+            .unwrap_or_default()
+    ));
 }
 
 /// The ending for a commissioning that refused: the machine was never taken.
@@ -1874,7 +2737,16 @@ pub fn commission_failed(
     sink: &dyn Sink,
     surface: &Surface,
 ) -> Outcome {
-    let outcome = faulted(shared, FaultStage::Commission, refusal, sink, surface);
+    // No session and so no record: nothing was ever taken hold of, and the
+    // refusal itself is the whole of what happened.
+    let outcome = faulted(
+        shared,
+        FaultStage::Commission,
+        refusal,
+        Vec::new(),
+        sink,
+        surface,
+    );
     shared.request_stop(Stop::Detached);
     shared.end_motion();
     outcome
@@ -1893,10 +2765,11 @@ fn park<R>(
     shared: &Shared,
     stage: FaultStage,
     refusal: Refusal,
+    record: Vec<Entry>,
     sink: &dyn Sink,
     surface: &Surface,
 ) -> Outcome {
-    let outcome = faulted(shared, stage, refusal, sink, surface);
+    let outcome = faulted(shared, stage, refusal, record, sink, surface);
     while shared.stopping().is_none() {
         thread::sleep(PARK_POLL);
     }
@@ -1916,19 +2789,34 @@ fn park<R>(
 /// The state surface is written here too, and here is after: torque came off
 /// before this was reached, so nothing about a file has ever stood between the
 /// machine and the minimum risk condition.
+///
+/// The condition the machine is left in is read off `record` rather than out of
+/// the refusal's wording, and the latest one at that: a wind-down that began
+/// over a grabbed head and latched because a servo dropped out on the way down
+/// is an incident about the servo, and that is the word an alert rule and an
+/// operator both need.
 fn faulted(
     shared: &Shared,
     stage: FaultStage,
     refusal: Refusal,
+    record: Vec<Entry>,
     sink: &dyn Sink,
     surface: &Surface,
 ) -> Outcome {
-    let report = FaultReport::new(stage, refusal.to_string());
+    let report = FaultReport::recorded(stage, refusal.to_string(), record);
     shared.set_fault(report.clone());
-    surface.parked(report.stage, &report.detail, sink);
+    // Before the parked record, so the one file an operator reads carries what
+    // the session had left of the machine as well as what stopped it.
+    state_antennas(shared, sink, surface);
+    surface.parked(&report, sink);
     sink.event(
         "motion_fault",
-        &json!({ "stage": report.stage.to_string(), "detail": report.detail }),
+        &json!({
+            "stage": report.stage.to_string(),
+            "slug": report.slug,
+            "detail": report.detail,
+            "incident": report.story(),
+        }),
     );
     sink.line(&format!(
         "fault: {report}. commanding has stopped and torque is off: the machine is at the \
@@ -1950,12 +2838,15 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
-    use motion_proto::{MotionScript, Step};
+    use std::sync::mpsc::{Sender, channel};
+
+    use motion_proto::{Acceptance, MotionScript, Step};
     use reachy_bench::pump::ReadFailures;
-    use reachy_bus::IdOutcome;
+    use reachy_bus::{IdOutcome, XactError};
     use reachy_motion::{
-        AntennaPhaseConfig, ClockStretch, CommandDisposition, Fault, JointId, PhaseSeparation,
-        RegId, SeqError, SeqStep, ServoHealth, StepContext,
+        AntennaPhaseConfig, BusFailureSource, ClockStretch, CommandDisposition, JointId, Maneuver,
+        Outcome as TimelineOutcome, PhaseSeparation, RegId, SeqError, SeqStep, ServoHealth,
+        StepContext, WireFailure,
     };
 
     use super::*;
@@ -1974,6 +2865,11 @@ mod tests {
     /// Where [`Event::Turn`]'s stow step sits. Short enough that an engage the
     /// fixture is told to take its time over outlasts it.
     const TURN_STOW_MS: u64 = 40;
+    /// What the fixture says one stow maneuver is allowed, end to end.
+    const FAKE_STOW_BUDGET: Duration = Duration::from_secs(3);
+    /// How far the fixture's session clock advances per move commanded. Enough
+    /// of the budget above that a second one would be visible as a second one.
+    const FAKE_MOVE_STEP: Duration = Duration::from_secs(1);
     /// How many times one move may be replaced before the fixture calls the
     /// loop broken. No test asks the world to change more than once inside a
     /// move, so anything past that is the loop answering with the posture it is
@@ -2004,6 +2900,61 @@ mod tests {
         Release,
         /// The fault release: nine writes and nothing else.
         ReleaseNow,
+        /// The masked wind-down: stow on what still commands, then release
+        /// everything.
+        MaskedStow,
+    }
+
+    /// A wire that stopped carrying commands under torque: control not trusted,
+    /// torque off on the spot, and a person before the next engage.
+    ///
+    /// Found by the layer holding the wire and not by the tick, which is why the
+    /// record does not have it yet — the response is what puts it there.
+    fn bus_failure() -> Refusal {
+        Refusal::naming(
+            ErrorClass::ImmediateAllTorqueOffToPark,
+            bus_silent(),
+            "the bus is not carrying commands: servo 12: silence",
+        )
+    }
+
+    /// The condition [`bus_failure`] names, as a record carries it.
+    fn bus_silent() -> Fault {
+        Fault::BusFailure {
+            source: BusFailureSource::Transaction {
+                id: 12,
+                kind: WireFailure::Silent,
+            },
+        }
+    }
+
+    /// A plan of ours the tick would not run. The platform is healthy and still
+    /// commanding, so the head is stowed under control and nothing latches, and
+    /// no condition of the machine is named at all.
+    fn move_aborted() -> Refusal {
+        Refusal::new(
+            ErrorClass::SlowStowToRest,
+            "the move was abandoned: the step for leg 3 is past the bound",
+        )
+    }
+
+    /// A hand or a snag on the head. The motors still command, so the answer is
+    /// a controlled stow back to rest — and the tick raised it, so it is already
+    /// in the record.
+    fn head_obstructed() -> Refusal {
+        Refusal::new(
+            ErrorClass::SlowStowToRest,
+            "leg 3 is 0.4000 rad from its goal and not closing",
+        )
+    }
+
+    /// A leg servo dropping out mid-move: it is off already, the stow carries on
+    /// without it, and the ending latches.
+    fn head_servo_fault() -> Refusal {
+        Refusal::new(
+            ErrorClass::MaskedSlowStowToPark,
+            "leg 3 (servo 13) reports hardware error 0x20",
+        )
     }
 
     /// A script asking for one posture from the moment it lands.
@@ -2071,8 +3022,24 @@ mod tests {
         gate_engage: Option<usize>,
         /// The engage, counted from zero, that fails outright.
         fault_engage: Option<usize>,
-        /// The move, counted from zero, that refuses.
-        refuse_move: Option<usize>,
+        /// The move, counted from zero, that refuses, and what it answers with.
+        ///
+        /// The refusal carries the class, because the class is the whole of what
+        /// the loop decides on: the same fixture answering
+        /// `ImmediateAllTorqueOffToPark` and answering `SlowStowToRest` is a
+        /// parked daemon and a daemon back at rest.
+        refuse_move: Vec<(usize, Refusal)>,
+        /// What the tick recorded before the move refused, if a test says so.
+        /// Pushed onto the session's own channel, which is where the real one
+        /// arrives from.
+        raises: Vec<Entry>,
+        /// The joints the session has out of service, as the engagement reports
+        /// them at any moment. A session engaged onto latched antenna bits starts
+        /// with them already in here and no event ever announces it, which is one
+        /// of the two ways a machine ends up commanding the head alone.
+        out_of_service: JointSet,
+        /// Where this session's record is being pushed, once there is a session.
+        pushes: Option<Sender<Entry>>,
         /// What the world does in the middle of a move, and which move.
         interrupt: Option<(usize, Event)>,
         /// Whether a refused move also asks the daemon to stop. On by default,
@@ -2094,6 +3061,16 @@ mod tests {
         sleeps: bool,
         /// How long each dwell asked to watch for, in order.
         dwells: Rc<RefCell<Vec<Duration>>>,
+        /// The session clock, advanced one [`FAKE_MOVE_STEP`] per move
+        /// commanded, so a deadline taken before a stow is a different number
+        /// from one taken after it — which is the whole of what a maneuver
+        /// inheriting its clock means.
+        elapsed: Duration,
+        /// The maneuver the record has open, as this fixture's own entries left
+        /// it.
+        open: Option<Maneuver>,
+        /// The deadline each masked stow was handed, in order.
+        stow_deadlines: Rc<RefCell<Vec<Duration>>>,
         watches: usize,
         engages: usize,
         moves: usize,
@@ -2132,7 +3109,10 @@ mod tests {
                 unreadable_engage: false,
                 gate_engage: None,
                 fault_engage: None,
-                refuse_move: None,
+                refuse_move: Vec::new(),
+                raises: Vec::new(),
+                out_of_service: JointSet::EMPTY,
+                pushes: None,
                 interrupt: None,
                 refusal_stops: true,
                 engage_takes: Duration::ZERO,
@@ -2141,6 +3121,9 @@ mod tests {
                 unacked_release: false,
                 sleeps: false,
                 dwells: Rc::new(RefCell::new(Vec::new())),
+                elapsed: Duration::ZERO,
+                open: None,
+                stow_deadlines: Rc::new(RefCell::new(Vec::new())),
                 watches: 0,
                 engages: 0,
                 moves: 0,
@@ -2161,6 +3144,11 @@ mod tests {
 
         fn seen(&self) -> Rc<RefCell<Vec<String>>> {
             Rc::clone(&self.seen)
+        }
+
+        /// The deadlines the masked stow was handed, readable after the run.
+        fn stow_deadlines(&self) -> Rc<RefCell<Vec<Duration>>> {
+            Rc::clone(&self.stow_deadlines)
         }
 
         /// A machine a crash or a hand left somewhere other than its fold.
@@ -2190,8 +3178,40 @@ mod tests {
         /// A refusal out of the nth move, which also stops the daemon: a parked
         /// thread waits for that, and a test that never sent one would wait with
         /// it.
-        fn refusing_move(mut self, nth: usize) -> Self {
-            self.refuse_move = Some(nth);
+        ///
+        /// Control not trusted: the wire stopped carrying, torque comes off on
+        /// the spot and the daemon parks.
+        fn refusing_move(self, nth: usize) -> Self {
+            self.refusing_move_with(nth, bus_failure())
+        }
+
+        /// The same, answering with `refusal` — which is what decides the
+        /// response, the disposition and where the loop goes next.
+        fn refusing_move_with(mut self, nth: usize, refusal: Refusal) -> Self {
+            self.refuse_move.push((nth, refusal));
+            self
+        }
+
+        /// A refusal that does not also stop the daemon, so what the loop does
+        /// *after* an ending is observable.
+        fn unstopped(mut self) -> Self {
+            self.refusal_stops = false;
+            self
+        }
+
+        /// What the tick had already recorded by the time the move refused.
+        fn having_raised(mut self, entries: impl IntoIterator<Item = Entry>) -> Self {
+            self.raises = entries.into_iter().collect();
+            self
+        }
+
+        /// A machine whose engagements start with `joints` already out of
+        /// service: the health gate let the wake through on bits that had latched
+        /// before it, so there is nothing for an event to announce.
+        fn engaging_without(mut self, joints: impl IntoIterator<Item = JointId>) -> Self {
+            for joint in joints {
+                self.out_of_service.insert(joint);
+            }
             self
         }
 
@@ -2238,7 +3258,7 @@ mod tests {
         /// is what a fault does in life, and the only way the parked wait is
         /// observable.
         fn refusing_move_unstopped(mut self, nth: usize) -> Self {
-            self.refuse_move = Some(nth);
+            self.refuse_move.push((nth, bus_failure()));
             self.refusal_stops = false;
             self
         }
@@ -2363,6 +3383,18 @@ mod tests {
         machine: &'e mut Fake,
     }
 
+    impl Held<'_> {
+        /// Put an entry on this session's record, as the libraries would.
+        ///
+        /// Best-effort, exactly like the real subscriber: a record nobody is
+        /// reading is not an error on the reporting path of a machine in trouble.
+        fn push(&self, entry: Entry) {
+            if let Some(pushes) = &self.machine.pushes {
+                let _ = pushes.send(entry);
+            }
+        }
+    }
+
     impl Rest for Fake {
         type Active<'e>
             = Held<'e>
@@ -2382,12 +3414,15 @@ mod tests {
                 .refuse_watch
                 .is_some_and(|(from, count)| (from..from + count).contains(&nth));
             if self.watch_failing {
-                return Err(Refusal::new("servo 11: timed out"));
+                return Err(Refusal::new(ErrorClass::Refuse, "servo 11: timed out"));
             }
             Ok(self.standing)
         }
 
-        fn engage(&mut self, _line: &mut dyn FnMut(&str)) -> Result<Held<'_>, EngageFailed> {
+        fn engage(
+            &mut self,
+            _line: &mut dyn FnMut(&str),
+        ) -> Result<(Held<'_>, Incident), EngageFailed> {
             let nth = self.engages;
             self.engages += 1;
             thread::sleep(self.engage_takes);
@@ -2395,10 +3430,14 @@ mod tests {
             // an engage over a bus that is not answering refuses rather than
             // faults, and it happens before any of the torque-on gates.
             if self.unreadable_engage && self.watch_failing {
-                return Err(EngageFailed::Gate(Refusal::new("servo 11: timed out")));
+                return Err(EngageFailed::Gate(Refusal::new(
+                    ErrorClass::Refuse,
+                    "servo 11: timed out",
+                )));
             }
             if self.gate_engage == Some(nth) {
                 return Err(EngageFailed::Gate(Refusal::new(
+                    ErrorClass::Refuse,
                     "the supply is below the floor: 5.5 V against 6.0 V",
                 )));
             }
@@ -2407,11 +3446,14 @@ mod tests {
                 // waits to be stopped.
                 self.shared.request_stop(Stop::Operator);
                 return Err(EngageFailed::Fault(Refusal::new(
+                    ErrorClass::ImmediateAllTorqueOffToPark,
                     "servo 14: no answer to the enable",
                 )));
             }
             self.record(Act::Engage);
-            Ok(Held { machine: self })
+            let (pushes, pushed) = channel();
+            self.pushes = Some(pushes);
+            Ok((Held { machine: self }, Incident::new(pushed)))
         }
     }
 
@@ -2425,13 +3467,23 @@ mod tests {
         ) -> Result<Posture, Refusal> {
             let nth = self.machine.moves;
             self.machine.moves += 1;
+            // Commanded time passes whether or not the move finishes: a stow a
+            // servo dropped out of still spent most of its clock.
+            self.machine.elapsed = self.machine.elapsed.saturating_add(FAKE_MOVE_STEP);
             let says = self.machine.says_moving.pop_front().unwrap_or_default();
             let reports = self.machine.reports_moving.pop_front().unwrap_or_default();
-            if self.machine.refuse_move == Some(nth) {
+            if let Some((_, refusal)) = self.machine.refuse_move.iter().find(|(at, _)| *at == nth) {
+                let refusal = refusal.clone();
                 if self.machine.refusal_stops {
                     self.machine.shared.request_stop(Stop::Operator);
                 }
-                return Err(Refusal::new("the tick faulted: envelope on path"));
+                // As the real one does: whatever the tick raised is on the
+                // session's channel before the ending reaches the loop.
+                let raised = std::mem::take(&mut self.machine.raises);
+                for entry in raised {
+                    self.push(entry);
+                }
+                return Err(refusal);
             }
             self.machine.record(Act::Move(posture));
             for text in says {
@@ -2485,7 +3537,10 @@ mod tests {
             match next {
                 Some(Event::Refuse) => {
                     self.machine.shared.request_stop(Stop::Operator);
-                    Err(Refusal::new("servo 13: timed out"))
+                    Err(Refusal::new(
+                        ErrorClass::ImmediateAllTorqueOffToPark,
+                        "servo 13: timed out",
+                    ))
                 }
                 _ => Ok(()),
             }
@@ -2497,7 +3552,10 @@ mod tests {
                 // As with a refused move: the ending parks, and a parked thread
                 // waits to be stopped.
                 self.machine.shared.request_stop(Stop::Operator);
-                return Err(Refusal::new("servo 12 did not acknowledge torque off"));
+                return Err(Refusal::new(
+                    ErrorClass::ImmediateAllTorqueOffToPark,
+                    "servo 12 did not acknowledge torque off",
+                ));
             }
             if self.machine.release_off_stow {
                 return Ok(Verdict {
@@ -2513,10 +3571,86 @@ mod tests {
             })
         }
 
+        fn masked_stow(
+            self,
+            deadline: Duration,
+            line: &mut dyn FnMut(&str),
+            event: &mut dyn FnMut(TickEvent),
+        ) -> Disposition {
+            self.machine.record(Act::MaskedStow);
+            self.machine.stow_deadlines.borrow_mut().push(deadline);
+            if self.machine.elapsed >= deadline {
+                line("  the stow clock is spent; releasing torque now");
+            }
+            // The maneuver's own stow is a commanded move like any other, and it
+            // reports what it saw: the fixture takes the next move's events for
+            // it, in the order the moves were commanded.
+            for reported in self.machine.reports_moving.pop_front().unwrap_or_default() {
+                event(reported);
+            }
+            // As the library's own maneuver does: an expansion closes the
+            // maneuver that was already open rather than opening a second one.
+            let maneuver = self.machine.open.unwrap_or(Maneuver::MaskedSlowStow);
+            let at = self.machine.elapsed;
+            self.push(Entry::Response {
+                maneuver,
+                outcome: TimelineOutcome::Completed,
+                at,
+            });
+            // What the library's own maneuver answers for this class: the mask
+            // only grows, so a stow that masked anything latches.
+            Disposition::Park
+        }
+
+        fn stow_deadline(&self) -> Duration {
+            self.machine.elapsed.saturating_add(FAKE_STOW_BUDGET)
+        }
+
+        fn open_maneuver(&self) -> Option<Maneuver> {
+            self.machine.open
+        }
+
+        fn out_of_service(&self) -> JointSet {
+            self.machine.out_of_service
+        }
+
+        fn note(&mut self, fault: Fault) {
+            let at = self.machine.elapsed;
+            self.push(Entry::Fault { fault, at });
+        }
+
+        fn note_response(&mut self, maneuver: Maneuver, outcome: TimelineOutcome) {
+            // The record's own rule, as the library keeps it: an outcome that
+            // ends a maneuver leaves nothing open.
+            self.machine.open = (!outcome.ends()).then_some(maneuver);
+            let at = self.machine.elapsed;
+            self.push(Entry::Response {
+                maneuver,
+                outcome,
+                at,
+            });
+        }
+
         fn disengage_now(self, _line: &mut dyn FnMut(&str)) -> Result<(), Refusal> {
             self.machine.record(Act::ReleaseNow);
             if self.machine.unacked_release {
-                return Err(Refusal::new("servo 12 did not acknowledge torque off"));
+                // Named, and recorded here, exactly as the library does it: a
+                // minimum risk condition believed rather than known is a
+                // condition of the machine, and the call that consumed the
+                // engagement is the only layer that could have seen it. The
+                // ending still says the record does not have it — that is a fact
+                // about the error's type, not about this session — so anything
+                // above that notes what it is handed would write it twice.
+                let fault = Fault::TorqueOffUnconfirmed { id: 12 };
+                self.push(Entry::Fault {
+                    fault,
+                    at: self.machine.elapsed,
+                });
+                return Err(Refusal::naming(
+                    ErrorClass::ImmediateAllTorqueOffToPark,
+                    fault,
+                    "servo 12 did not acknowledge torque off",
+                ));
             }
             Ok(())
         }
@@ -3181,13 +4315,383 @@ mod tests {
             panic!("the move up refused");
         };
         assert_eq!(report.stage, FaultStage::Motion);
-        assert!(report.detail.contains("envelope on path"), "{report}");
+        assert!(report.detail.contains("not carrying commands"), "{report}");
         assert_eq!(
             acts,
             [Act::Watch, Act::Engage, Act::ReleaseNow],
             "the fault ending is the nine writes and nothing else",
         );
         assert_eq!(shared.fault(), Some(&report));
+    }
+
+    /// Every class of ending takes the maneuver its class asks for, and leaves
+    /// the daemon where that class says.
+    ///
+    /// The table this whole routing exists to be: one representative ending per
+    /// class, each driven through the real loop, asserted on what reached the
+    /// machine and on whether the daemon may take another script afterwards. A
+    /// class routed to the wrong maneuver is a head dropped where it should have
+    /// been stowed, or an outage over an event the machine recovers from by
+    /// itself, and nothing else in this file would notice either.
+    #[test]
+    fn every_class_of_ending_takes_the_maneuver_its_class_asks_for() {
+        // (what the move answered, what reached the machine after the engage,
+        //  whether a person has to look before the next engage)
+        let table: [(Refusal, &[Act], bool); 5] = [
+            // Nothing changed and nothing is wrong: the head still comes down,
+            // because this daemon is nobody's operator standing next to a bench.
+            (
+                Refusal::new(ErrorClass::Refuse, "the tick would not take the command"),
+                &[Act::Move(Posture::Stow), Act::Release],
+                false,
+            ),
+            (
+                move_aborted(),
+                &[Act::Move(Posture::Stow), Act::Release],
+                false,
+            ),
+            (
+                Refusal::new(
+                    ErrorClass::ImmediateAllTorqueOffToRest,
+                    "the wind-down did not finish",
+                ),
+                &[Act::ReleaseNow],
+                false,
+            ),
+            (head_servo_fault(), &[Act::MaskedStow], true),
+            (bus_failure(), &[Act::ReleaseNow], true),
+        ];
+
+        for (refusal, maneuver, latches) in table {
+            let shared = Arc::new(Shared::new(POD));
+            let machine =
+                Fake::new(&shared, [Event::Raise, Event::Wait]).refusing_move_with(0, refusal);
+
+            let (outcome, acts) = drive(&shared, machine);
+
+            let named = format!("{acts:?} / {outcome}");
+            assert_eq!(&acts[..2], [Act::Watch, Act::Engage], "{named}");
+            assert_eq!(&acts[2..], maneuver, "{named}");
+            assert_eq!(
+                matches!(outcome, Outcome::Faulted(_)),
+                latches,
+                "the wrong disposition: {named}"
+            );
+            assert_eq!(
+                shared.fault().is_some(),
+                latches,
+                "the fault cell is for park-class endings and no other: {named}"
+            );
+        }
+    }
+
+    /// A hand on the head is met by a controlled stow, and the daemon goes back
+    /// to work.
+    ///
+    /// The outage this routing exists to end: before it, a grab took torque off
+    /// on the spot and parked the daemon until somebody restarted it, over an
+    /// event that is over the moment the hand comes away.
+    #[test]
+    fn a_grabbed_head_stows_under_control_and_is_still_taking_scripts() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(&shared, [Event::Raise, Event::Wait])
+            .refusing_move_with(0, head_obstructed())
+            .having_raised([Entry::Fault {
+                fault: Fault::HeadObstructed {
+                    joint: JointId::Leg(3),
+                    error: 0.4,
+                },
+                at: Duration::from_millis(5),
+            }]);
+
+        let (outcome, acts, sink) = driven(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator), "{acts:?}");
+        assert_eq!(
+            &acts[1..],
+            [Act::Engage, Act::Move(Posture::Stow), Act::Release],
+            "the head was stowed under control and released, not dropped: {acts:?}"
+        );
+        assert_eq!(shared.fault(), None, "nothing latched over a grab");
+        assert_eq!(
+            shared.accept(&holding(9, Posture::Up), Instant::now()),
+            Delivered::Scheduled(Acceptance::Accepted),
+            "the daemon is still taking scripts"
+        );
+        assert_eq!(
+            shared.antennas(),
+            Antennas::Ok,
+            "and with both antennas: a grab took nothing out of service"
+        );
+        let fields = sink
+            .fields("motion_incident")
+            .expect("a wind-down back to rest is reported");
+        assert_eq!(fields["slug"], json!("head_obstructed"));
+        assert_eq!(fields["disposition"], json!("rest"));
+        // And somebody is told, because nothing else here would tell them: the
+        // fault cell is untouched and the daemon is taking scripts, so a run
+        // that stowed a grabbed head looks from outside like one that did not.
+        let (told, count) = shared
+            .take_incident()
+            .expect("a wind-down owes an operator the news");
+        assert!(told.contains("head_obstructed"), "{told}");
+        assert_eq!(count, 1);
+        // The whole story, not half of it: a condition is what happened and a
+        // maneuver is what answered it, and the daemon is the layer that
+        // commanded this one, so the daemon is the only thing that can say it
+        // started and that it finished. Asserted end to end, because the record
+        // for the incident an unattended machine takes most often is the whole
+        // of the evidence anybody gets.
+        assert_eq!(
+            fields["incident"].as_str(),
+            Some(
+                "head_obstructed: leg 4 is 0.4000 rad from its goal and not closing → slow_stow \
+                 started → slow_stow completed"
+            ),
+            "{fields:?}"
+        );
+        assert!(
+            sink.fields("motion_fault").is_none(),
+            "an ending nothing latched must not be reported as a park"
+        );
+    }
+
+    /// A wind-down the wire defeats is reported as the wire, not as the hand it
+    /// set out to answer.
+    ///
+    /// Two conditions in one incident, and what the machine is left by is the
+    /// later one: the tick raised the grab, this daemon commanded the controlled
+    /// stow, and the stow's own transactions stopped coming back. Nothing else
+    /// sees that second condition — the tick did not raise it, and the library
+    /// handed it back rather than consuming it — so a record without it publishes
+    /// the park under a hand that is long gone, and an alert rule watching for a
+    /// wire that died under torque never fires for the one case it exists for.
+    #[test]
+    fn a_stow_the_wire_defeats_is_named_by_the_wire() {
+        let shared = Arc::new(Shared::new(POD));
+        let grab = Fault::HeadObstructed {
+            joint: JointId::Leg(3),
+            error: 0.4,
+        };
+        let machine = Fake::new(&shared, [Event::Raise, Event::Wait])
+            .refusing_move_with(0, head_obstructed())
+            .refusing_move_with(1, bus_failure())
+            .having_raised([Entry::Fault {
+                fault: grab,
+                at: Duration::from_millis(5),
+            }]);
+
+        let (outcome, acts, sink) = driven(&shared, machine);
+
+        let Outcome::Faulted(report) = outcome else {
+            panic!("the wire stopped carrying under the stow: {acts:?}");
+        };
+        assert_eq!(
+            &acts[1..],
+            // The stow was commanded and refused, so nothing records it as a
+            // move; what the machine saw next is the immediate release.
+            [Act::Engage, Act::ReleaseNow],
+            "the defeated stow escalated rather than being re-commanded: {acts:?}"
+        );
+        assert_eq!(report.slug, Some("bus_failure"));
+        assert_eq!(
+            report
+                .record
+                .iter()
+                .filter_map(|entry| match entry {
+                    Entry::Fault { fault, .. } => Some(*fault),
+                    Entry::Response { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            [grab, bus_silent()],
+            "both conditions, each once, in the order they happened: {:?}",
+            report.record
+        );
+        assert!(
+            report
+                .story()
+                .expect("a story")
+                .ends_with("bus_failure: the bus is not carrying commands: servo 12: silence"),
+            "the story ends on the condition the machine was left in: {report:?}"
+        );
+        assert_eq!(
+            sink.fields("motion_fault").expect("a park is reported")["slug"],
+            json!("bus_failure")
+        );
+    }
+
+    /// A wind-down back to Resting does not re-raise the head for the script
+    /// that just failed, and does raise it for the next one.
+    ///
+    /// The other half of not latching: a daemon that went back to Resting and
+    /// immediately re-engaged for the same ask would cycle torque on and off
+    /// against whatever ended the raise, for as long as the script asked for the
+    /// head up. What changes the answer is a new ask, not another pass.
+    #[test]
+    fn a_wind_down_leaves_the_head_down_until_a_new_script_asks() {
+        let engages = |acts: &[Act]| acts.iter().filter(|act| **act == Act::Engage).count();
+
+        let shared = Arc::new(Shared::new(POD));
+        let once = Fake::new(&shared, [Event::Raise, Event::Wait, Event::Wait])
+            .refusing_move_with(0, head_obstructed())
+            .unstopped();
+        let (_, acts) = drive(&shared, once);
+        assert_eq!(
+            engages(&acts),
+            1,
+            "the script that failed asked again: {acts:?}"
+        );
+
+        let shared = Arc::new(Shared::new(POD));
+        let again = Fake::new(
+            &shared,
+            [Event::Raise, Event::Wait, Event::Raise, Event::Wait],
+        )
+        .refusing_move_with(0, head_obstructed())
+        .unstopped();
+        let (_, acts) = drive(&shared, again);
+        assert_eq!(
+            engages(&acts),
+            2,
+            "a fresh script is a fresh ask and is tried: {acts:?}"
+        );
+    }
+
+    /// A servo dropping out during a wind-down that began at rest latches it.
+    ///
+    /// The sticky maximum: the stow carries on without the servo that went — the
+    /// head is not dropped — but a servo that dropped out is not something the
+    /// next wake may engage past, so the ending parks. The disposition comes back
+    /// from the maneuver rather than being re-derived up here.
+    #[test]
+    fn a_servo_dropping_out_of_a_wind_down_latches_an_ending_that_would_have_rested() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(&shared, [Event::Raise, Event::Wait])
+            // The raise meets a hand; the stow that answers it loses a servo.
+            .refusing_move_with(0, head_obstructed())
+            .refusing_move_with(1, head_servo_fault())
+            .having_raised([Entry::Fault {
+                fault: Fault::HeadServoFault {
+                    joint: JointId::Leg(3),
+                    id: 13,
+                    bits: 0x20,
+                },
+                at: Duration::from_millis(5),
+            }]);
+
+        let (outcome, acts, sink) = driven(&shared, machine);
+
+        let Outcome::Faulted(report) = outcome else {
+            panic!("a servo dropped out of the wind-down: {acts:?}");
+        };
+        assert_eq!(
+            &acts[1..],
+            // The stow it re-commanded is the move that refused, so nothing
+            // records it; what the machine saw next is the masked wind-down
+            // rather than the immediate release.
+            [Act::Engage, Act::MaskedStow],
+            "the stow carried on masked rather than being given up on: {acts:?}"
+        );
+        assert_eq!(report.slug, Some("head_servo_fault"));
+        assert!(
+            report.detail.contains("not closing") && report.detail.contains("hardware error"),
+            "both endings are in the detail: {report}"
+        );
+        no_wind_down_was_reported(&shared, &sink);
+    }
+
+    /// The escalation of a defeated stow runs on the clock that stow started on.
+    ///
+    /// One stow window covers the whole controlled response however many servos
+    /// drop out of it. A daemon that let the library open a fresh budget here
+    /// would drive the head for two whole stow windows against whatever defeated
+    /// the first — and the window is sized so that a hand holding the head is not
+    /// pushed indefinitely. The bench answers this same event with one window;
+    /// nothing but this compares them.
+    #[test]
+    fn a_defeated_stow_escalates_on_the_clock_it_started_with() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(&shared, [Event::Raise, Event::Wait])
+            .refusing_move_with(0, head_obstructed())
+            .refusing_move_with(1, head_servo_fault());
+        let deadlines = machine.stow_deadlines();
+
+        let (outcome, acts) = drive(&shared, machine);
+
+        assert!(matches!(outcome, Outcome::Faulted(_)), "{acts:?}");
+        // The raise ran one step of the fixture's clock before the hand stopped
+        // it, so the response opened its window there: that step plus the whole
+        // of one stow budget, and not a step further for the stow the servo
+        // dropped out of.
+        assert_eq!(
+            deadlines.borrow().as_slice(),
+            [FAKE_MOVE_STEP + FAKE_STOW_BUDGET],
+            "the expansion was handed a second stow window instead of the \
+             remainder of the first"
+        );
+    }
+
+    /// The park report carries the condition and the story as values, and the
+    /// words are made of them at the sink.
+    ///
+    /// What an alert rule keys on and what the person it woke reads are the same
+    /// entries, so neither can be a sentence somebody parsed back apart.
+    #[test]
+    fn a_park_carries_the_condition_and_the_story_it_recorded() {
+        let raised = Entry::Fault {
+            fault: Fault::BusFailure {
+                source: BusFailureSource::Transaction {
+                    id: 12,
+                    kind: WireFailure::Silent,
+                },
+            },
+            // The raise this refused had run its clock: the fixture's session
+            // time is one move old when the ending is answered.
+            at: FAKE_MOVE_STEP,
+        };
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(&shared, [Event::Raise, Event::Wait]).refusing_move(0);
+
+        let (outcome, _, sink) = driven(&shared, machine);
+
+        let Outcome::Faulted(report) = outcome else {
+            panic!("the wire stopped carrying");
+        };
+        assert_eq!(report.slug, Some("bus_failure"));
+        assert_eq!(
+            report.record,
+            [raised],
+            "the condition the wire-holding layer found reached the record as a value"
+        );
+        let fields = sink.fields("motion_fault").expect("a park is reported");
+        assert_eq!(fields["slug"], json!("bus_failure"));
+        assert_eq!(fields["incident"], json!(report.story().expect("a story")));
+        assert_eq!(
+            report.story().as_deref(),
+            Some("bus_failure: the bus is not carrying commands: servo 12: silence"),
+            "rendered from the entries, once, here"
+        );
+        no_wind_down_was_reported(&shared, &sink);
+    }
+
+    /// A park is not also a wind-down, on either surface.
+    ///
+    /// The two are structurally exclusive today — one disposition chooses between
+    /// them — and nothing holds that but this. A regression that noted both would
+    /// page an operator twice off one ending: once to say nothing will move again
+    /// until somebody restarts the daemon, and then, on the next chore, to say the
+    /// machine needs nothing. The second contradicts the first about whether anybody
+    /// has to get up.
+    fn no_wind_down_was_reported(shared: &Shared, sink: &Collect) {
+        assert_eq!(
+            shared.take_incident(),
+            None,
+            "a park was also reported as an ending that rested"
+        );
+        assert!(
+            sink.fields("motion_incident").is_none(),
+            "a park was captured as an ending that rested"
+        );
     }
 
     /// A dwell that refuses is where an unattended machine's faults are found,
@@ -3210,6 +4714,12 @@ mod tests {
     /// A servo that never acknowledged its torque-off is named in the fault
     /// report. It is the one fact that decides whether a hand can go on the
     /// head, so it cannot be left to the terminal.
+    ///
+    /// And it names the incident: a minimum risk condition believed rather than
+    /// known is the condition the machine was left in, whatever preceded it. Once
+    /// in the record and not twice — the release consumed the engagement and
+    /// recorded it on the way out, so this layer noting what it was handed would
+    /// tell the story twice over.
     #[test]
     fn an_unacknowledged_release_is_carried_into_the_fault_report() {
         let shared = Arc::new(Shared::new(POD));
@@ -3224,6 +4734,23 @@ mod tests {
         assert!(
             report.detail.contains("servo 12 did not acknowledge"),
             "{report}"
+        );
+        assert_eq!(report.slug, Some("torque_off_unconfirmed"));
+        assert_eq!(
+            report
+                .record
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    Entry::Fault {
+                        fault: Fault::TorqueOffUnconfirmed { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the condition is in the record once: {:?}",
+            report.record
         );
     }
 
@@ -3577,8 +5104,13 @@ mod tests {
         );
         assert!(
             value_of(&state_in(&dir), "fault_detail")
-                .is_some_and(|detail| detail.contains("envelope")),
+                .is_some_and(|detail| detail.contains("not carrying commands")),
             "the fault detail is what an operator reads before deciding anything"
+        );
+        assert_eq!(
+            value_of(&state_in(&dir), "fault_slug").as_deref(),
+            Some("bus_failure"),
+            "the condition is named in the one word a probe can key on"
         );
     }
 
@@ -4101,6 +5633,278 @@ mod tests {
         assert_eq!(shared.take_stow_miss(), None);
     }
 
+    /// Which joints being out of service means the antennas are, asked of the
+    /// whole vocabulary rather than of the two joints anybody would think to
+    /// name.
+    ///
+    /// Membership and not emptiness. A head servo on its way to a park-class
+    /// fault lands in the same set, and a predicate that read the set's emptiness
+    /// would paint `antennas=degraded` over it — sending an operator to the two
+    /// joints on the machine that are fine.
+    #[test]
+    fn the_antennas_are_degraded_by_an_antenna_and_by_nothing_else() {
+        for joint in JointId::ALL {
+            let mut out = JointSet::EMPTY;
+            out.insert(joint);
+            let expected = match joint {
+                JointId::AntennaRight | JointId::AntennaLeft => Antennas::Degraded,
+                JointId::BodyYaw | JointId::Leg(_) => Antennas::Ok,
+            };
+            assert_eq!(antennas_of(out), expected, "with {joint} out of service");
+        }
+        assert_eq!(antennas_of(JointSet::EMPTY), Antennas::Ok);
+    }
+
+    /// A session engaged onto antenna bits that had already latched: the health
+    /// gate lets the wake through on them rather than refusing presence over two
+    /// antennas, so nothing in the session ever announces it and the engage's own
+    /// look at the joints out of service is the only thing that can.
+    ///
+    /// Every surface answers from that one look — the file a probe reads, the
+    /// answer a script's sender gets, the alert — and the head goes up and comes
+    /// down as it would on a whole machine.
+    #[test]
+    fn a_session_engaged_without_its_antennas_says_so_everywhere() {
+        let dir = temp_dir();
+        let path = state_in(&dir);
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [Event::Raise, Event::Wait, Event::Stop(Stop::Operator)],
+        )
+        .engaging_without([JointId::AntennaRight, JointId::AntennaLeft])
+        .watching_state(&path);
+        let seen = machine.seen();
+
+        let (outcome, acts, _, sink) = stated(&path, &shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator), "{acts:?}");
+        assert!(
+            acts.contains(&Act::Move(Posture::Up)),
+            "the head kept its presence: {acts:?}"
+        );
+        assert_eq!(
+            value_of(&path, "antennas").as_deref(),
+            Some("degraded"),
+            "the state file carries it for the probe"
+        );
+        assert_eq!(
+            shared.accept(&holding(9, Posture::Up), Instant::now()),
+            Delivered::Scheduled(Acceptance::Accepted),
+        );
+        assert_eq!(
+            shared.antennas(),
+            Antennas::Degraded,
+            "the one asking us to move the antennas hears it"
+        );
+        let fields = sink
+            .fields("antennas_degraded")
+            .expect("the pair leaving the moves is an event of the session");
+        assert!(
+            fields["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("right antenna")),
+            "{fields}"
+        );
+        assert!(
+            shared.take_antennas_alarm().is_some(),
+            "an operator is owed the news once"
+        );
+        assert!(!shared.faulted(), "two limp antennas are not a fault");
+        assert!(
+            seen.borrow().iter().any(|record| record.contains("active")),
+            "the run really passed through the surface: {:?}",
+            seen.borrow()
+        );
+    }
+
+    /// The other source: the pair leaves the moves in the middle of a session,
+    /// which the tick announces. The same cell, the same file, the same answer to
+    /// a delivered script — and said once, however many periods report it.
+    #[test]
+    fn a_pair_that_leaves_the_moves_mid_session_reaches_every_surface_once() {
+        let dir = temp_dir();
+        let path = state_in(&dir);
+        let shared = Arc::new(Shared::new(POD));
+        let snagged = TickEvent::AntennasDegraded(Fault::AntennaObstructed {
+            joint: JointId::AntennaRight,
+            error: 0.4,
+        });
+        let flagged = TickEvent::AntennasDegraded(Fault::AntennaServoFault {
+            joint: JointId::AntennaLeft,
+            id: 21,
+            bits: 0x20,
+        });
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Raise,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .reporting_moving([vec![snagged]])
+        .saying([vec![flagged]]);
+
+        let (outcome, acts, _, sink) = stated(&path, &shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator), "{acts:?}");
+        assert_eq!(shared.antennas(), Antennas::Degraded);
+        assert_eq!(
+            value_of(&path, "antennas").as_deref(),
+            Some("degraded"),
+            "the mid-session degrade reached the file a probe reads"
+        );
+        let events = sink.all_fields("antennas_degraded");
+        assert_eq!(
+            events.len(),
+            1,
+            "the pair is out of service once, whatever else the tick reports: {events:?}"
+        );
+        assert!(
+            events[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("right antenna")),
+            "{events:?}"
+        );
+        assert!(
+            shared.take_antennas_alarm().is_some(),
+            "one flip, one alert"
+        );
+        let lines = sink.said().lines;
+        assert!(
+            lines.iter().any(|line| line.contains("left antenna")),
+            "the second report still reached the console in the tick's own words: {lines:?}"
+        );
+        assert!(!shared.faulted());
+    }
+
+    /// The next engage retries the pair, so the surfaces have to be able to say
+    /// it came back: a record that could only ever go one way would send
+    /// somebody to a machine that is whole.
+    #[test]
+    fn a_re_engage_that_gets_the_pair_back_says_so() {
+        let dir = temp_dir();
+        let path = state_in(&dir);
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Raise,
+                Event::Wait,
+                Event::Lower,
+                Event::Wait,
+                Event::Raise,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .sleeping()
+        .reporting_moving([vec![TickEvent::AntennasDegraded(
+            Fault::AntennaObstructed {
+                joint: JointId::AntennaRight,
+                error: 0.4,
+            },
+        )]]);
+
+        let (outcome, acts, _, sink) = stated(&path, &shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator), "{acts:?}");
+        assert!(
+            sink.saw("antennas_degraded"),
+            "the first session really lost the pair"
+        );
+        assert_eq!(
+            acts.iter().filter(|act| **act == Act::Engage).count(),
+            2,
+            "the second wake engaged again: {acts:?}"
+        );
+        assert_eq!(shared.antennas(), Antennas::Ok);
+        assert_eq!(value_of(&path, "antennas").as_deref(), Some("ok"));
+    }
+
+    /// The pair leaving the moves during the stow that ends the session still
+    /// reaches every surface.
+    ///
+    /// The case the surfaces are written where the change happens for: this
+    /// session is over by the time anything else would state it — no engage
+    /// follows to judge the pair again, and the loop is on its way back to
+    /// Resting — so a standing condition that arrived on the last move the machine
+    /// ever made would be a probe reading `antennas=ok` off a machine that has
+    /// lost them.
+    #[test]
+    fn a_pair_lost_during_the_wind_down_still_reaches_every_surface() {
+        let dir = temp_dir();
+        let path = state_in(&dir);
+        let shared = Arc::new(Shared::new(POD));
+        let snagged = TickEvent::AntennasDegraded(Fault::AntennaObstructed {
+            joint: JointId::AntennaRight,
+            error: 0.4,
+        });
+        let machine = Fake::new(&shared, [Event::Raise, Event::Wait])
+            // The raise meets a hand, and the controlled stow answering it is
+            // where the pair goes: nothing about the events is popped for a move
+            // that refused, so the second entry is the stow's.
+            .refusing_move_with(0, head_obstructed())
+            .reporting_moving([vec![], vec![snagged]]);
+
+        let (outcome, acts, _, sink) = stated(&path, &shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator), "{acts:?}");
+        assert_eq!(shared.antennas(), Antennas::Degraded);
+        assert_eq!(
+            value_of(&path, "antennas").as_deref(),
+            Some("degraded"),
+            "the session ended without the pair reaching the file a probe reads"
+        );
+        assert_eq!(sink.all_fields("antennas_degraded").len(), 1);
+        assert!(
+            shared.take_antennas_alarm().is_some(),
+            "one flip, one alert, whichever move it happened on"
+        );
+        assert!(!shared.faulted(), "a snagged pair is not a park");
+    }
+
+    /// And the pair leaving the moves during the *masked* stow, which the library
+    /// commands rather than this daemon.
+    ///
+    /// The maneuver is the library's, so its tick events arrive through the hook
+    /// it is handed and nowhere else. A parked machine that shows `antennas=ok`
+    /// beside a record naming an antenna is one machine described two ways, on the
+    /// file an operator reads before they walk over to it.
+    #[test]
+    fn a_pair_lost_during_the_masked_stow_reaches_the_parked_surfaces() {
+        let dir = temp_dir();
+        let path = state_in(&dir);
+        let shared = Arc::new(Shared::new(POD));
+        let snagged = TickEvent::AntennasDegraded(Fault::AntennaObstructed {
+            joint: JointId::AntennaRight,
+            error: 0.4,
+        });
+        let machine = Fake::new(&shared, [Event::Raise, Event::Wait])
+            // A hand on the head, then a servo dropping out of the stow that
+            // answers it: the response carries on masked, and the pair goes on
+            // the way down. Two refused moves pop nothing, so the third entry is
+            // the masked stow's.
+            .refusing_move_with(0, head_obstructed())
+            .refusing_move_with(1, head_servo_fault())
+            .reporting_moving([vec![], vec![], vec![snagged]]);
+
+        let (outcome, acts, _, sink) = stated(&path, &shared, machine);
+
+        assert!(matches!(outcome, Outcome::Faulted(_)), "{acts:?}");
+        assert_eq!(acts.last(), Some(&Act::MaskedStow), "{acts:?}");
+        assert_eq!(shared.antennas(), Antennas::Degraded);
+        assert_eq!(
+            value_of(&path, "antennas").as_deref(),
+            Some("degraded"),
+            "the parked file says the machine still has a pair it has not got"
+        );
+        assert_eq!(sink.all_fields("antennas_degraded").len(), 1);
+        assert!(shared.take_antennas_alarm().is_some());
+    }
+
     /// The supply and the error bits are what the two torque-on gates read, so
     /// how stale they may be is this daemon's policy and not a property of a
     /// sweep. Never due after the first is a gate judging every engage on
@@ -4305,6 +6109,61 @@ mod tests {
             assert!(
                 matches!(refused, EngageFailed::Gate(_)),
                 "{what}: {refused:?}"
+            );
+        }
+    }
+
+    /// The phase an ending is classified at changes both the answer and the
+    /// story, so the three sites that choose it are load-bearing.
+    ///
+    /// A sweep that cannot read the machine while it is resting is a refusal:
+    /// nothing is energized, the machine is as safe as it was, and asking again at
+    /// the next poll is the whole of the answer — which is what lets this daemon
+    /// ride out a bus that goes away for five seconds instead of waiting for a
+    /// person. The same failure with the head held up is the wire no longer
+    /// carrying commands: torque comes off on the spot, the condition goes into
+    /// the record, and the daemon parks. `Machine::commission`, `remedial_sweep`
+    /// and the resting `watch` are the pre-torque sites; every other ending in
+    /// this module arrives through `From`, which is under torque.
+    #[test]
+    fn the_phase_an_ending_is_classified_at_decides_what_it_asks_for() {
+        let context = StepContext::reg(SeqStep::PinAndEnable, 11, RegId::PresentPosition);
+        for error in [
+            PumpError::Bus {
+                id: 11,
+                source: XactError::Timeout {
+                    id: 11,
+                    waited: Duration::from_millis(20),
+                },
+            },
+            PumpError::Sequence(SeqError::NoAnswer { context }),
+        ] {
+            let resting = Refusal::pre_torque(&error);
+            assert_eq!(
+                resting.class(),
+                ErrorClass::Refuse,
+                "nothing was energized, so asking again later is the answer: {error}"
+            );
+            assert_eq!(
+                resting.unrecorded(),
+                None,
+                "a refusal names no condition of the machine: {error}"
+            );
+
+            let holding = Refusal::under_torque(&error);
+            assert_eq!(
+                holding.class(),
+                ErrorClass::ImmediateAllTorqueOffToPark,
+                "the wire stopped carrying under a head this daemon is holding up: {error}"
+            );
+            assert!(
+                matches!(holding.unrecorded(), Some(Fault::BusFailure { .. })),
+                "the record is owed the condition, whichever layer found it: {error}"
+            );
+            assert_eq!(
+                resting.to_string(),
+                holding.to_string(),
+                "the wording is the library's either way; the phase decides the answer"
             );
         }
     }
@@ -4796,7 +6655,7 @@ mod tests {
 
         let outcome = commission_failed(
             &shared,
-            Refusal::new("servo 21 answered nothing"),
+            Refusal::new(ErrorClass::Refuse, "servo 21 answered nothing"),
             &sink,
             &surface,
         );

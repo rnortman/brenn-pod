@@ -40,9 +40,10 @@ const PLAIN_ECHO_CHARS: u64 = common::FAKE_TRANSCRIPT.len() as u64;
 const AUDIO_DEADLINE: Duration = Duration::from_secs(20);
 const FLUSH_DEADLINE: Duration = Duration::from_secs(20);
 
-// TODO(barge-in-flake): rare, not reproducible on demand; the leading suspect is the
-// `playback_no_pod` / client-disconnect race. Rate, evidence, and next action live in
-// TODO.md — read it first.
+// TODO(barge-in-flake): fails on a machine still warm from a build and passes on a quiet
+// one, roughly two in three; the one `-- --nocapture` run tried so far passed, which is
+// too little to rule either a daemon race or a harness-side one out. The recipe, the
+// evidence and the pending decision live in TODO.md — read it first.
 #[test]
 fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
     let speaches_url = common::spawn_fake_speaches(TTS_SAMPLES);

@@ -172,10 +172,9 @@ fn stated(secs: Option<f64>) -> Option<Duration> {
 /// Refuse a move duration nothing could run on.
 ///
 /// Zero is refused here where it is lawful for the rest delay, and for the
-/// opposite reason: a rest delay of nothing means let go at once, while a move
-/// of nothing means carry the head from stow to neutral inside one control
-/// period — a per-tick step the guard faults on rather than trimming, which is a
-/// stopped move and a de-torqued machine.
+/// opposite reason: a rest delay of nothing means let go at once, while a move of
+/// nothing asks for the whole span inside one control period, which is not a move
+/// anybody wants and almost always a units slip.
 fn check_duration(key: &str, secs: Option<f64>) -> Result<(), String> {
     let Some(secs) = secs else { return Ok(()) };
     if !secs.is_finite() || secs <= 0.0 || Duration::try_from_secs_f64(secs).is_err() {
@@ -716,6 +715,33 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
         }
     }
 
+    /// Every key the daemon reads, out of the parser's own refusal.
+    ///
+    /// `deny_unknown_fields` makes serde name every field it knows when it meets
+    /// one it does not, so the enumeration is the deserializer's and cannot drift
+    /// from the struct — which is the whole point of asking it this way rather
+    /// than keeping a list somebody has to remember to extend.
+    fn keys_the_daemon_reads() -> Vec<String> {
+        let refusal = Config::parse(&file("a_key_no_daemon_reads = 1"))
+            .expect_err("a key nothing reads is refused")
+            .to_string();
+        let (_, listed) = refusal
+            .split_once("expected one of ")
+            .expect("the refusal names the fields it knows");
+        let keys: Vec<String> = listed
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            keys.len() > 5,
+            "no key names were read out of the refusal, so whoever asked is checking nothing: \
+             {refusal}"
+        );
+        keys
+    }
+
     /// Every key the daemon reads is a line in the example, live or commented.
     ///
     /// The file's premise, asked of the struct rather than of a list somebody
@@ -723,27 +749,10 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
     /// a knob nobody copying this file can find, and it slips past everything
     /// else in this module by construction: an unstated optional key is `None`
     /// in the example and `None` in the default, so nothing compares unequal.
-    ///
-    /// The key set comes out of the parser's own refusal. `deny_unknown_fields`
-    /// makes serde name every field it knows when it meets one it does not, so
-    /// the enumeration is the deserializer's and cannot drift from the struct.
     #[test]
     fn every_key_the_daemon_reads_is_a_line_in_the_example() {
-        let refusal = Config::parse(&file("a_key_no_daemon_reads = 1"))
-            .expect_err("a key nothing reads is refused")
-            .to_string();
-        let (_, listed) = refusal
-            .split_once("expected one of ")
-            .expect("the refusal names the fields it knows");
-        let keys: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
-        assert!(
-            keys.len() > 5,
-            "no key names were read out of the refusal, so this test is checking nothing: \
-             {refusal}"
-        );
-
         let text = include_str!("../reachy-motiond.example.toml");
-        for key in keys {
+        for key in keys_the_daemon_reads() {
             // Live, commented out, or — for the table nested whole — its own
             // header. The leading newline is what keeps `duration_s` from
             // matching inside `antenna_duration_s`.
@@ -758,6 +767,272 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
                  file can find"
             );
         }
+    }
+
+    /// The three antenna arcs the floors are quoted for, radians: the
+    /// stow-to-neutral presence sweep, the re-stow of an antenna left just
+    /// inboard of sideways, and the widest sweep a bench command can ask for.
+    ///
+    /// Computed from the library's constants rather than stated, because the arcs
+    /// are the input to the antenna floors that two documents quote and nothing
+    /// else would notice moving. Each arc assumes the sweep takes the way round
+    /// that misses the outboard sideways point: stow to neutral is a full turn
+    /// less the stow angle, re-stow from just inboard of sideways adds the
+    /// sideways angle, and the widest is bounded by a full turn (the long way is
+    /// always less than a full turn, so TAU over-approximates by at most 3 mrad /
+    /// 4 µs of floor).
+    fn antenna_arcs() -> [f64; 3] {
+        let stow = reachy_motion::disarm::STOW_ANTENNAS[1].abs();
+        let sideways = reachy_motion::ANTENNA_OUTBOARD[1].abs();
+        let to_neutral = std::f64::consts::TAU - stow;
+        [to_neutral, to_neutral + sideways, std::f64::consts::TAU]
+    }
+
+    /// Every floor this daemon's example quotes, derived where the derivation
+    /// lives.
+    struct Floors {
+        /// The yaw cap in the units the prose quotes it in.
+        yaw_cap_deg: f64,
+        /// The head group's floor.
+        head: f64,
+        /// The yaw's, in the three spans the prose names: the cap, cap to cap,
+        /// and the half turn a hand can leave the body at.
+        yaw: [f64; 3],
+        /// The arcs the antenna floors are for, radians.
+        arcs: [f64; 3],
+        /// The antennas', one per [`Floors::arcs`] entry.
+        antennas: [f64; 3],
+        /// The machine's own fold clock, which the prose claims carries the
+        /// widest fold.
+        stow: f64,
+    }
+
+    /// The floors, from the machine's configuration and the library's
+    /// arithmetic.
+    ///
+    /// Nothing here is a literal that a document could also hold — a bound or
+    /// the tick rate moving in the bench file is how these numbers go stale.
+    fn floors() -> Floors {
+        let motion = reachy_bench::config::MotionSection::default();
+        let envelope = reachy_bench::config::EnvelopeSection::default();
+        let tick_hz = f64::from(motion.tick_hz);
+        let cap = envelope.body_yaw_limit_deg.to_radians();
+        let yaw_span = [cap, 2.0 * cap, std::f64::consts::PI];
+        let arcs = antenna_arcs();
+        Floors {
+            yaw_cap_deg: envelope.body_yaw_limit_deg,
+            head: reachy_motion::HEAD_GROUP_FLOOR_S,
+            yaw: yaw_span.map(|span| {
+                reachy_motion::duration_floor_s(span, motion.max_step_body_yaw_rad, tick_hz)
+            }),
+            arcs,
+            antennas: arcs.map(|span| {
+                reachy_motion::duration_floor_s(span, motion.max_step_antennas_rad, tick_hz)
+            }),
+            stow: motion.stow_duration_s,
+        }
+    }
+
+    /// The slice of `text` from `from` up to the next `to`.
+    fn between<'a>(text: &'a str, from: &str, to: &str) -> &'a str {
+        let start = text
+            .find(from)
+            .unwrap_or_else(|| panic!("the text no longer carries `{from}`"));
+        let rest = &text[start..];
+        let end = rest
+            .find(to)
+            .unwrap_or_else(|| panic!("the text no longer carries `{to}` after `{from}`"));
+        &rest[..end]
+    }
+
+    /// One quoted figure, in the passage that owns it.
+    fn quotes(text: &str, expected: &str, doc: &str) {
+        assert!(
+            text.contains(expected),
+            "{doc} no longer says `{expected}`, so a figure it prints is not the one the \
+             library derives from the shipped bounds"
+        );
+    }
+
+    /// The FLOORS block quotes the derivation, not a number of its own.
+    #[test]
+    fn the_examples_floors_are_the_ones_the_library_derives() {
+        let text = include_str!("../reachy-motiond.example.toml");
+        let example = Config::parse(text).expect("the example parses");
+        let f = floors();
+        let doc = "the example's FLOORS block";
+
+        let block = between(text, "# FLOORS.", "\n# The two head-group lines");
+        // The argument these numbers come from has one home, and this block
+        // points at it rather than restating it.
+        quotes(
+            block,
+            "FLOORS comment of `crates/reachy-bench/reachy-bench.example.toml`",
+            doc,
+        );
+
+        let head = between(block, "#   head group", "#   body yaw");
+        quotes(head, &format!("{:.2} s", f.head), doc);
+
+        let yaw = between(block, "#   body yaw", "#   antennas");
+        quotes(
+            yaw,
+            &format!("{:.2} s from the {:.0}-degree cap", f.yaw[0], f.yaw_cap_deg),
+            doc,
+        );
+        quotes(yaw, &format!("and {:.2} s", f.yaw[1]), doc);
+        quotes(yaw, &format!("needs {:.2} s of yaw", f.yaw[2]), doc);
+        quotes(yaw, &format!("`stow_duration_s = {:.1}`", f.stow), doc);
+
+        let antennas = between(block, "#   antennas", "commands the first two");
+        quotes(
+            antennas,
+            &format!("{:.2} s for the {:.2} rad", f.antennas[0], f.arcs[0]),
+            doc,
+        );
+        quotes(antennas, &format!("{:.2} s to re-stow", f.antennas[1]), doc);
+        quotes(
+            antennas,
+            &format!("and {:.2} s for the", f.antennas[2]),
+            doc,
+        );
+
+        // The two claims the prose makes about shipped values, checked as
+        // claims and not only as text: the calm fold carries the widest yaw a
+        // hand can leave the body at, and the one duration this file
+        // recommends clears the worst arc the daemon commands.
+        assert!(
+            f.stow >= f.yaw[2],
+            "the {:.2} s fold no longer carries the {:.2} s half turn the block says it does",
+            f.stow,
+            f.yaw[2],
+        );
+        let shared = example
+            .durations()
+            .antennas
+            .expect("the file recommends a shared antenna clock")
+            .as_secs_f64();
+        assert!(
+            shared >= f.antennas[1],
+            "the recommended {shared:.1} s antenna clock is under the {:.2} s worst case the \
+             daemon reaches, which is the whole reason the key ships uncommented",
+            f.antennas[1],
+        );
+        quotes(
+            text,
+            &format!("{shared:.1} s clears the {:.2} s worst", f.antennas[1]),
+            doc,
+        );
+    }
+
+    /// The operator runbook, read from the repository.
+    ///
+    /// It is the document an investigation reaches for first and the one nothing
+    /// else in this repo touches. Read at run time rather than embedded, because
+    /// it is not this crate's file and a device crate should not fail to *build*
+    /// because a repo-root document moved.
+    fn runbook() -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../docs/runbooks/reachy-end-to-end.md");
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "the operator runbook quoting this daemon's knobs and duration floors is \
+                 unreadable at {}: {error}",
+                path.display()
+            )
+        })
+    }
+
+    /// One value a knob's own row claims, against what the daemon runs on.
+    fn claims(row: &str, expected: &str, key: &str, doc: &str) {
+        assert!(
+            row.contains(expected),
+            "{doc}'s row for `{key}` no longer says `{expected}`, so it quotes a value this \
+             daemon does not run on"
+        );
+    }
+
+    /// The runbook table row that leads with `key`, up to the next row or the
+    /// end of the table.
+    fn row<'a>(table: &'a str, key: &str) -> &'a str {
+        let start = table
+            .find(&format!("`{key}`"))
+            .unwrap_or_else(|| panic!("the table no longer carries a row for `{key}`"));
+        let rest = &table[start..];
+        &rest[..rest.find("\n|").unwrap_or(rest.len())]
+    }
+
+    /// Every knob the runbook's daemon-policy table is for has a row, and the
+    /// values those rows quote are the ones the daemon runs on.
+    ///
+    /// The example file has a structural guard that every key the daemon reads is
+    /// a line in it, so the table an operator reaches for *first* is the one place
+    /// a knob can go unmentioned. The key set is the timing subset of the struct's
+    /// own keys, taken by the unit its name ends in rather than listed, so the
+    /// next key measured in seconds or milliseconds has to appear in the table
+    /// too. The rest of the struct — the machine's file, the pod, the channel, the
+    /// bridge's nested table — is deliberately not this table's business and is
+    /// documented around it.
+    #[test]
+    fn the_runbooks_knob_table_carries_every_knob_it_is_for() {
+        let text = runbook();
+        let table = between(&text, "**The daemon's policy**", "**The machine**");
+        let doc = "the runbook's daemon-policy table";
+
+        let tuning: Vec<String> = keys_the_daemon_reads()
+            .into_iter()
+            .filter(|key| key.ends_with("_ms") || key.ends_with("_s"))
+            .collect();
+        assert!(
+            tuning.len() > 5,
+            "the suffix filter matched almost nothing, so this test is checking nothing: {tuning:?}"
+        );
+        for key in &tuning {
+            assert!(
+                table.contains(&format!("`{key}`")),
+                "{doc} has no row for `{key}`, so it is a knob nobody reading the runbook can \
+                 find"
+            );
+        }
+
+        // The four optional clocks have no default at all, which is what their
+        // rows say instead of a number.
+        let defaults = minimal();
+        for (key, value) in [
+            ("hold_dwell_ms", defaults.hold_dwell_ms),
+            ("rest_poll_ms", defaults.rest_poll_ms),
+            ("rest_delay_ms", defaults.rest_delay_ms),
+        ] {
+            claims(row(table, key), &format!("| {value} |"), key, doc);
+        }
+        for (key, stated) in [
+            ("up_duration_s", defaults.up_duration_s),
+            ("stow_duration_s", defaults.stow_duration_s),
+            (
+                "antenna_duration_right_s",
+                defaults.antenna_duration_right_s,
+            ),
+            ("antenna_duration_left_s", defaults.antenna_duration_left_s),
+        ] {
+            assert!(
+                stated.is_none(),
+                "`{key}` now has a default, so {doc} calling it unset is wrong"
+            );
+            claims(row(table, key), "| unset |", key, doc);
+        }
+
+        let shared = Config::parse(include_str!("../reachy-motiond.example.toml"))
+            .expect("the example parses")
+            .durations()
+            .antennas
+            .expect("the file recommends a shared antenna clock")
+            .as_secs_f64();
+        claims(
+            row(table, "antenna_duration_s"),
+            &format!("| {shared:.1} in the example |"),
+            "antenna_duration_s",
+            doc,
+        );
     }
 
     #[test]
