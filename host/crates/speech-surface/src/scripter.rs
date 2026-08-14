@@ -228,7 +228,7 @@ impl Cause {
 }
 
 /// One script the scripter decided to publish.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScriptPublish {
     /// Whose head.
     pub pod: PodId,
@@ -1000,14 +1000,11 @@ impl ScriptTask {
     }
 }
 
-/// A script's timeline as JSONL fields: the same offsets and spellings the wire
-/// carries, so a capture on this side joins against the daemon's.
+/// A script's timeline as JSONL fields: the wire's own shape, from the protocol
+/// crate, so a capture on this side joins against the daemon's and neither has
+/// a copy of the shape to keep current.
 fn steps_json(script: &MotionScript) -> Vec<serde_json::Value> {
-    script
-        .steps()
-        .iter()
-        .map(|step| json!({ "after_ms": step.after_ms, "posture": step.posture.as_str() }))
-        .collect()
+    script.steps().iter().map(Step::capture).collect()
 }
 
 /// Publish what the scripter decided, one at a time and in order, retrying what
@@ -1171,13 +1168,23 @@ mod tests {
         }
     }
 
+    /// The posture a scripter-built step names. The scripter emits base
+    /// posture steps and nothing else, so anything else here is a bug in the
+    /// test rather than a case to handle.
+    fn posture_of(step: &Step) -> Posture {
+        step.action
+            .base()
+            .and_then(motion_proto::Base::posture)
+            .expect("the scripter emits posture steps")
+    }
+
     /// The steps of a script, as (offset, posture) pairs.
     fn steps(publish: &ScriptPublish) -> Vec<(u64, Posture)> {
         publish
             .script
             .steps()
             .iter()
-            .map(|step| (step.after_ms, step.posture))
+            .map(|step| (step.after_ms, posture_of(step)))
             .collect()
     }
 
@@ -1187,7 +1194,7 @@ mod tests {
             .script
             .steps()
             .iter()
-            .find(|step| step.posture == Posture::Stow)
+            .find(|step| posture_of(step) == Posture::Stow)
             .expect("a closing script stows")
             .after_ms
     }

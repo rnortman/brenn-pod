@@ -46,16 +46,21 @@ pub mod bus;
 pub mod cells;
 pub mod cli;
 pub mod config;
+pub mod library;
 pub mod motion;
+pub mod overlay;
 pub mod report;
 pub mod state;
 
 pub use bus::{Chore, Listener};
-pub use cells::{Delivered, FaultReport, FaultStage, Shared, Stop};
+pub use cells::{Delivered, FaultReport, FaultStage, Overlaid, Playing, Shared, Stop};
 pub use cli::{Invocation, exit_code};
 pub use config::{Config, ConfigError, Overrides};
+pub use library::{LibraryError, Motions, Unplayable};
 pub use motion::{
-    Active, Clock, Clocks, Incident, Machine, Outcome, Refusal, Rest, Source, StartupError, Timing,
+    Active, BaseAt, BasePlan, Clock, Clocks, Incident, Machine, Outcome, Refusal, Rest, Source,
+    StartupError, Streamed, Timing,
 };
+pub use overlay::Overlays;
 pub use report::{Sink, Streams};
 pub use state::{Phase, Surface, Watching};

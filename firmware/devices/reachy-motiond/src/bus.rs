@@ -351,6 +351,30 @@ impl<'a> Listener<'a> {
             }
         };
 
+        // Whose script it is, first of all. The screen below answers out of
+        // this machine's library and against ceilings derived from this
+        // machine's own bounds, so running it on another pod's script would
+        // report a refusal — by name or by speed — from a daemon the script was
+        // never addressed to, and two daemons on one channel would contradict
+        // each other about it.
+        if self.shared.foreign(&script) {
+            self.ignored(
+                "foreign",
+                &format!("addressed to {:?}, not to this machine", script.pod()),
+                &delivery,
+            );
+            return;
+        }
+
+        // The library check, ahead of `accept` so a refused script leaves the
+        // running one and the seq high-water mark exactly as they were. A
+        // daemon holding no library answers "not held" for every name, which
+        // refuses any script that plays anything — fail-closed.
+        if let Err(error) = self.shared.motions().screen(&script) {
+            self.ignored(error.reason(), &error.to_string(), &delivery);
+            return;
+        }
+
         match self.shared.accept(&script, Instant::now()) {
             Delivered::Faulted => {
                 // What the scripter is told is which condition took the machine
@@ -411,10 +435,7 @@ impl<'a> Listener<'a> {
                     &json!({
                         "pod": script.pod(),
                         "seq": script.seq(),
-                        "steps": script.steps().iter().map(|step| json!({
-                            "after_ms": step.after_ms,
-                            "posture": step.posture.as_str(),
-                        })).collect::<Vec<_>>(),
+                        "steps": script.steps().iter().map(motion_proto::Step::capture).collect::<Vec<_>>(),
                         "timeout_ms": script.timeout_ms(),
                         "antennas": antennas.as_str(),
                         "sender": delivery.envelope.sender,
@@ -955,7 +976,7 @@ fn timeline(script: &MotionScript) -> String {
     script
         .steps()
         .iter()
-        .map(|step| format!("{} at {} ms", step.posture, step.after_ms))
+        .map(|step| format!("{} at {} ms", step.action, step.after_ms))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -963,11 +984,12 @@ fn timeline(script: &MotionScript) -> String {
 #[cfg(test)]
 mod tests {
     use brenn_bridge::MessageEnvelope;
-    use motion_proto::{Desired, Posture, Step};
+    use motion_proto::{Desired, Play, Posture, Step};
     use reachy_motion::{Entry, Fault, JointId, Maneuver, Outcome as TimelineOutcome};
 
     use super::*;
     use crate::cells::{FaultReport, FaultStage};
+    use crate::library::{Motions, fixtures};
     use crate::report::Collect;
 
     const POD: &str = "reachy00";
@@ -985,7 +1007,19 @@ mod tests {
     /// The same before anything has attached: no wire, so nothing written to the
     /// bridge would reach a peer.
     fn detached_fixture(sink: &Collect) -> (Arc<Shared>, Listener<'_>) {
-        let shared = Arc::new(Shared::new(POD));
+        holding(sink, Motions::none())
+    }
+
+    /// A listener over fresh cells holding `motions`, already attached.
+    fn fixture_holding(sink: &Collect, motions: Motions) -> (Arc<Shared>, Listener<'_>) {
+        let (shared, mut listener) = holding(sink, motions);
+        listener.on_event(BridgeEvent::Attached(facts(true)));
+        (shared, listener)
+    }
+
+    /// The detached listener, with the library named.
+    fn holding(sink: &Collect, motions: Motions) -> (Arc<Shared>, Listener<'_>) {
+        let shared = Arc::new(Shared::with_motions(POD, motions));
         let listener = Listener::new(Arc::clone(&shared), CHANNEL, sink);
         (shared, listener)
     }
@@ -1219,6 +1253,157 @@ mod tests {
         listener.on_event(delivered("not json at all"));
 
         assert_eq!(listener.chore(Instant::now()), None);
+    }
+
+    /// A script naming a motion is refused, reported, and leaves the timeline
+    /// in force untouched.
+    ///
+    /// This daemon's fixture holds no library — the shipped configuration,
+    /// where no `clip_dir` is named — so every name is one it does not have.
+    /// Accepting instead — replacing whatever was running, moving the base,
+    /// and silently playing none of the emotes —
+    /// is indistinguishable at the publisher from success, which is the one
+    /// disposition a fail-closed wire must not have. The refusal runs ahead of
+    /// `accept`, so the seq high-water mark does not move either and a
+    /// corrected re-publish at the same number is still heard.
+    #[test]
+    fn a_script_naming_a_motion_this_daemon_does_not_hold_is_refused() {
+        let sink = Collect::default();
+        let (shared, mut listener) = fixture(&sink);
+        listener.on_event(delivered(&nominal(7)));
+        let standing = shared.desired(Instant::now());
+
+        let with_a_play = script(
+            POD,
+            8,
+            vec![
+                Step::new(0, Posture::Up),
+                Step::play(400, Play::new("pollen/emotions/loving1")),
+            ],
+        );
+        listener.on_event(delivered(&with_a_play));
+
+        assert_eq!(
+            sink.fields("motion_script_ignored").expect("reported")["reason"],
+            json!("no_such_motion")
+        );
+        let detail = sink.fields("motion_script_ignored").expect("reported")["detail"]
+            .as_str()
+            .expect("a detail")
+            .to_owned();
+        assert!(detail.contains("pollen/emotions/loving1"), "{detail}");
+        assert_eq!(
+            shared.desired(Instant::now()),
+            standing,
+            "the prior schedule stands"
+        );
+        assert_eq!(
+            shared.accepted_seq(),
+            Some(7),
+            "a library refusal does not move the high-water mark"
+        );
+    }
+
+    /// A daemon that holds the motion takes the script, overlays and all.
+    ///
+    /// The counterpart of the refusal above, and the reason the screen is a
+    /// library question rather than a blanket no: the same script the empty
+    /// daemon refuses is scheduled by one whose `clip_dir` holds the name.
+    #[test]
+    fn a_script_playing_a_motion_this_daemon_holds_is_accepted() {
+        let sink = Collect::default();
+        let (_dir, motions) =
+            fixtures::loaded(&[("nod.json", fixtures::clip("pod/nod", 8, 1.5))], &sink);
+        let (shared, mut listener) = fixture_holding(&sink, motions);
+
+        listener.on_event(delivered(&script(
+            POD,
+            3,
+            vec![
+                Step::new(0, Posture::Up),
+                Step::play(400, Play::new("pod/nod")),
+            ],
+        )));
+
+        assert_eq!(shared.accepted_seq(), Some(3));
+        assert_eq!(
+            shared.desired(Instant::now()),
+            Desired::Posture(Posture::Up)
+        );
+        assert!(
+            !sink.saw("motion_script_ignored"),
+            "{:?}",
+            sink.said().events
+        );
+    }
+
+    /// A speed above the motion's own ceiling is refused under its own slug,
+    /// and leaves the timeline in force alone.
+    ///
+    /// Distinct from an unknown name on purpose: the name is right and the
+    /// library is deployed, so what an operator has to change is the script's
+    /// number, not the machine's contents.
+    #[test]
+    fn a_script_playing_a_held_motion_too_fast_is_refused_as_over_speed() {
+        let sink = Collect::default();
+        let (_dir, motions) =
+            fixtures::loaded(&[("nod.json", fixtures::clip("pod/nod", 8, 1.5))], &sink);
+        let (shared, mut listener) = fixture_holding(&sink, motions);
+        listener.on_event(delivered(&nominal(4)));
+        let standing = shared.desired(Instant::now());
+
+        listener.on_event(delivered(&script(
+            POD,
+            5,
+            vec![
+                Step::new(0, Posture::Up),
+                Step::play(400, Play::at_speed("pod/nod", 2.0)),
+            ],
+        )));
+
+        let fields = sink.fields("motion_script_ignored").expect("reported");
+        assert_eq!(fields["reason"], json!("over_speed"));
+        assert!(
+            fields["detail"]
+                .as_str()
+                .expect("a detail")
+                .contains("pod/nod"),
+            "{fields}"
+        );
+        assert_eq!(shared.desired(Instant::now()), standing);
+        assert_eq!(shared.accepted_seq(), Some(4));
+    }
+
+    /// Another machine's script is disposed of as another machine's, whatever
+    /// this daemon's library would have made of it.
+    ///
+    /// The screen answers out of this daemon's own library and against ceilings
+    /// derived from this machine's bounds, both of which are per-machine. Run
+    /// ahead of the pod question, it has two daemons on one channel reporting
+    /// contradictory refusals for one script, and an operator chasing an
+    /// `over_speed` that came from the wrong machine's numbers.
+    #[test]
+    fn another_pods_script_is_reported_as_foreign_and_not_screened() {
+        let sink = Collect::default();
+        let (_dir, motions) =
+            fixtures::loaded(&[("nod.json", fixtures::clip("pod/nod", 8, 1.5))], &sink);
+        let (shared, mut listener) = fixture_holding(&sink, motions);
+
+        listener.on_event(delivered(&script(
+            "reachy01",
+            3,
+            vec![
+                Step::new(0, Posture::Up),
+                // A name this daemon does not hold, played faster than this
+                // daemon's ceilings would allow: both would be refusals of its
+                // own if this script were its business.
+                Step::play(400, Play::at_speed("pod/nowhere", 2.0)),
+            ],
+        )));
+
+        let fields = sink.fields("motion_script_ignored").expect("reported");
+        assert_eq!(fields["reason"], json!("foreign"));
+        assert_eq!(shared.accepted_seq(), None);
     }
 
     #[test]

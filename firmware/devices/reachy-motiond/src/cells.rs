@@ -58,11 +58,14 @@
 //! what the motion thread does before it parks.
 
 use std::fmt;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use motion_proto::{Acceptance, Desired, MotionScript, Schedule};
+use reachy_clips::Motion;
 use reachy_motion::{Entry, Fault, Story, last_fault};
+
+use crate::library::Motions;
 
 /// Why the motion thread is being asked to stop.
 ///
@@ -397,10 +400,83 @@ pub struct WatchAlarm {
     pub failing: bool,
 }
 
-/// The nine cells, held behind one handle both threads clone.
+/// One overlay the running script has open, as the motion thread reads it.
+///
+/// Owned rather than borrowed from the schedule: what answers this holds a
+/// lock, and a caller that kept a reference would hold it for the whole of a
+/// control period. The motion is the library's own handle rather than the
+/// name off the wire — this is built afresh every control period, and an
+/// `Arc` costs a counter where a name costs an allocation and a second lookup
+/// in whoever reads it.
+#[derive(Debug, Clone)]
+pub struct Playing {
+    /// Which wire step started it, which is also its composition order.
+    pub index: usize,
+    /// The motion it plays.
+    pub motion: Arc<Motion>,
+    /// The invocation speed.
+    pub speed: f64,
+    /// How long the timeline says it has been running.
+    pub elapsed_ms: u64,
+}
+
+impl Playing {
+    /// The name the wire addressed this motion by.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.motion.name()
+    }
+}
+
+/// Two overlays are the same overlay when they are the same motion at the same
+/// point of the same step. By name rather than by handle: a library reloaded
+/// from the same directory holds different `Arc`s for the same vocabulary, and
+/// what a reader means to ask is whether the motion is the same one.
+impl PartialEq for Playing {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.speed == other.speed
+            && self.elapsed_ms == other.elapsed_ms
+            && self.motion.name() == other.motion.name()
+    }
+}
+
+/// What the running script is playing at an instant, and which script that is.
+///
+/// The two together because they are read together: a sequence number that
+/// changed means a different timeline, and every player belonging to the old
+/// one is dropped whatever the names say.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Overlaid {
+    /// The script the overlays belong to, if one is running.
+    pub seq: Option<u64>,
+    /// The overlays open now, in composition order.
+    pub plays: Vec<Playing>,
+}
+
+/// The nine cells and the motion vocabulary, held behind one handle both
+/// threads clone.
 #[derive(Debug)]
 pub struct Shared {
+    /// The machine a script has to be addressed to for this daemon to have any
+    /// business with it.
+    ///
+    /// Beside the schedule's own copy rather than read through it, because the
+    /// question is asked before the schedule is: everything the bus thread does
+    /// with a script — screening it against this machine's library and its
+    /// machine-derived speed ceilings, reporting what it made of it — is only
+    /// this daemon's to do for a script addressed to this daemon.
+    pod: String,
     schedule: Mutex<Schedule>,
+    /// The motions a `play` step can name.
+    ///
+    /// Not a cell: nothing mutates it after startup, and both threads read it
+    /// for different halves of the same question — the bus thread screens an
+    /// arriving script against it, the motion thread plays out of it. Held here
+    /// so the schedule and the library are joined under one lock in
+    /// [`Self::playing`] rather than by two calls a replacement can land
+    /// between.
+    motions: Motions,
     /// Torque-on gate refusals the bus thread has not alerted on yet.
     ///
     /// Not the fault cell: a refused engage is an expected error — nothing was
@@ -458,8 +534,19 @@ impl Shared {
     /// The schedule starts empty, so a daemon that comes up in the middle of a
     /// conversation asks for no posture change until somebody scripts one.
     pub fn new(pod: impl Into<String>) -> Self {
+        Self::with_motions(pod, Motions::none())
+    }
+
+    /// The same, holding `motions` as the vocabulary a `play` step names.
+    ///
+    /// The daemon's own constructor. [`Self::new`] is the posture-only machine,
+    /// which is a real configuration rather than a default worth hiding.
+    pub fn with_motions(pod: impl Into<String>, motions: Motions) -> Self {
+        let pod = pod.into();
         Self {
-            schedule: Mutex::new(Schedule::new(pod)),
+            motions,
+            schedule: Mutex::new(Schedule::new(pod.clone())),
+            pod,
             engage_refusals: Mutex::new(Collapsed::default()),
             stow_misses: Mutex::new(Collapsed::default()),
             watch: Mutex::new(WatchNotice::default()),
@@ -573,6 +660,76 @@ impl Shared {
     /// it, and the motion thread checks [`Self::fault`] first.
     pub fn desired(&self, now: Instant) -> Desired {
         self.schedule().desired(now)
+    }
+
+    /// The motions this daemon holds.
+    pub fn motions(&self) -> &Motions {
+        &self.motions
+    }
+
+    /// Whether `script` is addressed to some other machine.
+    ///
+    /// The same question [`motion_proto::Schedule::accept`] answers with
+    /// [`Acceptance::Foreign`], asked before the schedule is reached: a channel
+    /// may carry more than one machine's traffic, and everything this daemon
+    /// does with a script it is not authoritative for — screening it against a
+    /// library another machine's script was never written against, reporting
+    /// what this machine made of it — is noise about somebody else's timeline.
+    pub fn foreign(&self, script: &MotionScript) -> bool {
+        script.pod() != self.pod
+    }
+
+    /// What the running script has playing as of `now`, against this daemon's
+    /// own library.
+    ///
+    /// The overlay half of [`Self::desired`], and read the same way: the
+    /// timeline's answer and nothing else. An expired script plays nothing, for
+    /// the same reason it asks for no posture — a lapse is the end of
+    /// instruction.
+    pub fn playing(&self, now: Instant) -> Overlaid {
+        let schedule = self.schedule();
+        self.overlaid(&schedule, now)
+    }
+
+    /// The base command and the open windows, from one read of the schedule.
+    ///
+    /// What a composed control period asks for, and it asks for both at once on
+    /// purpose: a replacement landing between two reads would have the base
+    /// answered from one script and the overlays from the next, and the run
+    /// would carry on toward a posture nothing was asking for any more.
+    pub fn composing(&self, now: Instant) -> (Desired, Overlaid) {
+        let schedule = self.schedule();
+        let desired = schedule.desired(now);
+        let overlaid = self.overlaid(&schedule, now);
+        (desired, overlaid)
+    }
+
+    /// The open windows of the script this schedule is running, under a lock
+    /// the caller already holds.
+    fn overlaid(&self, schedule: &Schedule, now: Instant) -> Overlaid {
+        let Some((script, elapsed_ms)) = schedule.running_at(now) else {
+            return Overlaid::default();
+        };
+        let plays = script
+            .overlays_at(elapsed_ms, |play| self.motions.window(play))
+            .into_iter()
+            .filter_map(|overlay| {
+                // Only a motion this daemon holds: acceptance resolves every
+                // name before a script runs at all, and the window arithmetic
+                // above has already passed over anything else.
+                let motion = self.motions.motion(&overlay.play.name)?;
+                Some(Playing {
+                    index: overlay.index,
+                    motion: Arc::clone(motion),
+                    speed: overlay.play.speed,
+                    elapsed_ms: overlay.elapsed_ms,
+                })
+            })
+            .collect();
+        Overlaid {
+            seq: Some(script.seq()),
+            plays,
+        }
     }
 
     /// The next instant at which [`Self::desired`] can change by itself.
@@ -729,6 +886,80 @@ mod tests {
     /// What a delivery the schedule saw comes back as.
     fn taken(acceptance: Acceptance) -> Delivered {
         Delivered::Scheduled(acceptance)
+    }
+
+    /// What the timeline is playing is read the same way as what it asks of the
+    /// posture: the script's own arithmetic, against this daemon's library, and
+    /// nothing at all once the script has lapsed.
+    #[test]
+    fn what_is_playing_is_the_timeline_answering_until_it_lapses() {
+        let sink = crate::report::Collect::default();
+        let (_dir, motions) = crate::library::fixtures::loaded(
+            &[(
+                "wiggle.json",
+                crate::library::fixtures::clip("test/wiggle", 10, 1.0),
+            )],
+            &sink,
+        );
+        let shared = Shared::with_motions(POD, motions);
+        let script = MotionScript::new(
+            POD,
+            7,
+            vec![
+                Step::new(0, Posture::Up),
+                Step::play(100, motion_proto::Play::new("test/wiggle")),
+            ],
+            30_000,
+        )
+        .expect("a lawful script");
+        let now = Instant::now();
+        shared.accept(&script, now);
+
+        assert_eq!(
+            shared.playing(now).plays,
+            Vec::new(),
+            "a window that has not opened is playing"
+        );
+        let open = shared.playing(now + ms(150));
+        assert_eq!(open.seq, Some(7));
+        assert_eq!(open.plays.len(), 1);
+        assert_eq!(open.plays[0].name(), "test/wiggle");
+        assert_eq!(open.plays[0].index, 1, "the step that opened it");
+        assert_eq!(
+            open.plays[0].elapsed_ms, 50,
+            "a daemon reading late joins where the timeline says"
+        );
+        assert_eq!(
+            shared.playing(now + ms(30_000)),
+            Overlaid::default(),
+            "a lapsed script kept playing"
+        );
+
+        let at = now + ms(150);
+        let (desired, playing) = shared.composing(at);
+        assert_eq!(desired, shared.desired(at));
+        assert_eq!(playing, shared.playing(at));
+    }
+
+    /// A daemon holding no library plays nothing, whatever a script names.
+    #[test]
+    fn a_daemon_with_no_library_plays_nothing() {
+        let shared = shared();
+        let script = MotionScript::new(
+            POD,
+            1,
+            vec![
+                Step::new(0, Posture::Up),
+                Step::play(100, motion_proto::Play::new("test/wiggle")),
+            ],
+            30_000,
+        )
+        .expect("a lawful script");
+        let now = Instant::now();
+        shared.accept(&script, now);
+
+        assert!(shared.playing(now + ms(150)).plays.is_empty());
+        assert!(shared.motions().is_empty());
     }
 
     /// A daemon that has heard nothing asks for no posture change. Resting is

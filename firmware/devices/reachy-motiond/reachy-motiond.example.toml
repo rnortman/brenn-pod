@@ -34,6 +34,20 @@ pod = "reachy00"
 # the scripter's grant on the bus has to allow it.
 channel = "brenn:reachy.motion"
 
+# The directory of motion documents — clips and sequences — this daemon plays a
+# script's `play` steps out of. Commented out, which is a daemon that holds no
+# library: the head still takes posture scripts, and a script that plays
+# anything is refused for naming a motion nothing holds.
+#
+# It is a directory the deploy command fills, in RAM. Nothing about a motion
+# library is flash-resident state during development, and a path under
+# /persistent here would be that by another name.
+#
+# Every `*.json` in it is read once at startup. A document that does not
+# validate is named on the way past and skipped, and the rest of the library
+# loads — one bad file does not cost the machine its vocabulary.
+# clip_dir = "/run/brenn-app/motions"
+
 # The longest the motion loop watches the machine before it looks at the
 # schedule again. A ceiling, not a period: a dwell is cut short by the running
 # script's next step or by its expiry, so a step at an arbitrary offset lands on

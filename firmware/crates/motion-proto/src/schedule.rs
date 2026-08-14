@@ -27,7 +27,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::script::{MotionScript, Posture};
+use crate::script::{Base, MotionScript, Posture};
 
 /// What a delivery did to the schedule.
 ///
@@ -58,6 +58,13 @@ pub enum Desired {
     Unchanged,
     /// The posture the running script names as of now.
     Posture(Posture),
+    /// The running script asks for the base to stay where it is commanded now.
+    ///
+    /// Distinct from `Unchanged`, which is the absence of an instruction: this
+    /// is an instruction, and one a machine mid-transition answers by stopping
+    /// where it is rather than by carrying on. Folding it in with "nothing was
+    /// asked" would turn a freeze into whatever the default is.
+    Keep,
     /// The running script has lapsed. Stow and rest.
     ///
     /// Distinct from `Posture(Stow)` because it is also the daemon's leave to
@@ -180,10 +187,26 @@ impl Schedule {
         if elapsed >= running.script.expiry_ms() {
             return Desired::Expired;
         }
-        running
-            .script
-            .posture_at(elapsed)
-            .map_or(Desired::Unchanged, Desired::Posture)
+        match running.script.base_at(elapsed) {
+            None => Desired::Unchanged,
+            Some(Base::Posture(posture)) => Desired::Posture(posture),
+            Some(Base::Keep) => Desired::Keep,
+        }
+    }
+
+    /// The script in force at `now` and how long it has been running, or
+    /// `None` when nothing is running or the timeline has lapsed.
+    ///
+    /// What a caller resolving overlays needs and [`Self::desired`] cannot
+    /// carry: the windows are the script's own arithmetic against a library
+    /// only the caller holds, so the script and its clock come out and the
+    /// resolution happens there. The lapse is applied here, so an expired
+    /// script has no overlays for the same reason it has no posture.
+    #[must_use]
+    pub fn running_at(&self, now: Instant) -> Option<(&MotionScript, u64)> {
+        let running = self.running.as_ref()?;
+        let elapsed = running.elapsed_ms(now);
+        (elapsed < running.script.expiry_ms()).then_some((&running.script, elapsed))
     }
 
     /// The next instant at which [`Self::desired`] can change by itself, if
@@ -211,7 +234,7 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::Step;
+    use crate::script::{Play, Step};
 
     const POD: &str = "reachy00";
 
@@ -270,6 +293,35 @@ mod tests {
         assert_eq!(schedule.desired(start + ms(30_000)), Desired::Expired);
         assert_eq!(schedule.desired(start + ms(600_000)), Desired::Expired);
         assert_eq!(schedule.expires_at(), Some(start + ms(30_000)));
+    }
+
+    /// The overlay caller's view of the same timeline: nothing before a script
+    /// lands, the script and its own elapsed clock while it runs, and nothing
+    /// once it lapses — the same instant `desired` starts answering `Expired`.
+    #[test]
+    fn the_running_script_and_its_clock_come_out_until_the_lapse() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(POD);
+        assert!(schedule.running_at(start).is_none());
+
+        schedule.accept(&nominal(1), start);
+
+        let (script, elapsed) = schedule.running_at(start).expect("a running script");
+        assert_eq!(script.seq(), 1);
+        assert_eq!(elapsed, 0);
+
+        let (_, elapsed) = schedule
+            .running_at(start + ms(6_740))
+            .expect("still running");
+        assert_eq!(elapsed, 6_740);
+
+        let (_, elapsed) = schedule
+            .running_at(start + ms(29_999))
+            .expect("running to the last millisecond");
+        assert_eq!(elapsed, 29_999);
+
+        assert!(schedule.running_at(start + ms(30_000)).is_none());
+        assert!(schedule.running_at(start + ms(600_000)).is_none());
     }
 
     /// A step still ahead of the clock does not disturb the machine. A hold
@@ -503,5 +555,71 @@ mod tests {
             Desired::Posture(Posture::Up)
         );
         assert_eq!(schedule.desired(start + ms(9_001)), Desired::Expired);
+    }
+
+    /// A `keep` step asks for something, and what it asks for is distinct from
+    /// the absence of an instruction: a machine mid-transition answers a freeze
+    /// to one and carries on for the other.
+    #[test]
+    fn a_keep_step_asks_for_the_base_to_stay_where_it_is() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(POD);
+        schedule.accept(
+            &script(
+                1,
+                vec![
+                    Step::new(0, Posture::Up),
+                    Step::keep(2_000),
+                    Step::new(4_000, Posture::Stow),
+                ],
+                30_000,
+            ),
+            start,
+        );
+
+        assert_eq!(schedule.desired(start), Desired::Posture(Posture::Up));
+        assert_eq!(
+            schedule.desired(start + ms(1_999)),
+            Desired::Posture(Posture::Up)
+        );
+        assert_eq!(schedule.desired(start + ms(2_000)), Desired::Keep);
+        assert_eq!(schedule.desired(start + ms(3_999)), Desired::Keep);
+        assert_eq!(
+            schedule.desired(start + ms(4_000)),
+            Desired::Posture(Posture::Stow)
+        );
+        // A script holding via `keep` still lapses like every other one.
+        assert_eq!(schedule.desired(start + ms(30_000)), Desired::Expired);
+    }
+
+    /// The steps that start overlays are not base steps: the base is what the
+    /// last due *base* step said, however many motions have started since, and
+    /// a play step still moves the boundary the motion thread waits on.
+    #[test]
+    fn play_steps_move_the_clock_without_moving_the_base() {
+        let start = Instant::now();
+        let mut schedule = Schedule::new(POD);
+        schedule.accept(
+            &script(
+                1,
+                vec![
+                    Step::new(0, Posture::Up),
+                    Step::play(400, Play::new("pod/wiggle")),
+                    Step::new(9_000, Posture::Stow),
+                ],
+                30_000,
+            ),
+            start,
+        );
+
+        assert_eq!(
+            schedule.desired(start + ms(400)),
+            Desired::Posture(Posture::Up)
+        );
+        assert_eq!(schedule.next_boundary(start), Some(start + ms(400)));
+        assert_eq!(
+            schedule.next_boundary(start + ms(400)),
+            Some(start + ms(9_000))
+        );
     }
 }

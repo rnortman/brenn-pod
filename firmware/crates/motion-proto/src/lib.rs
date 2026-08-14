@@ -7,8 +7,13 @@
 //! no async, so both ends can test it and neither end grows protocol logic of
 //! its own.
 //!
-//! The unit of intent is a **script**: a timeline of postures at offsets from
-//! the moment it arrives, under a timeout after which the head goes back down.
+//! The unit of intent is a **script**: a timeline at offsets from the moment it
+//! arrives, under a timeout after which the head goes back down. Its steps come
+//! in two kinds — a **base** step, which is where the head is going (a posture,
+//! or `keep`: hold the base where it is), and a **play** step, which starts a
+//! named motion from the daemon's own library as an overlay layered on top of
+//! whatever the base is doing. The base collapses to the last due step; overlays
+//! are windows, several of which can be open at once.
 //! The timeout is an unconditional ceiling on the script's own timeline — every
 //! step falls strictly inside it — so "the head is up for at most this long" is
 //! readable off one field of one message, with no arithmetic and no second
@@ -58,6 +63,8 @@ pub mod seq;
 
 pub use schedule::{Acceptance, Desired, Schedule};
 pub use script::{
-    DecodeError, MAX_TIMEOUT_MS, MOTION_SCRIPT_TYPE, MotionScript, Posture, ScriptError, Step,
+    Action, ActiveOverlay, Base, DecodeError, MAX_CONCURRENT_OVERLAYS, MAX_MOTION_NAME_LEN,
+    MAX_SPEED, MAX_TIMEOUT_MS, MIN_SPEED, MOTION_SCRIPT_TYPE, MotionScript, OverlayError, Play,
+    PlayWindow, Posture, ScriptError, Step,
 };
 pub use seq::{SeqSource, unix_millis};

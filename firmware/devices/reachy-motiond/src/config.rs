@@ -99,6 +99,16 @@ pub struct Config {
     /// deployment uses is operator topology, and a name invented here would be
     /// a convention two ends could silently disagree about.
     pub channel: String,
+    /// The directory of clip and sequence documents the daemon plays overlays
+    /// out of, or absent for a daemon that holds no library at all.
+    ///
+    /// Absent is the shipped default and is not a degraded mode: with no
+    /// library this is the posture-only daemon it has always been, and a script
+    /// that plays anything is refused for naming a motion nothing holds. There
+    /// is no default path because a guessed one would silently pick up whatever
+    /// a previous deployment left in it.
+    #[serde(default)]
+    pub clip_dir: Option<PathBuf>,
     /// The longest the motion loop watches an engaged machine before it looks
     /// at the schedule again.
     #[serde(default = "default_hold_dwell_ms")]
@@ -268,6 +278,20 @@ impl Config {
         // here and left to drift from the other end's copy.
         brenn_bridge::validate_channel_name(&self.channel)
             .map_err(|refusal| format!("channel {refusal}"))?;
+        // Stated-but-empty is the one shape that cannot mean anything: it is
+        // neither a directory nor the absence of one, and it would resolve to
+        // the process's working directory, which under systemd is `/`.
+        if self
+            .clip_dir
+            .as_ref()
+            .is_some_and(|dir| dir.as_os_str().is_empty())
+        {
+            return Err(
+                "clip_dir is empty; name the directory of motion documents, or delete the key \
+                 for a daemon that holds no library"
+                    .to_string(),
+            );
+        }
         if self.hold_dwell_ms == 0 {
             return Err(
                 "hold_dwell_ms must be at least 1 (0 reads the schedule in a spin loop)"
@@ -402,6 +426,31 @@ token_file = \"/run/brenn-app/conf/bridge.token\"
         // the durations must leave all three to the machine's own configuration,
         // which is the only way the two files cannot come to disagree.
         assert_eq!(config.durations(), Overrides::default());
+        // A daemon nobody gave a library to holds none, rather than defaulting
+        // to a directory it would then walk at startup.
+        assert_eq!(config.clip_dir, None);
+    }
+
+    /// A stated `clip_dir` is the directory the daemon reads its library from.
+    #[test]
+    fn a_stated_clip_dir_is_carried_whole() {
+        let text = file("clip_dir = \"/run/brenn-app/clips\"");
+        let config = Config::parse(&text).expect("the file parses");
+        config.validate().expect("the file validates");
+        assert_eq!(config.clip_dir, Some(PathBuf::from("/run/brenn-app/clips")));
+    }
+
+    /// A `clip_dir` stated as the empty string is refused.
+    ///
+    /// The one shape that cannot mean anything: it is neither a directory nor
+    /// the absence of one, and it resolves to the process's working directory —
+    /// which under systemd is `/`, so the startup walk would read the root of
+    /// the filesystem looking for motion documents.
+    #[test]
+    fn an_empty_clip_dir_is_refused() {
+        let config = Config::parse(&file("clip_dir = \"\"")).expect("the file parses");
+        let message = config.validate().expect_err("an empty clip_dir is refused");
+        assert!(message.contains("clip_dir"), "{message}");
     }
 
     /// The one place presence pace is tunable without touching the machine's

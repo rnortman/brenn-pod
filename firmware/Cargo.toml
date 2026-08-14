@@ -53,12 +53,13 @@ log = "0.4"
 # instead of the revisions devices/reachy-motiond/Cargo.toml pins. For local work
 # on the pod and the motion library together; a machine without the clone then
 # fails to resolve, and public CI cannot see it, so the table stays commented out
-# on anything that is pushed. Re-pin the three `rev =` values and regenerate
+# on anything that is pushed. Re-pin the four `rev =` values and regenerate
 # Cargo.lock before commenting it back out.
 #
 # [patch."https://github.com/rnortman/brenn-reachy"]
 # reachy-bench = { path = "../../brenn-reachy/crates/reachy-bench" }
 # reachy-bus = { path = "../../brenn-reachy/crates/reachy-bus" }
+# reachy-clips = { path = "../../brenn-reachy/crates/reachy-clips" }
 # reachy-motion = { path = "../../brenn-reachy/crates/reachy-motion" }
 
 [profile.release]

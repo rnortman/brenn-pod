@@ -2178,7 +2178,11 @@ mod tests {
             assert_eq!(publish.cause, Cause::Closing, "{shape:?}");
             let steps = publish.script.steps();
             assert_eq!(steps.len(), 2, "{shape:?}: up now, down at the margin");
-            assert_eq!(steps[1].posture, motion_proto::Posture::Stow, "{shape:?}");
+            assert_eq!(
+                steps[1].action.base().and_then(motion_proto::Base::posture),
+                Some(motion_proto::Posture::Stow),
+                "{shape:?}"
+            );
             assert_eq!(
                 steps[1].after_ms, 500,
                 "{shape:?}: nothing played, so the margin runs from now"

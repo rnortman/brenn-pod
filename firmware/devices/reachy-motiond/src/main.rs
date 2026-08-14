@@ -20,6 +20,7 @@ use reachy_motiond::bus::{self, Listener};
 use reachy_motiond::cells::Shared;
 use reachy_motiond::cli::{self, Invocation};
 use reachy_motiond::config::Config;
+use reachy_motiond::library::Motions;
 use reachy_motiond::motion::{self, Machine, Timing};
 use reachy_motiond::report::{Sink, Streams};
 use reachy_motiond::state::{self, Surface};
@@ -50,6 +51,16 @@ fn run(path: &Path) -> u8 {
         Ok(machine) => machine,
         Err(error) => return cli::refuse_startup(&sink, &error),
     };
+    // Derived against this machine's own bounds: a clip's speed ceiling and its
+    // blend ramps come out of the envelope and the step bounds the bench file
+    // states, so the library must be read after the machine resolves.
+    let motions = match config.clip_dir.as_deref() {
+        Some(dir) => match Motions::load(dir, &machine.clip_limits(), &sink) {
+            Ok(motions) => motions,
+            Err(error) => return cli::refuse_startup(&sink, &error),
+        },
+        None => Motions::none(),
+    };
     let (bridge, handle, events) = match Bridge::new(&config.bridge) {
         Ok(parts) => parts,
         Err(error) => return cli::refuse_startup(&sink, &error),
@@ -76,7 +87,7 @@ fn run(path: &Path) -> u8 {
         Err(error) => return cli::refuse_startup(&sink, &error),
     };
 
-    let shared = Arc::new(Shared::new(&config.pod));
+    let shared = Arc::new(Shared::with_motions(&config.pod, motions));
     let bus = spawn_bus(bridge, handle, events, &config, Arc::clone(&shared));
 
     // Before commissioning, which is the first thing here that takes real time.

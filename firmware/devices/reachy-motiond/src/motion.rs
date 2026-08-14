@@ -61,6 +61,7 @@
 //! share of that narration goes through [`DwellNarration`] first, because five
 //! identical reports a second are not something anybody can read.
 
+use std::cell::Cell;
 use std::fmt;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, channel};
@@ -69,22 +70,25 @@ use std::time::{Duration, Instant};
 
 use motion_proto::{Desired, Posture};
 use reachy_bench::commands::{
-    Commissioned, Engaged, commission, neutral_targets, stow_pose_targets, wind_down,
+    Commissioned, Engaged, Steer, StreamBase, commission, neutral_targets, stow_pose_targets,
+    wind_down,
 };
 use reachy_bench::config::{self, Resolved, resolve_for_commanding};
 use reachy_bench::pump::{
     Disposition, ErrorClass, MonotonicClock, Phase as TorquePhase, PumpError, TickEvent,
 };
 use reachy_bus::{BusPort, OpenError, SerialBusPort};
+use reachy_clips::{ClipLimits, compose};
 use reachy_motion::{
-    Entry, Fault, JointGroup, JointSet, JointTargets, Maneuver, MoveDurations,
+    CommandRejection, Entry, Fault, JointGroup, JointSet, JointTargets, Maneuver, MoveDurations,
     Outcome as TimelineOutcome, PollCadence, at_stow,
 };
 use serde_json::json;
 use thiserror::Error;
 
-use crate::cells::{Antennas, FaultReport, FaultStage, Shared, Stop, condition, story};
+use crate::cells::{Antennas, FaultReport, FaultStage, Overlaid, Shared, Stop, condition, story};
 use crate::config::Overrides;
+use crate::overlay::Overlays;
 use crate::report::Sink;
 use crate::state::{Phase, Surface, Watching};
 
@@ -364,6 +368,18 @@ impl Machine {
     #[must_use]
     pub fn clocks(&self) -> &Clocks {
         &self.clocks
+    }
+
+    /// The bounds a motion document is derived and validated against on this
+    /// unit: this machine's geometry, envelope and per-tick step bounds.
+    ///
+    /// Read off the bench configuration rather than the library's defaults, so
+    /// a clip's speed ceiling and its blend floors are what *this* machine's
+    /// numbers imply. A daemon deriving against defaults would admit a clip its
+    /// own tick then refuses every period.
+    #[must_use]
+    pub fn clip_limits(&self) -> ClipLimits {
+        ClipLimits::from_motion_config(&self.resolved.motion)
     }
 
     /// Open the servo bus, exclusively.
@@ -811,6 +827,81 @@ pub trait Rest {
     ) -> Result<(Self::Active<'_>, Incident), EngageFailed>;
 }
 
+/// What a move already in flight should become.
+///
+/// Two answers because a script can ask for two different things of a move it
+/// finds running: somewhere else, or nowhere. The second is what a `keep`
+/// means mid-transition — the base is to stay where it is, and where it is,
+/// mid-move, is a pose no posture names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retarget {
+    /// Turn the head around toward this posture from wherever it has got to.
+    To(Posture),
+    /// Stop here: abandon the trajectory and hold the last commanded setpoint.
+    HoldHere,
+}
+
+/// How a move ended.
+///
+/// A frozen move has no posture to report and must not be given one: the head
+/// is between two of them, and a caller told it reached either would command
+/// the next move from a pose the machine is not in and would record a state
+/// that was never true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    /// The head is at this posture, which is the last one the move was aimed
+    /// at and not necessarily the one first asked for.
+    Reached(Posture),
+    /// The head is holding where the move was stopped.
+    HeldHere,
+}
+
+/// What the base layer does for the length of one streamed run.
+///
+/// The overlay loop's half of what a posture step means: the same two answers
+/// the dwell path has — go somewhere, or stay — said once at the top of a run
+/// rather than at every boundary, because a run ends the moment either answer
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasePlan {
+    /// Hold the configuration the machine is already commanding. What a `keep`
+    /// means, and what an overlay over a posture already reached rides on.
+    Held,
+    /// Carry the base to this posture while the overlays ride it.
+    To(Posture),
+}
+
+/// Where the base layer is on one control period.
+#[derive(Debug, Clone, Copy)]
+pub struct BaseAt {
+    /// The configuration the base commands now.
+    pub targets: JointTargets,
+    /// Whether the base has nothing further to command: always for a held
+    /// base, and for a transition once its trajectory is spent.
+    pub arrived: bool,
+    /// The control period this run is being driven at, which is what an
+    /// overlay's own clock advances by. The machine's, not the loop's: the tick
+    /// rate is a property of the machine that was resolved at startup.
+    pub period: Duration,
+}
+
+/// How a streamed run ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Streamed {
+    /// The daemon stopped supplying setpoints. The machine holds the last one
+    /// it was given.
+    Ended,
+    /// The machine would not take a composed setpoint. Nothing was commanded on
+    /// that period and nothing faulted — per the doctrine a plan of ours the
+    /// tick refuses parks nothing and latches nothing — and the head is where
+    /// the last accepted period put it.
+    ///
+    /// The tick's own refusal, carried whole rather than worded: this is the
+    /// failure a live machine is expected to produce, and which class it was
+    /// and which joint it named are what the report is asked for afterwards.
+    Refused(CommandRejection),
+}
+
 /// The machine holding torque: the postures, the moves between them, and the
 /// two ways torque comes off.
 pub trait Active {
@@ -818,10 +909,10 @@ pub trait Active {
     /// finally ended.
     ///
     /// `retarget` is asked at every control period whether `posture` is still
-    /// what is wanted; answering `Some` turns the head around from where it has
-    /// got to, and the answer becomes the move. What comes back is the posture
-    /// the machine is actually holding, which is the last one answered and not
-    /// necessarily the one asked for.
+    /// what is wanted; answering [`Retarget::To`] turns the head around from
+    /// where it has got to, and the answer becomes the move, while
+    /// [`Retarget::HoldHere`] stops it where it is. What comes back says which
+    /// of those ended the run, and a posture only when the head is at one.
     ///
     /// A script can land while the head is halfway up, and a move that had to
     /// finish before the reverse one started would put the head down a whole
@@ -840,8 +931,8 @@ pub trait Active {
         posture: Posture,
         line: &mut dyn FnMut(&str),
         event: &mut dyn FnMut(TickEvent),
-        retarget: &mut dyn FnMut() -> Option<Posture>,
-    ) -> Result<Posture, Refusal>;
+        retarget: &mut dyn FnMut() -> Option<Retarget>,
+    ) -> Result<Arrival, Refusal>;
 
     /// Watch the machine hold for `dwell`, commanding nothing.
     ///
@@ -849,6 +940,34 @@ pub trait Active {
     /// about is this daemon's policy, and keying on the event kind is what
     /// keeps that policy off the wording another repository chose.
     fn hold(&mut self, dwell: Duration, event: &mut dyn FnMut(TickEvent)) -> Result<(), Refusal>;
+
+    /// Command one setpoint per control period, composed by `compose`, over a
+    /// base this machine samples.
+    ///
+    /// The tick-granular entry point, and the only one: the daemon owns the
+    /// overlays and the composition, the machine owns the reference they ride
+    /// on and the period they ride at. `compose` is asked once per period with
+    /// where the base is, and answers the setpoint to command or `None` to end
+    /// the run — which is how a schedule that changed under the run, an
+    /// overlay that faded out and a stop all end it, at the granularity of one
+    /// period rather than one dwell.
+    ///
+    /// Every composed setpoint faces the same envelope check, per-tick step
+    /// bound and antenna mask a planned sample faces; none of that is bypassed
+    /// and none of it is duplicated here. A setpoint the machine will not take
+    /// comes back as [`Streamed::Refused`] rather than as an `Err`, because it
+    /// is a plan of ours the tick would not run: nothing was commanded, nothing
+    /// faulted, and the head holds where the last accepted period put it.
+    ///
+    /// A [`BasePlan::To`] the machine will not plan at all is also a
+    /// [`Streamed::Refused`], reported before any setpoint goes out.
+    fn stream(
+        &mut self,
+        base: BasePlan,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+        compose: &mut dyn FnMut(BaseAt) -> Option<JointTargets>,
+    ) -> Result<Streamed, Refusal>;
 
     /// Settle, measure where the machine came to rest, and release torque.
     ///
@@ -1115,21 +1234,29 @@ impl<P: BusPort> Active for SessionActive<'_, '_, P> {
         posture: Posture,
         line: &mut dyn FnMut(&str),
         event: &mut dyn FnMut(TickEvent),
-        retarget: &mut dyn FnMut() -> Option<Posture>,
-    ) -> Result<Posture, Refusal> {
+        retarget: &mut dyn FnMut() -> Option<Retarget>,
+    ) -> Result<Arrival, Refusal> {
         let (up, stow) = (self.up, self.stow);
         let (targets, durations) = targets_for(posture, up, stow);
-        let mut arrived = posture;
-        self.engaged.move_retargeting_events(
+        let mut arrived = Arrival::Reached(posture);
+        self.engaged.move_steering(
             targets,
             durations,
             &mut self.clock,
             line,
             event,
             &mut || {
-                let next = retarget()?;
-                arrived = next;
-                Some(targets_for(next, up, stow))
+                Some(match retarget()? {
+                    Retarget::To(next) => {
+                        arrived = Arrival::Reached(next);
+                        let (targets, durations) = targets_for(next, up, stow);
+                        Steer::To(targets, durations)
+                    }
+                    Retarget::HoldHere => {
+                        arrived = Arrival::HeldHere;
+                        Steer::HoldHere
+                    }
+                })
             },
         )?;
         Ok(arrived)
@@ -1141,6 +1268,44 @@ impl<P: BusPort> Active for SessionActive<'_, '_, P> {
         // knowing about all arrive as events.
         self.engaged.hold_events(dwell, &mut self.clock, event)?;
         Ok(())
+    }
+
+    fn stream(
+        &mut self,
+        base: BasePlan,
+        line: &mut dyn FnMut(&str),
+        event: &mut dyn FnMut(TickEvent),
+        compose: &mut dyn FnMut(BaseAt) -> Option<JointTargets>,
+    ) -> Result<Streamed, Refusal> {
+        let base = match base {
+            BasePlan::Held => StreamBase::Held,
+            BasePlan::To(posture) => {
+                let (targets, durations) = targets_for(posture, self.up, self.stow);
+                StreamBase::Toward(targets, durations)
+            }
+        };
+        let period = self.engaged.period();
+        let outcome = self.engaged.stream_layered(
+            base,
+            &mut self.clock,
+            line,
+            event,
+            &mut |targets, arrived| {
+                compose(BaseAt {
+                    targets: *targets,
+                    arrived,
+                    period,
+                })
+            },
+        );
+        match outcome {
+            Ok(()) => Ok(Streamed::Ended),
+            // The one ending this answers with rather than raises: the tick
+            // would not take what we composed, and by the doctrine that is a
+            // bad plan of ours and not a condition of the machine.
+            Err(PumpError::Rejected(why)) => Ok(Streamed::Refused(why)),
+            Err(error) => Err(Refusal::under_torque(&error)),
+        }
     }
 
     fn disengage(self, line: &mut dyn FnMut(&str)) -> Result<Verdict, Refusal> {
@@ -1471,6 +1636,14 @@ struct Watch {
     /// at every boundary from then until a new script lands, and a run that
     /// said so each time would bury the one line that matters.
     lapse_reported: Option<u64>,
+    /// The script whose `keep` is the live base command, once it has been said.
+    ///
+    /// A `keep` is the answer at every boundary it covers, so the line is said
+    /// on the transition into it and not once a dwell: the operator wants to
+    /// know the daemon saw the command, not that it is still seeing it. Cleared
+    /// by any other answer, so a script that keeps, raises and keeps again says
+    /// so twice.
+    keeping: Option<u64>,
     /// The script whose ask for the head up has already been answered — by a
     /// torque-on gate refusing the engage, or by an ending that answered the
     /// raise itself and put the machine back down.
@@ -1924,6 +2097,10 @@ fn active<R: Rest>(
     // When the head reached stow with nothing else to do, which is what the
     // rest delay is measured from.
     let mut settled: Option<Instant> = None;
+    // The overlays playing over that posture, across passes: a base command
+    // that changes ends the streamed run, and the players have to survive it —
+    // rebuilding them would ramp a full-weight overlay back up from zero.
+    let mut players = Overlays::none();
 
     loop {
         if let Some(stop) = shared.stopping() {
@@ -1932,13 +2109,76 @@ fn active<R: Rest>(
             return Err(release_for(head, posture, stop, &mut ctx));
         }
 
-        let (desired, reason) = match wanted(shared, watch, sink) {
-            Some(wanted) => wanted,
+        let (opening, ask, playing) = composing(shared, watch, sink);
+        // Whatever this pass does next, players belonging to a script that is
+        // no longer running are gone as of this read. Here rather than in the
+        // streamed pass alone: a replacement or a lapse that opens no window of
+        // its own never reaches the pass, and the motion it cut short would go
+        // unsaid or be blamed on whichever script eventually played something.
+        players.forget(playing.seq, sink);
+        let (desired, reason) = match ask {
+            Some(Ask::Posture(wanted, reason)) => (Some(wanted), reason),
+            // `keep` asks for no move at all, whatever the machine is doing and
+            // whatever its posture is known to be. An unknown posture holds as
+            // an unknown posture: folding it here would answer the one base
+            // command that means "do not move the base" with a stow.
+            Some(Ask::Hold) => {
+                said_keep(shared, watch, sink);
+                (posture, "script")
+            }
             // Nothing asks for a change, and a machine whose posture is unknown
             // still has to be folded: the fold is the change.
-            None => (posture.unwrap_or(Posture::Stow), "script"),
+            None => (Some(posture.unwrap_or(Posture::Stow)), "script"),
         };
-        if Some(desired) != posture {
+
+        // An overlay open now takes the pass: the loop runs at the machine's
+        // own control period, composing the base and the players into one
+        // setpoint each period, and the dwell regime is what it comes back to.
+        if players.wants(&playing) {
+            let plan = match desired.filter(|wanted| Some(*wanted) != posture) {
+                Some(wanted) => {
+                    watch.dwells.flush(&mut |text| sink.line(text));
+                    BasePlan::To(wanted)
+                }
+                None => BasePlan::Held,
+            };
+            settled = None;
+            let leaving = posture;
+            let mut say = |sink: &dyn Sink| {
+                if let BasePlan::To(wanted) = plan {
+                    sink.line(&format!(
+                        "motion: {} -> {wanted}, under a motion",
+                        from(leaving)
+                    ));
+                    started(sink, leaving, wanted, reason);
+                }
+            };
+            let pass = Pass {
+                plan,
+                opening,
+                say: &mut say,
+            };
+            match overlaid(&mut head, pass, &mut players, shared, sink, surface) {
+                Ok(Composed::Arrived(arrived)) => {
+                    posture = Some(arrived);
+                    reached(sink, arrived);
+                }
+                Ok(Composed::Travelling) => {
+                    if plan != BasePlan::Held {
+                        posture = None;
+                    }
+                }
+                // Empty: this pass moved nothing and must not forget the posture.
+                Ok(Composed::Untouched) => {}
+                Err(refusal) => {
+                    script_answered(shared, watch);
+                    return respond(head, Fold::Owed, refusal, &mut ctx);
+                }
+            }
+            continue;
+        }
+
+        if let Some(desired) = desired.filter(|wanted| Some(*wanted) != posture) {
             watch.dwells.flush(&mut |text| sink.line(text));
             sink.line(&format!("motion: {} -> {desired}", from(posture)));
             started(sink, posture, desired, reason);
@@ -1952,15 +2192,28 @@ fn active<R: Rest>(
                 &mut |text| sink.line(text),
                 &mut |event| ticked(event, shared, sink, surface),
                 &mut || {
-                    let (next, reason) = retarget_to(shared, watch, sink, in_flight)?;
-                    sink.line(&format!("motion: {in_flight} -> {next}, mid-move"));
-                    started(sink, Some(in_flight), next, reason);
-                    in_flight = next;
-                    Some(next)
+                    let (change, reason) = retarget_to(shared, watch, sink, in_flight)?;
+                    match change {
+                        Retarget::To(next) => {
+                            sink.line(&format!("motion: {in_flight} -> {next}, mid-move"));
+                            started(sink, Some(in_flight), next, reason);
+                            in_flight = next;
+                        }
+                        Retarget::HoldHere => froze(shared, watch, sink, in_flight),
+                    }
+                    Some(change)
                 },
             );
             let arrived = match outcome {
-                Ok(arrived) => arrived,
+                // A frozen move is where the head is, and that is nowhere the
+                // loop can name: the posture goes unknown, which is the state
+                // the fold default and every later ask already handle.
+                Ok(Arrival::HeldHere) => {
+                    posture = None;
+                    settled = None;
+                    continue;
+                }
+                Ok(Arrival::Reached(arrived)) => arrived,
                 // Wherever the move had got to, the head is not folded: a
                 // controlled stow is owed if the class asks for one.
                 Err(refusal) => {
@@ -1998,6 +2251,96 @@ fn active<R: Rest>(
             return respond(head, Fold::owed_by(posture), refusal, &mut ctx);
         }
     }
+}
+
+/// What a streamed pass left the base as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Composed {
+    /// The base reached the posture the plan named, with the overlays riding
+    /// it.
+    Arrived(Posture),
+    /// The run ended with the base still travelling: the head is between two
+    /// postures and the next pass commands from where it stands.
+    Travelling,
+    /// The run ended before it commanded a single setpoint. The head has not
+    /// moved, so whatever the loop knew about its posture is still true.
+    Untouched,
+}
+
+/// What the loop decided about one streamed pass before it began.
+struct Pass<'a> {
+    /// What the base does for the length of the run.
+    plan: BasePlan,
+    /// The schedule read `plan` was decided from. Handed in rather than read
+    /// again: a replacement landing between the two reads would leave the run's
+    /// per-period guard comparing the new script's answer against a plan built
+    /// from the old one, and the base would carry on toward a posture nothing
+    /// was asking for any more. The run is right for as long as this stands.
+    opening: Desired,
+    /// The narration a base transition owes, said on the period the first
+    /// setpoint goes out. A run can end before it commands anything, and a
+    /// transition line for a head that never moved is a transition that did not
+    /// happen.
+    say: &'a mut dyn FnMut(&dyn Sink),
+}
+
+/// Run one pass at the machine's control period: the base under the pass's
+/// plan, the overlays composed on top of it, one setpoint per period.
+///
+/// The run ends the moment the schedule's base answer changes, so the loop
+/// decides what a new base command means in the one place that decides it for
+/// every other pass.
+///
+/// A composed setpoint the machine will not take drops this script's overlays
+/// and nothing else. Per the doctrine that is a plan of ours the tick refused —
+/// nothing parks, nothing latches — so the base survives it, and the loop
+/// re-acquires the base with an ordinary move on its next pass.
+fn overlaid<A: Active>(
+    head: &mut A,
+    pass: Pass<'_>,
+    players: &mut Overlays,
+    shared: &Shared,
+    sink: &dyn Sink,
+    surface: &Surface,
+) -> Result<Composed, Refusal> {
+    let Pass { plan, opening, say } = pass;
+    let arrived = Cell::new(false);
+    let commanded = Cell::new(false);
+    let outcome = head.stream(
+        plan,
+        &mut |text| sink.line(text),
+        &mut |event| ticked(event, shared, sink, surface),
+        &mut |base| {
+            arrived.set(base.arrived);
+            if shared.stopping().is_some() {
+                return None;
+            }
+            let (desired, playing) = shared.composing(Instant::now());
+            if desired != opening {
+                return None;
+            }
+            players.sync(&playing, sink);
+            // Nothing left to say: every overlay has faded and the base has
+            // stopped moving. The machine holds what this period gave it and
+            // the loop goes back to its dwells.
+            if players.is_empty() && base.arrived {
+                return None;
+            }
+            if !commanded.replace(true) {
+                say(sink);
+            }
+            Some(compose(base.targets, players.advance(base.period)))
+        },
+    )?;
+    let refused = matches!(outcome, Streamed::Refused(_));
+    if let Streamed::Refused(why) = outcome {
+        players.refuse(&why, sink);
+    }
+    Ok(match plan {
+        _ if !commanded.get() => Composed::Untouched,
+        BasePlan::To(posture) if arrived.get() && !refused => Composed::Arrived(posture),
+        _ => Composed::Travelling,
+    })
 }
 
 /// Mark the running script as answered, so a wind-down back to Resting does not
@@ -2089,16 +2432,58 @@ fn take_hold<'e, R: Rest>(
     }
 }
 
-/// What the schedule asks of the machine now, or `None` when it asks for no
-/// change.
+/// What the schedule asks of the machine now — the read itself, and the ask it
+/// becomes, which is `None` when nothing asks for a change.
+///
+/// The read comes back with the answer because a caller that acts on it over
+/// several periods has to know *which* read its plan came from: a second read
+/// of its own could be a different script's answer.
 ///
 /// The lapse is said once per script rather than once per boundary: expiry is
-/// the answer from the moment it happens until another script lands.
-fn wanted(shared: &Shared, watch: &mut Watch, sink: &dyn Sink) -> Option<(Posture, &'static str)> {
-    match shared.desired(Instant::now()) {
-        Desired::Unchanged => None,
-        Desired::Posture(wanted) => Some((wanted, "script")),
+/// the answer from the moment it happens until another script lands, and so is
+/// a `keep`.
+fn wanted(shared: &Shared, watch: &mut Watch, sink: &dyn Sink) -> (Desired, Option<Ask>) {
+    let desired = shared.desired(Instant::now());
+    (desired, asked(desired, shared, watch, sink))
+}
+
+/// The same, with the overlays the same read found open.
+///
+/// What the loop's pass boundary asks, because the two answers have to be one
+/// script's: a replacement landing between a base read and an overlay read
+/// would have the pass enter a streamed run on the new script's windows with a
+/// plan built from the old script's base — a run that ends on its own first
+/// period having commanded nothing, after saying it was moving the head.
+fn composing(
+    shared: &Shared,
+    watch: &mut Watch,
+    sink: &dyn Sink,
+) -> (Desired, Option<Ask>, Overlaid) {
+    let (desired, playing) = shared.composing(Instant::now());
+    (desired, asked(desired, shared, watch, sink), playing)
+}
+
+/// The ask `desired` becomes, with the reporting a change of answer owes.
+fn asked(desired: Desired, shared: &Shared, watch: &mut Watch, sink: &dyn Sink) -> Option<Ask> {
+    match desired {
+        Desired::Unchanged => {
+            watch.keeping = None;
+            None
+        }
+        // `keep` commands no move and changes no posture state: the base stays
+        // where it is, known posture or not.
+        //
+        // Said nowhere here. `wanted` is asked from two places and they hold
+        // for different reasons: the loop's hold arm holds what the head is
+        // already holding, and the retarget closure stops a move between two
+        // postures. Each says its own, where it is true.
+        Desired::Keep => Some(Ask::Hold),
+        Desired::Posture(wanted) => {
+            watch.keeping = None;
+            Some(Ask::Posture(wanted, "script"))
+        }
         Desired::Expired => {
+            watch.keeping = None;
             let seq = shared.accepted_seq();
             if watch.lapse_reported != seq {
                 watch.lapse_reported = seq;
@@ -2106,9 +2491,59 @@ fn wanted(shared: &Shared, watch: &mut Watch, sink: &dyn Sink) -> Option<(Postur
                 sink.line("script: lapsed; folding the head and going back to rest");
                 sink.event("motion_script_expired", &json!({ "seq": seq }));
             }
-            Some((Posture::Stow, "timeout"))
+            Some(Ask::Posture(Posture::Stow, "timeout"))
         }
     }
+}
+
+/// Say that a `keep` is the live base command, once per transition into it.
+///
+/// Called from the loop's hold arm alone, which is the one place the statement
+/// is true: the head is holding what it holds, no move was issued, and none
+/// will be while this answer stands.
+fn said_keep(shared: &Shared, watch: &mut Watch, sink: &dyn Sink) {
+    let seq = shared.accepted_seq();
+    if watch.keeping == seq {
+        return;
+    }
+    watch.keeping = seq;
+    watch.dwells.flush(&mut |text| sink.line(text));
+    sink.line("script: keep; the base holds where it is");
+    sink.event("motion_keep", &json!({ "seq": seq }));
+}
+
+/// Say that a `keep` stopped a move where it had got to.
+///
+/// The freeze's own line and event rather than a posture: the head is between
+/// `in_flight` and wherever it started, so there is no state to report reaching
+/// and `motion_posture` keeps its two-value domain. Counts as this script's
+/// keep having been said, so the loop's hold arm does not say it a second time
+/// on the next boundary.
+fn froze(shared: &Shared, watch: &mut Watch, sink: &dyn Sink, in_flight: Posture) {
+    watch.keeping = shared.accepted_seq();
+    watch.dwells.flush(&mut |text| sink.line(text));
+    sink.line(&format!(
+        "motion: {in_flight} abandoned mid-move; keep holds the base where it is"
+    ));
+    sink.event(
+        "motion_keep_froze",
+        &json!({
+            "seq": shared.accepted_seq(),
+            "abandoned": in_flight.as_str(),
+        }),
+    );
+}
+
+/// What the schedule asks of the machine, when it asks for anything.
+///
+/// Two answers rather than one, because "hold what you are doing" and "nothing
+/// was asked" are different asks with different consequences and only one of
+/// them folds a machine whose posture is unknown.
+enum Ask {
+    /// Carry the head to this posture, for this reason.
+    Posture(Posture, &'static str),
+    /// Command nothing. What the machine is holding is what it holds.
+    Hold,
 }
 
 /// What a move already carrying the head to `in_flight` should become, or
@@ -2122,18 +2557,34 @@ fn wanted(shared: &Shared, watch: &mut Watch, sink: &dyn Sink) -> Option<(Postur
 /// A stop is answered first, and answered with the fold. A daemon asked to stop
 /// while the head is on its way up has no reason to finish the raise — the
 /// shutdown path's own stow is the move this becomes, run early and while the
-/// loop is still the thing driving it.
+/// loop is still the thing driving it. A stop therefore outranks a `keep`:
+/// freezing the head halfway up on the way out would leave it there for the
+/// shutdown stow to start from, a move later.
+///
+/// The reason travels with the answer rather than being derived again where the
+/// line is written: a second derivation is a second answer, and the two can
+/// disagree about which of a stop and a script moved the head.
 fn retarget_to(
     shared: &Shared,
     watch: &mut Watch,
     sink: &dyn Sink,
     in_flight: Posture,
-) -> Option<(Posture, &'static str)> {
+) -> Option<(Retarget, &'static str)> {
     let (next, reason) = match shared.stopping() {
         Some(_) => (Posture::Stow, "shutdown"),
-        None => wanted(shared, watch, sink)?,
+        None => match wanted(shared, watch, sink).1? {
+            Ask::Posture(next, reason) => (next, reason),
+            // The freeze: a `keep` landing on a move in flight means the base
+            // stays where it is, and where it is, mid-move, is between the two
+            // postures. It cannot be answered with an endpoint, so it is not a
+            // posture this compares against `in_flight`.
+            Ask::Hold => return Some((Retarget::HoldHere, "script")),
+        },
     };
-    (next != in_flight).then_some((next, reason))
+    // TODO(play-step-preempts-in-flight-move): an overlay window opening while
+    // this move is in flight is not answered here, so the move runs to its
+    // target and the overlay joins partway in rather than at its first frame.
+    (next != in_flight).then_some((Retarget::To(next), reason))
 }
 
 /// How long the next dwell watches for: the configured ceiling, cut short by
@@ -2840,9 +3291,10 @@ mod tests {
 
     use std::sync::mpsc::{Sender, channel};
 
-    use motion_proto::{Acceptance, MotionScript, Step};
+    use motion_proto::{Acceptance, MotionScript, Play, Step};
     use reachy_bench::pump::ReadFailures;
     use reachy_bus::{IdOutcome, XactError};
+    use reachy_clips::{interpolate_pose, lerp};
     use reachy_motion::{
         AntennaPhaseConfig, BusFailureSource, ClockStretch, CommandDisposition, JointId, Maneuver,
         Outcome as TimelineOutcome, PhaseSeparation, RegId, SeqError, SeqStep, ServoHealth,
@@ -2865,6 +3317,10 @@ mod tests {
     /// Where [`Event::Turn`]'s stow step sits. Short enough that an engage the
     /// fixture is told to take its time over outlasts it.
     const TURN_STOW_MS: u64 = 40;
+    /// Where [`Event::PlayThenLower`]'s second base step sits: a few paced
+    /// streamed periods past the play step, and well inside the motion's own
+    /// window, so the base command changes while the overlay is still playing.
+    const BASE_CHANGE_MS: u64 = 80;
     /// What the fixture says one stow maneuver is allowed, end to end.
     const FAKE_STOW_BUDGET: Duration = Duration::from_secs(3);
     /// How far the fixture's session clock advances per move commanded. Enough
@@ -2876,6 +3332,33 @@ mod tests {
     /// already carrying — which on a real machine is a head that creeps and
     /// never arrives, and here would be an endless test.
     const MAX_RETARGETS: usize = 4;
+    /// How many periods the fixture's base transition takes. Enough that a
+    /// motion joining it composes over a reference that is genuinely moving,
+    /// short enough that a test reads its whole series.
+    const FAKE_BASE_PERIODS: u32 = 8;
+    /// The control period the fixture reports. The tick rate everything is
+    /// floored at, which is also what a clip's frames are sampled at.
+    const FAKE_PERIOD: Duration = Duration::from_millis(20);
+    /// How many periods one streamed run may take before the fixture calls the
+    /// loop broken. A run ends when the caller stops answering; anything past
+    /// this is a caller that never will.
+    const MAX_STREAM_PERIODS: u32 = 400;
+    /// Where a play step sits on the timelines these tests write. Not zero,
+    /// because step offsets ascend strictly and the base step it rides is at
+    /// zero — a play step is a step like any other.
+    const PLAY_STEP_MS: u64 = 1;
+    /// How long before it is read a script carrying a play step is taken to
+    /// have landed.
+    ///
+    /// A script arrives on the bus thread and is read by this one on its next
+    /// pass, and these fixtures run in microseconds — so a play step a
+    /// millisecond in would not be due yet at the instant the loop looked. One
+    /// control period back is the smallest offset that makes the timeline
+    /// answer what it answers in life.
+    fn landed(now: Instant) -> Instant {
+        now.checked_sub(FAKE_PERIOD)
+            .expect("a monotonic clock a period past its start")
+    }
 
     fn timing() -> Timing {
         Timing {
@@ -2895,6 +3378,11 @@ mod tests {
         Move(Posture),
         /// A move replaced while it was running, and the posture it became.
         Retarget(Posture),
+        /// A move stopped where it had got to, holding between two postures.
+        Freeze,
+        /// A streamed run: one composed setpoint per control period, over the
+        /// base this plan names.
+        Stream(BasePlan),
         Hold,
         /// The orderly release: settle, measure, torque off.
         Release,
@@ -2957,6 +3445,26 @@ mod tests {
         )
     }
 
+    /// The configuration a posture means, with no clock beside it.
+    fn posture_targets(posture: Posture) -> JointTargets {
+        match posture {
+            Posture::Up => neutral_targets(),
+            Posture::Stow => stow_pose_targets(),
+        }
+    }
+
+    /// The configuration `s` of the way from `from` to `to`.
+    fn between(from: &JointTargets, to: &JointTargets, s: f64) -> JointTargets {
+        JointTargets {
+            head_pose_body: interpolate_pose(&from.head_pose_body, &to.head_pose_body, s),
+            body_yaw: lerp(from.body_yaw, to.body_yaw, s),
+            antennas: [
+                lerp(from.antennas[0], to.antennas[0], s),
+                lerp(from.antennas[1], to.antennas[1], s),
+            ],
+        }
+    }
+
     /// A script asking for one posture from the moment it lands.
     fn holding(seq: u64, posture: Posture) -> MotionScript {
         MotionScript::new(POD, seq, vec![Step::new(0, posture)], TIMEOUT_MS)
@@ -2978,6 +3486,32 @@ mod tests {
         Lapse,
         /// A script arrives asking for the head down.
         Lower,
+        /// A script arrives asking for the head up, and for the base to stay
+        /// where it is a short way in. What a publisher changing overlays
+        /// mid-motion sends, and the only way `keep` reaches a machine at all:
+        /// it never wakes one by itself.
+        RaiseThenKeep,
+        /// A script arrives that keeps twice with a raise between them, so the
+        /// second keep is a fresh transition into the answer rather than the
+        /// same one still standing.
+        KeepRaiseKeep,
+        /// A script arrives asking for the head up and playing this motion from
+        /// the moment it lands: the overlay rides the raise it asked for, which
+        /// is the layered-over-a-moving-reference case.
+        Play(&'static str),
+        /// A script arrives that leaves the base where it is and plays this
+        /// motion over it. What a publisher changing overlays mid-conversation
+        /// sends, and the held-base case.
+        KeepAndPlay(&'static str),
+        /// A script arrives asking for the head up, playing this motion from
+        /// the moment it lands, and lowering the base part-way through it. One
+        /// script, two base commands: the case where a streamed run ends on a
+        /// base change and the players have to survive it.
+        PlayThenLower(&'static str),
+        /// A script arrives whose only step is a `keep` — lawful on the wire,
+        /// since `keep` defines the base as much as a named posture does, and
+        /// the one script that must never put torque on a resting machine.
+        KeepOnly,
         /// A script arrives carrying a whole turn: up as it lands, stow a short
         /// way in. The nominal shape, and the one where the timeline can move on
         /// while an engage is still on the wire.
@@ -3071,9 +3605,35 @@ mod tests {
         open: Option<Maneuver>,
         /// The deadline each masked stow was handed, in order.
         stow_deadlines: Rc<RefCell<Vec<Duration>>>,
+        /// Where the machine is standing, as the fixture's own moves and
+        /// streams left it. What a streamed base is sampled from and toward.
+        at: JointTargets,
+        /// The base sample and the composed setpoint of every period any
+        /// streamed run commanded, in order. The only record of what layering
+        /// actually produced.
+        composed: Rc<RefCell<Vec<(JointTargets, JointTargets)>>>,
+        /// Where in [`Self::composed`] each streamed run began, so a test can
+        /// read one run's periods apart from the next one's.
+        stream_marks: Rc<RefCell<Vec<usize>>>,
+        /// Whether a streamed period costs a period of wall time. What a run
+        /// whose own script changes its base part-way through needs: the
+        /// timeline is read against the real clock, and a fixture that streams
+        /// in microseconds never reaches a step written in milliseconds.
+        stream_paced: bool,
+        /// The streamed run, counted from zero, that fails outright, and what
+        /// it answers with — the fault path, where a composed setpoint the tick
+        /// merely refuses is [`Self::refuse_setpoint`].
+        refuse_stream: Vec<(usize, Refusal)>,
+        /// The period of a streamed run whose composed setpoint the tick will
+        /// not take. Not a fault: nothing is commanded and nothing latches.
+        refuse_setpoint: Option<u32>,
+        /// What the world does in the middle of a streamed run, and at which
+        /// period.
+        stream_interrupt: Option<(u32, Event)>,
         watches: usize,
         engages: usize,
         moves: usize,
+        streams: usize,
         /// What the machine reports on each dwell, one entry per dwell. A dwell
         /// past the end of the script reports nothing.
         says: VecDeque<Vec<TickEvent>>,
@@ -3124,9 +3684,17 @@ mod tests {
                 elapsed: Duration::ZERO,
                 open: None,
                 stow_deadlines: Rc::new(RefCell::new(Vec::new())),
+                at: stow_pose_targets(),
+                composed: Rc::new(RefCell::new(Vec::new())),
+                stream_marks: Rc::new(RefCell::new(Vec::new())),
+                stream_paced: false,
+                refuse_stream: Vec::new(),
+                refuse_setpoint: None,
+                stream_interrupt: None,
                 watches: 0,
                 engages: 0,
                 moves: 0,
+                streams: 0,
                 says: VecDeque::new(),
                 says_moving: VecDeque::new(),
                 reports_moving: VecDeque::new(),
@@ -3212,6 +3780,45 @@ mod tests {
             for joint in joints {
                 self.out_of_service.insert(joint);
             }
+            self
+        }
+
+        /// Every period a streamed run commanded: where the base was, and what
+        /// the composition made of it.
+        fn composed(&self) -> Rc<RefCell<Vec<(JointTargets, JointTargets)>>> {
+            Rc::clone(&self.composed)
+        }
+
+        /// Where in [`Self::composed`] each streamed run began.
+        fn stream_marks(&self) -> Rc<RefCell<Vec<usize>>> {
+            Rc::clone(&self.stream_marks)
+        }
+
+        /// A streamed period costing a period of wall time, so a script whose
+        /// own timeline changes the base part-way through gets there.
+        fn pacing_stream(mut self) -> Self {
+            self.stream_paced = true;
+            self
+        }
+
+        /// The tick refusing the composed setpoint of the nth period of every
+        /// streamed run. A plan of ours the machine would not take: nothing was
+        /// commanded, nothing faulted.
+        fn refusing_setpoint(mut self, period: u32) -> Self {
+            self.refuse_setpoint = Some(period);
+            self
+        }
+
+        /// The nth streamed run failing outright, which also stops the daemon.
+        fn refusing_stream_with(mut self, nth: usize, refusal: Refusal) -> Self {
+            self.refuse_stream.push((nth, refusal));
+            self
+        }
+
+        /// `event` happening at the nth period of a streamed run. What a script
+        /// landing mid-motion looks like from the loop's side.
+        fn interrupting_stream(mut self, period: u32, event: Event) -> Self {
+            self.stream_interrupt = Some((period, event));
             self
         }
 
@@ -3345,8 +3952,76 @@ mod tests {
                     let script = holding(self.next_seq(), Posture::Up);
                     self.shared.accept(&script, arrived);
                 }
+                Some(Event::Play(motion)) => {
+                    let script = MotionScript::new(
+                        POD,
+                        self.next_seq(),
+                        vec![
+                            Step::new(0, Posture::Up),
+                            Step::play(PLAY_STEP_MS, Play::new(motion)),
+                        ],
+                        TIMEOUT_MS,
+                    )
+                    .expect("a lawful script");
+                    self.shared.accept(&script, landed(now));
+                }
+                Some(Event::KeepAndPlay(motion)) => {
+                    let script = MotionScript::new(
+                        POD,
+                        self.next_seq(),
+                        vec![Step::keep(0), Step::play(PLAY_STEP_MS, Play::new(motion))],
+                        TIMEOUT_MS,
+                    )
+                    .expect("a lawful script");
+                    self.shared.accept(&script, landed(now));
+                }
+                Some(Event::PlayThenLower(motion)) => {
+                    let script = MotionScript::new(
+                        POD,
+                        self.next_seq(),
+                        vec![
+                            Step::new(0, Posture::Up),
+                            Step::play(PLAY_STEP_MS, Play::new(motion)),
+                            Step::new(BASE_CHANGE_MS, Posture::Stow),
+                        ],
+                        TIMEOUT_MS,
+                    )
+                    .expect("a lawful script");
+                    self.shared.accept(&script, landed(now));
+                }
                 Some(Event::Lower) => {
                     let script = holding(self.next_seq(), Posture::Stow);
+                    self.shared.accept(&script, now);
+                }
+                Some(Event::RaiseThenKeep) => {
+                    let script = MotionScript::new(
+                        POD,
+                        self.next_seq(),
+                        vec![Step::new(0, Posture::Up), Step::keep(TURN_STOW_MS)],
+                        TIMEOUT_MS,
+                    )
+                    .expect("a lawful script");
+                    self.shared.accept(&script, now);
+                }
+                Some(Event::KeepRaiseKeep) => {
+                    let script = MotionScript::new(
+                        POD,
+                        self.next_seq(),
+                        vec![
+                            Step::new(0, Posture::Up),
+                            Step::keep(TURN_STOW_MS),
+                            Step::new(TURN_STOW_MS * 2, Posture::Up),
+                            Step::keep(TURN_STOW_MS * 3),
+                        ],
+                        TIMEOUT_MS,
+                    )
+                    .expect("a lawful script");
+                    self.shared.accept(&script, now);
+                }
+                Some(Event::KeepOnly) => {
+                    let script =
+                        MotionScript::new(POD, self.next_seq(), vec![Step::keep(0)], TIMEOUT_MS)
+                            .expect("a lawful script");
                     self.shared.accept(&script, now);
                 }
                 Some(Event::Turn) => {
@@ -3463,8 +4138,8 @@ mod tests {
             posture: Posture,
             line: &mut dyn FnMut(&str),
             event: &mut dyn FnMut(TickEvent),
-            retarget: &mut dyn FnMut() -> Option<Posture>,
-        ) -> Result<Posture, Refusal> {
+            retarget: &mut dyn FnMut() -> Option<Retarget>,
+        ) -> Result<Arrival, Refusal> {
             let nth = self.machine.moves;
             self.machine.moves += 1;
             // Commanded time passes whether or not the move finishes: a stow a
@@ -3505,17 +4180,102 @@ mod tests {
                 self.machine.interrupt = None;
                 self.machine.apply(Some(event));
             }
-            let mut arrived = posture;
+            let mut arrived = Arrival::Reached(posture);
             for _ in 0..MAX_RETARGETS {
                 let Some(next) = retarget() else {
+                    if let Arrival::Reached(reached) = arrived {
+                        self.machine.at = posture_targets(reached);
+                    }
                     return Ok(arrived);
                 };
-                self.machine.record(Act::Retarget(next));
-                arrived = next;
+                match next {
+                    Retarget::To(next) => {
+                        self.machine.record(Act::Retarget(next));
+                        arrived = Arrival::Reached(next);
+                    }
+                    // As the real one does: the trajectory is abandoned on the
+                    // period the answer arrives, so the run ends there and the
+                    // closure is not asked again.
+                    Retarget::HoldHere => {
+                        self.machine.record(Act::Freeze);
+                        return Ok(Arrival::HeldHere);
+                    }
+                }
             }
             panic!(
                 "the loop replaced one move {MAX_RETARGETS} times over: it is answering with the \
                  posture already in flight"
+            );
+        }
+
+        fn stream(
+            &mut self,
+            base: BasePlan,
+            _line: &mut dyn FnMut(&str),
+            event: &mut dyn FnMut(TickEvent),
+            compose: &mut dyn FnMut(BaseAt) -> Option<JointTargets>,
+        ) -> Result<Streamed, Refusal> {
+            let nth = self.machine.streams;
+            self.machine.streams += 1;
+            self.machine.record(Act::Stream(base));
+            let mark = self.machine.composed.borrow().len();
+            self.machine.stream_marks.borrow_mut().push(mark);
+            if let Some((_, refusal)) = self.machine.refuse_stream.iter().find(|(at, _)| *at == nth)
+            {
+                let refusal = refusal.clone();
+                if self.machine.refusal_stops {
+                    self.machine.shared.request_stop(Stop::Operator);
+                }
+                return Err(refusal);
+            }
+            for reported in self.machine.reports_moving.pop_front().unwrap_or_default() {
+                event(reported);
+            }
+            let start = self.machine.at;
+            let end = match base {
+                BasePlan::Held => start,
+                BasePlan::To(posture) => posture_targets(posture),
+            };
+            for period in 0..MAX_STREAM_PERIODS {
+                if self.machine.stream_paced {
+                    thread::sleep(FAKE_PERIOD);
+                }
+                // The world changes at a period the test names, which is where
+                // a script landing mid-motion arrives in life too.
+                if let Some((at, happening)) = self.machine.stream_interrupt
+                    && at == period
+                {
+                    self.machine.stream_interrupt = None;
+                    self.machine.apply(Some(happening));
+                }
+                let travelled = match base {
+                    BasePlan::Held => 1.0,
+                    BasePlan::To(_) => {
+                        f64::from(period.min(FAKE_BASE_PERIODS)) / f64::from(FAKE_BASE_PERIODS)
+                    }
+                };
+                let targets = between(&start, &end, travelled);
+                let arrived = travelled >= 1.0;
+                let Some(composed) = compose(BaseAt {
+                    targets,
+                    arrived,
+                    period: FAKE_PERIOD,
+                }) else {
+                    self.machine.at = targets;
+                    return Ok(Streamed::Ended);
+                };
+                if self.machine.refuse_setpoint == Some(period) {
+                    return Ok(Streamed::Refused(CommandRejection::StepTooLarge {
+                        joint: JointId::AntennaRight,
+                        delta: 0.6,
+                    }));
+                }
+                self.machine.composed.borrow_mut().push((targets, composed));
+                self.machine.at = composed;
+            }
+            panic!(
+                "the loop streamed {MAX_STREAM_PERIODS} periods without ending: it is composing \
+                 over a base that never arrives"
             );
         }
 
@@ -3736,6 +4496,906 @@ mod tests {
         );
         let fields = sink.fields("motion_startup").expect("the look is reported");
         assert_eq!(fields["at_stow"], json!(false));
+    }
+
+    /// `keep` means "do not move the base", and it means it against a machine
+    /// whose posture nobody knows as much as against one holding a named
+    /// posture. A run engaged onto a machine found standing has no posture at
+    /// all, and the fold that answers *no* ask must not answer this one: a
+    /// `keep` that folded would move the head to stow on the one command whose
+    /// whole content is that the head does not move.
+    #[test]
+    fn a_keep_against_an_unknown_posture_holds_instead_of_folding() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Wait,
+                Event::RaiseThenKeep,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        // The startup fold is refused, so the head is still standing crooked
+        // when the script wakes it and the engage pins it there: the loop opens
+        // with no posture at all.
+        .standing_elsewhere()
+        .gating_engage(0)
+        // The engage outlasts the raise step, so the first thing the loop is
+        // asked for once torque is on is the keep.
+        .engage_taking(Duration::from_millis(TURN_STOW_MS * 3));
+
+        let (outcome, acts, sink) = driven(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        let engaged = acts
+            .iter()
+            .rposition(|act| *act == Act::Engage)
+            .expect("the script engages the machine");
+        // The first thing torque does is hold. The stow at the end of the run is
+        // the shutdown's own fold, which every ending owes whatever was running.
+        assert_eq!(acts[engaged + 1], Act::Hold, "{acts:?}");
+        let stopped = acts
+            .iter()
+            .rposition(|act| *act == Act::Release)
+            .expect("the run releases");
+        assert!(
+            !acts[engaged..stopped - 1].contains(&Act::Move(Posture::Stow)),
+            "a keep commanded the fold it exists to prevent: {acts:?}"
+        );
+        assert!(sink.saw("motion_keep"));
+    }
+
+    /// The keep is said once, when it becomes the live base command — not once
+    /// a dwell for as long as it is the answer, which is the rule the lapse
+    /// line already follows.
+    #[test]
+    fn a_keep_is_said_once_and_not_once_a_dwell() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Wait,
+                Event::RaiseThenKeep,
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .standing_elsewhere()
+        .gating_engage(0)
+        .engage_taking(Duration::from_millis(TURN_STOW_MS * 3));
+
+        let (_, _, sink) = driven(&shared, machine);
+
+        let said = sink.all_fields("motion_keep");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0]["seq"], json!(1));
+        assert_eq!(
+            sink.said()
+                .lines
+                .iter()
+                .filter(|line| line.contains("keep"))
+                .count(),
+            1,
+        );
+    }
+
+    /// The canonical case, and the one the other keep tests skip past: the raise
+    /// completes, the head is at `Up`, and *then* the keep comes due. What makes
+    /// it a no-op is that the loop offers its own posture back and the filter
+    /// drops it; a filter that re-issued the move would re-plan a move to where
+    /// the head already is at every keep boundary, which is a twitch on the
+    /// bench and nothing at all in a suite that never lets a raise finish.
+    #[test]
+    fn a_keep_against_a_posture_the_head_is_holding_commands_nothing() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::RaiseThenKeep,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .sleeping();
+
+        let (outcome, acts, sink) = driven(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        let raised = acts
+            .iter()
+            .position(|act| *act == Act::Move(Posture::Up))
+            .expect("the script raises the head");
+        let stopped = acts
+            .iter()
+            .rposition(|act| *act == Act::Release)
+            .expect("the run releases");
+        // Everything between the raise and the shutdown's own fold is a hold.
+        assert!(
+            acts[raised + 1..stopped - 1]
+                .iter()
+                .all(|act| *act == Act::Hold),
+            "the keep commanded a move: {acts:?}"
+        );
+        let said = sink.all_fields("motion_keep");
+        assert_eq!(said.len(), 1, "{said:?}");
+    }
+
+    /// Said once per transition into the answer, not once per script: a script
+    /// that keeps, raises and keeps again says so twice, which is what clearing
+    /// the watch on every other answer buys.
+    #[test]
+    fn a_second_keep_after_a_raise_is_said_again() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::KeepRaiseKeep,
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .sleeping();
+
+        let (_, _, sink) = driven(&shared, machine);
+
+        let said = sink.all_fields("motion_keep");
+        assert_eq!(said.len(), 2, "{said:?}");
+    }
+
+    /// A `keep`-only script reaching a resting machine puts torque on nothing.
+    ///
+    /// `wants_up` matches the raise and only the raise, and this is the test of
+    /// that: the wire's other base command means "do not move", and answering it
+    /// by engaging nine servos would be the opposite of what it says. Nothing in
+    /// the code says so but a doc comment, so a widened match — waking on any
+    /// ask that is not `Unchanged`, say — would go unnoticed without it.
+    #[test]
+    fn a_keep_only_script_never_wakes_a_resting_machine() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::KeepOnly,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        );
+
+        let (outcome, acts, _) = driven(&shared, machine);
+
+        assert_eq!(outcome, Outcome::Released(Stop::Operator));
+        assert!(
+            !acts.contains(&Act::Engage),
+            "a keep woke a resting machine: {acts:?}"
+        );
+    }
+
+    /// A `keep` that lands mid-move stops the move where it has got to.
+    ///
+    /// The whole point of the base command: a publisher changing overlays
+    /// mid-motion wants the base left alone, and a raise that ran on to its
+    /// target would move the base a whole move further than the publisher ever
+    /// asked for. The head then holds between the two postures — a pose no
+    /// posture names — so no `motion_posture` is claimed for it and the freeze
+    /// reports itself instead, once.
+    #[test]
+    fn a_keep_mid_move_freezes_the_head_where_it_is() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [Event::Raise, Event::Wait, Event::Stop(Stop::Operator)],
+        )
+        // The keep replaces the running script while the raise is on the wire,
+        // which is the only way the retarget closure ever sees one.
+        .interrupting(0, Event::KeepOnly);
+
+        let (_, acts, sink) = driven(&shared, machine);
+
+        let raised = acts
+            .iter()
+            .position(|act| *act == Act::Move(Posture::Up))
+            .expect("the script raises the head");
+        assert_eq!(
+            acts[raised + 1],
+            Act::Freeze,
+            "the raise was stopped where it had got to: {acts:?}"
+        );
+        assert!(
+            !acts[raised..]
+                .iter()
+                .any(|act| matches!(act, Act::Retarget(_))),
+            "a freeze is not a move toward anywhere: {acts:?}"
+        );
+        assert_eq!(
+            acts[raised + 2],
+            Act::Hold,
+            "and the head holds there rather than being commanded again: {acts:?}"
+        );
+        let lines = &sink.said().lines;
+        assert_eq!(
+            lines.iter().filter(|line| line.contains("keep")).count(),
+            1,
+            "the keep is claimed once, by the freeze that made it true: {lines:?}"
+        );
+        assert_eq!(
+            sink.fields("motion_keep_froze")
+                .expect("the freeze is its own event")["abandoned"],
+            json!("up"),
+            "the freeze says which move it stopped"
+        );
+        assert!(
+            !sink.saw("motion_keep"),
+            "the hold arm claimed a keep the freeze had already claimed"
+        );
+        assert_eq!(
+            sink.all_fields("motion_posture")
+                .iter()
+                .map(|fields| fields["state"].clone())
+                .collect::<Vec<_>>(),
+            [json!("stow")],
+            "the frozen raise reported reaching a posture the head is not at"
+        );
+    }
+
+    /// A posture restated after a freeze moves the head again.
+    ///
+    /// The freeze leaves the loop's posture unknown, which is the state the
+    /// fold default and every later ask already handle: the head is somewhere
+    /// between two postures, so the next named one is a move and not a no-op —
+    /// and the tick shapes it from the setpoint the freeze left, which is what
+    /// makes restating `up` a way to carry on rather than a step.
+    #[test]
+    fn a_posture_restated_after_a_freeze_moves_the_head_again() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Raise,
+                Event::Raise,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .interrupting(0, Event::KeepOnly);
+
+        let (_, acts, _) = driven(&shared, machine);
+
+        let froze = acts
+            .iter()
+            .position(|act| *act == Act::Freeze)
+            .expect("the keep stops the raise");
+        assert!(
+            acts[froze..].contains(&Act::Move(Posture::Up)),
+            "the restated raise was taken for a posture the head already held: {acts:?}"
+        );
+    }
+
+    /// A script that expires after freezing the head still folds it.
+    ///
+    /// The lapse is the daemon's leave to go back to the minimum risk
+    /// condition, and a frozen head is no more exempt from it than a holding
+    /// one: the unknown posture is not stow, so the stow is commanded and the
+    /// ordinary rest follows it.
+    #[test]
+    fn a_script_that_expires_after_a_freeze_stows_the_head() {
+        let shared = Arc::new(Shared::new(POD));
+        let machine = Fake::new(
+            &shared,
+            [
+                Event::Raise,
+                Event::Lapse,
+                Event::Wait,
+                Event::Wait,
+                Event::Stop(Stop::Operator),
+            ],
+        )
+        .interrupting(0, Event::KeepOnly)
+        .sleeping();
+
+        let (_, acts, sink) = driven(&shared, machine);
+
+        let froze = acts
+            .iter()
+            .position(|act| *act == Act::Freeze)
+            .expect("the keep stops the raise");
+        assert!(
+            acts[froze..].contains(&Act::Move(Posture::Stow)),
+            "the lapse left the head frozen where it was: {acts:?}"
+        );
+        assert!(acts.contains(&Act::Release), "and it went back to rest");
+        assert!(sink.saw("motion_script_expired"));
+    }
+
+    /// The layering tests, and the fixtures that belong to them alone.
+    mod overlays {
+        use super::*;
+
+        /// The motion an antennas-only clip is named by in these tests.
+        const WIGGLE: &str = "test/wiggle";
+        /// A head-only one, for what a motion that drives the head does to a base.
+        const NOD: &str = "test/nod";
+
+        /// A daemon holding both fixture motions, and the schedule they play
+        /// against.
+        ///
+        /// The library is read off a real directory by the real walk, because a
+        /// daemon that plays a motion is a daemon that read a document.
+        fn with_motions() -> (tempfile::TempDir, Arc<Shared>) {
+            let sink = Collect::default();
+            let (dir, motions) = crate::library::fixtures::loaded(
+                &[
+                    (
+                        "wiggle.json",
+                        crate::library::fixtures::clip(WIGGLE, 10, 1.0),
+                    ),
+                    (
+                        "nod.json",
+                        crate::library::fixtures::head_clip(NOD, 10, 0.002),
+                    ),
+                ],
+                &sink,
+            );
+            (dir, Arc::new(Shared::with_motions(POD, motions)))
+        }
+
+        /// A machine whose script plays `motion` from the top and is then stopped.
+        fn playing(shared: &Arc<Shared>, motion: &'static str) -> Fake {
+            Fake::new(
+                shared,
+                [
+                    Event::Play(motion),
+                    Event::Wait,
+                    Event::Stop(Stop::Operator),
+                ],
+            )
+        }
+
+        /// A motion plays over the base its own script commands, composed into one
+        /// setpoint per control period.
+        ///
+        /// The layered case end to end: the script raises the head and plays a
+        /// motion from the same instant, so the overlay rides a reference that is
+        /// itself moving — the case that needs no tracker to exercise, and the one
+        /// the whole design is shaped around.
+        #[test]
+        fn a_motion_plays_over_the_base_its_script_commands() {
+            let (_dir, shared) = with_motions();
+            let machine = playing(&shared, WIGGLE);
+            let composed = machine.composed();
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(outcome, Outcome::Released(Stop::Operator));
+            assert!(
+                acts.contains(&Act::Stream(BasePlan::To(Posture::Up))),
+                "the raise was commanded on its own rather than under the motion: {acts:?}"
+            );
+            assert!(
+                !acts.contains(&Act::Move(Posture::Up)),
+                "the base was commanded twice: {acts:?}"
+            );
+            assert_eq!(
+                sink.fields("motion_play").expect("the motion is announced")["name"],
+                json!(WIGGLE)
+            );
+            let periods = composed.borrow();
+            assert!(
+                periods.len() > 8,
+                "the motion played fewer periods than its base transition took: {}",
+                periods.len()
+            );
+            assert!(
+                periods
+                    .iter()
+                    .any(|(base, _)| base.head_pose_body != periods[0].0.head_pose_body),
+                "the base never moved, so nothing was layered over a moving reference"
+            );
+            assert!(
+                periods
+                    .iter()
+                    .any(|(base, out)| out.antennas != base.antennas),
+                "the motion drove nothing"
+            );
+        }
+
+        /// An antennas-only motion says nothing at all about the head or the body.
+        ///
+        /// The mask is exact, not approximate: the channels no overlay drives are
+        /// the base's own numbers, bit for bit. Anything else is a motion that
+        /// pins a head somebody else is steering — the failure the whole delta-and-
+        /// mask representation exists to prevent.
+        #[test]
+        fn an_antennas_only_motion_leaves_the_head_and_the_body_untouched() {
+            let (_dir, shared) = with_motions();
+            let machine = Fake::new(
+                &shared,
+                [
+                    Event::Raise,
+                    Event::KeepAndPlay(WIGGLE),
+                    Event::Wait,
+                    Event::Stop(Stop::Operator),
+                ],
+            );
+            let composed = machine.composed();
+
+            let (_, acts, _) = driven(&shared, machine);
+
+            assert!(
+                acts.contains(&Act::Stream(BasePlan::Held)),
+                "the motion moved the base it was asked to leave alone: {acts:?}"
+            );
+            let periods = composed.borrow();
+            assert!(!periods.is_empty(), "nothing was composed");
+            for (base, out) in periods.iter() {
+                assert_eq!(
+                    out.head_pose_body, base.head_pose_body,
+                    "an antennas-only motion moved the head"
+                );
+                assert_eq!(
+                    out.body_yaw, base.body_yaw,
+                    "an antennas-only motion turned the body"
+                );
+            }
+            assert!(
+                periods
+                    .iter()
+                    .any(|(base, out)| out.antennas != base.antennas),
+                "the antennas were never driven either"
+            );
+        }
+
+        /// A head-driving motion composes with a base transition without pinning
+        /// the channels it does not drive.
+        ///
+        /// The other half of the mask: the head is the base's pose *and* the
+        /// motion's delta at once, while the antennas and the body stay the base's
+        /// alone.
+        #[test]
+        fn a_head_motion_composes_with_the_base_it_rides() {
+            let (_dir, shared) = with_motions();
+            let machine = playing(&shared, NOD);
+            let composed = machine.composed();
+
+            let (_, _, _) = driven(&shared, machine);
+
+            let periods = composed.borrow();
+            assert!(
+                periods
+                    .iter()
+                    .any(|(base, out)| out.head_pose_body != base.head_pose_body),
+                "the head motion contributed nothing to the composition"
+            );
+            for (base, out) in periods.iter() {
+                assert_eq!(
+                    out.antennas, base.antennas,
+                    "a head motion moved an antenna"
+                );
+                assert_eq!(out.body_yaw, base.body_yaw, "a head motion turned the body");
+            }
+        }
+
+        /// A composed setpoint the machine will not take drops the overlays and
+        /// keeps the base.
+        ///
+        /// The doctrine's own disposition for a plan of ours the tick refuses:
+        /// nothing parks, nothing latches, and the experiment that failed is the
+        /// layering rather than the script. The base is re-acquired by an ordinary
+        /// move, and the overlays of that script are not tried again — a refusal
+        /// that re-entered would refuse once a period for as long as the window
+        /// stayed open.
+        #[test]
+        fn a_refused_setpoint_drops_the_overlays_and_keeps_the_base() {
+            let (_dir, shared) = with_motions();
+            let machine = Fake::new(
+                &shared,
+                [
+                    Event::Play(WIGGLE),
+                    Event::Wait,
+                    Event::Wait,
+                    Event::Stop(Stop::Operator),
+                ],
+            )
+            .refusing_setpoint(3);
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(
+                outcome,
+                Outcome::Released(Stop::Operator),
+                "a refused setpoint faulted the daemon"
+            );
+            assert_eq!(
+                acts.iter()
+                    .filter(|act| matches!(act, Act::Stream(_)))
+                    .count(),
+                1,
+                "the refused overlays were played again: {acts:?}"
+            );
+            let streamed = acts
+                .iter()
+                .position(|act| matches!(act, Act::Stream(_)))
+                .expect("the motion started");
+            assert!(
+                acts[streamed..].contains(&Act::Move(Posture::Up)),
+                "the base was left where the refusal found it: {acts:?}"
+            );
+            assert_eq!(
+                sink.fields("motion_overlays_dropped")
+                    .expect("the drop is reported")["motions"],
+                json!([WIGGLE]),
+                "the drop does not say which motion was playing"
+            );
+            assert!(
+                !sink.saw("motion_fault"),
+                "a plan the tick refused was answered as a fault"
+            );
+        }
+
+        /// A stop asked for while a motion is playing ends the run on the period it
+        /// arrives on.
+        ///
+        /// The loop's own stop check is at the top of a pass, which a streamed run
+        /// does not reach until it ends by itself — so the check inside the compose
+        /// closure is the whole of what gets a stop answered promptly. Without it a
+        /// stop landing a period into a long motion would be sat on for the rest of
+        /// the motion and its blend-out, with the head still being commanded
+        /// composed setpoints after the daemon had been told to go to the minimum
+        /// risk condition.
+        #[test]
+        fn a_stop_during_a_motion_ends_the_run_on_the_period_it_arrives() {
+            let (_dir, shared) = with_motions();
+            let machine =
+                playing(&shared, WIGGLE).interrupting_stream(3, Event::Stop(Stop::Operator));
+            let composed = machine.composed();
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(outcome, Outcome::Released(Stop::Operator));
+            assert_eq!(
+                composed.borrow().len(),
+                3,
+                "the run carried on past the stop"
+            );
+            // Deliberately silent about the motion it cut. The truncation
+            // reports exist so a capture can tell a clip a republish or a lapse
+            // truncated from one that played out — both leave the daemon
+            // running and the trace otherwise unmarked. A stop, like a fault,
+            // ends the session and narrates itself; the clip stopping is what
+            // stopping means, and one more line about it would be noise on the
+            // way out.
+            assert!(
+                !sink.saw("motion_overlays_replaced") && !sink.saw("motion_overlays_lapsed"),
+                "the stop reported the motion it ended as a script disposition"
+            );
+            let streamed = acts
+                .iter()
+                .position(|act| matches!(act, Act::Stream(_)))
+                .expect("the motion started");
+            assert!(
+                acts[streamed..].contains(&Act::Move(Posture::Stow)),
+                "the stop did not fold the head: {acts:?}"
+            );
+            assert!(
+                acts.contains(&Act::Release),
+                "and it did not go back to rest: {acts:?}"
+            );
+        }
+
+        /// A base command the running script changes ends the streamed run and the
+        /// players ride through it.
+        ///
+        /// One script, two base commands: the run is right only for as long as the
+        /// base answer it was planned from stands, so it ends and the loop plans the
+        /// new base in the one place that decides that for every other pass. The
+        /// overlay is not part of what changed — rebuilding the players would ramp a
+        /// full-weight motion back up from zero, which on a machine is a visible
+        /// jerk and a motion that starts over instead of finishing.
+        #[test]
+        fn a_base_change_ends_the_run_and_the_motion_rides_through_it() {
+            let (_dir, shared) = with_motions();
+            let machine = Fake::new(
+                &shared,
+                [
+                    Event::PlayThenLower(WIGGLE),
+                    Event::Wait,
+                    Event::Stop(Stop::Operator),
+                ],
+            )
+            .pacing_stream();
+            let composed = machine.composed();
+            let marks = machine.stream_marks();
+
+            let (_, acts, sink) = driven(&shared, machine);
+
+            let streams: Vec<&Act> = acts
+                .iter()
+                .filter(|act| matches!(act, Act::Stream(_)))
+                .collect();
+            assert_eq!(
+                streams,
+                vec![
+                    &Act::Stream(BasePlan::To(Posture::Up)),
+                    &Act::Stream(BasePlan::To(Posture::Stow)),
+                ],
+                "the base change did not end the run and start the new base: {acts:?}"
+            );
+            assert_eq!(
+                sink.all_fields("motion_play").len(),
+                1,
+                "the players were rebuilt across the base change"
+            );
+            let boundary = marks.borrow()[1];
+            let periods = composed.borrow();
+            let (base, out) = periods[boundary];
+            assert_ne!(
+                out.antennas, base.antennas,
+                "the motion came back at zero weight after the base change"
+            );
+        }
+
+        /// A replacement landing mid-motion drops the players of the script it
+        /// replaced and plays its own.
+        ///
+        /// Replacement is the wire's own update model, and an overlay is no
+        /// exception to it: the timeline that opened these windows is gone, so the
+        /// players are gone with it — not faded, which would have two scripts'
+        /// motions on the head at once, and not carried, which would play a motion
+        /// nothing is asking for any more. The base is untouched by any of it: the
+        /// replacement names the posture the head is already holding, so the run it
+        /// entered on stays right and no second base command is issued.
+        #[test]
+        fn a_replacement_mid_motion_drops_the_players_and_plays_its_own() {
+            let (_dir, shared) = with_motions();
+            let machine =
+                playing(&shared, WIGGLE).interrupting_stream(REPLACED_AT, Event::Play(NOD));
+            let composed = machine.composed();
+            let marks = machine.stream_marks();
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(outcome, Outcome::Released(Stop::Operator));
+            assert_eq!(
+                acts.iter()
+                    .filter(|act| matches!(act, Act::Stream(_)))
+                    .count(),
+                1,
+                "the base was commanded again for a replacement that asked for the same posture: \
+             {acts:?}"
+            );
+            assert_eq!(
+                played(&sink),
+                vec![WIGGLE.to_owned(), NOD.to_owned()],
+                "the replacement did not take over the overlays"
+            );
+            cut_short(&sink, WIGGLE);
+            let started = acts
+                .iter()
+                .position(|act| matches!(act, Act::Stream(_)))
+                .expect("the first motion started");
+            assert!(
+                !acts[started..].contains(&Act::Move(Posture::Up)),
+                "the head re-travelled to the posture it was already holding: {acts:?}"
+            );
+            let start = marks.borrow()[0] + REPLACED_AT as usize;
+            let periods = composed.borrow();
+            let after = periods
+                .get(start..)
+                .expect("the run played on past the replacement");
+            took_over(after);
+        }
+
+        /// A replacement that opens with `keep` starts its motion over the base
+        /// exactly where the replaced script left it.
+        ///
+        /// The on-the-fly overlay change the `keep` base command exists for: the
+        /// publisher swaps the motion without restating a posture, so the run ends
+        /// on the changed base answer, no base move is issued at all, and the new
+        /// motion rides the setpoint the last period commanded.
+        #[test]
+        fn a_replacement_that_keeps_the_base_plays_over_where_it_was_left() {
+            let (_dir, shared) = with_motions();
+            let machine =
+                playing(&shared, WIGGLE).interrupting_stream(REPLACED_AT, Event::KeepAndPlay(NOD));
+            let composed = machine.composed();
+            let marks = machine.stream_marks();
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(outcome, Outcome::Released(Stop::Operator));
+            let streams: Vec<&Act> = acts
+                .iter()
+                .filter(|act| matches!(act, Act::Stream(_)))
+                .collect();
+            assert_eq!(
+                streams,
+                vec![
+                    &Act::Stream(BasePlan::To(Posture::Up)),
+                    &Act::Stream(BasePlan::Held),
+                ],
+                "the replacement's keep did not hold the base where it was: {acts:?}"
+            );
+            let started = acts
+                .iter()
+                .position(|act| matches!(act, Act::Stream(_)))
+                .expect("the first motion started");
+            assert!(
+                !acts[started..].contains(&Act::Move(Posture::Up)),
+                "a keep issued a base move: {acts:?}"
+            );
+            assert_eq!(
+                played(&sink),
+                vec![WIGGLE.to_owned(), NOD.to_owned()],
+                "the replacement did not take over the overlays"
+            );
+            cut_short(&sink, WIGGLE);
+            let start = marks.borrow()[1];
+            let periods = composed.borrow();
+            let after = periods
+                .get(start..)
+                .expect("the run played on past the replacement");
+            took_over(after);
+        }
+
+        /// The streamed period a replacement lands on in the tests above: far
+        /// enough in that the motion it replaces is at full weight, and early
+        /// enough that the run has periods left to show what the replacement did.
+        const REPLACED_AT: u32 = 3;
+
+        /// The motions announced as started, in the order they started.
+        fn played(sink: &Collect) -> Vec<String> {
+            sink.all_fields("motion_play")
+                .iter()
+                .map(|fields| {
+                    fields["name"]
+                        .as_str()
+                        .expect("a play event names its motion")
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        /// What the composed periods from a replacement onwards say about the
+        /// takeover: the replaced script's antennas motion contributes nothing any
+        /// more, and the replacement's own head motion reaches the head.
+        fn took_over(after: &[(JointTargets, JointTargets)]) {
+            for (base, out) in after {
+                assert_eq!(
+                    out.antennas, base.antennas,
+                    "the replaced script's antennas motion was still being commanded"
+                );
+            }
+            assert!(
+                after
+                    .iter()
+                    .any(|(base, out)| out.head_pose_body != base.head_pose_body),
+                "the replacement's own motion never reached the head"
+            );
+        }
+
+        /// The replacement named the motion it cut short, so a capture can tell a
+        /// truncated motion from one that played out.
+        fn cut_short(sink: &Collect, motion: &str) {
+            assert_eq!(
+                sink.fields("motion_overlays_replaced")
+                    .expect("the replacement says what it cut short")["motions"],
+                json!([motion])
+            );
+        }
+
+        /// A replacement landing on a streamed run's own first period leaves the
+        /// posture the loop is still holding.
+        ///
+        /// The base plan and the overlay windows come from one read of the schedule,
+        /// so a run that enters is right about both — but a replacement can still
+        /// land between that read and the run's first period, and the run then ends
+        /// having commanded nothing. The head has not moved: forgetting its posture
+        /// would have the next pass re-command the posture it is already holding,
+        /// and the transition line and event would describe a move that never ran.
+        #[test]
+        fn a_run_that_commands_nothing_leaves_the_posture_alone() {
+            let (_dir, shared) = with_motions();
+            let machine = playing(&shared, WIGGLE).interrupting_stream(0, Event::Lower);
+            let composed = machine.composed();
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(outcome, Outcome::Released(Stop::Operator));
+            assert!(
+                composed.borrow().is_empty(),
+                "the run commanded a setpoint after all"
+            );
+            assert!(
+                !acts.contains(&Act::Move(Posture::Stow)),
+                "the loop forgot a posture it was holding and re-commanded it: {acts:?}"
+            );
+            assert!(
+                sink.all_fields("motion_move").is_empty(),
+                "a transition that never ran was announced"
+            );
+        }
+
+        /// A machine that stops taking commands while a motion is playing parks the
+        /// daemon, exactly as one that stops mid-move does.
+        ///
+        /// The line between the two refusals a streamed run can end with: a
+        /// composed setpoint the tick would not take is ours and costs the
+        /// overlays, while a machine that has stopped answering is the platform and
+        /// costs the session.
+        #[test]
+        fn a_machine_that_stops_answering_mid_motion_parks() {
+            let (_dir, shared) = with_motions();
+            let machine = Fake::new(&shared, [Event::Play(WIGGLE), Event::Wait])
+                .refusing_stream_with(0, bus_failure());
+
+            let (outcome, acts, _) = driven(&shared, machine);
+
+            assert!(
+                matches!(outcome, Outcome::Faulted(_)),
+                "a bus that stopped carrying commands under a motion was survived: {outcome:?}"
+            );
+            assert!(
+                acts.contains(&Act::ReleaseNow),
+                "torque was not written off on the spot: {acts:?}"
+            );
+        }
+
+        /// A script that lapses while a motion is playing folds the head, and says
+        /// which motion the lapse cut short.
+        ///
+        /// Expiry is the daemon's leave to return to the minimum risk condition and
+        /// an overlay is no exemption from it: the players are dropped where they
+        /// are, the stow is commanded, and the ordinary rest follows.
+        ///
+        /// Reported as a lapse rather than as a replacement, and reported at all:
+        /// a lapse mid-motion truncates a clip exactly as a republish does, and it
+        /// reaches no `sync` — the script it belonged to is gone, so nothing opens
+        /// a window again — which is why the loop asks about it at the top of every
+        /// pass.
+        #[test]
+        fn a_script_that_lapses_mid_motion_folds_the_head() {
+            let (_dir, shared) = with_motions();
+            let machine = Fake::new(
+                &shared,
+                [
+                    Event::Play(WIGGLE),
+                    Event::Wait,
+                    Event::Wait,
+                    Event::Stop(Stop::Operator),
+                ],
+            )
+            .interrupting_stream(3, Event::Lapse)
+            .sleeping();
+
+            let (_, acts, sink) = driven(&shared, machine);
+
+            let streamed = acts
+                .iter()
+                .position(|act| matches!(act, Act::Stream(_)))
+                .expect("the motion started");
+            assert!(
+                acts[streamed..].contains(&Act::Move(Posture::Stow)),
+                "the lapse left the head up with a motion playing: {acts:?}"
+            );
+            assert!(acts.contains(&Act::Release), "and it went back to rest");
+            assert!(sink.saw("motion_script_expired"));
+            let fields = sink
+                .fields("motion_overlays_lapsed")
+                .expect("the lapse says what it cut short");
+            assert_eq!(fields["motions"], json!([WIGGLE]));
+            assert!(
+                !sink.saw("motion_overlays_replaced"),
+                "a lapse was reported as a republish: {sink:?}"
+            );
+        }
     }
 
     /// The wake: a script asking for the head up engages the machine, raises it,
@@ -4032,13 +5692,13 @@ mod tests {
         assert_eq!(retarget_to(&shared, &mut watch, &sink, Posture::Up), None);
         assert_eq!(
             retarget_to(&shared, &mut watch, &sink, Posture::Stow),
-            Some((Posture::Up, "script"))
+            Some((Retarget::To(Posture::Up), "script"))
         );
 
         shared.request_stop(Stop::Operator);
         assert_eq!(
             retarget_to(&shared, &mut watch, &sink, Posture::Up),
-            Some((Posture::Stow, "shutdown")),
+            Some((Retarget::To(Posture::Stow), "shutdown")),
             "a stop is answered with the fold, whatever the script still says"
         );
         assert_eq!(retarget_to(&shared, &mut watch, &sink, Posture::Stow), None);

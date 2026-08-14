@@ -17,9 +17,9 @@ license.workspace = true
 # clippy and tests cover it.
 
 [dependencies]
-# The three `rev =` pins below move together: they are one motion revision, and
+# The four `rev =` pins below move together: they are one motion revision, and
 # this daemon's refusal to engage after a failed position sweep is only correct
-# against a library whose failed sweep clears the freshness flag. Bump all three
+# against a library whose failed sweep clears the freshness flag. Bump all four
 # or none. The workspace manifest carries a commented-out [patch] table that
 # redirects them at a local clone for joint work on both repositories.
 #
@@ -28,16 +28,20 @@ license.workspace = true
 # neutral and stow postures. A git dependency because the dependency arrow runs
 # this way and never the reverse — the motion crates know nothing of a bus, a pod
 # identity or a presence channel.
-reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "ace6065cb7cc01679a72c27a803270d1a9cd3a32" }
+reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "8fbe7c0a6fdab71c1f4772b740157b8c3a3bdd69" }
 # The serial port and the typed refusal when something else already holds it.
 # Named directly because opening the port and classifying that refusal is the
 # daemon's; everything after the open goes through the session.
-reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "ace6065cb7cc01679a72c27a803270d1a9cd3a32" }
+reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "8fbe7c0a6fdab71c1f4772b740157b8c3a3bdd69" }
 # The joint-target type the two postures are expressed in. Named so the
 # posture-to-pose mapping can be a function of this daemon's own, with the type in
 # its signature, instead of living inside a trait implementation that needs a
 # servo bus to reach.
-reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "ace6065cb7cc01679a72c27a803270d1a9cd3a32" }
+reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "8fbe7c0a6fdab71c1f4772b740157b8c3a3bdd69" }
+# The motion library: the clip and sequence assets this daemon loads from
+# `clip_dir`, the resolution that turns a directory of documents into motions
+# addressable by name, and the per-tick playback a script's `play` steps drive.
+reachy-clips = { git = "https://github.com/rnortman/brenn-reachy", rev = "8fbe7c0a6fdab71c1f4772b740157b8c3a3bdd69" }
 # The motion-script schema and the executor state that runs one, shared with the
 # scripter on the speech host so neither end carries protocol logic of its own.
 motion-proto = { path = "../../crates/motion-proto" }
