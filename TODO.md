@@ -539,46 +539,26 @@ See `TODO(script-timebase)` at the wire schema in
 `firmware/crates/motion-proto/src/script.rs`.
 
 
-## `play-step-preempts-in-flight-move` — as of 2026-08-14
+## `base-refusal-escalation` — deferred as of 2026-08-14 (needs a fault-doctrine decision)
 
-A `play` step that comes due while the active loop is blocked inside `move_to` does not
-interrupt that move. The overlay is not lost — once the move ends, the loop's overlay arm
-starts the player at the timeline offset it should already have reached, through
-`ClipPlayer::joining_at` — but until then the base transition runs alone and the motion
-plays from partway in rather than from its first frame.
+A composed setpoint the tick refuses is, by the doctrine, a plan of ours and not a
+condition of the machine: nothing parks and nothing latches. The scripted loop answers
+one by dropping the overlays that were riding the base, and — since the blocking move
+left the loop — a bare base drive the tick refuses is answered the same way minus the
+overlays: reported, dwelt on, and re-offered on the next pass. A base plan the tick
+refuses *every* time is therefore retried for as long as the script asks for that
+posture, paced only by the dwell, with no counter, no threshold and no ending. The
+blocking path it replaced raised the same rejection as a refusal and ran the fault
+ladder (`Fold::Owed`).
 
-Every script whose `play` window opens while the loop is inside `move_to` hits this, not
-just replacement scripts. The simplest first-contact script does: `{posture up @0}`,
-`{play nod @500}` on a resting machine takes the `move_to` arm on its first pass — the
-window is not open yet — and the raise then runs for seconds with the retarget closure
-unable to see the window open at 500ms. The same holds for a single script whose `play`
-step falls inside a later transition (`{up @0}`, `{stow @3000}`, `{play nod @3200}`), which
-is the "nod during an up→stow transition" case the layering feature exists to serve. What
-already works is the narrow coincidence: a `play` step due on the *same* pass as the
-posture step, where both are due together so the pass takes the overlay arm and streams
-the base itself — plus the `keep` freeze path, which is implemented.
+Deferred rather than done because neither answer is this loop's to pick: reverting to
+the fault ladder contradicts the doctrine's "a refused plan parks nothing and latches
+nothing", and any middle answer — how many refusals in what window, and which response
+they earn — is a fault-management decision that belongs with the doctrine in
+`../brenn-reachy/docs/fault-management.md`, not with the daemon that would implement it.
 
-Deferred rather than dismissed: it was cut for increment scope, not rejected. What it
-needs before it can be written is a semantic call, not just the edit. There is no stated
-rule for "a `play` step comes due while a non-`keep` base move is in flight", and the
-existing late-join rule — a daemon arriving mid-window joins the clip at the offset it
-should already have reached — reads *for* today's behaviour. Ending an in-flight base move
-because an overlay came due trades the posture timeline's stated target for overlay
-fidelity and adds an observable outcome that has to be distinguishable from the `keep`
-freeze, so it is an addition to the motion semantics and wants a design decision.
+Done = a persistently refused bare base plan reaches a defined ending the doctrine names,
+with the threshold and the response stated there and pinned by a loop test.
 
-Proposed shape, once that call is made: answer `Retarget::HoldHere` from the loop's
-retarget closure when the schedule has an overlay window open, with its own reported line
-rather than the `keep` freeze's. The move ends where it is, the loop falls through to the
-overlay arm, which re-plans the base toward the posture target under the overlay rather
-than abandoning it, and the overlay starts at zero offset. The edit itself is roughly a
-dozen lines plus a loop test; the decision is the work.
-
-Done = a `play` step coming due during an in-flight base move ends that move on the period
-the step comes due and starts its overlay at the clip's first frame, pinned by a
-`motion.rs` loop test, with the ended move reported distinguishably from a `keep` freeze —
-against a decided rule for which layer wins.
-
-See `TODO(play-step-preempts-in-flight-move)` at `retarget_to` in
+See `TODO(base-refusal-escalation)` at `overlaid` in
 `firmware/devices/reachy-motiond/src/motion.rs`.
-

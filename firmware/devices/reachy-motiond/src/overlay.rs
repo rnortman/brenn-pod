@@ -137,6 +137,14 @@ impl Overlays {
     /// nothing here asks the library anything.
     pub fn sync(&mut self, overlaid: &Overlaid, sink: &dyn Sink) {
         self.forget(overlaid.seq, sink);
+        // A script whose composition the machine refused is not played again,
+        // here any more than at the pass boundary [`Self::wants`] guards: the
+        // same clip over the same base composes the same setpoint, and a run
+        // that took its windows up again would offer the tick what it has just
+        // refused, once a period, for as long as the windows stayed open.
+        if self.refused {
+            return;
+        }
         let seq = self.seq;
         self.players.retain(|(index, player)| {
             if overlaid.plays.iter().any(|play| play.index == *index) {
@@ -233,7 +241,11 @@ impl Overlays {
 }
 
 /// The slug a composed-target refusal is aggregated under.
-fn reason(why: &CommandRejection) -> &'static str {
+///
+/// Shared with the loop's bare-base refusal report: which class of refusal a
+/// session saw is one question, and deriving its answer twice is two
+/// vocabularies for one aggregation.
+pub fn reason(why: &CommandRejection) -> &'static str {
     match why {
         CommandRejection::Envelope(_) => "envelope",
         CommandRejection::Trajectory(_) => "unshapeable",
@@ -243,7 +255,7 @@ fn reason(why: &CommandRejection) -> &'static str {
 }
 
 /// The joint a refusal names, for the refusals that name one.
-fn joint(why: &CommandRejection) -> Option<JointId> {
+pub fn joint(why: &CommandRejection) -> Option<JointId> {
     match why {
         CommandRejection::AntennaUnreachable { joint, .. }
         | CommandRejection::StepTooLarge { joint, .. } => Some(*joint),
@@ -498,6 +510,16 @@ mod tests {
                 }],
             }),
             "another window of the refused script was played"
+        );
+        players.sync(&open(&motions, 1, 1, 20), &sink);
+        assert!(
+            players.is_empty(),
+            "a run inside the refused script took its windows up again"
+        );
+        assert_eq!(
+            sink.all_fields("motion_play").len(),
+            1,
+            "the refused window was started a second time"
         );
         assert_eq!(
             sink.fields("motion_overlays_dropped")

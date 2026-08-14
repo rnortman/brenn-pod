@@ -49,12 +49,21 @@ license = "Apache-2.0"
 esp-idf-svc = { version = "0.52.1" }
 log = "0.4"
 
+# The four motion crates are one revision of one repository, pinned here rather than
+# in devices/reachy-motiond/Cargo.toml so a bump is one contiguous edit instead of
+# four scattered ones: a bump that misses an entry resolves two revisions of the same
+# source and fails as a type mismatch between identical-looking paths. Bump all four
+# together, and regenerate Cargo.lock.
+reachy-bench = { git = "https://github.com/rnortman/brenn-reachy", rev = "9a9b7cb1a804665e37dfe28f38381ec70d684b2b" }
+reachy-bus = { git = "https://github.com/rnortman/brenn-reachy", rev = "9a9b7cb1a804665e37dfe28f38381ec70d684b2b" }
+reachy-motion = { git = "https://github.com/rnortman/brenn-reachy", rev = "9a9b7cb1a804665e37dfe28f38381ec70d684b2b" }
+reachy-clips = { git = "https://github.com/rnortman/brenn-reachy", rev = "9a9b7cb1a804665e37dfe28f38381ec70d684b2b" }
+
 # Uncomment to build the motion crates out of the clone beside this repository
-# instead of the revisions devices/reachy-motiond/Cargo.toml pins. For local work
-# on the pod and the motion library together; a machine without the clone then
-# fails to resolve, and public CI cannot see it, so the table stays commented out
-# on anything that is pushed. Re-pin the four `rev =` values and regenerate
-# Cargo.lock before commenting it back out.
+# instead of the revisions above. For local work on the pod and the motion library
+# together; a machine without the clone then fails to resolve, and public CI cannot
+# see it, so the table stays commented out on anything that is pushed. Re-pin the four
+# `rev =` values above and regenerate Cargo.lock before commenting it back out.
 #
 # [patch."https://github.com/rnortman/brenn-reachy"]
 # reachy-bench = { path = "../../brenn-reachy/crates/reachy-bench" }

@@ -320,7 +320,7 @@ impl fmt::Display for Motions {
 pub(crate) mod fixtures {
     use std::path::Path;
 
-    use reachy_clips::{ClipLimits, STEP_MARGIN};
+    use reachy_clips::{ClipLimits, DEFAULT_BLEND_MS, STEP_MARGIN};
     use reachy_motion::FLOOR_TICK_HZ;
     use tempfile::TempDir;
 
@@ -340,6 +340,27 @@ pub(crate) mod fixtures {
     /// speed, and the number in the document is the number that comes back out
     /// of the library.
     pub fn clip(name: &str, frames: usize, max_speed: f64) -> String {
+        clip_with(name, frames, max_speed, fixture_blend_ms(frames))
+    }
+
+    /// The blend fields a document carries, rendered for splicing into one.
+    ///
+    /// `None` writes no fields at all, which is how a fixture reaches the
+    /// loader's own defaulting rather than a number of its own.
+    fn blend_fields(blend: Option<u64>) -> String {
+        blend.map_or_else(String::new, |blend| {
+            format!(r#""blend_in_ms": {blend}, "blend_out_ms": {blend},"#)
+        })
+    }
+
+    /// The same clip authoring `blend` at either end rather than the ramp the
+    /// fixtures default to.
+    ///
+    /// The ramp is a parameter rather than something a caller patches into the
+    /// rendered text: a substitution that stops matching leaves a clip whose
+    /// blend is the default while the test goes on asserting about the number
+    /// it thought it wrote.
+    pub fn clip_with(name: &str, frames: usize, max_speed: f64, blend: u64) -> String {
         let step = limits().max_step.antennas * STEP_MARGIN / max_speed;
         let track: Vec<String> = (0..frames)
             .map(|index| {
@@ -350,10 +371,24 @@ pub(crate) mod fixtures {
         format!(
             r#"{{"version": 1, "kind": "clip", "name": "{name}",
                  "channels": ["antennas"], "frame_hz": {FLOOR_TICK_HZ},
-                 "max_speed": {max_speed}, "blend_in_ms": 200, "blend_out_ms": 200,
+                 "max_speed": {max_speed}, {}
                  "frames": [{}]}}"#,
+            blend_fields(Some(blend)),
             track.join(",")
         )
+    }
+
+    /// The ramp a fixture clip of `frames` frames authors at either end.
+    ///
+    /// A ramp longer than its own clip is refused at load, and these fixtures
+    /// run to a handful of frames, so the library's own default is taken only
+    /// by a clip long enough to hold it. The same answer the loader reaches for
+    /// an omitted ramp, held to it by
+    /// `the_fixture_ramp_is_the_clips_own_span_capped_at_the_library_default`.
+    pub fn fixture_blend_ms(frames: usize) -> u64 {
+        let frames = u32::try_from(frames).expect("a small count");
+        let span_ms = f64::from(frames) * 1000.0 / FLOOR_TICK_HZ;
+        (span_ms as u64).min(u64::from(DEFAULT_BLEND_MS))
     }
 
     /// A head-only clip of `frames` frames lifting the head `dz` metres on
@@ -363,6 +398,13 @@ pub(crate) mod fixtures {
     /// the antennas or the body does to a composition, and the mask that makes
     /// it say nothing.
     pub fn head_clip(name: &str, frames: usize, dz: f64) -> String {
+        head_clip_with(name, frames, dz, Some(fixture_blend_ms(frames)))
+    }
+
+    /// The same head clip authoring `blend` at either end, or — at `None` —
+    /// saying nothing about its ramps, so the loader's own default and the cap
+    /// on it are what the document ends up with.
+    pub fn head_clip_with(name: &str, frames: usize, dz: f64, blend: Option<u64>) -> String {
         let track: Vec<String> = (0..frames)
             .map(|index| {
                 let lift = f64::from(u8::try_from(index % 2).expect("0 or 1")) * dz;
@@ -372,8 +414,9 @@ pub(crate) mod fixtures {
         format!(
             r#"{{"version": 1, "kind": "clip", "name": "{name}",
                  "channels": ["head"], "frame_hz": {FLOOR_TICK_HZ},
-                 "max_speed": 1.0, "blend_in_ms": 200, "blend_out_ms": 200,
+                 "max_speed": 1.0, {}
                  "frames": [{}]}}"#,
+            blend_fields(blend),
             track.join(",")
         )
     }
@@ -408,7 +451,11 @@ pub(crate) mod fixtures {
 mod tests {
     use motion_proto::{MAX_MOTION_NAME_LEN, MAX_SPEED, MIN_SPEED, Play};
 
-    use super::fixtures::{clip, limits, loaded, write, written};
+    use reachy_clips::DEFAULT_BLEND_MS;
+
+    use super::fixtures::{
+        clip, clip_with, fixture_blend_ms, head_clip_with, limits, loaded, write, written,
+    };
     use super::*;
     use crate::report::Collect;
 
@@ -495,19 +542,115 @@ mod tests {
         );
     }
 
+    /// A ramp the author wrote longer than the clip it fades is a content
+    /// fault the library refuses, and it reaches this daemon as the same
+    /// per-document skip a malformed file does.
+    ///
+    /// Held here rather than left to the library's own tests because the skip
+    /// is where the two crates meet: the daemon's contract is that one bad file
+    /// costs the machine that motion and nothing else, and a refusal class the
+    /// library later promoted to a whole-load failure would break that contract
+    /// here, silently.
+    #[test]
+    fn a_ramp_longer_than_its_own_clip_is_named_and_skipped() {
+        let sink = Collect::default();
+        let (_dir, motions) = loaded(
+            &[
+                ("good.json", clip("pod/nod", 8, 1.5)),
+                // Four frames is 80 ms of motion under a minute of fade — the
+                // hundredfold typo the ceiling exists for.
+                ("slow.json", clip_with("pod/slow", 4, 1.0, 60_000)),
+            ],
+            &sink,
+        );
+
+        assert_eq!(motions.len(), 1);
+        assert!(motions.motion("pod/nod").is_some());
+        assert!(motions.motion("pod/slow").is_none());
+        let fields = sink.fields("motion_asset_skipped").expect("reported");
+        assert!(
+            fields["source"]
+                .as_str()
+                .expect("a source")
+                .ends_with("slow.json"),
+            "{fields}"
+        );
+        let error = fields["error"].as_str().expect("an error");
+        assert!(error.contains("60000"), "{error}");
+        assert!(error.contains("80"), "{error}");
+        assert_eq!(
+            sink.fields("motion_library").expect("reported")["skipped"],
+            json!(1)
+        );
+    }
+
+    /// A document that says nothing about its ramps gets the library's default,
+    /// capped at the clip's own span — and that capped number is what the
+    /// window this daemon computes carries.
+    ///
+    /// The fixtures all author their ramps, so without this the defaulting path
+    /// the wire's timeline arithmetic depends on is exercised nowhere in the
+    /// crate.
+    #[test]
+    fn an_omitted_ramp_takes_the_library_default_capped_at_the_clip() {
+        let sink = Collect::default();
+        // A small enough lift that no derived floor stretches either ramp, so
+        // what comes back out is the cap and nothing else.
+        let (_dir, motions) = loaded(
+            &[
+                ("short.json", head_clip_with("pod/short", 4, 0.0002, None)),
+                ("long.json", head_clip_with("pod/long", 40, 0.0002, None)),
+            ],
+            &sink,
+        );
+
+        let short = motions.window(&Play::new("pod/short")).expect("held");
+        assert_eq!(short.duration_ms, 80);
+        assert_eq!(short.blend_out_ms, 80);
+        let long = motions.window(&Play::new("pod/long")).expect("held");
+        assert_eq!(long.duration_ms, 800);
+        assert_eq!(long.blend_out_ms, u64::from(DEFAULT_BLEND_MS));
+    }
+
+    /// The ramp the fixtures author is the same answer the library reaches for
+    /// a document that authors none: the clip's own span, capped at the default.
+    ///
+    /// `fixture_blend_ms` re-derives the library's clip duration and its default
+    /// on this side of the seam, so the two can drift and leave every fixture
+    /// authoring a ramp its test's comment no longer describes. This holds the
+    /// local formula to the loaded clip's own numbers.
+    #[test]
+    fn the_fixture_ramp_is_the_clips_own_span_capped_at_the_library_default() {
+        let sink = Collect::default();
+        let (_dir, motions) = loaded(
+            &[
+                ("short.json", head_clip_with("pod/short", 4, 0.0002, None)),
+                ("long.json", head_clip_with("pod/long", 40, 0.0002, None)),
+            ],
+            &sink,
+        );
+
+        for (name, frames) in [("pod/short", 4), ("pod/long", 40)] {
+            let motion = motions.motion(name).expect("held");
+            let span_ms = ms_ceil(motion.duration_s());
+            assert_eq!(
+                fixture_blend_ms(frames),
+                span_ms.min(u64::from(DEFAULT_BLEND_MS)),
+                "{name}"
+            );
+            // The loader's own defaulting reaches the same number, which is
+            // what makes the fixtures' ramps lawful under the ceiling.
+            assert_eq!(u64::from(motion.blend_out_ms()), fixture_blend_ms(frames));
+        }
+    }
+
     /// What a load changed about an asset it accepted is said too: a ramp the
     /// document asked for and the machine's step bounds would not allow is a
     /// difference between the file and what plays.
     #[test]
     fn a_stretched_ramp_is_reported_against_the_asset() {
         let sink = Collect::default();
-        let (_dir, motions) = loaded(
-            &[(
-                "brisk.json",
-                clip("pod/brisk", 8, 2.0).replace("\"blend_in_ms\": 200", "\"blend_in_ms\": 1"),
-            )],
-            &sink,
-        );
+        let (_dir, motions) = loaded(&[("brisk.json", clip_with("pod/brisk", 8, 2.0, 1))], &sink);
 
         assert_eq!(motions.len(), 1);
         let fields = sink.fields("motion_asset_note").expect("reported");
@@ -555,15 +698,16 @@ mod tests {
     #[test]
     fn a_windows_two_numbers_are_the_duration_and_the_fade() {
         let sink = Collect::default();
-        // Eight frames at the floor tick rate is 160 ms.
+        // Eight frames at the floor tick rate is 160 ms, and the fixture's fade
+        // is that same span — the longest a clip this short may author.
         let (_dir, motions) = loaded(&[("nod.json", clip("pod/nod", 8, 1.5))], &sink);
 
         let window = motions.window(&Play::new("pod/nod")).expect("held");
         assert_eq!(window.duration_ms, 160);
-        assert_eq!(window.blend_out_ms, 200);
+        assert_eq!(window.blend_out_ms, 160);
         // The clock scales with the speed and the fade does not.
-        assert_eq!(window.span_ms(1.0), 360);
-        assert_eq!(window.span_ms(2.0), 280);
+        assert_eq!(window.span_ms(1.0), 320);
+        assert_eq!(window.span_ms(2.0), 240);
     }
 
     /// The screen a script passes before the schedule sees it.
