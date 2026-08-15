@@ -538,27 +538,3 @@ is present.
 See `TODO(script-timebase)` at the wire schema in
 `firmware/crates/motion-proto/src/script.rs`.
 
-
-## `base-refusal-escalation` — deferred as of 2026-08-14 (needs a fault-doctrine decision)
-
-A composed setpoint the tick refuses is, by the doctrine, a plan of ours and not a
-condition of the machine: nothing parks and nothing latches. The scripted loop answers
-one by dropping the overlays that were riding the base, and — since the blocking move
-left the loop — a bare base drive the tick refuses is answered the same way minus the
-overlays: reported, dwelt on, and re-offered on the next pass. A base plan the tick
-refuses *every* time is therefore retried for as long as the script asks for that
-posture, paced only by the dwell, with no counter, no threshold and no ending. The
-blocking path it replaced raised the same rejection as a refusal and ran the fault
-ladder (`Fold::Owed`).
-
-Deferred rather than done because neither answer is this loop's to pick: reverting to
-the fault ladder contradicts the doctrine's "a refused plan parks nothing and latches
-nothing", and any middle answer — how many refusals in what window, and which response
-they earn — is a fault-management decision that belongs with the doctrine in
-`../brenn-reachy/docs/fault-management.md`, not with the daemon that would implement it.
-
-Done = a persistently refused bare base plan reaches a defined ending the doctrine names,
-with the threshold and the response stated there and pinned by a loop test.
-
-See `TODO(base-refusal-escalation)` at `overlaid` in
-`firmware/devices/reachy-motiond/src/motion.rs`.

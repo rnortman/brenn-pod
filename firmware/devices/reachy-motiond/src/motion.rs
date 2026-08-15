@@ -917,9 +917,12 @@ pub trait Active {
     /// Every composed setpoint faces the same envelope check, per-tick step
     /// bound and antenna mask a planned sample faces; none of that is bypassed
     /// and none of it is duplicated here. A setpoint the machine will not take
-    /// comes back as [`Streamed::Refused`] rather than as an `Err`, because it
-    /// is a plan of ours the tick would not run: nothing was commanded, nothing
-    /// faulted, and the head holds where the last accepted period put it.
+    /// comes back as [`Streamed::Refused`] rather than as an `Err`, because
+    /// only the caller knows what rode the refused setpoint: a refusal an
+    /// overlay was composed into is answered by dropping the overlays and
+    /// re-acquiring, while a bare one ends the session. Either way nothing was
+    /// commanded, nothing faulted, and the head holds where the last accepted
+    /// period put it.
     ///
     /// A [`BasePlan::To`] the machine will not plan at all is also a
     /// [`Streamed::Refused`], reported before any setpoint goes out.
@@ -2047,6 +2050,14 @@ fn active<R: Rest>(
             return Err(release_for(head, base, stop, &mut ctx));
         }
 
+        // Which script this pass is answering, read before the schedule it
+        // plans from. The bus thread writes both while this thread works, and a
+        // pass that ends in a refusal marks the script it answered: read at
+        // response time instead, a replacement landing in between would be
+        // marked answered for a plan it never asked for and would never raise
+        // the head. Erring older is the safe side — a script marked one too
+        // early is tried again, one marked too late is lost.
+        let asking = shared.accepted_seq();
         let (opening, ask, playing) = composing(shared, watch, sink);
         // Whatever this pass does next, players belonging to a script that is
         // no longer running are gone as of this read. Here rather than in the
@@ -2154,17 +2165,17 @@ fn active<R: Rest>(
                 // Empty: this pass moved nothing and must not forget the base.
                 Ok(Composed::Untouched) => {}
                 Err(refusal) => {
-                    script_answered(shared, watch);
+                    script_answered(watch, asking);
                     return respond(head, Fold::Owed, refusal, &mut ctx);
                 }
             }
-            // A refused pass falls through to the dwell instead of starting the
-            // next run at once. The base command that was refused is still the
-            // base command, so an immediate retry is the same plan re-offered
-            // as fast as the loop can build it — a hot spin against a machine
-            // that is refusing, with no dwell between attempts and nothing on
-            // the console to say how often it is happening. The dwell paces the
-            // re-acquisition and costs one pass.
+            // A pass whose layering was refused falls through to the dwell
+            // instead of starting the next run at once. The base command under
+            // those overlays is still the base command, so an immediate retry
+            // is the same plan re-offered as fast as the loop can build it — a
+            // hot spin, with nothing on the console to say how often it is
+            // happening. The dwell paces the bare re-acquisition and costs one
+            // pass.
             if !refused {
                 continue;
             }
@@ -2190,7 +2201,7 @@ fn active<R: Rest>(
         watch.dwells.end_dwell(&mut |text| sink.line(text));
         if let Err(refusal) = held {
             watch.dwells.flush(&mut |text| sink.line(text));
-            script_answered(shared, watch);
+            script_answered(watch, asking);
             return respond(head, Fold::owed_by(base.at()), refusal, &mut ctx);
         }
     }
@@ -2257,11 +2268,13 @@ enum Composed {
     /// The run ended with the base still travelling: the head is between two
     /// postures and the next pass commands from where it stands.
     Travelling,
-    /// The machine would not take what the pass composed, or would not plan the
-    /// base at all. The overlays are dropped and the head is where the last
-    /// accepted period put it; `moved` says whether there was one, because a
-    /// run refused before it commanded anything left the posture as true as it
-    /// found it.
+    /// The machine would not take what the pass composed over the base. The
+    /// overlays are dropped and the head is where the last accepted period put
+    /// it; `moved` says whether there was one, because a run refused before it
+    /// commanded anything left the posture as true as it found it.
+    ///
+    /// Layered refusals only: a refused setpoint no overlay was riding comes
+    /// back as an `Err` and ends the session.
     ///
     /// No arrival survives this ending. A run whose base has arrived and whose
     /// overlays have all faded ends on that period, so a refusal reached after
@@ -2304,10 +2317,13 @@ struct Pass<'a> {
 /// decides what a new base command means in the one place that decides it for
 /// every other pass.
 ///
-/// A composed setpoint the machine will not take drops this script's overlays
-/// and nothing else. Per the doctrine that is a plan of ours the tick refused —
-/// nothing parks, nothing latches — so the base survives it, and the loop
-/// re-acquires the base on a later pass, after a dwell.
+/// A refused setpoint an overlay was riding drops this script's overlays and
+/// nothing else: the experiment that failed is the layering, so the base
+/// survives it and the loop re-acquires it on a later pass, after a dwell.
+/// A refused setpoint the base was carrying alone ends the session instead —
+/// the rejection comes back as an `Err`, and the caller winds the machine down
+/// to rest under control. Both are plans of ours the tick refused, so neither
+/// parks anything and neither latches anything.
 fn overlaid<A: Active>(
     head: &mut A,
     pass: Pass<'_>,
@@ -2370,12 +2386,18 @@ fn overlaid<A: Active>(
         // spent: there is nothing to drop, and reporting it as a dropped overlay
         // would name a layering that does not exist and stop the script's later
         // windows from ever playing.
+        //
+        // Dropping the overlays changes the next offer, which is what makes
+        // re-acquisition a recovery. A bare plan has nothing left to change:
+        // the rejection is arithmetic over that plan and the measured pose, so
+        // re-offering it gets the same answer, and a loop that kept re-offering
+        // would hold the head torqued in place against a defect for as long as
+        // the script asked for that posture. The session ends instead.
         if layered.get() {
             players.refuse(&why, sink);
         } else {
-            // TODO(base-refusal-escalation): a base plan the tick refuses every
-            // time is re-offered every pass, paced only by the dwell.
             base_refused(sink, plan, &why);
+            return Err(Refusal::from(PumpError::Rejected(why)));
         }
     }
     Ok(match plan {
@@ -2390,17 +2412,23 @@ fn overlaid<A: Active>(
     })
 }
 
-/// Mark the running script as answered, so a wind-down back to Resting does not
-/// raise the head again for the script that has just failed.
+/// Mark `asking` — the script the pass planned from — as answered, so a
+/// wind-down back to Resting does not raise the head again for the script that
+/// has just failed.
 ///
 /// The same mark a refused engage leaves, and for the same reason: a condition
 /// that ended one raise will end the next one, and without this the loop would
 /// re-engage at the top of every pass for as long as the script asks for the
 /// head up — a machine cycling torque on and off against a hand instead of
-/// waiting for the ask to change. Read before the response, which takes seconds:
-/// a script that lands during the wind-down is a fresh ask and is tried.
-fn script_answered(shared: &Shared, watch: &mut Watch) {
-    watch.raise_answered_for = shared.accepted_seq();
+/// waiting for the ask to change.
+///
+/// The number is the pass's own, taken when it read its schedule, rather than
+/// whatever is accepted now: everything between that read and this call — a
+/// streamed run, and a response that takes seconds — is time a replacement can
+/// land in, and any script this pass never planned from is a fresh ask that
+/// has to be tried.
+fn script_answered(watch: &mut Watch, asking: Option<u64>) {
+    watch.raise_answered_for = asking;
 }
 
 /// Pin the machine where it stands and enable torque, timing it and saying so.
@@ -2639,15 +2667,16 @@ fn reached(sink: &dyn Sink, posture: Posture) {
 /// the base is what the tick rejected, so the clip library and the compositor
 /// have nothing to answer for. Classified by the same reason and joint as an
 /// overlay drop, so a session's refusals aggregate together whichever half
-/// produced them.
+/// produced them. Said before the ending it belongs to; this line carries only
+/// which plan and that the base rather than the layering is what the machine
+/// would not take — the rejection detail travels with the ending itself.
 fn base_refused(sink: &dyn Sink, plan: BasePlan, why: &CommandRejection) {
     let plan = match plan {
         BasePlan::To(posture) => posture.as_str(),
         BasePlan::Held => "held",
     };
     sink.line(&format!(
-        "motion: the machine would not take the base ({plan}) — {why}. it is offered again after \
-         a dwell."
+        "motion: the machine would not take the base ({plan}). winding down."
     ));
     sink.event(
         "motion_base_refused",
@@ -3395,6 +3424,13 @@ mod tests {
     /// past the two-frame motion's whole length and blend-out, and short of
     /// [`FAKE_BASE_PERIODS`], where the drive ends.
     const BARE_AFTER_SPEND_PERIOD: u32 = 6;
+    /// The period of a held run on which a two-frame motion's player spends.
+    ///
+    /// A held base arrives on every period, so the run ends on the first period
+    /// with no player left: the period the last one spends on is the only one
+    /// that offers the held base bare, and it is a count of periods rather than
+    /// wall time because a player is advanced by the period it is handed.
+    const HELD_SPEND_PERIOD: u32 = 2;
     /// Where [`Event::SpendThenPlay`]'s second play step sits: several paced
     /// periods past [`BARE_AFTER_SPEND_PERIOD`], so the window opens on the
     /// drive that re-acquires the base rather than on the refused one.
@@ -3693,10 +3729,12 @@ mod tests {
         /// it answers with — the fault path, where a composed setpoint the tick
         /// merely refuses is [`Self::refuse_setpoint`].
         refuse_stream: Vec<(usize, Refusal)>,
-        /// The streamed run, and the period of it, whose composed setpoint the
-        /// tick will not take. Not a fault: nothing is commanded and nothing
-        /// latches.
-        refuse_setpoint: Option<(usize, u32)>,
+        /// The streamed runs, and the period of each, whose composed setpoint
+        /// the tick will not take. Not a fault: nothing is commanded and
+        /// nothing latches. A list rather than one entry because the two
+        /// refusal responses compose — an overlay drop leaves the base running,
+        /// so the run after it is the one that can be refused bare.
+        refuse_setpoint: Vec<(usize, u32)>,
         /// What the world does in the middle of a streamed run, and at which
         /// period.
         stream_interrupt: Option<(u32, Event)>,
@@ -3762,7 +3800,7 @@ mod tests {
                 stream_marks: Rc::new(RefCell::new(Vec::new())),
                 stream_paced: false,
                 refuse_stream: Vec::new(),
-                refuse_setpoint: None,
+                refuse_setpoint: Vec::new(),
                 stream_interrupt: None,
                 stream_interrupt_run: None,
                 watches: 0,
@@ -3877,11 +3915,11 @@ mod tests {
 
         /// The tick refusing the composed setpoint of one period of one streamed
         /// run. A plan of ours the machine would not take: nothing was
-        /// commanded, nothing faulted. Keyed to a single run, because a fixture
+        /// commanded, nothing faulted. Keyed to named runs, because a fixture
         /// that refused every run would only ever be testing the loop's patience
         /// with a machine that says no forever.
         fn refusing_setpoint(mut self, nth: usize, period: u32) -> Self {
-            self.refuse_setpoint = Some((nth, period));
+            self.refuse_setpoint.push((nth, period));
             self
         }
 
@@ -4399,7 +4437,7 @@ mod tests {
                     self.machine.at = targets;
                     return Ok(Streamed::Ended);
                 };
-                if self.machine.refuse_setpoint == Some((nth, period)) {
+                if self.machine.refuse_setpoint.contains(&(nth, period)) {
                     return Ok(Streamed::Refused(CommandRejection::StepTooLarge {
                         joint: JointId::AntennaRight,
                         delta: 0.6,
@@ -4582,6 +4620,37 @@ mod tests {
             .filter(|line| line.starts_with("motion: "))
             .cloned()
             .collect()
+    }
+
+    /// A session that streamed `plan`, wound down under control, and then
+    /// watched — the whole shape of a refused bare base's ending.
+    ///
+    /// One statement rather than a hand-rolled prefix in each test that pins it,
+    /// because the ending is the loop's answer to every bare refusal and it
+    /// grows whenever the response ladder does: two copies drift into two
+    /// different pins, one of which fails while the other stays green and stops
+    /// meaning what its message says.
+    fn wound_down_acts(acts: &[Act], plan: BasePlan) {
+        let expected = [
+            Act::Watch,
+            Act::Engage,
+            Act::Stream(plan),
+            Act::Move(Posture::Stow),
+            Act::Release,
+        ];
+        assert_eq!(
+            acts.get(..expected.len()),
+            Some(&expected[..]),
+            "the refused bare base did not wind the session down under \
+             control: {acts:?}"
+        );
+        assert!(
+            // The rest of the run is the resting watch and nothing else: the
+            // script still asks for its posture, and a loop that engaged again
+            // would cycle torque against whatever produced the rejection.
+            acts[expected.len()..].iter().all(|act| *act == Act::Watch),
+            "the answered script was driven again: {acts:?}"
+        );
     }
 
     /// The same again, against a state surface at `path`, and keeping what that
@@ -5242,8 +5311,12 @@ mod tests {
         /// With one arm for every scripted drive, a bare base runs through the
         /// same stream a layered one does, and the tick's answer to it says
         /// nothing about any clip: reporting it as a dropped overlay names a
-        /// layering that never existed and — worse — retires the script's whole
-        /// overlay timeline over a rejection its windows had no part in.
+        /// layering that never existed, and the ending it earns is the base's
+        /// ending rather than a drop of clips that were not there.
+        ///
+        /// The refusal here lands on the run's first setpoint, so the head is
+        /// still at the posture it started from: the owed stow is commanded
+        /// from a folded machine and settles at once.
         #[test]
         fn a_bare_base_refusal_is_not_blamed_on_the_overlays() {
             let (_dir, shared) = with_motions();
@@ -5261,7 +5334,7 @@ mod tests {
             // periods out, so nothing is composed over the base.
             .refusing_setpoint(0, 0);
 
-            let (outcome, _acts, sink) = driven(&shared, machine);
+            let (outcome, acts, sink) = driven(&shared, machine);
 
             assert_eq!(outcome, Outcome::Released(Stop::Operator));
             let refused = sink
@@ -5269,14 +5342,50 @@ mod tests {
                 .expect("the bare base drive's refusal is reported as its own");
             assert_eq!(refused["plan"], json!("up"));
             assert_eq!(refused["reason"], json!("step_too_large"));
+            assert_eq!(
+                refused["joint"],
+                json!(JointId::AntennaRight.to_string()),
+                "the base's refusal names its joint in a form a drop's does not, \
+                 so the two halves no longer aggregate: {refused:?}"
+            );
             assert!(
                 !sink.saw("motion_overlays_dropped"),
                 "a bare base refusal was reported as a dropped overlay: {sink:?}"
             );
+            let said = sink.said().lines;
             assert!(
-                sink.saw("motion_play"),
-                "the script's window never played after a refusal it had no \
-                 part in: {sink:?}"
+                said.contains(
+                    &"motion: the machine would not take the base (up). winding down.".to_owned()
+                ),
+                "the console does not say the session is ending: {said:?}"
+            );
+            assert!(
+                !said.iter().any(|line| line.contains("offered again")),
+                "the console promises a re-offer the loop no longer makes: {said:?}"
+            );
+            wound_down_acts(&acts, BasePlan::To(Posture::Up));
+            assert!(
+                !sink.saw("motion_play"),
+                "the script went on playing through the ending its base earned: {sink:?}"
+            );
+            assert_eq!(
+                sink.fields("motion_incident")
+                    .expect("the ending is recorded")["disposition"],
+                json!("rest"),
+                "a plan the tick refused latched something: {sink:?}"
+            );
+            let events = sink.said().events;
+            let rested = events
+                .iter()
+                .rposition(|(name, _)| name == "motion_resting")
+                .expect("the loop came back to rest");
+            let ended = events
+                .iter()
+                .position(|(name, _)| name == "motion_incident")
+                .expect("the ending is recorded");
+            assert!(
+                rested > ended,
+                "the last rest is not the one the wind-down ended at: {events:?}"
             );
         }
 
@@ -5285,8 +5394,9 @@ mod tests {
         /// A drive goes on streaming until the base arrives, so a brief motion
         /// early in a long move leaves the rest of that move bare — and the
         /// setpoint the machine refuses there carried no overlay. Blaming the
-        /// clips for it names a layering that had already ended and retires the
-        /// script's remaining windows, which never played at all.
+        /// clips for it names a layering that had already ended, and drops
+        /// overlays that had nothing to do with the ending: what the machine
+        /// refused was the base, and the base's refusal ends the session.
         #[test]
         fn a_refusal_after_a_window_has_spent_belongs_to_the_base() {
             let (_dir, shared) = with_motions();
@@ -5307,7 +5417,7 @@ mod tests {
             // refused setpoint is the bare base.
             .refusing_setpoint(0, BARE_AFTER_SPEND_PERIOD);
 
-            let (outcome, _acts, sink) = driven(&shared, machine);
+            let (outcome, acts, sink) = driven(&shared, machine);
 
             assert_eq!(outcome, Outcome::Released(Stop::Operator));
             assert!(
@@ -5325,9 +5435,183 @@ mod tests {
                 .collect();
             assert_eq!(
                 played,
-                vec![json!(BLINK), json!(NOD)],
-                "the script's later window never played after a refusal between \
-                 the two: {sink:?}"
+                vec![json!(BLINK)],
+                "a window the session had already ended still played: {sink:?}"
+            );
+            wound_down_acts(&acts, BasePlan::To(Posture::Up));
+        }
+
+        /// A refused setpoint under a base that was only holding ends the
+        /// session too.
+        ///
+        /// The plan shape where the ending is least obvious and most needed: a
+        /// `keep` asks the base to stand still, so a refusal there costs no
+        /// travel to re-offer and would sit torqued against the same rejection
+        /// once a period for as long as the script kept asking. The period the
+        /// script's last window spends on is where a held base is offered bare.
+        #[test]
+        fn a_refused_held_base_ends_the_session() {
+            let (_dir, shared) = with_motions();
+            let machine = Fake::new(
+                &shared,
+                [
+                    Event::Raise,
+                    Event::KeepAndPlay(BLINK),
+                    Event::Wait,
+                    Event::Wait,
+                    Event::Stop(Stop::Operator),
+                ],
+            )
+            .refusing_setpoint(1, HELD_SPEND_PERIOD);
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(outcome, Outcome::Released(Stop::Operator));
+            let refused = sink
+                .fields("motion_base_refused")
+                .expect("a held base the machine would not take is reported as the base's");
+            assert_eq!(
+                refused["plan"],
+                json!("held"),
+                "the report names a posture for a base that was asked to stand still"
+            );
+            assert!(
+                !sink.saw("motion_overlays_dropped"),
+                "a spent window was blamed for a held base's refusal: {sink:?}"
+            );
+            let expected = [
+                Act::Watch,
+                Act::Engage,
+                Act::Stream(BasePlan::To(Posture::Up)),
+                Act::Hold,
+                Act::Stream(BasePlan::Held),
+                Act::Move(Posture::Stow),
+                Act::Release,
+            ];
+            assert_eq!(
+                acts.get(..expected.len()),
+                Some(&expected[..]),
+                "a refused held base was re-offered instead of winding the \
+                 session down: {acts:?}"
+            );
+            assert!(
+                acts[expected.len()..].iter().all(|act| *act == Act::Watch),
+                "the answered script was driven again: {acts:?}"
+            );
+        }
+
+        /// A bare re-acquisition the machine also refuses ends the session.
+        ///
+        /// The two responses in sequence, which is the whole of the layering:
+        /// dropping the overlays changes the next offer, so it earns one
+        /// recovery; the bare base it re-offers has nothing left to change, so
+        /// its refusal is terminal. A loop that gave the second one a dwell too
+        /// would hold the head torqued against a plan the machine keeps
+        /// rejecting.
+        #[test]
+        fn a_bare_re_acquisition_the_machine_also_refuses_ends_the_session() {
+            let (_dir, shared) = with_motions();
+            let machine = Fake::new(
+                &shared,
+                [
+                    Event::Play(WIGGLE),
+                    Event::Wait,
+                    Event::Wait,
+                    Event::Stop(Stop::Operator),
+                ],
+            )
+            // The layered refusal, then the bare re-acquisition it hands to the
+            // next pass, refused on its first setpoint.
+            .refusing_setpoint(0, 3)
+            .refusing_setpoint(1, 0);
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(outcome, Outcome::Released(Stop::Operator));
+            assert_eq!(
+                sink.all_fields("motion_overlays_dropped").len(),
+                1,
+                "the overlays were dropped for a refusal they were not in: {sink:?}"
+            );
+            let events = sink.said().events;
+            let dropped = events
+                .iter()
+                .position(|(name, _)| name == "motion_overlays_dropped")
+                .expect("the layered refusal drops the overlays");
+            let bare = events
+                .iter()
+                .position(|(name, _)| name == "motion_base_refused")
+                .expect("the bare re-acquisition's refusal is the base's");
+            assert!(
+                bare > dropped,
+                "the bare refusal is not the one that followed the drop: {events:?}"
+            );
+            let expected = [
+                Act::Watch,
+                Act::Engage,
+                Act::Stream(BasePlan::To(Posture::Up)),
+                Act::Hold,
+                Act::Stream(BasePlan::To(Posture::Up)),
+                Act::Move(Posture::Stow),
+                Act::Release,
+            ];
+            assert_eq!(
+                acts.get(..expected.len()),
+                Some(&expected[..]),
+                "the twice-refused base was offered a third time: {acts:?}"
+            );
+            assert!(
+                acts[expected.len()..].iter().all(|act| *act == Act::Watch),
+                "the answered script was driven again: {acts:?}"
+            );
+        }
+
+        /// A script that lands as the base is being refused is not marked
+        /// answered.
+        ///
+        /// The mark exists to stop the loop cycling torque against the script
+        /// whose plan just failed. Taken from whatever is accepted at response
+        /// time it names the wrong script: a replacement that landed during the
+        /// run never asked for the plan the machine rejected, and marking it
+        /// would leave the head resting through a script nothing ever answers.
+        #[test]
+        fn a_script_landing_as_the_base_is_refused_is_still_tried() {
+            let (_dir, shared) = with_motions();
+            let machine = Fake::new(
+                &shared,
+                [
+                    Event::RaiseThenPlay(NOD),
+                    Event::Wait,
+                    Event::Wait,
+                    Event::Wait,
+                    Event::Stop(Stop::Operator),
+                ],
+            )
+            .pacing_stream()
+            // The replacement lands on the period the machine refuses the bare
+            // base, which is the window the mark can be read in.
+            .interrupting_stream(0, Event::Raise)
+            .refusing_setpoint(0, 0);
+
+            let (outcome, acts, sink) = driven(&shared, machine);
+
+            assert_eq!(outcome, Outcome::Released(Stop::Operator));
+            assert!(
+                sink.saw("motion_base_refused"),
+                "the run did not end on the bare refusal this test is about: {sink:?}"
+            );
+            let released = acts
+                .iter()
+                .position(|act| *act == Act::Release)
+                .expect("the refused base wound the session down");
+            assert!(
+                acts[released..].contains(&Act::Engage),
+                "the script that landed while the old one was being refused was \
+                 marked answered, and the head never rose for it: {acts:?}"
+            );
+            assert!(
+                acts[released..].contains(&Act::Stream(BasePlan::To(Posture::Up))),
+                "the fresh script was engaged for and then not driven: {acts:?}"
             );
         }
 
