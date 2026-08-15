@@ -538,3 +538,42 @@ is present.
 See `TODO(script-timebase)` at the wire schema in
 `firmware/crates/motion-proto/src/script.rs`.
 
+
+## `loop-fixture-paced-jitter` — not blocked as of 2026-08-15 (a re-derivation of the paced fixtures' time budget, not a line)
+
+The motion loop's tests drive the real loop against a real clock: their dwells sleep, and
+a script step or a clip window comes due when wall time says so. That makes every gap in
+a fixture's timeline a margin, and a wake-up later than the gap reads the timeline wrong
+— an ask stepped past and never seen, a window opened after the drive it was meant to
+join. Two of them failed that way on a loaded machine on 2026-08-15
+(`a_keep_against_a_posture_the_head_is_holding_commands_nothing`,
+`a_second_keep_after_a_raise_is_said_again`), passing on a quiet one.
+
+The gaps a script writes are now wide enough to absorb that (`SCRIPT_STEP_MS`,
+`REST_DELAY`). The gaps a *paced drive* offers are not, and cannot be widened the same
+way: a drive is `FAKE_BASE_PERIODS` sleeps of `FAKE_PERIOD`, 160 ms end to end, and the
+fixtures put base changes, play windows and refusals inside it. Injecting one 45 ms
+hiccup at the sweep that delivers the script — the sleep overshoot a loaded workstation
+produced — still breaks four:
+`overlays::a_play_step_due_mid_drive_joins_the_run_already_under_way`,
+`overlays::a_base_change_ends_the_run_and_the_motion_rides_through_it`,
+`overlays::a_bare_base_refusal_is_not_blamed_on_the_overlays` and
+`overlays::a_refusal_after_a_window_has_spent_belongs_to_the_base`.
+
+Widening that margin is not one number. `FAKE_PERIOD` is also the rate a clip's frames
+are sampled at, so lengthening the drive by lengthening the period rewrites every clip
+fixture; lengthening it by adding periods re-derives the relationships the constants
+carry instead — which clips outlive a drive, `BARE_AFTER_SPEND_PERIOD`,
+`HELD_SPEND_PERIOD`, `LATE_PLAY_MS`, `BASE_CHANGE_MS`, and the `JOIN_SLACK_MS` bound that
+separates "picked up next period" from "waited out the drive". The other answer is to
+stop paying real time at all: hand the loop a clock it reads through, and the fixtures
+step it. That is a change to the daemon's own code for the tests' benefit, and it is a
+decision rather than a chore — which is why this is an entry and not a patch.
+
+Done = a single sleep overshoot of a few hundred milliseconds, injected at any one hop of
+a motion-loop test, cannot change what that test observes; the paced constants say what
+margin they carry; and no fixture asserts a wall-clock bound tighter than the margin it
+was given.
+
+See `TODO(loop-fixture-paced-jitter)` at `FAKE_BASE_PERIODS` in
+`firmware/devices/reachy-motiond/src/motion.rs`.

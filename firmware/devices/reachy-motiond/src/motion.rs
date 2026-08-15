@@ -3370,12 +3370,34 @@ mod tests {
     /// long enough that a boundary cutting it is visible.
     const DWELL: Duration = Duration::from_millis(200);
     const REST_POLL: Duration = Duration::from_millis(1);
-    const REST_DELAY: Duration = Duration::from_millis(30);
+    /// How long a folded head is held before it is let go.
+    ///
+    /// Wide for the same reason [`SCRIPT_STEP_MS`] is: the tests that turn on
+    /// this window need something to land inside it, so the window is their
+    /// whole margin. A wake-up late by more than the delay closes it early — a
+    /// wake read as a fresh session, a stop read as a release that has already
+    /// happened. Nothing asserts the number itself.
+    ///
+    /// Under [`DWELL`] rather than over it, so a fixture that sleeps its way to
+    /// the end of the delay still gets there in one dwell and the act sequences
+    /// that count holds are unmoved.
+    const REST_DELAY: Duration = Duration::from_millis(150);
     /// Long enough that no test's script lapses while the test is running.
     const TIMEOUT_MS: u64 = 30_000;
-    /// Where [`Event::Turn`]'s stow step sits. Short enough that an engage the
-    /// fixture is told to take its time over outlasts it.
-    const TURN_STOW_MS: u64 = 40;
+    /// How far apart the steps of a script whose own timeline advances the run
+    /// sit — [`Event::Turn`]'s stow step, and every step of the `keep` scripts.
+    ///
+    /// The gap is the whole margin these fixtures have. Their dwells really
+    /// sleep, so the loop reads its schedule about once per boundary, and each
+    /// ask is live only until the next step is due: a sleep that returns late
+    /// by more than one gap steps straight past an ask, and the run never sees
+    /// it — a raise that never happens, or two keeps read as one. So the gap is
+    /// an order of magnitude above what a loaded machine adds to a sleep, which
+    /// is what it costs to be a margin rather than a coin toss.
+    ///
+    /// Deliberately not at the [`FAKE_PERIOD`] scale the paced fixtures work
+    /// in: nothing here is counting control periods.
+    const SCRIPT_STEP_MS: u64 = 400;
     /// Where [`Event::PlayThenLower`]'s second base step sits: a few paced
     /// streamed periods past the play step, and well inside the motion's own
     /// window, so the base command changes while the overlay is still playing.
@@ -3388,6 +3410,12 @@ mod tests {
     /// How many periods the fixture's base transition takes. Enough that a
     /// motion joining it composes over a reference that is genuinely moving,
     /// short enough that a test reads its whole series.
+    ///
+    /// This and [`FAKE_PERIOD`] between them are the whole margin the paced
+    /// fixtures have: a step or a window that has to land *inside* a drive has
+    /// this many periods of real sleeping to land in, and a wake-up late by
+    /// more than that lands outside it.
+    // TODO(loop-fixture-paced-jitter)
     const FAKE_BASE_PERIODS: u32 = 8;
     /// The control period the fixture reports. The tick rate everything is
     /// floored at, which is also what a clip's frames are sampled at.
@@ -4176,7 +4204,7 @@ mod tests {
                     let script = MotionScript::new(
                         POD,
                         self.next_seq(),
-                        vec![Step::new(0, Posture::Up), Step::keep(TURN_STOW_MS)],
+                        vec![Step::new(0, Posture::Up), Step::keep(SCRIPT_STEP_MS)],
                         TIMEOUT_MS,
                     )
                     .expect("a lawful script");
@@ -4188,9 +4216,9 @@ mod tests {
                         self.next_seq(),
                         vec![
                             Step::new(0, Posture::Up),
-                            Step::keep(TURN_STOW_MS),
-                            Step::new(TURN_STOW_MS * 2, Posture::Up),
-                            Step::keep(TURN_STOW_MS * 3),
+                            Step::keep(SCRIPT_STEP_MS),
+                            Step::new(SCRIPT_STEP_MS * 2, Posture::Up),
+                            Step::keep(SCRIPT_STEP_MS * 3),
                         ],
                         TIMEOUT_MS,
                     )
@@ -4209,7 +4237,7 @@ mod tests {
                         self.next_seq(),
                         vec![
                             Step::new(0, Posture::Up),
-                            Step::new(TURN_STOW_MS, Posture::Stow),
+                            Step::new(SCRIPT_STEP_MS, Posture::Stow),
                         ],
                         TIMEOUT_MS,
                     )
@@ -4741,7 +4769,7 @@ mod tests {
         .gating_engage(0)
         // The engage outlasts the raise step, so the first thing the loop is
         // asked for once torque is on is the keep.
-        .engage_taking(Duration::from_millis(TURN_STOW_MS * 3));
+        .engage_taking(Duration::from_millis(SCRIPT_STEP_MS * 3));
 
         let (outcome, acts, sink) = driven(&shared, machine);
 
@@ -4783,7 +4811,7 @@ mod tests {
         )
         .standing_elsewhere()
         .gating_engage(0)
-        .engage_taking(Duration::from_millis(TURN_STOW_MS * 3));
+        .engage_taking(Duration::from_millis(SCRIPT_STEP_MS * 3));
 
         let (_, _, sink) = driven(&shared, machine);
 
@@ -4845,6 +4873,11 @@ mod tests {
     /// Said once per transition into the answer, not once per script: a script
     /// that keeps, raises and keeps again says so twice, which is what clearing
     /// the watch on every other answer buys.
+    ///
+    /// The waits outnumber the script's steps because a dwell is cut to
+    /// [`DWELL`] as well as to the next boundary, so a [`SCRIPT_STEP_MS`] gap
+    /// takes more than one of them to cross. The stop has to arrive after the
+    /// last keep comes due or the run ends before the thing under test happens.
     #[test]
     fn a_second_keep_after_a_raise_is_said_again() {
         let shared = Arc::new(Shared::new(POD));
@@ -4852,6 +4885,10 @@ mod tests {
             &shared,
             [
                 Event::KeepRaiseKeep,
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
+                Event::Wait,
                 Event::Wait,
                 Event::Wait,
                 Event::Wait,
@@ -7853,11 +7890,15 @@ mod tests {
             [Event::Wait, Event::Wait, Event::Stop(Stop::Operator)],
         )
         .gating_engage(0)
-        .engage_taking(Duration::from_millis(120));
+        .engage_taking(Duration::from_millis(SCRIPT_STEP_MS));
 
+        // Half way through the engage, so the fixture keeps a margin as wide as
+        // the half on either side: the second script has to land after the
+        // engage starts and before it answers, and both ends of that window are
+        // real sleeps on a machine that may be doing anything else.
         let racing = Arc::clone(&shared);
         let lands_mid_engage = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(SCRIPT_STEP_MS / 2));
             racing.accept(&holding(5, Posture::Up), Instant::now());
         });
 
@@ -7940,7 +7981,7 @@ mod tests {
         // The engage outlasts the turn's stow step, so the first thing the loop
         // is asked for once torque is on is the posture it would have assumed
         // the machine was already in.
-        .engage_taking(Duration::from_millis(TURN_STOW_MS * 3));
+        .engage_taking(Duration::from_millis(SCRIPT_STEP_MS * 3));
 
         let (outcome, acts) = drive(&shared, machine);
 
