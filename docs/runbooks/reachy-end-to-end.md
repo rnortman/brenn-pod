@@ -7,11 +7,13 @@ accounts — everything runs locally.
 Assumes a checkout of this repo, a Reachy Mini on the same LAN with brenn-os on it, and
 SSH-as-root to that unit.
 
-Steps 1–5 are the audio half, and they are the whole runbook for a unit whose head never
-moves. The head is a second daemon and a second rung: it wants the Brenn bus, and it is
-["The other half: the head"](#the-other-half-the-head) below. If what you are doing is
-recovering a unit that already worked, skip to
-["Recovering a rebooted robot"](#recovering-a-rebooted-robot) — that is one command.
+Steps 1–5 are the whole runbook, and they are the whole of what this repository puts on a
+unit. The head is the other half of a robot and it is another repository's: brenn-reachy
+owns the motion stack, its payload, its deploy tooling and its runbook
+(`docs/bench-runbook.md` there). Nothing here brings it up, and nothing here reports on
+it — a `ready` from `reachy-status` says the pod is up and says nothing about the head. If
+what you are doing is recovering a unit that already worked, skip to
+["Recovering a rebooted pod"](#recovering-a-rebooted-pod) — that is one command.
 
 ## Doctrine first: everything lands in RAM
 
@@ -37,13 +39,13 @@ in this repo, not a service and not a Brenn server. It listens for pod connectio
 the incoming audio into utterances (wake word + endpointer), hands each utterance to a
 *brain*, and sends the brain's audio answer back down to the pod.
 
-**The motion daemon** is `reachy-motiond`, a second Linux binary on the same unit, run as
-its own systemd service. It owns the servo bus and nothing else does: the head rests with
-the motors unpowered, a wake word engages it in tens of milliseconds, and every ending it
-has — a finished conversation, a timeout, a shutdown, a fault — takes torque off again. It
-takes no orders from the audio path directly; it obeys motion scripts published on the
-Brenn bus, which is why the head is a later rung than the parrot. Its half of this runbook
-starts at ["The other half: the head"](#the-other-half-the-head).
+**The motion stack** is brenn-reachy's, and on a robot it is deployed from that clone as
+one payload under one launcher — the pod binary among its applications. It owns the servo
+bus and nothing else does. This repository ships the libraries the voice pipeline is built
+from and the pod that hears and speaks; it deploys neither the head nor, on a robot, the
+pod. `deploy-reachy-pod.sh` refuses a unit carrying that payload for exactly this reason:
+activating a pod-only payload there would replace the whole stack with a binary that
+cannot move the machine.
 
 **The brain** here is `mode = "echo"` — the parrot: transcribe what you said and read it
 back. STT and TTS come from a local `speaches` container. (`mode = "wav"` — answer every
@@ -239,127 +241,11 @@ STT and TTS have all run over one TLS-PSK connection. Record the outcome — pas
 failure transcript — in
 `~/src/brenn-ops/docs/adr/2026/07/31-multi--reachy-xvf3800-usb-audio-pipeline/bench-observations.md`.
 
-## The other half: the head
+## Recovering a rebooted pod
 
-Steps 1–5 leave a unit that hears and speaks and never moves. The head is
-`reachy-motiond`: a second daemon, a second service, and the servo bus.
-
-**Read the fault doctrine before touching anything that arms, disarms or handles a motion
-fault**: `docs/fault-management.md` in the sibling brenn-reachy checkout. The short form
-is the shape of everything below — the Minimum Risk Condition is *stowed and de-torqued*,
-a fault de-torques the motors, nothing ever gates de-torquing, and holding torque is never
-a fault response.
-
-### What it needs, and where each piece is authored
-
-Three files reach the device, from two repositories, and they answer different questions:
-
-| File on the device | What it describes | Authored in |
-|---|---|---|
-| `/var/lib/brenn-app/reachy-bench.toml` | **the machine** — servo map, bus node, the crank datum a human measured, the envelope, the step bounds, the tick rate | brenn-reachy, `.local/reachy-bench.toml` (gitignored: it is one unit's calibration) |
-| `/var/lib/brenn-app/reachy-motiond.toml` | **the policy** — which pod this is, which channel its scripts arrive on, the rest and dwell timings, optional move-duration overrides | this repo, `firmware/.local/reachy-motiond.toml` |
-| `/var/lib/brenn-app/motiond-token` | the bearer token the daemon attaches to the bus with | this repo, `firmware/.local/motiond-token` |
-
-The split is deliberate: the machine's truth has one source and it is not presence policy.
-Start the daemon's config from
-`firmware/devices/reachy-motiond/reachy-motiond.example.toml`, which writes every
-defaulted key at its default and documents what omitting it means.
-
-The head also needs the bus. `speech-surface` publishes motion scripts on
-`[brenn] presence_channel`, so the host config has to be a `mode = "brenn"` one with a
-`[brenn.bridge]` attachment — the parrot rung in step 1 has neither, and with
-`presence_channel` unset the daemon's startup says `presence_absent` and the head never
-moves. Both ends must name the same channel, and the remote's ACLs on the bus have to
-allow it.
-
-### Bring it up
-
-```bash
-make -C firmware reachy-up
-```
-
-That is the whole robot, and it is the same command whether this is the first time or the
-morning after a reboot — see the next section for why it is one command.
-
-To ask whether it worked, or whether it is still true:
-
-```bash
-make -C firmware reachy-status
-```
-
-Read-only, one ssh, and it touches no servo. It prints eleven checks — the payload store,
-the payload, `brenn-app.service`, the pod's `audio.conf`, the three motion files, the
-motion binary, `reachy-motiond.service`, the servo bus node the machine's own
-configuration names, and what the motion daemon says it is doing — each `OK` or `MISSING`,
-and exits nonzero if anything is missing. Ten of the eleven have the same fix, which is
-`make reachy-up`. The self-test record is reported and never counted: nothing gates on it.
-
-The eleventh is the daemon's own state, and it is the one whose fix is not a push. A
-daemon whose machine faulted **parks**: torque comes off, it commands nothing further, and
-it deliberately does not exit — a fault is never auto-cleared, and a process that exited
-would let systemd's restart policy re-torque a machine nobody has looked at. So
-`systemctl is-active` calls a parked daemon running. It writes `starting`, `resting`,
-`active`, `parked` or `stopping` to `/run/reachy-motiond/state` — its unit's
-`RuntimeDirectory`, so the file goes away with the service and can never be stale — along
-with whether its pre-torque sweeps are answering and whether the antennas are still in the
-moves. `reachy-status` reads that file and says so:
-
-- `resting` or `active`, sweeps answering → `OK`.
-- `parked` → `MISSING`, printing the fault's stage and detail. Read
-  `make -C firmware reachy-motiond-logs`, then restart the unit. `make reachy-up` does not
-  clear a fault and the report says as much.
-- sweeps failing → `MISSING`. The machine is limp and safe, and no wake will raise the
-  head until the servo bus answers again; it recovers by itself when it does.
-- the antennas out of service → an informational `--` line, never counted against
-  readiness. The head keeps its presence and every script still runs, so this is news
-  rather than unreadiness; the symptom table below says what to do with it.
-- no file while the unit is running → `MISSING`: the daemon has only just started, or the
-  deployed binary predates the state file. Re-run, then redeploy if it persists.
-
-Then watch the daemon:
-
-```bash
-make -C firmware reachy-motiond-logs
-```
-
-### Say the wake phrase again
-
-1. The head comes up within about half a second of the wake — that is the acknowledgement,
-   and it is the whole point of the raise being quick.
-2. It stays up while the brain thinks and while the answer plays.
-3. It starts down about half a second after the speech ends — not at some later timeout.
-   The host sends the whole timeline in one message when playback starts, so the stow is
-   scheduled from how long the audio is rather than reacted to afterwards.
-4. Five seconds later (`rest_delay_ms`) torque comes off and the machine goes limp at
-   stow. A wake inside that window turns the head straight back up with no release in
-   between.
-
-The antennas take the **inboard** arc, crossing over the head rather than sweeping out to
-the sides — that is the smaller exterior envelope and it is deliberate. An antenna already
-pointing sideways takes the short way down instead.
-
-### The supervised form
-
-`make -C firmware reachy-motiond-deploy` leaves the daemon running under systemd with no
-terminal attached. For bench work there is the other form:
-
-```bash
-make -C firmware reachy-motiond-run
-```
-
-It builds, pushes and runs the daemon in the foreground with a pty, and refuses while the
-service is up — one process at a time on the servo bus, with the port's `flock` refusing
-underneath either way. `^C` ends it, and so do `kill` and `systemctl stop`: SIGINT and
-SIGTERM are the same signal to this daemon, and all of them stow the head and take torque
-off. brenn-reachy's own bench targets — the operator tool that moves the machine by hand —
-refuse while the service is running, for the same reason.
-
-## Recovering a rebooted robot
-
-A reboot clears everything: `/run/brenn-app` and `/var/lib/brenn-app` are both RAM, and so
-is `/run/systemd/system`, where the motion daemon's unit is written. Nothing this
-repository pushes touches the eMMC, in dev iteration, ever — that is the brenn-os design
-and not an accident to be fixed by persisting something.
+A reboot clears everything: `/run/brenn-app` and `/var/lib/brenn-app` are both RAM.
+Nothing this repository pushes touches the eMMC, in dev iteration, ever — that is the
+brenn-os design and not an accident to be fixed by persisting something.
 
 So recovery is one command, and it is the same one as first-time bring-up:
 
@@ -371,20 +257,19 @@ In order, each step idempotent on its own:
 
 1. `reachy-deploy` — the audio payload; `brenn-app` is dead without it
 2. `reachy-provision` — the pod's `audio.conf`
-3. `reachy-bench-config` — the machine's configuration, out of the brenn-reachy clone
-4. `reachy-motiond-config` — the motion daemon's configuration
-5. `reachy-motiond-token` — its bus token
-6. `reachy-motiond-deploy` — its binary and its unit, last, so the service starts with
-   everything it reads already in place
-7. `reachy-status` — the answer
+3. `reachy-status` — the answer
 
 There is no self-test step: no record gates anything that moves. The individual targets
 still exist for the case where one file is the only thing that changed.
 
+On a robot this is not the recovery: the pod there is one application of brenn-reachy's
+payload, and that clone's own deploy brings the whole stack back in one command.
+
 ## The knob map
 
-Every timing that decides how the head behaves, what owns it, and what pushes it. This is
-what makes "tweak the presence timings without code changes" true in practice.
+Every timing this repository owns that decides when the head is asked to move, and what
+pushes it. This is what makes "tweak the presence timings without code changes" true in
+practice.
 
 **The host's schedule** — when the head goes up and when it is told to come down. Lives in
 whichever `speech-surface` config the daemon is actually started with (`SPEECH_CONFIG` in
@@ -399,45 +284,9 @@ whichever `speech-surface` config the daemon is actually started with (`SPEECH_C
 | `presence_max_engaged_ms` | `[brenn]` | 30000 | The floor under the timeout every script carries: the daemon stows this long after receipt whatever else happens. The bound that matters while the brain is still thinking. A turn whose speech reaches further carries a timeout sized from its own timeline instead — a script's timeout is a ceiling on that timeline, never shorter than it. Capped at 600000 (the protocol's own ceiling); a config past that is refused at startup |
 | `presence_stow_margin_ms` | `[brenn]` | 500 | How long after the estimated end of the speech the head starts down. Absorbs playback jitter |
 
-**The daemon's policy** — `firmware/.local/reachy-motiond.toml`. Pushed by
-`make -C firmware reachy-motiond-config`, which does *not* restart anything; the daemon
-reads its configuration once, so follow it with `make -C firmware reachy-motiond-deploy`.
-
-| Key | Default | Decides |
-|---|---|---|
-| `hold_dwell_ms` | 200 | The longest the motion loop watches the machine before consulting the schedule again. A ceiling, not a period — a step at an arbitrary offset lands on the script's own clock |
-| `rest_poll_ms` | 100 | How often the resting watch sweeps a limp machine. Bounds how stale the pose an engage plans from can be, and how long a script asking for the head up waits |
-| `rest_delay_ms` | 5000 | How long the head holds at stow, still torqued, before torque comes off. The quick-follow-up window. Refused above 60000 |
-| `up_duration_s` | unset | Overrides the machine's own raise duration for this daemon alone |
-| `stow_duration_s` | unset | The same for the fold. The budget a *defeated* stow gets comes from the machine's file, not from here, so setting this longer than the machine's own value spends that budget inside this daemon's leisurely controlled stow: a stow a grabbed head defeats then escalates straight to torque off instead of through the masked stow. Torque comes off sooner, with the head not yet stowed |
-| `antenna_duration_s` | 1.5 in the example | The antennas' shared clock. They are mechanically independent of the head group, which is why a quick lift is not floored by an antenna arc. The two tips cross inboard over the head, and the resolver measures every commanded pair at that crossing and lengthens the later side until they clear it — whatever this key resolves to. So what a value here buys is the pace at which the pair is parted, never the parting itself |
-| `antenna_duration_right_s`, `antenna_duration_left_s` | unset | One clock per antenna, overriding the shared key for that side alone. What they are for is choosing the stagger yourself: the side given the longer clock is the one that reaches the crossing second. Left unset — as the example ships them — both sides ride the shared clock and the resolver stands the pair apart, saying in the capture which side it lengthened |
-
-**The machine** — brenn-reachy `.local/reachy-bench.toml`. Pushed by
-`make -C firmware reachy-bench-config` (or brenn-reachy's own `make bench-config`), and
-read by both the daemon and the operator tool, so the two cannot describe different
-platforms.
-
-| Key | In | Decides |
-|---|---|---|
-| `up_duration_s`, `stow_duration_s`, `move_duration_s` | `[motion]` | The head group's clocks — the head pose and the body yaw, which the six legs follow through the IK. What the daemon governs unless it overrides them |
-| `antenna_duration_s` | `[motion]` | The antennas' clock; absent means they ride whichever head-group clock the move is using |
-| `max_step_legs_rad`, `max_step_body_yaw_rad`, `max_step_antennas_rad` | `[motion]` | Not timings — the per-tick bounds a duration has to clear. A move whose span will not fit at the duration asked for runs on a clock stretched to fit. The guard past that abandons the move where it stands and is **never** a clamp: the wide goal is not sent at all, and the machine keeps its torque, so the head comes down under control and ends at rest rather than dropping where it was |
-| `tick_hz` | `[motion]` | The control period those bounds are per |
-
-Duration floors are the thing to read before shortening a move, and they are stated where
-you edit a duration: the FLOORS comment of `crates/reachy-bench/reachy-bench.example.toml` in
-the sibling brenn-reachy checkout carries the per-joint seconds, where they come from, and
-what the effective clock carries on top of them. The daemon's example restates the seconds beside its own keys. This document does not
-repeat either, because a floor moves with the bounds and the tick rate and a third copy of
-it is a copy that goes stale.
-
-What matters here is the consequence. A duration under its floor is a move the library
-right-sizes before it commands it: the path is unchanged and traversed more slowly, and a
-`motion_clock_stretched` line in the capture carries what was asked for beside what it ran
-on. So a value set too low costs a slower move and a line of output, never a move that stops
-partway or a head that settles limp — and that, a configured clock under the floor for the
-span being asked for, is the everyday case the stretch exists for.
+**The head's timings** are brenn-reachy's — the machine's own file and the motion stack's
+configuration, both authored and pushed from that clone. They are documented there,
+because a second copy of a duration is a copy that goes stale.
 
 ## When it does not work
 
@@ -445,11 +294,8 @@ Capture these before changing anything — they are what an investigation needs:
 
 - **The pod's journal**: `make -C firmware reachy-logs`, from before the attempt through
   the failure. Volatile, so capture it while it is there.
-- **The motion daemon's journal**: `make -C firmware reachy-motiond-logs`. Its JSONL goes
-  to the journal too, in service mode — script receipts and refusals, every engage with
-  its wall clock, every release with its verdict, and every fault.
-- **`make -C firmware reachy-status`**, which says in one screen which of the ten things
-  a reboot clears is missing, and what the motion daemon says it is doing.
+- **`make -C firmware reachy-status`**, which says in one screen which of the four things
+  a reboot clears is missing.
 - **The host daemon's console output**, and its JSONL file.
 - **The recorded segments** under `host/framelogs/`, if the segment reached the host at
   all.
@@ -476,22 +322,7 @@ Common shapes:
 | Daemon rejects the config naming `mode` | `mode = "bypass"` from an old config — the mode is gone; the only value is `"oww"` |
 | Nothing wakes | The wake threshold is too high for the room, you are too far from the array, or that is not the phrase the configured model listens for |
 
-And the motion half:
-
-| Symptom | Look at |
-|---|---|
-| Anything at all is wrong after a reboot | `make -C firmware reachy-status` first, then `make -C firmware reachy-up`. Between them they cover every file a reboot cleared — do not go looking one refusal at a time |
-| The head never moves, and everything else works | `presence_channel` unset in the host config, or set to a channel the daemon does not name. The host says `presence_absent` at startup; the daemon reports every script it receives, so if it reports none the message is not reaching it |
-| Wakes do nothing, the head never moves, and `reachy-status` says the daemon is **parked** | The machine faulted. Torque is off and the daemon commands nothing until a person acts — that is the doctrine, not a bug. The status line names the stage and the fault; read `make -C firmware reachy-motiond-logs` for the run that produced it, decide whether the cause is addressed, then `ssh root@<host> systemctl restart reachy-motiond.service`. A restart is the only way out, and nothing restarts it for you |
-| `reachy-status` says the daemon **cannot read the machine** | The servo bus stopped answering the resting sweeps. The machine is limp and safe, and the daemon keeps sweeping and recovers on its own — but no wake raises the head until it does. Check the serial cabling and the bus node; nothing needs restarting |
-| `reachy-motiond.service` is installed but not running | Its `ConditionPathExists` lines are unmet — one of the three motion files is missing, which is what keeps a half-provisioned device quiet instead of crash-looping. `reachy-status` names which one |
-| The service exits and systemd does not restart it | Exit 6 is a fault: the machine is limp at stow and restarting is noise until someone looks at the journal. Exit 7 is a futile bus attachment — a token, a URL or an ACL. Neither is restarted on purpose |
-| A script stops partway through, the journal names a joint and a step, and `reachy-status` still says the daemon is ready | A per-tick step bound abandoned the move: the goal past the bound is never clamped and sent. The head then comes down under control, the daemon returns to `resting` and takes the next script, and nothing latches — which is why it also raises an alert, since from outside a daemon that stopped a script and one that had a quiet hour look the same. A duration under its floor is *not* a plausible cause any more: the library right-sizes such a clock before commanding it. This means a planner defect, so keep the journal and report it |
-| `reachy-status` prints a `--` line saying the antennas are out of service | The pair was taken out of the moves — torque off on the two antennas, the head untouched. One of three things: an antenna stopped tracking its goal mid-sweep (a hand, a snag, or two tips meeting at the crossing), an antenna's hardware-error byte came up on the health poll, or the engage's own health gate found such a byte already latched and started the session without the pair. Nothing is unready: the head keeps its presence and every script still runs, so no push and no restart is the answer, and the status line is informational and uncounted on purpose. One Warning alert goes out when it starts, not one per wake; the state file carries `antennas=degraded` for as long as it stands, and the next engage retries the pair — so look the two antennas over for a snag before it does. `reachy-bench reboot` clears a latch the retry cannot |
-| The head comes down late, at a flat ~30 s | That is a hold script running out its `presence_max_engaged_ms`, which means the closing script never went out. The host's JSONL says whether one was published. Two consecutive losses are needed for this now: the host sends the stow once more at the first refresh past it |
-| The daemon refuses a script and says the timeline outruns its timeout, or the timeout outruns 600000 ms | The publisher is not our scripter, or its arithmetic slipped past the host-side clamp. The script standing before it — and that script's timeout — still governs, so the head is still bounded. The host's `script_horizon_clamped` line names a stow instant that was cut back; its absence points at another publisher on the channel |
-| The head stays up with torque on for a long time after a turn | `rest_delay_ms`. It is the only knob that holds the pinch posture, which is why it is refused above 60 s |
-| A bench command refuses (exit 3 or 4) | The other daemon has the bus. Exit 3 is `brenn-app.service`, exit 4 is `reachy-motiond.service`; stop the one you do not want, or use `make -C firmware reachy-motiond-run`, which refuses for the same reason |
-| The daemon refuses to start on the machine's configuration | The bench file is missing or has no crank datum. The datum is calibration a human measured, not a gate that can be waived |
+The head is not in this table. A robot whose head is wrong is brenn-reachy's runbook:
+nothing this repository deploys or reports on can tell you anything about it.
 
 A failure here is a finding worth writing down, not a step to retry until it passes.

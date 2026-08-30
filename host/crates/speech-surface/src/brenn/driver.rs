@@ -4,9 +4,8 @@
 //! Four things converge here because they all touch the same bridge: the event
 //! pump that renders what the attachment did and routes response messages into
 //! the brain, the forwarder that publishes the fire-and-forget notices the brain
-//! queued, the retry timer for a response channel the peer would not serve, and
-//! the exit path that decides whether the bridge's ending is a shutdown or a
-//! fault.
+//! queued, the retry timer for any channel the peer would not serve, and the
+//! exit path that decides whether the bridge's ending is a shutdown or a fault.
 //!
 //! Two rules shape the loop, and both come from the bridge's event channel being
 //! bounded and *awaited*: an embedder that stops draining it back-pressures the
@@ -57,9 +56,53 @@ const RESPONSE_DEPTHS: SubscriptionDepths = SubscriptionDepths {
 /// See [`RESPONSE_DEPTHS`]: a reattach replays nothing.
 const RESPONSE_RESUME: ResumePolicy = ResumePolicy::Cursorless;
 
-/// How long to wait before asking again for a response channel the peer said was
-/// not there. Nothing else retries it — the hold is dropped with the refusal —
-/// and a bus brain with no response path is dead, so the ask has to come back.
+/// Subscription statement for the motion intent channel.
+///
+/// Live only, and for a sharper reason than the response channel's: a script's
+/// offsets run from the moment it arrives, so a raise published yesterday and
+/// replayed at a reattach would pop the head up at three in the morning. The
+/// push depth satisfies the plane's "at least one non-zero" precondition with
+/// room for a burst; a missed script is repaired by its sender's next refresh,
+/// and the standing script's own timeout covers the gap either way.
+const MOTION_DEPTHS: SubscriptionDepths = SubscriptionDepths {
+    push_depth: 4,
+    retain_depth: 0,
+};
+
+/// See [`MOTION_DEPTHS`]: a reattach replays no raise.
+const MOTION_RESUME: ResumePolicy = ResumePolicy::Cursorless;
+
+/// Where a motion intent body goes once the driver has it off the bus.
+///
+/// Opaque: the body is an unparsed channel payload, and what it compiles into
+/// is the consumer's concern, not this loop's.
+///
+/// Staleness is the sink's judgement too. This loop reports what the bus lost
+/// on the way here (the delivery-gap line) and nothing else; whether the intent
+/// *in* a body is stale — a redelivery, an ordering number already spent — is a
+/// statement about content only the consumer that decodes it can make, and a run
+/// of such drops is watched where it is made.
+///
+/// Must not block: this runs on the loop draining the bridge's bounded event
+/// channel, and an embedder that stops draining it back-pressures the socket
+/// read.
+pub trait IntentSink: Send + Sync + 'static {
+    /// Take one body. `Err` carries the one word the driver's line reports the
+    /// drop with — a sink that could not take it says why here rather than
+    /// narrating on its own.
+    ///
+    /// `&'static str` because `reason` on `brenn_delivery_dropped` is a fixed
+    /// vocabulary that log queries and alert rules are written against: a sink
+    /// picks from words it declares, and whatever variable detail sits behind
+    /// one of them belongs on the sink's own stream.
+    fn deliver(&self, body: &str) -> Result<(), &'static str>;
+}
+
+/// How long to wait before asking again for a channel the peer said was not
+/// there. It governs every hold: nothing else retries one — the hold is dropped
+/// with the refusal — and each hold's own reason demands the ask come back. A
+/// bus brain with no response path is dead, and a host that stopped hearing
+/// remote intent looks exactly like one nobody is sending to.
 const RESUBSCRIBE_DELAY: Duration = Duration::from_secs(30);
 
 /// The channels the driver's loop selects on, and the bridge task it ends by
@@ -102,6 +145,29 @@ struct HelpDoc {
     task: Option<JoinHandle<()>>,
 }
 
+/// One channel this driver holds, and the state of getting it held.
+struct Hold {
+    channel: String,
+    depths: SubscriptionDepths,
+    resume: ResumePolicy,
+    /// When to ask for this channel again, or `None` while the subscription is
+    /// not in doubt. Per hold rather than one shared slot: channels are refused
+    /// independently, and a single deadline would let a later refusal move an
+    /// earlier ask.
+    resubscribe_at: Option<Instant>,
+}
+
+impl Hold {
+    fn new(channel: String, depths: SubscriptionDepths, resume: ResumePolicy) -> Self {
+        Self {
+            channel,
+            depths,
+            resume,
+            resubscribe_at: None,
+        }
+    }
+}
+
 /// The bridge-facing task. Build it, then [`run`](BridgeDriver::run) it.
 pub struct BridgeDriver {
     handle: BridgeHandle,
@@ -109,13 +175,20 @@ pub struct BridgeDriver {
     response_channel: String,
     publish_channel: String,
     wake_channel: Option<String>,
+    /// The motion intent channel the configuration named, if it named one. A
+    /// subscription is stated for it only when a sink is wired too: both halves
+    /// or neither, since deliveries nothing consumes would spend a hold and drop
+    /// every message.
+    motion_channel: Option<String>,
+    intents: Option<Arc<dyn IntentSink>>,
     attribution: Option<String>,
     help: Option<HelpDoc>,
     tokens: DriverTokens,
     jsonl: JsonlHandle,
-    /// When to ask for the response channel again, or `None` when the current
-    /// subscription is not in doubt.
-    resubscribe_at: Option<Instant>,
+    /// Every channel this run holds. One rule per site: a channel that joins
+    /// this list is stated at startup, gets its own refusal deadline, and is
+    /// asked for again when that deadline passes, with no further code.
+    holds: Vec<Hold>,
 }
 
 impl BridgeDriver {
@@ -145,20 +218,34 @@ impl BridgeDriver {
             response_channel: config.response_channel.clone(),
             publish_channel: config.publish_channel.clone(),
             wake_channel: config.wake_channel.clone(),
+            motion_channel: config.motion_channel.clone(),
+            intents: None,
             attribution: config.attribution.clone(),
             help,
             tokens,
             jsonl,
-            resubscribe_at: None,
+            holds: Vec::new(),
         }
+    }
+
+    /// Hear motion intent from the bus, delivering each body to `sink`.
+    ///
+    /// The channel is the one the configuration handed to `new` named, so a
+    /// driver's channels all come from one config and no caller can assemble one
+    /// out of two. A configuration naming no motion channel states no
+    /// subscription and never calls the sink.
+    #[must_use]
+    pub fn with_intents(mut self, sink: Arc<dyn IntentSink>) -> Self {
+        self.intents = Some(sink);
+        self
     }
 
     /// Drive the bridge until it ends or the teardown token fires.
     ///
-    /// The response subscription is stated before the loop and before anything
-    /// has attached: the subscription plane holds the statement and re-sends it
-    /// at every attachment, so there is no attach to wait for and no window to
-    /// lose it in.
+    /// Every hold is stated before the loop and before anything has attached:
+    /// the subscription plane holds the statement and re-sends it at every
+    /// attachment, so there is no attach to wait for and no window to lose it
+    /// in.
     pub async fn run(mut self, io: DriverIo) {
         let DriverIo {
             mut events,
@@ -168,7 +255,11 @@ impl BridgeDriver {
         // Cloned out of `tokens`: the loop's own arm cannot hold a borrow of
         // `self` while the other arms' handlers take it mutably.
         let teardown = self.tokens.teardown.clone();
-        self.subscribe_response().await;
+        self.state_holds();
+        for hold in &self.holds {
+            self.subscribe(hold.channel.clone(), hold.depths, hold.resume)
+                .await;
+        }
         let asked_to_stop = loop {
             tokio::select! {
                 // Teardown first: a flood of deliveries must not starve a stop.
@@ -182,10 +273,7 @@ impl BridgeDriver {
                     None => break false,
                 },
                 Some(notice) = notices.recv() => self.publish_notice(notice),
-                () = due(self.resubscribe_at) => {
-                    self.resubscribe_at = None;
-                    self.subscribe_response().await;
-                }
+                () = due(self.next_resubscribe()) => self.resubscribe().await,
             }
         };
         if asked_to_stop {
@@ -242,17 +330,61 @@ impl BridgeDriver {
         }
     }
 
-    /// State the response-channel hold. A gone bridge is not reported here: the
-    /// event channel closing says the same thing, and that path owns the line.
-    async fn subscribe_response(&self) {
-        let _ = self
-            .handle
-            .subscribe(
-                self.response_channel.clone(),
-                RESPONSE_DEPTHS,
-                RESPONSE_RESUME,
-            )
-            .await;
+    /// Decide what this run holds: the response channel always, and the motion
+    /// intent channel when a sink is wired to take what arrives on it.
+    ///
+    /// A configured channel with no sink is said out loud. Silently ignoring the
+    /// key would leave an operator who set it — or a wiring regression that
+    /// dropped the sink — with a head that never moves and a clean log, which is
+    /// the one diagnosis this stream exists to prevent.
+    fn state_holds(&mut self) {
+        self.holds.push(Hold::new(
+            self.response_channel.clone(),
+            RESPONSE_DEPTHS,
+            RESPONSE_RESUME,
+        ));
+        match (self.motion_channel.clone(), self.intents.is_some()) {
+            (Some(channel), true) => {
+                self.holds
+                    .push(Hold::new(channel, MOTION_DEPTHS, MOTION_RESUME));
+            }
+            (Some(channel), false) => self.jsonl.emit(
+                "brenn_motion_channel_unwired",
+                &json!({ "channel": channel }),
+            ),
+            (None, _) => {}
+        }
+    }
+
+    /// The earliest re-ask owed, or `None` when no hold is in doubt.
+    fn next_resubscribe(&self) -> Option<Instant> {
+        self.holds
+            .iter()
+            .filter_map(|hold| hold.resubscribe_at)
+            .min()
+    }
+
+    /// State every hold whose re-ask deadline has passed.
+    async fn resubscribe(&mut self) {
+        let now = Instant::now();
+        let owed: Vec<(String, SubscriptionDepths, ResumePolicy)> = self
+            .holds
+            .iter_mut()
+            .filter(|hold| hold.resubscribe_at.is_some_and(|at| at <= now))
+            .map(|hold| {
+                hold.resubscribe_at = None;
+                (hold.channel.clone(), hold.depths, hold.resume)
+            })
+            .collect();
+        for (channel, depths, resume) in owed {
+            self.subscribe(channel, depths, resume).await;
+        }
+    }
+
+    /// State one channel hold. A gone bridge is not reported here: the event
+    /// channel closing says the same thing, and that path owns the line.
+    async fn subscribe(&self, channel: String, depths: SubscriptionDepths, resume: ResumePolicy) {
+        let _ = self.handle.subscribe(channel, depths, resume).await;
     }
 
     /// Render one bridge event, and route a delivery. Nothing here awaits.
@@ -289,12 +421,18 @@ impl BridgeDriver {
     }
 
     /// The peer will not serve a channel. For the response channel that is fatal
-    /// to every turn until it comes back, so the ask is scheduled again.
+    /// to every turn until it comes back, and for the motion channel it leaves
+    /// remote intent with no way in, so either ask is scheduled again.
     fn on_unavailable(&mut self, channel: String) {
-        let ours = channel == self.response_channel;
-        if ours {
-            self.resubscribe_at = Some(Instant::now() + RESUBSCRIBE_DELAY);
-        }
+        let at = Instant::now() + RESUBSCRIBE_DELAY;
+        let ours = match self.holds.iter_mut().find(|hold| hold.channel == channel) {
+            Some(hold) => {
+                hold.resubscribe_at = Some(at);
+                true
+            }
+            // A channel this driver never asked for; nothing to schedule.
+            None => false,
+        };
         self.jsonl.emit(
             "brenn_channel_unavailable",
             &json!({
@@ -329,7 +467,20 @@ impl BridgeDriver {
                 DeliverOutcome::ReplyMismatch { pending } => ("reply_mismatch", Some(pending.0)),
                 DeliverOutcome::Backlogged => ("backlog", None),
             }
+        } else if let (Some(motion), Some(sink)) =
+            (self.motion_channel.as_deref(), self.intents.as_ref())
+            && motion == delivery.channel
+        {
+            // The sink screens the body; this loop only says a body it would not
+            // take went nowhere. A body the sink accepted is not reported here at
+            // all — what happens to it afterwards is the consumer's to narrate.
+            match sink.deliver(&delivery.envelope.body) {
+                Ok(()) => return,
+                Err(reason) => (reason, None),
+            }
         } else {
+            // A channel this driver never asked for. Held rather than routed: a
+            // subscription the peer invented is not a mandate to act on it.
             ("unexpected_channel", None)
         };
         let mut fields = json!({
@@ -445,6 +596,37 @@ mod tests {
     const RESPONSE: &str = "brenn:pod.speak";
     const WAKE: &str = "brenn:pod.wake";
     const HELP: &str = "brenn:pod.help";
+    const MOTION: &str = "brenn:pod.motion";
+
+    /// A sink that keeps the bodies it took and refuses on demand, so a test can
+    /// read both halves of the routing without a consumer behind it.
+    #[derive(Default)]
+    struct Intents {
+        taken: std::sync::Mutex<Vec<String>>,
+        refuse: std::sync::Mutex<Option<&'static str>>,
+    }
+
+    impl Intents {
+        fn taken(&self) -> Vec<String> {
+            self.taken.lock().unwrap().clone()
+        }
+
+        fn refusing(reason: &'static str) -> Arc<Self> {
+            let sink = Self::default();
+            *sink.refuse.lock().unwrap() = Some(reason);
+            Arc::new(sink)
+        }
+    }
+
+    impl IntentSink for Intents {
+        fn deliver(&self, body: &str) -> Result<(), &'static str> {
+            if let Some(reason) = *self.refuse.lock().unwrap() {
+                return Err(reason);
+            }
+            self.taken.lock().unwrap().push(body.to_owned());
+            Ok(())
+        }
+    }
 
     /// A `[brenn]` table built the way an operator writes one, so the tests
     /// exercise the same defaults and the same parse the daemon does. `extra`
@@ -481,6 +663,14 @@ mod tests {
     }
 
     async fn fixture(script: &[Attempt], config: BrennConfig) -> Fixture {
+        fixture_with(script, config, None).await
+    }
+
+    async fn fixture_with(
+        script: &[Attempt],
+        config: BrennConfig,
+        intents: Option<Arc<dyn IntentSink>>,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::File(path.clone()))
@@ -516,6 +706,10 @@ mod tests {
             },
             jsonl.clone(),
         );
+        let driver = match intents {
+            Some(sink) => driver.with_intents(sink),
+            None => driver,
+        };
         let driver = tokio::spawn(driver.run(DriverIo {
             events,
             notices,
@@ -548,6 +742,25 @@ mod tests {
             peer.handshake().await;
             peer.answer_subscribe(RESPONSE, "Ok").await;
             peer
+        }
+
+        /// The same, for a driver that also holds the motion intent channel:
+        /// both statements answered, the motion one with `motion_kind`, and the
+        /// motion frame handed back so a test can read the depths it stated.
+        async fn attached_with_motion(&mut self, motion_kind: &'static str) -> (Peer, Value) {
+            let mut peer = self.peer();
+            peer.handshake().await;
+            let pick = move |channel: &str| {
+                if channel == MOTION { motion_kind } else { "Ok" }
+            };
+            let first = peer.answer_subscribe_with(pick).await;
+            let second = peer.answer_subscribe_with(pick).await;
+            let motion = if first["channel"] == MOTION {
+                first
+            } else {
+                second
+            };
+            (peer, motion)
         }
 
         /// Stop the driver and wait for it to finish, so the assertions that
@@ -1018,5 +1231,350 @@ mod tests {
         assert_eq!(line["outcome"], "the bridge was asked to shut down");
         assert!(!fx.shutdown.is_cancelled(), "the server was not stopped");
         assert!(fx.fatal.get().is_none());
+    }
+
+    /// The whole seam in one pass: the statement goes out with the recorded
+    /// depths and no resume, and a body delivered on that channel reaches the
+    /// sink verbatim — the driver parses nothing.
+    #[tokio::test]
+    async fn motion_intent_is_subscribed_live_only_and_handed_to_the_sink() {
+        let sink = Arc::new(Intents::default());
+        let mut fx = fixture_with(
+            &[Attempt::Open],
+            brenn_config(&format!("motion_channel = \"{MOTION}\"")),
+            Some(sink.clone()),
+        )
+        .await;
+        let (peer, stated) = fx.attached_with_motion("Ok").await;
+        assert_eq!(stated["push_depth"], 4);
+        assert_eq!(stated["retain_depth"], 0);
+        assert!(
+            stated["cursor"].is_null(),
+            "the first statement resumes from nothing: {stated}"
+        );
+        // The resume policy is invisible on a first statement — it decides what a
+        // *reattach* replays — so it is pinned where it is stated instead. A
+        // replayed raise would pop the head up at three in the morning.
+        assert_eq!(MOTION_RESUME, ResumePolicy::Cursorless);
+
+        let body = r#"{"type":"motion-script","pod":"pod-kitchen","seq":9,"steps":[]}"#;
+        peer.deliver(MOTION, body, 1);
+        let taken = tokio::time::timeout(WAIT, async {
+            loop {
+                let taken = sink.taken();
+                if !taken.is_empty() {
+                    return taken;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the delivery reaches the sink");
+        assert_eq!(taken, vec![body.to_string()]);
+
+        fx.teardown().await;
+        assert!(
+            !events(&fx.path).contains(&"brenn_delivery_dropped".to_string()),
+            "a body the sink took is not a drop: {:?}",
+            events(&fx.path)
+        );
+    }
+
+    /// The sink's own word for why a body went nowhere is what the line says.
+    /// Without it the operator's only evidence of a dropped intent is a head
+    /// that did not move.
+    #[tokio::test]
+    async fn a_sink_that_refuses_a_body_names_its_reason_on_the_line() {
+        let mut fx = fixture_with(
+            &[Attempt::Open],
+            brenn_config(&format!("motion_channel = \"{MOTION}\"")),
+            Some(Intents::refusing("backlog")),
+        )
+        .await;
+        let (peer, _) = fx.attached_with_motion("Ok").await;
+
+        peer.deliver(MOTION, "{}", 4);
+        let line = expect_line(&fx.path, "brenn_delivery_dropped").await;
+        assert_eq!(line["reason"], "backlog");
+        assert_eq!(line["channel"], MOTION);
+        assert_eq!(line["seq"], 4);
+        fx.teardown().await;
+    }
+
+    /// A peer that will not serve the motion channel gets asked again, on the
+    /// motion channel's own deadline. Nothing else retries it, and a host that
+    /// stopped hearing remote intent looks exactly like one nobody is sending to.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_motion_channel_is_asked_for_again() {
+        let mut fx = fixture_with(
+            &[Attempt::Open],
+            brenn_config(&format!("motion_channel = \"{MOTION}\"")),
+            Some(Arc::new(Intents::default())),
+        )
+        .await;
+        let (mut peer, _) = fx.attached_with_motion("Unavailable").await;
+
+        let line = expect_line(&fx.path, "brenn_channel_unavailable").await;
+        assert_eq!(line["channel"], MOTION);
+        assert_eq!(line["retry_in_ms"], RESUBSCRIBE_DELAY.as_millis() as u64);
+
+        // And the ask actually comes back: the refusal dropped the hold, so the
+        // driver's own timer is the only thing that can restore remote intent.
+        assert!(peer.wrote_nothing(), "the retry waits out its delay");
+        tokio::time::advance(RESUBSCRIBE_DELAY).await;
+        peer.answer_subscribe(MOTION, "Ok").await;
+        let subscribed = expect_line_on(&fx.path, "brenn_subscribed", MOTION).await;
+        assert_eq!(subscribed["channel"], MOTION);
+        fx.teardown().await;
+    }
+
+    /// Each hold owes its own re-ask. One shared deadline would let the later
+    /// refusal move the earlier ask, and re-asking every hold when the earliest
+    /// fires spends a round-trip on channels nobody refused.
+    #[tokio::test(start_paused = true)]
+    async fn two_refused_channels_keep_their_own_deadlines() {
+        let mut fx = fixture_with(
+            &[Attempt::Open],
+            brenn_config(&format!("motion_channel = \"{MOTION}\"")),
+            Some(Arc::new(Intents::default())),
+        )
+        .await;
+        let mut peer = fx.peer();
+        peer.handshake().await;
+        // Both statements are already on the wire, in the plane's own order, so
+        // they are read first and answered when this test wants them refused.
+        let first = peer.expect_frame("Subscribe").await;
+        let second = peer.expect_frame("Subscribe").await;
+        let motion_first = first["channel"] == MOTION;
+        assert_eq!(
+            second["channel"],
+            if motion_first { RESPONSE } else { MOTION },
+            "the run holds exactly the response and motion channels"
+        );
+
+        refuse(&peer, RESPONSE);
+        let refused = expect_line_on(&fx.path, "brenn_channel_unavailable", RESPONSE).await;
+        assert_eq!(refused["retry_in_ms"], RESUBSCRIBE_DELAY.as_millis() as u64);
+
+        let half = RESUBSCRIBE_DELAY / 2;
+        tokio::time::advance(half).await;
+        refuse(&peer, MOTION);
+        expect_line_on(&fx.path, "brenn_channel_unavailable", MOTION).await;
+
+        // The response channel's own deadline: its ask comes back and the motion
+        // one, refused half a delay later, is still owed.
+        tokio::time::advance(half).await;
+        let again = peer.expect_frame("Subscribe").await;
+        assert_eq!(again["channel"], RESPONSE);
+        peer.say(subscribed_ok(RESPONSE));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            peer.wrote_nothing(),
+            "the motion ask waits out its own delay"
+        );
+
+        tokio::time::advance(half).await;
+        let motion_again = peer.expect_frame("Subscribe").await;
+        assert_eq!(motion_again["channel"], MOTION);
+        fx.teardown().await;
+    }
+
+    /// Refuse `channel` on the peer's behalf, for the tests that decide when each
+    /// statement is answered rather than answering it where it is read.
+    fn refuse(peer: &Peer, channel: &str) {
+        peer.say(json!({
+            "type": "SubscribeResult",
+            "channel": channel,
+            "outcome": { "kind": "Unavailable" },
+            "replay_count": 0,
+        }));
+    }
+
+    fn subscribed_ok(channel: &str) -> Value {
+        json!({
+            "type": "SubscribeResult",
+            "channel": channel,
+            "outcome": { "kind": "Ok" },
+            "replay_count": 0,
+        })
+    }
+
+    /// The first line naming `event` *and* `channel`, waited for. The plain
+    /// [`expect_line`] cannot tell two channels' lines apart, and both of this
+    /// driver's holds write the same events.
+    async fn expect_line_on(path: &Path, event: &str, channel: &str) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(line) = lines(path)
+                .into_iter()
+                .find(|line| line["event"] == event && line["channel"] == channel)
+            {
+                return line;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {event} line for {channel} arrived; got {:?}",
+                lines(path)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A named channel with nothing wired to consume it is said out loud, once,
+    /// at startup — and no hold is spent on it. Without the line the symptom is a
+    /// head that never moves and a log with nothing in it about why, which is the
+    /// shape an operator cannot diagnose.
+    #[tokio::test]
+    async fn a_motion_channel_with_no_sink_is_reported_and_not_subscribed() {
+        let mut fx = fixture(
+            &[Attempt::Open],
+            brenn_config(&format!("motion_channel = \"{MOTION}\"")),
+        )
+        .await;
+        let line = expect_line(&fx.path, "brenn_motion_channel_unwired").await;
+        assert_eq!(line["channel"], MOTION);
+        let _peer = fx.attached().await;
+        expect_line(&fx.path, "brenn_subscribed").await;
+
+        fx.teardown().await;
+        let stated: Vec<String> = lines(&fx.path)
+            .iter()
+            .filter(|line| line["event"] == "brenn_subscribed")
+            .map(|line| line["channel"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(stated, vec![RESPONSE.to_string()]);
+    }
+
+    /// Unconfigured, nothing changes: a sink handed to a driver whose config
+    /// names no motion channel buys no subscription, so only the response hold
+    /// is ever stated and nothing reaches the sink.
+    #[tokio::test]
+    async fn no_motion_channel_states_no_subscription() {
+        let sink = Arc::new(Intents::default());
+        let mut fx = fixture_with(&[Attempt::Open], brenn_config(""), Some(sink.clone())).await;
+        let _peer = fx.attached().await;
+        expect_line(&fx.path, "brenn_subscribed").await;
+
+        fx.teardown().await;
+        let stated: Vec<String> = lines(&fx.path)
+            .iter()
+            .filter(|line| line["event"] == "brenn_subscribed")
+            .map(|line| line["channel"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(stated, vec![RESPONSE.to_string()]);
+        assert!(sink.taken().is_empty());
+    }
+
+    /// A driver assembled and never run, with its holds stated, for the two arms
+    /// a conformant peer cannot reach: the subscription plane refuses a
+    /// `SubscribeResult` for a channel it has nothing pending on and a `Deliver`
+    /// on a channel that was never active, so a socket cannot produce either. The
+    /// arms exist because the driver may not trust that of a peer.
+    async fn unrun(
+        config: BrennConfig,
+        intents: Option<Arc<dyn IntentSink>>,
+    ) -> (BridgeDriver, PathBuf, tempfile::TempDir, JoinHandle<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::File(path.clone()))
+            .await
+            .unwrap();
+        let (_bridge, handle, _events, _peers) = scripted(&[Attempt::Open], 3);
+        let (link, _notices) = BridgeLink::new(
+            handle.clone(),
+            config.publish_channel.clone(),
+            config.attribution.clone(),
+            jsonl.clone(),
+        );
+        let brain = Arc::new(BrennBrain::new(
+            Arc::new(link),
+            Duration::from_millis(config.response_timeout_ms),
+            Duration::from_millis(config.continuation_timeout_ms),
+            config.failure_message.clone(),
+            Arc::new(|_| {}),
+            Arc::new(BrainStats::default()),
+        ));
+        let driver = BridgeDriver::new(
+            &config,
+            handle,
+            brain,
+            DriverTokens {
+                teardown: CancellationToken::new(),
+                shutdown: CancellationToken::new(),
+                fatal: Arc::new(OnceLock::new()),
+            },
+            jsonl,
+        );
+        let mut driver = match intents {
+            Some(sink) => driver.with_intents(sink),
+            None => driver,
+        };
+        driver.state_holds();
+        (driver, path, dir, writer)
+    }
+
+    /// One delivery, envelope and all, as the bridge hands it over.
+    fn delivery(channel: &str, body: &str) -> Delivery {
+        Delivery {
+            channel: channel.to_owned(),
+            envelope: serde_json::from_value(json!({
+                "message_id": "00000000-0000-0000-0000-000000000001",
+                "source": "brenn",
+                "channel": channel,
+                "sender": "system:harness",
+                "publish_ts": "2023-11-14T22:13:20Z",
+                "body": body,
+                "urgency": "high",
+                "envelope_type": "brenn",
+            }))
+            .expect("the envelope shape the peer sends"),
+            seq: 1,
+            dropped: 0,
+        }
+    }
+
+    /// A refusal for a channel no hold covers schedules nothing and says it
+    /// scheduled nothing. Scheduling it anyway would put the driver in a re-ask
+    /// loop for a channel it never held, and a `retry_in_ms` on the line would
+    /// read to a log query as a channel this pod owns.
+    #[tokio::test]
+    async fn an_unheld_channel_refusal_schedules_no_re_ask() {
+        let (mut driver, path, _dir, _writer) = unrun(brenn_config(""), None).await;
+
+        driver.on_unavailable("brenn:pod.invented".to_string());
+        assert!(
+            driver.next_resubscribe().is_none(),
+            "nothing is owed for a channel this driver never asked for"
+        );
+        let line = expect_line(&path, "brenn_channel_unavailable").await;
+        assert_eq!(line["channel"], "brenn:pod.invented");
+        assert!(
+            line["retry_in_ms"].is_null(),
+            "a channel nobody holds is not coming back: {line}"
+        );
+
+        // And the held channel still schedules its own, so the lookup is a match
+        // rather than a blanket refusal to schedule.
+        driver.on_unavailable(RESPONSE.to_string());
+        assert!(driver.next_resubscribe().is_some());
+    }
+
+    /// A body arriving on the configured motion channel with no sink wired is a
+    /// narrated drop, not a panic and not silence: the subscription was never
+    /// stated, so a peer delivering there decided the routing on its own.
+    #[tokio::test]
+    async fn a_motion_delivery_with_no_sink_is_dropped_loudly() {
+        let (driver, path, _dir, _writer) = unrun(
+            brenn_config(&format!("motion_channel = \"{MOTION}\"")),
+            None,
+        )
+        .await;
+
+        driver.on_delivery(delivery(MOTION, "{\"type\":\"motion-script\"}"));
+        let line = expect_line(&path, "brenn_delivery_dropped").await;
+        assert_eq!(line["reason"], "unexpected_channel");
+        assert_eq!(line["channel"], MOTION);
     }
 }

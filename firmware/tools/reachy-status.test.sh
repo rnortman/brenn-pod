@@ -3,7 +3,7 @@
 # reachy-status.test.sh — host-only regression tests for reachy-status.sh.
 #
 # The status command's whole value is that it is trusted: an operator runs it
-# instead of torquing servos to find out what is missing, so a check that
+# instead of deploying blind to find out what is missing, so a check that
 # silently stops being asked, or an answer read as OK when the device said
 # otherwise, is worse than not having the command. Both are text processing —
 # the probe is composed here, the judgement is made here — and neither needs a
@@ -57,9 +57,7 @@ probe=$(cat)
 # Absolute device paths become fixture paths. The two prefixes the probe uses
 # are the payload store and the account's home.
 probe=${probe//\/run\/brenn-app/$STUB_ROOT/run/brenn-app}
-probe=${probe//\/run\/reachy-motiond/$STUB_ROOT/run/reachy-motiond}
 probe=${probe//\/var\/lib\/brenn-app/$STUB_ROOT/var/lib/brenn-app}
-probe=${probe//\/dev\/tty/$STUB_ROOT/dev/tty}
 printf '%s' "$probe" >"$STUB_SSH_PROBE"
 PATH="$STUB_STUBS:$PATH" bash -s <<<"$probe"
 SSH_EOF
@@ -101,9 +99,8 @@ new_tree() {
 	mkdir -p "$TREE/firmware/tools"
 	cp -- "$TOOL" "$HERE/lib.sh" "$TREE/firmware/tools/"
 	chmod +x "$TREE/firmware/tools/$(basename -- "$TOOL")"
-	mkdir -p "$ROOT/run/brenn-app/conf" "$ROOT/run/brenn-app/releases/motiond" \
-		"$ROOT/var/lib/brenn-app" "$ROOT/dev" "$ROOT/active"
-	STATE="$ROOT/run/reachy-motiond/state"
+	mkdir -p "$ROOT/run/brenn-app/conf" \
+		"$ROOT/var/lib/brenn-app" "$ROOT/active"
 	SSH_ARGV="$TREE/ssh.argv"
 	PROBE="$TREE/ssh.probe"
 	: >"$SSH_ARGV"
@@ -119,28 +116,8 @@ provision_all() {
 	touch "$ROOT/mounted"
 	mkdir -p "$ROOT/run/brenn-app/current"
 	install -m 0755 /dev/null "$ROOT/run/brenn-app/current/run"
-	touch "$ROOT/active/brenn-app.service" "$ROOT/active/reachy-motiond.service"
+	touch "$ROOT/active/brenn-app.service"
 	touch "$ROOT/run/brenn-app/conf/audio.conf"
-	# The serial node the fixture bench file names is a fixture path: the probe
-	# reads that value at run time out of the file, so it is one of the few
-	# things the stub's path rewriting cannot reach.
-	printf '[bus]\ndevice = "%s"\nbaud = 1000000\n' "$ROOT/dev/ttyAMA3" \
-		>"$ROOT/var/lib/brenn-app/reachy-bench.toml"
-	touch "$ROOT/var/lib/brenn-app/reachy-motiond.toml"
-	touch "$ROOT/var/lib/brenn-app/motiond-token"
-	install -m 0755 /dev/null "$ROOT/run/brenn-app/releases/motiond/reachy-motiond"
-	touch "$ROOT/dev/ttyAMA3"
-	# A running daemon writes this into its RuntimeDirectory, so a device that
-	# is actually ready has one. The unit does not, which is exactly why the
-	# `absent` case is a MISSING line rather than a silent pass.
-	daemon_says state=resting watch=ok
-}
-
-# What the motion daemon has written about itself, as its own key=value lines.
-daemon_says() {
-	mkdir -p -- "$(dirname -- "$STATE")"
-	printf '%s\n' "$@" >"$STATE"
-	printf 'updated_unix=%s\n' "$(date +%s)" >>"$STATE"
 }
 
 run_tool() {
@@ -166,13 +143,7 @@ says "empty-device-reports-the-missing-mount" 'MISSING.*/run/brenn-app is mounte
 says "empty-device-reports-the-missing-payload" 'MISSING.*audio payload'
 says "empty-device-reports-the-dead-app-service" 'MISSING.*brenn-app.service is running'
 says "empty-device-reports-the-missing-audio-conf" 'MISSING.*link configuration'
-says "empty-device-reports-the-missing-bench-config" "MISSING.*machine's configuration"
-says "empty-device-reports-the-missing-daemon-config" "MISSING.*motion daemon's configuration"
-says "empty-device-reports-the-missing-token" "MISSING.*bus token"
-says "empty-device-reports-the-missing-binary" 'MISSING.*motion daemon is deployed'
-says "empty-device-reports-the-dead-motiond-service" 'MISSING.*reachy-motiond.service is running'
-says "empty-device-reports-the-missing-port" 'MISSING.*servo bus node'
-# Ten missing things, one fix. The whole point of naming it on every report is
+# Four missing things, one fix. The whole point of naming it on every report is
 # that nobody has to map a missing file back to the target that writes it.
 says "empty-device-names-the-one-fix" 'make reachy-up'
 # The record gates nothing any more, so its absence is stated and not counted.
@@ -191,9 +162,7 @@ silent_about "ready-device-does-not-recommend-the-fix" 'make reachy-up'
 # Every check is still asked. A check that quietly stopped being made would
 # read exactly like a check that passed.
 for label in 'is mounted' 'audio payload' 'brenn-app.service is running' \
-	'link configuration' "machine's configuration" "motion daemon's configuration" \
-	'bus token' 'motion daemon is deployed' 'reachy-motiond.service is running' \
-	'servo bus node'; do
+	'link configuration'; do
 	says "ready-device-still-asks-about-${label// /-}" "OK .*${label}"
 done
 
@@ -202,189 +171,18 @@ done
 check "status-asks-once" \
 	"$(yes_no [ "$(wc -l <"$SSH_ARGV")" = 1 ])" \
 	"ssh argv was: $(cat -- "$SSH_ARGV")"
-# Read-only, and nothing that moves. The probe is the only thing that runs on
-# the device, so this is where "touches no servo" is enforceable.
-check "status-runs-nothing-that-moves" \
-	"$(no_yes grep -qE 'reachy-motiond |reachy-bench |systemctl (start|restart|stop)' -- "$PROBE")" \
+# Read-only, and it starts nothing. The probe is the only thing that runs on
+# the device, so this is where "changes nothing" is enforceable.
+check "status-starts-nothing" \
+	"$(no_yes grep -qE 'systemctl (start|restart|stop)' -- "$PROBE")" \
 	"the probe was: $(cat -- "$PROBE")"
-
-# ── what the motion daemon says it is doing ───────────────────────────────────
-#
-# The check this command exists for as much as any file: a parked daemon does
-# not exit, so its unit is active while it commands nothing at all. Every row
-# below is a robot that would otherwise have been called `ready`.
-
-new_tree
-provision_all
-run_tool reachy-dev
-says "a-resting-daemon-is-ready" 'OK .*motion daemon is running and ready'
-
-new_tree
-provision_all
-daemon_says state=active watch=ok
-run_tool reachy-dev
-check "an-active-daemon-is-ready-too" "$(yes_no [ "$EC" = 0 ])" "exit ${EC}: $OUT"
-says "an-active-daemon-says-which-state" 'OK .*ready \(active\)'
-
-# The line that stops a dead robot answering ready.
-new_tree
-provision_all
-daemon_says state=parked watch=ok \
-	'fault_stage=the motion loop' 'fault_detail=servo 4: timed out'
-run_tool reachy-dev
-check "a-parked-daemon-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
-says "a-parked-daemon-is-reported-as-faulted" 'MISSING.*FAULTED and is parked'
-says "a-parked-daemon-names-the-stage" 'the motion loop'
-says "a-parked-daemon-names-the-fault" 'servo 4: timed out'
-says "a-parked-daemon-names-the-action" 'make reachy-motiond-logs'
-silent_about "a-parked-daemon-is-not-called-ready" '^reachy-status.*: ready'
-# Pushing files does not clear a fault, and saying so would send an operator
-# round a loop that cannot end.
-says "a-parked-daemon-says-the-push-does-not-fix-it" 'make reachy-up does not fix that'
-silent_about "a-parked-daemon-is-not-blamed-on-a-missing-file" 'everything above is pushed by'
-
-# Limp, safe, and unable to raise its head: the machine is at the minimum risk
-# condition and recovers by itself, but nothing will wake until reads come back.
-new_tree
-provision_all
-daemon_says state=resting watch=failing
-run_tool reachy-dev
-check "a-failing-watch-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
-says "a-failing-watch-says-the-head-will-not-raise" 'MISSING.*cannot read the machine'
-says "a-failing-watch-says-it-recovers-by-itself" 'recovers by itself'
-
-new_tree
-provision_all
-daemon_says state=starting watch=ok
-run_tool reachy-dev
-check "a-starting-daemon-is-not-yet-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
-says "a-starting-daemon-says-to-re-run" 'MISSING.*still coming up'
-
-# The boot this feature was built for: a daemon that came up over a dead servo
-# bus retries its startup look forever, so it holds `starting` until somebody
-# fixes the cabling. Telling that operator to re-run in a moment is the one
-# action that can never resolve it.
-new_tree
-provision_all
-daemon_says state=starting watch=failing
-run_tool reachy-dev
-check "a-starting-daemon-over-a-dead-bus-is-not-ready" "$(yes_no [ "$EC" = 1 ])" \
-	"exit ${EC}: $OUT"
-says "a-starting-daemon-over-a-dead-bus-names-the-bus" 'MISSING.*cannot read the machine'
-silent_about "a-starting-daemon-over-a-dead-bus-is-not-told-to-wait" 'still coming up'
-
-# Mid-shutdown is not ready either, and it resolves on its own.
-new_tree
-provision_all
-daemon_says state=stopping watch=ok
-run_tool reachy-dev
-check "a-stopping-daemon-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
-says "a-stopping-daemon-says-so" 'MISSING.*shutting down'
-silent_about "a-stopping-daemon-is-not-called-ready" '^reachy-status.*: ready'
-
-# Two limp antennas on a robot holding a conversation perfectly well. Reported,
-# because nothing else about the machine looks any different; not counted,
-# because the head has its presence and no push or restart is the answer — the
-# next raise retries the pair.
-new_tree
-provision_all
-daemon_says state=active watch=ok antennas=degraded
-run_tool reachy-dev
-check "degraded-antennas-are-still-ready" "$(yes_no [ "$EC" = 0 ])" "exit ${EC}: $OUT"
-says "degraded-antennas-are-reported" '\-\-.*antennas are out of service'
-says "degraded-antennas-say-the-head-is-fine" 'head is unaffected'
-says "degraded-antennas-say-what-retries-them" 'next raise retries them'
-says "degraded-antennas-are-still-called-ready" '^reachy-status.*: ready'
-
-# The same field on a whole machine says nothing at all: a line per healthy
-# antenna pair is a line nobody reads, on the output an operator scans for the
-# one thing that is wrong.
-new_tree
-provision_all
-daemon_says state=active watch=ok antennas=ok
-run_tool reachy-dev
-silent_about "healthy-antennas-are-not-mentioned" 'antennas'
-
-# A parked daemon whose fault detail carries the separator this probe packs its
-# answer with. The detail is the motion libraries' own wording, so it is the one
-# field that can contain anything; it goes last for exactly this reason.
-new_tree
-provision_all
-daemon_says state=parked watch=ok antennas=ok \
-	'fault_stage=the motion loop' 'fault_detail=servo 4: timed out|and 5 too'
-run_tool reachy-dev
-check "a-detail-with-a-separator-is-still-parked" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
-# Bracketed, because `says` matches an extended regex: an unescaped `|` here
-# would be an alternation, and the case would pass on either half alone — which
-# is every truncation it exists to catch.
-says "a-detail-with-a-separator-is-read-whole" 'servo 4: timed out[|]and 5 too'
-
-# A phase this script predates. Host and daemon are pushed separately, so the
-# skew is a state this command will meet — and the answer that must never come
-# out of it is `ready`.
-new_tree
-provision_all
-daemon_says state=wedged watch=ok
-run_tool reachy-dev
-check "an-unknown-state-is-not-ready" "$(yes_no [ "$EC" = 1 ])" "exit ${EC}: $OUT"
-says "an-unknown-state-says-it-does-not-know" 'MISSING.*does not know'
-says "an-unknown-state-quotes-what-it-was-told" 'wedged'
-silent_about "an-unknown-state-is-not-called-ready" '^reachy-status.*: ready'
-
-# The unit is up and there is no file: either a daemon that has only just
-# started, or one deployed before this file existed. Both are "come back", and
-# neither is `ready`.
-new_tree
-provision_all
-rm -f -- "$STATE"
-run_tool reachy-dev
-check "no-state-file-under-a-running-unit-is-not-ready" "$(yes_no [ "$EC" = 1 ])" \
-	"exit ${EC}: $OUT"
-says "no-state-file-says-what-to-do" 'MISSING.*written no state'
-
-# With the unit down, its own MISSING line is the answer and the state is
-# reported without being judged: RuntimeDirectory takes the file away on stop,
-# so anything still there is a race with that.
-new_tree
-provision_all
-rm -f -- "$ROOT/active/reachy-motiond.service"
-run_tool reachy-dev
-says "a-dead-unit-is-what-is-reported" 'MISSING.*reachy-motiond.service is running'
-says "a-dead-unit-leaves-the-state-informational" '^  [-][-].*motion daemon state'
-silent_about "a-dead-unit-does-not-double-report-the-daemon" 'MISSING.*motion daemon'
-
-# ── the servo node the machine's own configuration names ──────────────────────
-
-# A unit wired to another node: the bench file is the authority, and the report
-# names the node it actually looked for rather than one it assumed.
-new_tree
-provision_all
-printf '[envelope]\ndevice = "/dev/nonsense"\n\n[bus]\ndevice = "%s"  # this unit\n' \
-	"$ROOT/dev/ttyAMA1" >"$ROOT/var/lib/brenn-app/reachy-bench.toml"
-run_tool reachy-dev
-check "another-node-is-missing-when-it-is-not-there" "$(yes_no [ "$EC" = 1 ])" \
-	"exit ${EC}: $OUT"
-says "the-report-names-the-node-the-bench-file-names" 'MISSING.*servo bus node.*/dev/ttyAMA1'
-silent_about "a-device-key-outside-the-bus-table-is-not-read" 'nonsense'
-
-new_tree
-provision_all
-printf '[bus]\ndevice = "%s"\n' "$ROOT/dev/ttyAMA1" \
-	>"$ROOT/var/lib/brenn-app/reachy-bench.toml"
-touch "$ROOT/dev/ttyAMA1"
-run_tool reachy-dev
-check "another-node-that-is-there-is-ok" "$(yes_no [ "$EC" = 0 ])" "exit ${EC}: $OUT"
-says "the-ok-line-names-that-node" 'OK .*servo bus node.*/dev/ttyAMA1'
-
-# With no bench file at all there is nothing to ask, so the default node stands
-# — and the bench file's own MISSING line is the one that matters.
-new_tree
-provision_all
-rm -f -- "$ROOT/var/lib/brenn-app/reachy-bench.toml"
-touch "$ROOT/dev/ttyAMA3"
-run_tool reachy-dev
-says "with-no-bench-file-the-default-node-is-checked" 'OK .*servo bus node.*/dev/ttyAMA3'
-says "with-no-bench-file-the-bench-file-is-what-is-missing" "MISSING.*machine's configuration"
+# And it asks about the audio half only. The motion half is brenn-reachy's, and
+# a probe here that read a daemon, the servo bus or the bench would give a
+# `ready` verdict whose motion half was answered by the wrong repository — the
+# worst answer this command can give.
+check "status-asks-nothing-about-motion" \
+	"$(no_yes grep -qE 'motiond|reachy-bench|ttyAMA|servo' -- "$PROBE")" \
+	"the probe was: $(cat -- "$PROBE")"
 
 # ── the self-test record, reported and never judged ───────────────────────────
 
@@ -424,10 +222,10 @@ says "silent-probe-says-it-understood-nothing" 'answered nothing this command un
 silent_about "silent-probe-is-not-ready" 'ready'
 
 # The counter and not the emptiness is what decides: a probe that answered only
-# the two informational keys produced output, and still asked nothing that can
-# be OK or MISSING.
+# the informational key produced output, and still asked nothing that can be OK
+# or MISSING.
 new_tree
-STUB_SSH_SAYS=$'port_path=/dev/ttyAMA3\nselftest=no record on the device\n' run_tool reachy-dev
+STUB_SSH_SAYS=$'selftest=no record on the device\n' run_tool reachy-dev
 check "informational-only-probe-refuses" "$(yes_no [ "$EC" != 0 ])" "exit ${EC}: $OUT"
 says "informational-only-probe-says-it-understood-nothing" 'answered nothing this command'
 silent_about "informational-only-probe-is-not-ready" 'ready'

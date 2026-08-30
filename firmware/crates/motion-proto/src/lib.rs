@@ -1,11 +1,20 @@
-//! `motion-proto` — timed motion scripts, and the executor state that runs one.
+//! `motion-proto` — timed motion scripts, and an executor state nothing runs.
 //!
 //! One channel on the bus carries what a machine's head should be doing. The
-//! publisher is whichever process can observe a speech interaction; the
-//! consumer is the motion daemon on the machine. This crate is the piece they
-//! share, and it is deliberately the only piece — no I/O, no clock of its own,
-//! no async, so both ends can test it and neither end grows protocol logic of
-//! its own.
+//! publisher is whichever process can observe a speech interaction; the consumer
+//! is the process on the machine that owns its motion. This crate is the piece
+//! they share, and it is deliberately the only piece — no I/O, no clock of its
+//! own, no async, so both ends can test it and neither end grows protocol logic
+//! of its own.
+//!
+//! brenn-reachy owns this contract: its copy of this crate is the one the
+//! robot's edge decodes with, and the shared contract modules here — `script.rs`
+//! and `seq.rs` — are kept byte-identical to that copy, so a change to either
+//! has to land in both. `schedule.rs` exists only here, and nothing in either
+//! tree consumes it. The copy here exists only while `speech-surface` builds
+//! against a path dependency inside this workspace, and goes when that
+//! dependency re-points.
+//! `TODO(motion-proto-retire)`
 //!
 //! The unit of intent is a **script**: a timeline at offsets from the moment it
 //! arrives, under a timeout after which the head goes back down. Its steps come
@@ -31,7 +40,7 @@
 //!   meant to grow richer intents, and a daemon built today must not choke on a
 //!   script authored by something newer.
 //! - **The schedule** ([`Schedule`]): the executor's state. Deliveries fold in;
-//!   the motion side asks what posture is wanted now.
+//!   the motion side asks what posture is wanted now. Nothing consumes it.
 //! - **The sequence source** ([`SeqSource`]): the publisher's half of the
 //!   ordering rule, kept here so both ends share one definition of it.
 //!

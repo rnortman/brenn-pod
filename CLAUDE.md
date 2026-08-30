@@ -16,9 +16,10 @@ Product-grade code — write every line as if it ships. Full charter: `README.md
 
 ## Reachy Fault Management
 
-The fault-management doctrine for the Reachy motion stack (including
-`reachy-motiond` in this repo) lives at `docs/fault-management.md` in the
-sibling `brenn-reachy` checkout (`../brenn-reachy/docs/fault-management.md`).
+The fault-management doctrine for the Reachy motion stack lives at
+`docs/fault-management.md` in the sibling `brenn-reachy` checkout
+(`../brenn-reachy/docs/fault-management.md`). No motion code runs from this
+repo — the stack, its deploy tooling and its doctrine are all that checkout's.
 Read it before touching anything that arms, disarms, or handles a motion
 fault. Only the two invariants that hold whatever the response are restated
 here: the Minimum Risk Condition is *stowed and de-torqued*, **nothing ever

@@ -12,7 +12,9 @@
 #
 #   --activate  hand the release to brenn-app-activate, which applies the
 #               contract check, switches the current symlink and restarts the
-#               application. This is the development deploy.
+#               application. This is the development deploy. It refuses a unit
+#               carrying the robot's payload, whose pod is deployed from
+#               brenn-reachy with the rest of that stack.
 #   --selftest  run the unattended bring-up registry out of the pushed release
 #               without activating it, as the account the application runs as.
 #   --bench     the same, for the registry's manual cases — the ones that need
@@ -41,6 +43,46 @@ payload_dir="${firmware_root}/target/reachy-pod/payload"
 store="${store_mount}/releases"
 activate=/usr/sbin/brenn-app-activate
 service=brenn-app.service
+
+# How a unit that is a robot says so: brenn-reachy pushes the robot's payload
+# into this directory of the same store and writes that stamp at its root with
+# the push. Two names owned by another repository, spelled here because this is
+# where they are read; they move together, and a rename there turns this refusal
+# off silently — which is why the refusal names them in its own text.
+#
+# The stamp rather than the directory: rsync --delete leaves the directory
+# behind when a push is interrupted, and an empty tree is not a payload.
+robot_release="${store}/motion"
+robot_stamp="${robot_release}/provenance.txt"
+
+# What the device answers with when it carries that payload. Its own code, like
+# the running-service refusal's 3, so a remote shell's own failures are not read
+# as this answer.
+#
+# Not exclusively this script's, on one connection: the activation replaces the
+# guard with brenn-app-activate, whose status vocabulary belongs to brenn-os and
+# is documented nowhere here, so a 4 from that connection can be either answer.
+rc_robot=4
+
+# Asked on the device, ahead of the thing it guards. A robot's payload is five
+# applications under one launcher — the pod among them — and an activation here
+# would make a pod-only payload current in their place: a robot that still talks
+# and can no longer move, with nothing narrating why. The pod on a robot is
+# deployed by brenn-reachy's tooling with the rest of the stack.
+#
+# Only the activation is guarded. The self-test modes activate nothing and
+# replace nothing, and a bench self-test on a robot whose stack is stopped is a
+# reading somebody wants; what it must not do is run beside a live stack holding
+# the board, and the running-service refusal below is what says so.
+robot_guard="[ -e ${robot_stamp} ] && exit ${rc_robot}"
+
+# The refusal itself, once, because it is reached from two places.
+refuse_robot() {
+	die "${host} carries the robot's motion payload (${robot_stamp}), and this pushes a pod-only one." \
+		"Activating it here would replace the whole stack — the launcher, the motion processes and the pod with it —" \
+		"with a payload that cannot move the machine. Deploy the robot's pod from brenn-reachy:" \
+		"    make -C ../brenn-reachy motion-deploy"
+}
 
 usage() {
 	die "usage: ${prog} <host> --activate|--selftest|--bench|--logs"
@@ -80,14 +122,61 @@ case "$mode" in
 esac
 dir="${store}/${release}"
 
+# The guard rides the connection that makes the push's directory, so a unit that
+# is a robot is turned away before a byte of a pod-only payload reaches it.
 echo "${prog}: pushing ${payload_dir}/ to ${host}:${dir}/" >&2
-ssh_root mkdir -p -- "$dir"
+guard=true
+[ "$mode" != --activate ] || guard=$robot_guard
+rc=0
+ssh_root "${guard}; mkdir -p -- ${dir}" || rc=$?
+case "$rc" in
+	0) ;;
+	"$rc_robot") refuse_robot ;;
+	# Anything else is the connection or the device, not this script's answer:
+	# an unreachable host, a host key BatchMode would not accept, a store that
+	# would not take the directory. Named here because 4 is the only status this
+	# guard assigns a meaning to, and a bare status reads as a device verdict.
+	*) die "ssh to root@${host} failed, or ${dir} could not be made on it (exit ${rc})." \
+		"Its own error is above. Nothing was pushed and nothing was activated." ;;
+esac
 rsync -a --delete -e "ssh -o BatchMode=yes" \
 	"${payload_dir}/" "root@${host}:${dir}/"
 
 case "$mode" in
 	--activate)
-		ssh_root "$activate" "$dir"
+		# Asked again, in the same invocation as the activation. The push above
+		# is a second connection, so a robot's payload can land between the two
+		# — from another terminal, or from brenn-reachy's own deploy — and only
+		# the question asked with the act is binding.
+		rc=0
+		ssh_root "${robot_guard}; exec ${activate} ${dir}" || rc=$?
+		case "$rc" in
+			0) ;;
+			# The guard's code, or the activation tool's own: exec puts that
+			# tool where the guard stood, so the number alone does not say
+			# which. A robot's payload arriving in between turns the deploy
+			# away, which is the direction to be wrong in.
+			"$rc_robot")
+				if ssh_root "[ -e ${robot_stamp} ]"; then
+					refuse_robot
+				fi
+				die "activating ${dir} on ${host} failed (exit ${rc})." \
+					"Asked again, the unit did not show the robot's stamp, so this is the activation tool's own status and not a refusal." \
+					"This script changed nothing after the push; ask the unit what it is running:" \
+					"    firmware/tools/reachy-status.sh ${host}"
+				;;
+			# Either the activation tool refused the release or the connection
+			# never landed, and the two are not distinguishable from a status
+			# alone — which is why this says both rather than exiting silently
+			# on ssh's own number. What the unit is running is not claimed: an
+			# activation that failed partway through is one of the shapes this
+			# covers.
+			*) die "activating ${dir} on ${host} failed (exit ${rc})." \
+				"Its own error is above: either brenn-app-activate refused the release," \
+				"or the connection to the unit did not land." \
+				"This script changed nothing after the push; ask the unit what it is running:" \
+				"    firmware/tools/reachy-status.sh ${host}" ;;
+		esac
 		;;
 	--selftest | --bench)
 		# A self-test wants the board to itself. A running application holds

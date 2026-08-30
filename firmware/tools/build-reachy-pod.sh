@@ -28,10 +28,6 @@
 #   REACHY_PODMAN   the podman to run (default podman)
 #   REACHY_BINFMT_DIR   where to look for the binfmt registration, for testing
 #                       the preflight on a host that has one
-#   REACHY_MOTION_REPO  the motion clone the workspace's overlay names (default
-#                       ../brenn-reachy beside this repo). This build compiles
-#                       none of it, but a [patch] table resolves workspace-wide,
-#                       so the container has to be able to see it.
 
 set -euo pipefail
 

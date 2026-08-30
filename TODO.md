@@ -471,109 +471,41 @@ See `TODO(barge-in-flake)` at
 `host/crates/speech-surface/tests/barge_integration.rs`.
 
 
-## `stow-budget-source-unpinned` — BLOCKED as of 2026-08-13 (needs a servo fixture the daemon's tests can reach)
+## `script-timebase` — BLOCKED as of 2026-08-09 (needs a timebase both ends share)
 
-`reachy-motiond` opens the deadline a defeated stow escalates on from the *machine's* file:
-`SessionActive::stow_deadline` (`firmware/devices/reachy-motiond/src/motion.rs`) adds
-`Engaged::stow_budget()`, which is the bench-resolved stow durations plus the settle
-timeout (brenn-reachy `crates/reachy-bench/src/commands.rs`). The daemon's own
-`stow_duration_s` override never reaches it — deliberately: a policy file may command a
-longer controlled stow, but it may not lengthen how long a stow a person has defeated
-keeps driving the head. That is the double-window defect this cycle removed, and the
-runbook's `stow_duration_s` row now states the property to operators.
+A motion script's step offsets are measured from the moment the receiving process
+stamped the script's arrival, so speech and motion co-start only as closely as delivery
+allows — well inside the ±500 ms coarse coordination accepts, and not survivable under
+tighter coupling: a beat on a word or a tilt at a phrase wants one timeline, which
+offsets-from-receipt cannot express. The schema reserves a `base` field for the absolute
+start instant that would fix it, and what that needs underneath is a clock both ends
+agree on rather than a field.
 
-Nothing in this repo holds that line. The one test in the area,
-`a_defeated_stow_escalates_on_the_clock_it_started_with`, runs against the `Fake`, whose
-`stow_deadline` is a stub, so it pins that *one* window is opened and is blind to which
-file sized it. A refactor to `self.stow.longest()` — the daemon already owns those
-durations for the moves it commands — passes the whole gate and makes the runbook
-sentence false.
+The account of record is brenn-reachy's entry under this slug. The process that stamps
+arrival and executes the timeline lives there, and so does the clock work this waits on.
+This half exists because the wire schema is still built here too, and it leaves with the
+crate (`motion-proto-retire`).
 
-Deferred rather than dismissed: pinning the seam needs a real `Engaged`, and this repo
-has no `BusPort` fake at all. The two ways to get one are a decision, not a line — export
-brenn-reachy's test-only scripted-servo fixture (`crates/reachy-bench/src/testutil.rs`,
-`mod testutil;` today) as public test support, which changes a sibling crate's public
-surface; or write a second scripted servo here, which is a second answer to what a servo
-does with a write, the duplication that fixture exists to prevent.
-
-Done = a test in this repo drives a session whose bench stow duration and daemon
-`stow_duration_s` override differ, and asserts the deadline the escalation runs on comes
-from the bench value — failing if the deadline is ever routed through `Clocks`.
-
-See `TODO(stow-budget-source-unpinned)` at `SessionActive::stow_deadline` in
-`firmware/devices/reachy-motiond/src/motion.rs`.
-
-
-## `script-timebase` — BLOCKED as of 2026-08-09 (needs the Clockwork port's shared clock)
-
-A motion script's step offsets are measured from the moment the daemon *received* the
-script (`firmware/crates/motion-proto/src/schedule.rs`). Speech and motion therefore
-start together only as closely as bridge delivery allows: the scripter emits the script
-as the audio starts streaming, and whatever the delivery takes is added to every offset
-in the timeline. That is well inside the ±500 ms this feature accepts, so the head's
-raise reads as an acknowledgement and the scheduled stow lands over the tail of the
-audio as intended.
-
-It does not survive tighter coupling. Emote and gaze steps computed against the audio
-timeline — a beat on a word, a tilt at a phrase — want the two timelines to be the same
-timeline, and offsets-from-receipt cannot express that: the daemon has no way to know
-what instant the host meant.
-
-The schema already reserves the field. A `base` carrying an absolute start instant makes
-every offset absolute too, and what it needs underneath is a timebase both ends share:
-either an NTP-disciplined wall clock on both machines, or a clock-mapping beacon pairing
-the pod's audio sample clock to the device's monotonic clock. After the Clockwork port
-one scheduler owns the audio and motion timelines together and emits scripts against
-that clock, which is the natural moment to pick — the two-binary split survives as long
-as the timebase is shared.
-
-Deferred rather than dismissed: it is a clock-distribution decision, not a field. Adding
-`base` before there is a clock to interpret it against would put an absolute time on the
-wire that each end reads differently, which is worse than the honest offsets.
-
-Done = scripts carry absolute step times on a timebase both ends agree on, the daemon
-executes against it, and offsets-from-receipt survive only as the fallback when no base
-is present.
+Done = brenn-reachy's Done, reached there.
 
 See `TODO(script-timebase)` at the wire schema in
 `firmware/crates/motion-proto/src/script.rs`.
 
+## `motion-proto-retire` — BLOCKED as of 2026-08-30 (needs a published brenn-reachy revision to pin)
 
-## `loop-fixture-paced-jitter` — not blocked as of 2026-08-15 (a re-derivation of the paced fixtures' time budget, not a line)
+`firmware/crates/motion-proto` is a second live copy of a wire contract brenn-reachy
+owns. `host/crates/speech-surface` still takes it as a path dependency inside this
+workspace, and re-pointing that dependency at brenn-reachy's crate needs a revision of
+that repository that resolves from GitHub. A local path override is not the way round
+it: green local gate, red public CI, which is what the retired `[patch]` table taught.
 
-The motion loop's tests drive the real loop against a real clock: their dwells sleep, and
-a script step or a clip window comes due when wall time says so. That makes every gap in
-a fixture's timeline a margin, and a wake-up later than the gap reads the timeline wrong
-— an ask stepped past and never seen, a window opened after the drive it was meant to
-join. Two of them failed that way on a loaded machine on 2026-08-15
-(`a_keep_against_a_posture_the_head_is_holding_commands_nothing`,
-`a_second_keep_after_a_raise_is_said_again`), passing on a quiet one.
+The hazard while both copies are editable is divergence with both gates green — a
+decode-tolerance fix made in whichever tree its author happened to be in leaves the two
+ends of one contract disagreeing about the same bytes.
 
-The gaps a script writes are now wide enough to absorb that (`SCRIPT_STEP_MS`,
-`REST_DELAY`). The gaps a *paced drive* offers are not, and cannot be widened the same
-way: a drive is `FAKE_BASE_PERIODS` sleeps of `FAKE_PERIOD`, 160 ms end to end, and the
-fixtures put base changes, play windows and refusals inside it. Injecting one 45 ms
-hiccup at the sweep that delivers the script — the sleep overshoot a loaded workstation
-produced — still breaks four:
-`overlays::a_play_step_due_mid_drive_joins_the_run_already_under_way`,
-`overlays::a_base_change_ends_the_run_and_the_motion_rides_through_it`,
-`overlays::a_bare_base_refusal_is_not_blamed_on_the_overlays` and
-`overlays::a_refusal_after_a_window_has_spent_belongs_to_the_base`.
+Done = `speech-surface` depends on brenn-reachy's `motion-proto` at a published
+revision, this crate's directory and its workspace membership are gone, and the
+`script-timebase` marker here goes with it.
 
-Widening that margin is not one number. `FAKE_PERIOD` is also the rate a clip's frames
-are sampled at, so lengthening the drive by lengthening the period rewrites every clip
-fixture; lengthening it by adding periods re-derives the relationships the constants
-carry instead — which clips outlive a drive, `BARE_AFTER_SPEND_PERIOD`,
-`HELD_SPEND_PERIOD`, `LATE_PLAY_MS`, `BASE_CHANGE_MS`, and the `JOIN_SLACK_MS` bound that
-separates "picked up next period" from "waited out the drive". The other answer is to
-stop paying real time at all: hand the loop a clock it reads through, and the fixtures
-step it. That is a change to the daemon's own code for the tests' benefit, and it is a
-decision rather than a chore — which is why this is an entry and not a patch.
-
-Done = a single sleep overshoot of a few hundred milliseconds, injected at any one hop of
-a motion-loop test, cannot change what that test observes; the paced constants say what
-margin they carry; and no fixture asserts a wall-clock bound tighter than the margin it
-was given.
-
-See `TODO(loop-fixture-paced-jitter)` at `FAKE_BASE_PERIODS` in
-`firmware/devices/reachy-motiond/src/motion.rs`.
+See `TODO(motion-proto-retire)` in the crate header,
+`firmware/crates/motion-proto/src/lib.rs`.

@@ -21,7 +21,7 @@ mod time;
 
 /// The ledger reading the scripter schedules from; part of [`scripter::ScriptInput`].
 pub use barge::TurnAudio;
-pub use brenn::driver::{BridgeDriver, DriverIo, DriverTokens};
+pub use brenn::driver::{BridgeDriver, DriverIo, DriverTokens, IntentSink};
 pub use brenn::{BridgeLink, NOTICE_QUEUE_DEPTH, Notice};
 pub use clip::{ClipError, SpineFormatViolation, check_spine_format, load_clip};
 pub use config::{
@@ -38,8 +38,8 @@ pub use recorder::{
 };
 pub use replay::{ReplayError, ReplayListener, ReplaySummary, StopReason, replay_framelog};
 pub use scripter::{
-    Cause, Now, SCRIPT_QUEUE_DEPTH, ScriptHandle, ScriptInbox, ScriptInput, ScriptPublish,
-    ScriptTask, ScriptTiming, Scripter,
+    BusSink, Cause, Now, SCRIPT_QUEUE_DEPTH, ScriptHandle, ScriptInbox, ScriptInput, ScriptOut,
+    ScriptPublish, ScriptSink, ScriptTask, ScriptTiming, Scripter,
 };
 
 /// Shared `Segment` builder for the crate's test modules. `Segment` grows a

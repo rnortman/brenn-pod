@@ -738,14 +738,53 @@ pub fn channel(jsonl: JsonlHandle) -> (ScriptHandle, ScriptInbox) {
     )
 }
 
-/// The script task: the scripter, its input queue, and the bridge it publishes
-/// on.
+/// One decided script on its way out of the task.
+///
+/// The body is the encoded `MotionScript` — the same bytes the bus publish
+/// carries — so a sink that hands it to a consumer in-process and a sink that
+/// puts it on the wire are looking at the same thing. `pod` and `seq` are beside
+/// it because every sink orders and reports by them, and re-parsing the body to
+/// recover two numbers it already decided is what a sink should not have to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptOut {
+    /// Which pod the timeline addresses.
+    pub pod: String,
+    /// The script's sequence number: rising per pod, and the number a consumer's
+    /// own gate compares against.
+    pub seq: u64,
+    /// The encoded `MotionScript` JSON.
+    pub body: String,
+}
+
+/// Where a decided script goes.
+///
+/// The default is [`BusSink`] — a publish on the presence channel — which is
+/// what every pod deployment does. A deployment that consumes its own scripter's
+/// emissions in-process injects its own sink instead and the decision half above
+/// is untouched: nothing in `Scripter` knows which of the two it is feeding.
+///
+/// Nothing here may block or await. The task calling it owes the pipeline's taps
+/// a queue it keeps draining, so a sink that needs to wait keeps its own queue
+/// and its own task, the way [`BusSink`] does.
+pub trait ScriptSink: Send + Sync + 'static {
+    /// Start whatever carries scripts onward. Called once, inside the task's
+    /// runtime, before the first [`ScriptSink::offer`]. A sink needing nothing
+    /// started leaves it be.
+    fn start(&self) {}
+
+    /// Take one script, in the order the decision loop decided it.
+    fn offer(&self, out: ScriptOut);
+
+    /// No more scripts are coming. A sink holding anything sends it and ends.
+    fn close(&self) {}
+}
+
+/// The script task: the scripter, its input queue, and the sink its decisions
+/// leave through.
 pub struct ScriptTask {
     core: Scripter,
     rx: mpsc::Receiver<ScriptInput>,
-    handle: BridgeHandle,
-    channel: String,
-    attribution: Option<String>,
+    sink: Arc<dyn ScriptSink>,
     jsonl: JsonlHandle,
 }
 
@@ -863,10 +902,96 @@ impl Publisher {
     }
 }
 
-impl ScriptTask {
-    /// Assemble the task. `channel` is the caller's copy of
+/// The default sink: one publish per script on the presence channel, ordered,
+/// superseded per pod, and retried when the bus refuses.
+///
+/// Everything bus-shaped lives here rather than in the task — the ordering, the
+/// per-pod slot, the retry, and the lines that report them — so a task feeding
+/// some other sink carries none of it.
+pub struct BusSink {
+    handle: BridgeHandle,
+    channel: String,
+    attribution: Option<String>,
+    jsonl: JsonlHandle,
+    pending: Arc<Publisher>,
+}
+
+impl BusSink {
+    /// Build the sink. `channel` is the caller's copy of
     /// `brenn.presence_channel`, which is also what decides whether the head is
     /// scripted at all — so it is passed rather than re-read here.
+    #[must_use]
+    pub fn new(
+        channel: String,
+        attribution: Option<String>,
+        handle: BridgeHandle,
+        jsonl: JsonlHandle,
+    ) -> Self {
+        Self {
+            handle,
+            channel,
+            attribution,
+            jsonl,
+            pending: Arc::new(Publisher::new()),
+        }
+    }
+}
+
+impl ScriptSink for BusSink {
+    /// Spawn the publisher.
+    ///
+    /// Not joined by anything: a peer that never answers must not hold up a
+    /// teardown that the driver behind it is waiting on. It ends on its own once
+    /// [`ScriptSink::close`] has been called and what it holds is out.
+    fn start(&self) {
+        drop(tokio::spawn(publish_loop(
+            self.handle.clone(),
+            Arc::clone(&self.pending),
+            self.jsonl.clone(),
+        )));
+    }
+
+    /// `Urgency::Normal`: a script moves a head, so it outranks the advisory
+    /// wake nudge, but it is not conversation content and a lost one is repaired
+    /// by the next re-emission.
+    fn offer(&self, out: ScriptOut) {
+        let request = PublishRequest {
+            channel: self.channel.clone(),
+            attribution: self.attribution.clone(),
+            body: out.body,
+            urgency: Urgency::Normal,
+        };
+        let seq = out.seq;
+        let outgoing = Outbound {
+            request,
+            pod: out.pod,
+            seq,
+            attempts: 0,
+        };
+        // A script this one replaced before the bus took it. Not a failure: the
+        // timeline that goes out is the newer one, which is what the daemon
+        // would have been left with anyway. Said in the file so a capture can
+        // tell a decided script that never reached the wire from one that did.
+        if let Some(superseded) = self.pending.offer(outgoing) {
+            self.jsonl.emit(
+                "script_publish_superseded",
+                &json!({
+                    "channel": self.channel,
+                    "pod": superseded.pod,
+                    "seq": superseded.seq,
+                    "by_seq": seq,
+                }),
+            );
+        }
+    }
+
+    fn close(&self) {
+        self.pending.close();
+    }
+}
+
+impl ScriptTask {
+    /// Assemble the task over the default bus sink.
     #[must_use]
     pub fn new(
         config: &BrennConfig,
@@ -875,12 +1000,23 @@ impl ScriptTask {
         inbox: ScriptInbox,
         jsonl: JsonlHandle,
     ) -> Self {
+        let sink = BusSink::new(channel, config.attribution.clone(), handle, jsonl.clone());
+        Self::with_sink(config, Arc::new(sink), inbox, jsonl)
+    }
+
+    /// Assemble the task over a caller-supplied sink, for a deployment that
+    /// consumes its own scripter's emissions instead of publishing them.
+    #[must_use]
+    pub fn with_sink(
+        config: &BrennConfig,
+        sink: Arc<dyn ScriptSink>,
+        inbox: ScriptInbox,
+        jsonl: JsonlHandle,
+    ) -> Self {
         Self {
             core: Scripter::new(config.script_timing()),
             rx: inbox.rx,
-            handle,
-            channel,
-            attribution: config.attribution.clone(),
+            sink,
             jsonl,
         }
     }
@@ -892,12 +1028,7 @@ impl ScriptTask {
     /// host dying outright — and unlike a parting publish, it needs no bridge
     /// that is already being torn down.
     pub async fn run(mut self, teardown: CancellationToken) {
-        let outbound = Arc::new(Publisher::new());
-        let publisher = tokio::spawn(publish_loop(
-            self.handle.clone(),
-            Arc::clone(&outbound),
-            self.jsonl.clone(),
-        ));
+        self.sink.start();
         loop {
             let deadline = self.core.deadline();
             tokio::select! {
@@ -909,39 +1040,29 @@ impl ScriptTask {
                 input = self.rx.recv() => match input {
                     Some(input) => {
                         if let Some(publish) = self.core.apply(input, Now::read()) {
-                            self.publish(&outbound, publish);
+                            self.publish(publish);
                         }
                     }
                     None => break,
                 },
                 () = due(deadline) => {
                     for publish in self.core.tick(Now::read()) {
-                        self.publish(&outbound, publish);
+                        self.publish(publish);
                     }
                 }
             }
         }
-        // The publisher sends what it is still holding and ends. Not joined: a
-        // peer that never answers must not hold up a teardown that the driver
-        // behind it is waiting on.
-        outbound.close();
-        drop(publisher);
+        self.sink.close();
     }
 
-    /// Hand one script to the publisher, in the order this loop decided it.
+    /// Hand one script to the sink, in the order this loop decided it.
     ///
-    /// Never awaited here: `BridgeHandle::publish` waits for the peer's answer,
-    /// and this loop owes the pipeline's taps a queue it keeps draining. It goes
-    /// through one ordered publisher rather than a task of its own because two
-    /// detached tasks reach the bridge in scheduler order, not spawn order — and
-    /// the daemon drops a script numbered below the last it accepted, so a
-    /// re-emission overtaking the change behind it would silence the change for
-    /// good rather than for a moment.
-    ///
-    /// `Urgency::Normal`: a script moves a head, so it outranks the advisory
-    /// wake nudge, but it is not conversation content and a lost one is repaired
-    /// by the next re-emission.
-    fn publish(&self, outbound: &Publisher, publish: ScriptPublish) {
+    /// Never awaited: this loop owes the pipeline's taps a queue it keeps
+    /// draining, and the sink's contract is that it does not block. Order is the
+    /// loop's to keep, because a consumer drops a script numbered below the last
+    /// it accepted — a re-emission overtaking the change behind it would silence
+    /// that change for good rather than for a moment.
+    fn publish(&self, publish: ScriptPublish) {
         let script = &publish.script;
         // Ahead of the script's own line, because it explains that line's
         // numbers: the stow it names is the ceiling's, not the horizon's.
@@ -969,34 +1090,11 @@ impl ScriptTask {
                 }),
             );
         }
-        let request = PublishRequest {
-            channel: self.channel.clone(),
-            attribution: self.attribution.clone(),
-            body: script.encode(),
-            urgency: Urgency::Normal,
-        };
-        let seq = script.seq();
-        let outgoing = Outbound {
-            request,
+        self.sink.offer(ScriptOut {
             pod: script.pod().to_owned(),
-            seq,
-            attempts: 0,
-        };
-        // A script this one replaced before the bus took it. Not a failure: the
-        // timeline that goes out is the newer one, which is what the daemon
-        // would have been left with anyway. Said in the file so a capture can
-        // tell a decided script that never reached the wire from one that did.
-        if let Some(superseded) = outbound.offer(outgoing) {
-            self.jsonl.emit(
-                "script_publish_superseded",
-                &json!({
-                    "channel": self.channel,
-                    "pod": superseded.pod,
-                    "seq": superseded.seq,
-                    "by_seq": seq,
-                }),
-            );
-        }
+            seq: script.seq(),
+            body: script.encode(),
+        });
     }
 }
 
@@ -2855,5 +2953,140 @@ mod tests {
             .map(|line| line["reason"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(reasons, vec!["queue_full", "scripter_gone"]);
+    }
+
+    /// A sink that keeps what it was handed, so a test can read the emissions
+    /// without a bus behind them.
+    #[derive(Default)]
+    struct Recorder {
+        taken: Mutex<Vec<ScriptOut>>,
+        started: AtomicU64,
+        /// What `started` read when the first script arrived. Taken there rather
+        /// than after the fact: a sink started only after it had already been
+        /// handed work would still read 1 by the time a test looked.
+        started_at_first_offer: Mutex<Option<u64>>,
+        closed: AtomicU64,
+    }
+
+    impl Recorder {
+        fn taken(&self) -> Vec<ScriptOut> {
+            self.taken.lock().unwrap().clone()
+        }
+    }
+
+    impl ScriptSink for Recorder {
+        fn start(&self) {
+            self.started.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn offer(&self, out: ScriptOut) {
+            let mut taken = self.taken.lock().unwrap();
+            if taken.is_empty() {
+                *self.started_at_first_offer.lock().unwrap() =
+                    Some(self.started.load(Ordering::Relaxed));
+            }
+            taken.push(out);
+        }
+
+        fn close(&self) {
+            self.closed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A task over an injected sink and no bus at all: the seam a deployment
+    /// consuming its own emissions in-process stands on.
+    async fn sink_fixture(
+        sink: Arc<Recorder>,
+    ) -> (ScriptHandle, CancellationToken, tokio::task::JoinHandle<()>) {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        drop(writer);
+        let config = brenn_config();
+        let (handle, inbox) = channel(jsonl.clone());
+        let task = ScriptTask::with_sink(&config, sink, inbox, jsonl);
+        let teardown = CancellationToken::new();
+        let join = tokio::spawn(task.run(teardown.clone()));
+        (handle, teardown, join)
+    }
+
+    /// Everything the sink has taken, once it has taken `count` of them.
+    async fn taken_at_least(sink: &Recorder, count: usize) -> Vec<ScriptOut> {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let taken = sink.taken();
+                if taken.len() >= count {
+                    return taken;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the sink is offered the decided scripts")
+    }
+
+    /// The injected sink is handed exactly what the bus publish would have
+    /// carried: the encoded script, and the two numbers a consumer orders and
+    /// screens by, agreeing with the body's own fields.
+    #[tokio::test]
+    async fn an_injected_sink_receives_what_the_publisher_would_have_sent() {
+        let sink = Arc::new(Recorder::default());
+        let (handle, teardown, join) = sink_fixture(sink.clone()).await;
+
+        handle.send(ScriptInput::Wake(pod()));
+        let out = taken_at_least(&sink, 1).await.remove(0);
+
+        let body: serde_json::Value = serde_json::from_str(&out.body).expect("the body is JSON");
+        assert_eq!(body["type"], "motion-script");
+        assert_eq!(body["pod"], "pod-kitchen");
+        assert_eq!(body["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(body["timeout_ms"], 30_000);
+        assert_eq!(out.pod, "pod-kitchen");
+        assert_eq!(body["seq"].as_u64(), Some(out.seq));
+        // The same text the wire would carry, not a re-render of it.
+        assert_eq!(
+            MotionScript::decode(&out.body)
+                .expect("the sink's body decodes as the wire contract")
+                .seq(),
+            out.seq
+        );
+
+        assert_eq!(sink.started.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *sink.started_at_first_offer.lock().unwrap(),
+            Some(1),
+            "the sink is started before it is handed anything"
+        );
+
+        // The second decision of the same engagement: the raise that produced no
+        // turn comes down at the linger. Two scripts is what makes the seam's
+        // ordering observable — a consumer drops a script numbered below the last
+        // it accepted, so a sink wiring that reordered would be silent damage.
+        handle.send(ScriptInput::Unanswered(pod()));
+        let taken = taken_at_least(&sink, 2).await;
+        assert!(
+            taken[0].seq < taken[1].seq,
+            "the sink sees the decisions in the order they were decided: {taken:?}"
+        );
+        let closing: serde_json::Value =
+            serde_json::from_str(&taken[1].body).expect("the body is JSON");
+        assert_eq!(
+            closing["steps"],
+            json!([
+                { "after_ms": 0, "posture": "up" },
+                { "after_ms": 8_000, "posture": "stow" },
+            ]),
+            "the second script is the close, not a re-render of the raise"
+        );
+        assert_eq!(closing["seq"].as_u64(), Some(taken[1].seq));
+
+        teardown.cancel();
+        tokio::time::timeout(WAIT, join)
+            .await
+            .expect("the task stops when told to")
+            .expect("the task does not panic");
+        assert_eq!(
+            sink.closed.load(Ordering::Relaxed),
+            1,
+            "a stopped task tells its sink no more are coming"
+        );
     }
 }

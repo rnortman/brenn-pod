@@ -159,6 +159,32 @@ impl Peer {
         frame
     }
 
+    /// Read the next `Subscribe` and answer it with the kind `answer` picks for
+    /// the channel it names.
+    ///
+    /// For an embedder holding more than one subscription: the plane states
+    /// every hold it is given and the order they reach the socket in is its own,
+    /// not the caller's, so a test naming the channel it expects next would be
+    /// asserting on something nothing promises.
+    pub(crate) async fn answer_subscribe_with(
+        &mut self,
+        answer: impl Fn(&str) -> &'static str,
+    ) -> Value {
+        let frame = self.expect_frame("Subscribe").await;
+        let channel = frame["channel"]
+            .as_str()
+            .expect("a subscribe names a channel")
+            .to_owned();
+        let kind = answer(&channel);
+        self.say(json!({
+            "type": "SubscribeResult",
+            "channel": channel,
+            "outcome": { "kind": kind },
+            "replay_count": 0,
+        }));
+        frame
+    }
+
     /// Read the next `Publish` and answer it with `kind` — one of the outcome
     /// kinds that carry no fields (`"Ok"`, `"RateLimited"`, `"Failed"`); a sized
     /// refusal needs its own frame. Returns the frame, so the test can assert

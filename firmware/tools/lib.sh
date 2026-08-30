@@ -41,18 +41,6 @@ store_mount=/run/brenn-app
 # path the bench configuration is provisioned to; the daemon reads it in place.
 app_home=/var/lib/brenn-app
 
-# Where the motion daemon says which of starting, resting, active, parked and
-# stopping it is in, and whether its pre-torque sweeps are answering.
-#
-# A name rather than a path, because systemd takes it as one: RuntimeDirectory=
-# in the unit creates /run/<name> for the account on start and removes it on
-# stop, so a stopped or crashed service leaves no stale state behind for the
-# next reader to be misled by. A parked daemon deliberately does not exit —
-# clearing a fault is an operator's decision — so `systemctl is-active` calls it
-# running, and this file is the only thing that tells the two apart.
-motiond_runtime_dir=reachy-motiond
-motiond_state="/run/${motiond_runtime_dir}/state"
-
 # Fail with a headline and any number of indented detail lines.
 die() {
 	echo "${prog}: $1" >&2
@@ -158,65 +146,9 @@ ensure_builder_image() {
 		-- "${firmware_root}/containers/reachy-builder"
 }
 
-# What an active motion overlay looks like in the workspace manifest, and where
-# the clone it names has to appear inside the container. The patch paths are
-# relative to firmware/Cargo.toml, so `../../brenn-reachy` under
-# ${container_repo}/firmware resolves one level above the repo mount.
-#
-# These stand whether or not a table does: an absent table mounts nothing, so
-# the overlay costs a grep on the cycles between the cross-repo changes it
-# serves.
-motion_patch_marker='path = "../../brenn-reachy/'
-container_motion_repo=/brenn-reachy
-
-# The brenn-reachy clone this workspace works against, or a failure when there
-# is none. Beside this repository by default; REACHY_MOTION_REPO names it when
-# it is somewhere else.
-#
-# Two callers with two different reasons: the container builds mount it while
-# the manifest's [patch] table redirects the motion crates at it, and the
-# bring-up pushes the unit's bench configuration out of it. The refusal is each
-# caller's to write — what "there is no clone" means differs — so this answers
-# with a status and says nothing.
-motion_repo_root() {
-	local root=${REACHY_MOTION_REPO:-${repo_root}/../brenn-reachy}
-	[ -d "${root}/crates/reachy-bench" ] || return 1
-	(cd -- "$root" && pwd)
-}
-
-# The volume specification the motion overlay needs, or nothing when the
-# manifest carries no overlay to serve.
-#
-# Every build in this workspace needs it while the table stands, not only the
-# daemon's: a `[patch]` table is applied during workspace-wide resolution, so a
-# container that cannot see the clone fails to resolve before it compiles
-# anything at all.
-#
-# Read-only: these builds compile the clone's sources and write nothing back
-# into it. REACHY_MOTION_REPO names the clone when it is not beside this repo.
-motion_overlay_volume() {
-	grep -qF -- "$motion_patch_marker" "${firmware_root}/Cargo.toml" || return 0
-
-	local root
-	root=$(motion_repo_root) || die \
-		"the workspace manifest redirects the motion crates at a clone beside this repo, and there is none at ${REACHY_MOTION_REPO:-${repo_root}/../brenn-reachy}." \
-		"Clone brenn-reachy beside this repository, or name the clone for this invocation:" \
-		"    REACHY_MOTION_REPO=<path> make <target>"
-	echo "${root}:${container_motion_repo}:ro"
-}
-
 # Build one workspace package in the container.
 container_build() {
 	local tag=$1 package=$2
-	# Expanded as ${mounts[@]+…} below: an empty array under `set -u` is an
-	# unbound variable on bash before 4.4, and empty is what this becomes the
-	# day the overlay's table goes away.
-	local mounts=() overlay
-	overlay=$(motion_overlay_volume)
-	if [ -n "$overlay" ]; then
-		echo "${prog}: overlaying the motion clone at ${overlay%%:*}" >&2
-		mounts+=(--volume "$overlay")
-	fi
 	mkdir -p -- "$arm64_target_dir" "$arm64_cargo_home"
 
 	# Rootless podman, uid 0 inside its user namespace — host-side this grants
@@ -229,7 +161,6 @@ container_build() {
 		--pull=never \
 		--security-opt label=disable \
 		--volume "${repo_root}:${container_repo}" \
-		${mounts[@]+"${mounts[@]}"} \
 		--workdir "${container_repo}/firmware" \
 		--env "CARGO_TARGET_DIR=${container_repo}/firmware/target/reachy-arm64" \
 		--env "CARGO_HOME=${container_repo}/firmware/target/reachy-cargo-home" \

@@ -685,6 +685,17 @@ pub struct BrennConfig {
     /// exists on the bus.
     #[serde(default)]
     pub presence_channel: Option<String>,
+    /// Optional channel motion intent is subscribed to, for senders that are not
+    /// this process — a behavior component, an ops automation. Absent means no
+    /// subscription is stated and nothing arrives from the bus; a deployment
+    /// whose only author of motion is its own scripter leaves it unset.
+    ///
+    /// Distinct from [`BrennConfig::presence_channel`] only by direction: that
+    /// one is where this pod publishes scripts, this one is where it hears them.
+    /// A deployment doing both on one channel would feed itself, which the
+    /// distinctness check below refuses.
+    #[serde(default)]
+    pub motion_channel: Option<String>,
     /// How often the standing script is re-emitted while it still says
     /// something. A script lost in transit is repaired within one of these, and
     /// a hold script is kept clear of its own timeout by them. Must be greater
@@ -754,6 +765,9 @@ impl BrennConfig {
         }
         if let Some(presence) = &self.presence_channel {
             channels.push(("presence_channel", presence.as_str()));
+        }
+        if let Some(motion) = &self.motion_channel {
+            channels.push(("motion_channel", motion.as_str()));
         }
         channels
     }
@@ -2196,6 +2210,7 @@ model = "m"
         assert_eq!(brenn.wake_channel, None);
         assert_eq!(brenn.help_channel, None);
         assert_eq!(brenn.presence_channel, None);
+        assert_eq!(brenn.motion_channel, None);
         assert_eq!(brenn.presence_refresh_ms, 5_000);
         assert_eq!(brenn.presence_linger_ms, 8_000);
         assert_eq!(brenn.presence_max_engaged_ms, 30_000);
@@ -2231,6 +2246,7 @@ response_channel = "brenn:pod.speak"
 wake_channel = "brenn:pod.wake"
 help_channel = "brenn:pod.help"
 presence_channel = "brenn:reachy.presence"
+motion_channel = "brenn:reachy.intent"
 presence_refresh_ms = 4000
 presence_linger_ms = 6000
 presence_max_engaged_ms = 20000
@@ -2255,6 +2271,7 @@ max_backoff_ms = 9000
             brenn.presence_channel.as_deref(),
             Some("brenn:reachy.presence")
         );
+        assert_eq!(brenn.motion_channel.as_deref(), Some("brenn:reachy.intent"));
         assert_eq!(brenn.script_timing().refresh, Duration::from_secs(4));
         assert_eq!(brenn.script_timing().linger, Duration::from_secs(6));
         assert_eq!(brenn.script_timing().max_engaged, Duration::from_secs(20));
@@ -2327,6 +2344,7 @@ max_backoff_ms = 9000
                 "presence_channel",
                 "presence_channel = \"local:reachy.presence\"",
             ),
+            ("motion_channel", "motion_channel = \"reachy.intent\""),
         ] {
             let err = Config::parse(&with_addr(&brenn_table(line)))
                 .expect("parse")
@@ -2345,6 +2363,8 @@ max_backoff_ms = 9000
             "help_channel = \"brenn:pod.speak\"",
             "wake_channel = \"brenn:pod.wake\"\nhelp_channel = \"brenn:pod.wake\"",
             "presence_channel = \"brenn:pod.speak\"",
+            // Publishing scripts where this pod hears them would feed it its own.
+            "presence_channel = \"brenn:reachy.head\"\nmotion_channel = \"brenn:reachy.head\"",
         ] {
             let err = Config::parse(&with_addr(&brenn_table(line)))
                 .expect("parse")

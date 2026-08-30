@@ -12,7 +12,7 @@
 #   libasound2-dev     — reachy-pod links libasound (the board's ALSA capture and
 #                        playback ends).
 # The device lanes (check-device, build-firmware, flash) additionally need espup.
-# The reachy lanes (reachy-pod, reachy-motiond and the deploy targets below) need
+# The reachy lanes (reachy-pod and the deploy targets below) need
 # podman, an aarch64 binfmt_misc registration on a non-arm64 workstation, and
 # ssh + rsync.
 
@@ -80,12 +80,10 @@ check-host: check-host-arch
 # touches a pod is text processing, and a wrong answer there mis-files or duplicates a key
 # that exists nowhere else. No toolchain, no device, no network.
 	tools/provision-reachy-pod.test.sh
-# The motion daemon's deploy path, with ssh and rsync stubbed, plus the overlay mount every
-# container build in this workspace currently depends on. The sharp ones are the exit-status
-# passthrough — the daemon's verdict is the whole of what says a machine faulted — and the
-# unit text, which is where the restart policy and the conditions that keep a rebooted device
-# quiet are written down.
-	tools/deploy-reachy-motiond.test.sh
+# The payload's deploy path, with ssh and rsync stubbed. The sharp one is the refusal that
+# keeps a pod-only payload off a robot: the store slot is shared, so an activation there
+# would replace a five-app stack with a binary that cannot move the machine.
+	tools/deploy-reachy-pod.test.sh
 # The readiness check, against a fixture filesystem. It is trusted instead of a bench run, so
 # a check that quietly stopped being asked would read exactly like a check that passed.
 	tools/reachy-status.test.sh
@@ -265,107 +263,24 @@ reachy-bench: reachy-host reachy-pod
 reachy-logs: reachy-host
 	tools/deploy-reachy-pod.sh $(REACHY_HOST) --logs
 
-# ── The head-presence daemon: build, provision, deploy ───────────────────────
-#
-# A second Linux binary for the same unit, built in the same container and
-# pushed into the same executable store, and — like the payload — run as a
-# systemd service with no terminal attached anywhere. The daemon rests with the
-# motors unpowered, a wake word engages it, and every ending it has takes torque
-# off again, so nobody needs to be watching for the machine to end up safe.
-#
-# reachy-motiond-run is the other form: a supervised foreground run for bench
-# work, which is what the deploy target used to be. It refuses while the service
-# is up, and the servo port's flock refuses underneath it either way.
-#
-# The machine's own configuration is authored in brenn-reachy, not here — the
-# crank datum and the envelope describe one unit and have one source of truth.
-# reachy-bench-config pushes that clone's copy, so bringing a rebooted robot
-# back is one command in one repository.
-
-# The daemon's own configuration for this unit, and the bearer token it presents
-# to the bus. Both gitignored: one names the unit's identity and channel, the
-# other is a credential.
-MOTIOND_CONFIG ?= .local/reachy-motiond.toml
-MOTIOND_TOKEN ?= .local/motiond-token
-
-# The machine's own configuration. Empty by default, which is not "none": the
-# deploy script then takes the sibling brenn-reachy clone's gitignored
-# .local/reachy-bench.toml, the reviewed copy for this unit. Name a file here to
-# push another.
-BENCH_CONFIG ?=
-
-# The aarch64 binary, built in the pinned container. Needs podman; needs no
-# device. While the workspace's [patch] table redirects the motion crates at a
-# clone beside this repo, this needs that clone too — the build script mounts it
-# into the container and says so if it is not there.
-.PHONY: reachy-motiond
-reachy-motiond:
-	tools/build-reachy-motiond.sh
-
-# Give the unit the daemon's configuration, and the token it attaches with.
-# Needs no build, so either can run before or after one; idempotent, and a
-# reboot is answered by `make reachy-up` — the device's copies are in RAM.
-#
-# Neither restarts anything: the daemon reads its configuration once, so a
-# changed value takes effect at the next `make reachy-motiond-deploy`. The knob
-# map in docs/runbooks/reachy-end-to-end.md says which file owns which timing.
-.PHONY: reachy-motiond-config
-reachy-motiond-config: reachy-host
-	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --config $(MOTIOND_CONFIG)
-
-.PHONY: reachy-motiond-token
-reachy-motiond-token: reachy-host
-	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --token $(MOTIOND_TOKEN)
-
-# Push the machine's own configuration, out of the brenn-reachy clone that
-# authors it. Here rather than only there so one repository's `reachy-up` can
-# bring a rebooted robot all the way back.
-.PHONY: reachy-bench-config
-reachy-bench-config: reachy-host
-	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --bench-config $(BENCH_CONFIG)
-
-# Build, push into the executable store, install the unit and restart it — then
-# return. The daemon is left running under systemd; no terminal is holding it up
-# and none has to stay open.
-.PHONY: reachy-motiond-deploy
-reachy-motiond-deploy: reachy-host reachy-motiond
-	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --deploy
-
-# The supervised form: build, push, and run it in the foreground at the bench.
-# ARGS is passed to the daemon verbatim; with none it is given the configuration
-# reachy-motiond-config pushed. Refuses while the service is running — one
-# process at a time on the servo bus, and the port's flock says so underneath.
-#
-# ^C ends it, and so does `kill` or `systemctl stop`: SIGINT and SIGTERM are the
-# same signal to this daemon, and both stow the head and take torque off. The
-# terminal carries the narration only; the daemon's JSONL is captured on the
-# device — the run prints where, and how to fetch it — because the pty this
-# needs for ^C would otherwise merge the two streams into one.
-.PHONY: reachy-motiond-run
-reachy-motiond-run: reachy-host reachy-motiond
-	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --run $(ARGS)
-
-# Follow what the deployed daemon is saying. Its JSONL and its narration both
-# go to the journal in service mode; the capture file is the supervised run's
-# arrangement and exists only there.
-.PHONY: reachy-motiond-logs
-reachy-motiond-logs: reachy-host
-	tools/deploy-reachy-motiond.sh $(REACHY_HOST) --logs
-
-# ── The whole robot: one command up, one command to ask ──────────────────────
+# ── The pod on a unit: one command up, one command to ask ───────────────────
 #
 # A reboot clears every device path this repository writes to — the payload
 # store and the account's home are both RAM, by design — and recovering used to
-# take six commands across two repositories, each failure discovered only after
-# the previous one was fixed. This is that sequence, in order, with each step
-# already idempotent on its own.
+# take a command per file, each failure discovered only after the previous one
+# was fixed. This is that sequence, in order, with each step already idempotent
+# on its own.
 #
 # The order is the dependency order: the payload first (nothing else works
-# without it), then the three configurations, then the daemon's binary and unit
-# last, so the service starts with everything it reads already in place.
+# without it), then the configuration it reads, then the readiness check that
+# says whether the two arrived.
 #
 # Sub-makes rather than prerequisites: prerequisites may be satisfied in any
 # order, and this one is not any order.
+#
+# This is the pod's half of a robot. The motion stack on the same unit — its
+# payload, the machine's own configuration, and its own bring-up sequence — is
+# brenn-reachy's, and is brought back from that clone.
 #
 # The prose version, with what each step restores and what to do when one of
 # them refuses, is docs/runbooks/reachy-end-to-end.md.
@@ -373,15 +288,12 @@ reachy-motiond-logs: reachy-host
 reachy-up: reachy-host
 	$(MAKE) reachy-deploy
 	$(MAKE) reachy-provision
-	$(MAKE) reachy-bench-config
-	$(MAKE) reachy-motiond-config
-	$(MAKE) reachy-motiond-token
-	$(MAKE) reachy-motiond-deploy
 	$(MAKE) reachy-status
 
-# Is this robot ready? Read-only, one ssh, and it touches no servo — which is
-# the point: every refusal in this stack was correct and none of them was
-# reachable without torquing something first.
+# Is this unit's pod ready? Read-only, one ssh, and it touches nothing — which
+# is the point: every refusal in this stack was correct and none of them was
+# reachable without deploying something first. It answers for the audio half; a
+# robot's motion half answers to brenn-reachy's own tooling.
 .PHONY: reachy-status
 reachy-status: reachy-host
 	tools/reachy-status.sh $(REACHY_HOST)

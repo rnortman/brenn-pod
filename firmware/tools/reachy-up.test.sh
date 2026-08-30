@@ -2,15 +2,14 @@
 #
 # reachy-up.test.sh — host-only regression tests for the `reachy-up` target.
 #
-# `reachy-up` has no body beyond an ordering: payload, then the three
-# configurations, then the daemon's binary and unit, then the status check. The
-# order is the whole deliverable — six commands across two repositories became
-# one, and the one is only correct if the service starts after everything it
-# reads is already on the device. Reordered, or a line lost in a merge, and the
-# target still exits zero on a healthy robot and fails confusingly on the one it
-# exists for: `reachy-motiond-deploy` before `reachy-motiond-config` leaves
-# systemd's ConditionPathExists unmet, and a dropped `reachy-bench-config` puts
-# the daemon on a machine whose own configuration never arrived.
+# `reachy-up` has no body beyond an ordering: the payload, then the
+# configuration it reads, then the status check. The order is the whole
+# deliverable, and it is only correct if the pod is on the device before it is
+# given the address it dials and asked whether it is ready. Reordered, or a line
+# lost in a merge, and the target still exits zero on a healthy unit and fails
+# confusingly on the one it exists for: provisioning before the payload lands
+# writes a configuration nothing reads yet, and a dropped `reachy-provision`
+# leaves a pod waiting forever for an address.
 #
 # `make -n` is what makes this testable without a device: recipe lines are
 # printed rather than run, while lines naming $(MAKE) still recurse — so the
@@ -39,10 +38,6 @@ plan() {
 		*deploy-reachy-pod.sh*--selftest*) echo selftest ;;
 		*deploy-reachy-pod.sh*--bench*) echo bench-selftest ;;
 		*provision-reachy-pod.sh*) echo audio-conf ;;
-		*deploy-reachy-motiond.sh*--bench-config*) echo bench-config ;;
-		*deploy-reachy-motiond.sh*--config*) echo motiond-config ;;
-		*deploy-reachy-motiond.sh*--token*) echo motiond-token ;;
-		*deploy-reachy-motiond.sh*--deploy*) echo motiond-deploy ;;
 		*reachy-status.sh*) echo status ;;
 		esac
 	done
@@ -65,35 +60,22 @@ WANT=$(
 	cat <<'STEPS'
 payload
 audio-conf
-bench-config
-motiond-config
-motiond-token
-motiond-deploy
 status
 STEPS
 )
-check "reachy-up-is-the-seven-steps-in-order" "$(yes_no [ "$STEPS" = "$WANT" ])" \
+check "reachy-up-is-the-three-steps-in-order" "$(yes_no [ "$STEPS" = "$WANT" ])" \
 	"the plan was:"$'\n'"$STEPS"
 
 # Named on their own account, because each is a line somebody could drop while
 # the sequence still looked plausible.
-says "reachy-up-pushes-the-machine-own-configuration" 'deploy-reachy-motiond\.sh .*--bench-config'
-says "reachy-up-pushes-the-daemon-configuration" 'deploy-reachy-motiond\.sh .*--config'
-says "reachy-up-pushes-the-bus-token" 'deploy-reachy-motiond\.sh .*--token'
-says "reachy-up-ends-by-asking-whether-the-robot-is-ready" 'reachy-status\.sh'
+says "reachy-up-pushes-the-payload" 'deploy-reachy-pod\.sh .*--activate'
+says "reachy-up-provisions-the-pod" 'provision-reachy-pod\.sh'
+says "reachy-up-ends-by-asking-whether-the-pod-is-ready" 'reachy-status\.sh'
 
-# The service starts last of the daemon's steps: its unit's ConditionPathExists
-# lines name the configuration and the token, so a restart before they land is a
-# unit that stays dead and a deploy that refuses.
-at() { grep -n -E "$1" <<<"$OUT" | head -1 | cut -d: -f1; }
-DEPLOY_AT=$(at 'deploy-reachy-motiond\.sh .*--deploy')
-CONFIG_AT=$(at 'deploy-reachy-motiond\.sh .*--config')
-TOKEN_AT=$(at 'deploy-reachy-motiond\.sh .*--token')
-WHERE="config at ${CONFIG_AT:-nowhere}, token at ${TOKEN_AT:-nowhere}, deploy at ${DEPLOY_AT:-nowhere}"
-check "reachy-up-starts-the-service-after-its-configuration" \
-	"$(yes_no [ "${DEPLOY_AT:-0}" -gt "${CONFIG_AT:-0}" ])" "$WHERE"
-check "reachy-up-starts-the-service-after-its-token" \
-	"$(yes_no [ "${DEPLOY_AT:-0}" -gt "${TOKEN_AT:-0}" ])" "$WHERE"
+# Nothing in this sequence touches the motion stack: that half of a robot is
+# deployed from brenn-reachy, and a line here pretending to bring it back would
+# be a recovery that silently left the head dead.
+silent_about "reachy-up-brings-up-no-motion-stack" 'motiond|motion'
 
 # Nothing gates on a self-test record, so bringing the robot up does not run
 # one — a self-test is a supervised bench act, not a step in a recovery that
