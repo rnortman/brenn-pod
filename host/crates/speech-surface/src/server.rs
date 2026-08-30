@@ -48,6 +48,7 @@ use speech_pipeline::{
     WakeCommandReason, WakeError, WavBrain, audio_ms, stage_delta_us,
 };
 
+use crate::alerts::{Alert, AlertInbox};
 use crate::barge::TurnLedger;
 use crate::brenn::BridgeLink;
 use crate::brenn::driver::{BridgeDriver, DriverIo, DriverTokens, IntentSink};
@@ -364,6 +365,7 @@ pub struct Server {
     jsonl: JsonlHandle,
     tls: TlsAccept,
     sinks: Sinks,
+    alerts: Option<AlertInbox>,
     // A test-supplied router join handle that stands in for the real router task,
     // so a mid-run router exit can be driven without a live brain and channel.
     #[cfg(test)]
@@ -424,6 +426,7 @@ impl Server {
                 deadline: TLS_HANDSHAKE_DEADLINE,
             },
             sinks: Sinks::default(),
+            alerts: None,
             #[cfg(test)]
             router_override: None,
             #[cfg(test)]
@@ -439,6 +442,20 @@ impl Server {
     #[must_use]
     pub fn with_sinks(mut self, sinks: Sinks) -> Self {
         self.sinks = sinks;
+        self
+    }
+
+    /// Carry the composing process's operator alerts on this run's attachment.
+    ///
+    /// The other direction from [`Sinks`]: the robot keeps one bus attachment
+    /// rather than growing a second for its reporting.
+    ///
+    /// Unwired, nothing changes — the pod daemon raises no alerts of its own.
+    /// Wired on a run with no bus brain the inbox is drained by nobody, which is
+    /// said once (`alert_seam_unused`) rather than left as silence.
+    #[must_use]
+    pub fn with_alerts(mut self, inbox: AlertInbox) -> Self {
+        self.alerts = Some(inbox);
         self
     }
 
@@ -518,6 +535,7 @@ impl Server {
             jsonl,
             tls,
             sinks,
+            alerts,
             ..
         } = self;
 
@@ -778,6 +796,10 @@ impl Server {
         // token: it publishes scripts and subscribes to nothing, so it needs the
         // handle and no part of the driver's loop.
         let mut script_join: Option<tokio::task::JoinHandle<()>> = None;
+        // Taken by the arm that has a bridge to drain onto; still `Some` after
+        // the match means the composer supplied a seam this run cannot carry.
+        let mut alerts = alerts;
+        let mut alert_join: Option<tokio::task::JoinHandle<()>> = None;
         let driver_join = match (brenn_parts, brenn_brain) {
             (Some(parts), Some(brain)) => {
                 if let Some(Scripter { wiring, inbox, .. }) = scripter {
@@ -811,6 +833,17 @@ impl Server {
                         ),
                     };
                     script_join = Some(tokio::spawn(task.run(bridge_teardown.clone())));
+                }
+                // An alert is fire-and-forget: nothing in the driver's loop
+                // waits on one, so the drain runs on its own task with the same
+                // teardown token.
+                if let Some(inbox) = alerts.take() {
+                    alert_join = Some(tokio::spawn(drain_alerts(
+                        inbox,
+                        parts.bridge.handle.clone(),
+                        bridge_teardown.clone(),
+                        jsonl.clone(),
+                    )));
                 }
                 let driver = BridgeDriver::new(
                     parts.config,
@@ -846,6 +879,12 @@ impl Server {
                 )));
             }
         };
+        // Said once, for the same reason an unused script sink is: an operator
+        // surface that reaches the bus in one deployment and silently does not
+        // in another is diagnosed by nothing.
+        if alerts.is_some() {
+            jsonl.emit("alert_seam_unused", &json!({ "reason": "no bus brain" }));
+        }
         // Drops the real handle if any; the task stops on the teardown token.
         #[cfg(test)]
         let driver_join = driver_override.or(driver_join);
@@ -1127,10 +1166,15 @@ impl Server {
         // to shut down: a script task still holding a publish open past that
         // point would only earn itself a failure line.
         if let Some(join) = script_join {
-            handle_scripter_exit(join.await, &jsonl);
+            handle_task_exit(SCRIPT_TASK_EXITED, join.await, &jsonl);
+        }
+        // Same reason and the same moment: the alert task publishes through the
+        // handle the driver is about to shut down.
+        if let Some(join) = alert_join {
+            handle_task_exit(ALERT_TASK_EXITED, join.await, &jsonl);
         }
         if !driver_joined && let Some(join) = driver_join {
-            handle_driver_exit(join.await, &jsonl);
+            handle_task_exit(DRIVER_EXITED, join.await, &jsonl);
         }
 
         // Final `stage_health` after the pipeline drained, before the caller
@@ -1748,37 +1792,81 @@ fn adopt_bridge_fault(bridge_fatal: &OnceLock<String>, fatal: &mut Option<Pipeli
     }
 }
 
-/// Shared by the shutdown-path and mid-run reporters so the
-/// `brenn_driver_exited` line shape stays in one place.
-fn emit_driver_exited(jsonl: &JsonlHandle, reason: &str, detail: &str) {
-    jsonl.emit(
-        "brenn_driver_exited",
-        &json!({ "reason": reason, "detail": detail }),
-    );
-}
+/// The event name a dead bridge driver is reported under. Named because the
+/// shutdown-path join and the mid-run reporter both emit it.
+const DRIVER_EXITED: &str = "brenn_driver_exited";
 
-/// Report the bridge driver's terminal join result at the shutdown-path join. A
-/// clean return is silent; this line fires only when the task itself died,
-/// taking every future bus event with it unreported.
-fn handle_driver_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
-    if let Err(e) = result {
-        emit_driver_exited(jsonl, driver_exit_reason(&e), &e.to_string());
-    }
-}
-
-/// Report a script task that did not exit cleanly.
+/// The event name a dead script task is reported under.
 ///
 /// A dead task degrades to a head that never rises again — safe, because the
 /// standing script's timeout stows it — but the degradation is silent
 /// otherwise: the taps' `script_input_dropped` lines are the only trace, and
 /// only if somebody interacts afterwards. Whoever is diagnosing a head that
 /// stopped answering needs the death named.
-fn handle_scripter_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
+const SCRIPT_TASK_EXITED: &str = "script_task_exited";
+
+/// The event name a dead alert task is reported under: an operator surface that
+/// stopped reaching the bus looks exactly like one with nothing to report.
+const ALERT_TASK_EXITED: &str = "alert_task_exited";
+
+/// The line shape every dead-task report has, in one place.
+fn emit_task_exit(jsonl: &JsonlHandle, event: &str, reason: &str, detail: &str) {
+    jsonl.emit(event, &json!({ "reason": reason, "detail": detail }));
+}
+
+/// Report one composed task's terminal join result under its own event name.
+///
+/// A clean return is silent; the line fires only when the task itself died,
+/// taking whatever it carried with it unreported. One function over the three
+/// tasks the server joins at teardown, because what an operator needs from all
+/// three is the same two fields and a name saying which died — and a reporting
+/// shape that changes in one copy and not the others is a change nobody sees
+/// until the incident that reads these lines.
+fn handle_task_exit(event: &str, result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
     if let Err(e) = result {
+        emit_task_exit(jsonl, event, driver_exit_reason(&e), &e.to_string());
+    }
+}
+
+/// Carry the composing process's alerts onto the bus until the seam closes or
+/// the bridge is torn down.
+///
+/// Every alert is one line here as well as one frame on the wire: the composer
+/// narrates on a stream nobody on the bus reads, and this daemon's own log is
+/// where an operator looks when the two disagree about what was raised.
+async fn drain_alerts(
+    mut inbox: AlertInbox,
+    handle: brenn_bridge::BridgeHandle,
+    teardown: CancellationToken,
+    jsonl: JsonlHandle,
+) {
+    loop {
+        let Alert {
+            severity,
+            title,
+            body,
+        } = tokio::select! {
+            () = teardown.cancelled() => break,
+            next = inbox.next() => match next {
+                Some(alert) => alert,
+                // Every raiser dropped: the composer is done, and no alert can
+                // arrive again on this seam.
+                None => break,
+            },
+        };
         jsonl.emit(
-            "script_task_exited",
-            &json!({ "reason": driver_exit_reason(&e), "detail": e.to_string() }),
+            "alert_raised",
+            &json!({ "severity": severity, "title": title }),
         );
+        if handle.alert(severity, title, body).await.is_err() {
+            // The bridge is gone; this alert is dropped and no further one
+            // can land.
+            jsonl.emit(
+                "alert_seam_ended",
+                &json!({ "reason": "the bridge is gone" }),
+            );
+            break;
+        }
     }
 }
 
@@ -1817,7 +1905,7 @@ fn handle_driver_exit_midrun(
             format!("bridge driver died mid-run: {e}"),
         ),
     };
-    emit_driver_exited(jsonl, reason, &detail);
+    emit_task_exit(jsonl, DRIVER_EXITED, reason, &detail);
     fatal.get_or_insert(PipelineFatal { detail });
 }
 
@@ -3770,6 +3858,22 @@ mod tests {
         crate::brenn::scripted::Peer,
         tokio::sync::oneshot::Sender<()>,
     ) {
+        brenn_server_composed(dir, extra, sinks, None, jsonl).await
+    }
+
+    /// The same, with the alert seam's server half supplied too — the whole of
+    /// what a composing process hands this server.
+    async fn brenn_server_composed(
+        dir: &Path,
+        extra: &str,
+        sinks: Sinks,
+        alerts: Option<crate::alerts::AlertInbox>,
+        jsonl: JsonlHandle,
+    ) -> (
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        crate::brenn::scripted::Peer,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
         let token = dir.join("bus.token");
         crate::psk::write_secret_file(&token, "a-bearer-token\n").expect("write token");
         let text = brenn_text(dir, &token, extra);
@@ -3782,6 +3886,10 @@ mod tests {
         let server = server
             .with_brenn_override(tokio::spawn(bridge.run()), bridge_handle, events)
             .with_sinks(sinks);
+        let server = match alerts {
+            Some(inbox) => server.with_alerts(inbox),
+            None => server,
+        };
         let run = tokio::spawn(async move {
             server
                 .run(async move {
@@ -3925,6 +4033,181 @@ mod tests {
         assert!(
             events_named(&lines, "brenn_motion_channel_unwired").is_empty(),
             "the sink is wired: {lines:?}"
+        );
+    }
+
+    /// The alert seam's whole point: what a composing process raises reaches the
+    /// bus on the attachment this server already holds, so the robot keeps one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_raised_alert_reaches_the_bus_on_the_server_s_own_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let (raiser, inbox) = crate::alerts::alert_seam(crate::alerts::ALERT_QUEUE_DEPTH);
+
+        let (run, mut peer, stop) = brenn_server_composed(
+            dir.path(),
+            "",
+            Sinks::default(),
+            Some(inbox),
+            handle.clone(),
+        )
+        .await;
+
+        raiser
+            .raise(crate::alerts::Alert {
+                severity: brenn_bridge::AlertSeverity::Critical,
+                title: "the head is parked".to_owned(),
+                body: "a fault row ended the session".to_owned(),
+            })
+            .expect("the seam is live");
+
+        // Frame ordering between the driver's startup and the alert is
+        // nondeterministic; loop until the alert lands.
+        let frame = loop {
+            let frame = peer.next_frame().await;
+            match frame["type"].as_str() {
+                Some("Alert") => break frame,
+                Some("Subscribe") => {
+                    let channel = frame["channel"]
+                        .as_str()
+                        .expect("a subscribe names a channel");
+                    peer.say(json!({
+                        "type": "SubscribeResult",
+                        "channel": channel,
+                        "outcome": { "kind": "Ok" },
+                        "replay_count": 0,
+                    }));
+                }
+                other => panic!("unexpected frame before the alert: {other:?}"),
+            }
+        };
+        assert_eq!(frame["severity"], "critical");
+        assert_eq!(frame["title"], "the head is parked");
+        assert_eq!(frame["body"], "a fault row ended the session");
+
+        stop.send(()).unwrap();
+        run.await.unwrap().expect("a requested stop");
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        let raised = events_named(&lines, "alert_raised");
+        assert_eq!(
+            raised.len(),
+            1,
+            "the daemon's own log has it too: {lines:?}"
+        );
+        assert_eq!(raised[0]["severity"], "critical");
+        assert_eq!(raised[0]["title"], "the head is parked");
+        assert!(
+            events_named(&lines, "alert_seam_unused").is_empty(),
+            "the seam was drained: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "alert_task_exited").is_empty(),
+            "the task ended on its teardown token: {lines:?}"
+        );
+    }
+
+    /// A seam supplied to a run with no bus brain: there is no attachment to
+    /// carry an alert, and the composer is told rather than left raising into a
+    /// queue nothing reads. The mirror of `presence_sink_unused`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_alert_seam_without_a_bus_brain_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let (raiser, inbox) = crate::alerts::alert_seam(1);
+
+        let cfg = config(&dir.path().join("store"), false);
+        let (server, _addr, stop_tx, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
+        let server = server.with_alerts(inbox);
+        let run = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+
+        let said = wait_for_event(&path, "the unused alert seam", |v| {
+            v["event"] == "alert_seam_unused"
+        })
+        .await;
+        assert_eq!(said["reason"], "no bus brain");
+
+        stop_tx.send(()).unwrap();
+        run.await.unwrap().expect("a requested stop");
+        drop(handle);
+        join.await.unwrap();
+
+        // The inbox went with the run, so the composer's next raise says the
+        // seam is gone instead of appearing to have been carried.
+        assert_eq!(
+            raiser
+                .raise(crate::alerts::Alert {
+                    severity: brenn_bridge::AlertSeverity::Warning,
+                    title: "a refusal".to_owned(),
+                    body: "the session declined a script".to_owned(),
+                })
+                .expect_err("nothing is draining"),
+            crate::alerts::AlertRefused::Gone
+        );
+
+        let lines = read_lines(&path);
+        assert_eq!(
+            events_named(&lines, "alert_seam_unused").len(),
+            1,
+            "said once: {lines:?}"
+        );
+    }
+
+    /// The drain's third exit, and the one that runs when the operator surface
+    /// has actually failed: the bridge refuses the publish.
+    ///
+    /// Driven against a handle whose bridge was never run and then dropped, so
+    /// the command channel is closed and every publish answers `BridgeGone`.
+    /// The end is said once with its reason, and the loop *stops* rather than
+    /// turning every further alert into a log line and a failed publish. A
+    /// drain that kept going would be a busy loop in exactly the condition it
+    /// exists to report.
+    #[tokio::test]
+    async fn an_alert_drain_whose_bridge_is_gone_says_so_once_and_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let (raiser, inbox) = crate::alerts::alert_seam(4);
+        let (bridge, bridge_handle, _events, _peers) =
+            crate::brenn::scripted::scripted(&[crate::brenn::scripted::Attempt::Open], 1);
+        drop(bridge);
+
+        for title in ["the head is parked", "and again"] {
+            raiser
+                .raise(crate::alerts::Alert {
+                    severity: brenn_bridge::AlertSeverity::Critical,
+                    title: title.to_owned(),
+                    body: "a fault row ended the session".to_owned(),
+                })
+                .expect("the seam is live");
+        }
+
+        // Two alerts queued and the raiser then dropped, so a drain that did
+        // not break would carry the second one and end on the empty seam
+        // instead — which is what the two counts below tell apart, without this
+        // case ever being able to park on a queue nothing fills.
+        drop(raiser);
+        let teardown = CancellationToken::new();
+        drain_alerts(inbox, bridge_handle, teardown, handle.clone()).await;
+
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        let ended = events_named(&lines, "alert_seam_ended");
+        assert_eq!(ended.len(), 1, "said once: {lines:?}");
+        assert_eq!(ended[0]["reason"], "the bridge is gone");
+        assert_eq!(
+            events_named(&lines, "alert_raised").len(),
+            1,
+            "the loop broke on the first failed publish: {lines:?}"
         );
     }
 
@@ -4221,29 +4504,37 @@ mod tests {
         );
     }
 
+    /// Every task the server joins at teardown, under its own event name.
+    ///
+    /// One case over the three because one function reports them: a task that
+    /// stops on its teardown token returns cleanly and says nothing, and one
+    /// that died is named. What each death costs differs — the script task
+    /// takes the head's only source with it, the alert task takes the operator
+    /// surface, the driver takes every future bus event — and none of that is
+    /// visible in the line beyond which name it carries, which is what this
+    /// asserts.
     #[tokio::test]
-    async fn handle_scripter_exit_reports_a_dead_task() {
-        let dir = tempfile::tempdir().unwrap();
-        let (handle, join, path) = jsonl_file(dir.path()).await;
+    async fn handle_task_exit_reports_a_dead_task_under_its_own_name() {
+        for event in [DRIVER_EXITED, SCRIPT_TASK_EXITED, ALERT_TASK_EXITED] {
+            let dir = tempfile::tempdir().unwrap();
+            let (handle, join, path) = jsonl_file(dir.path()).await;
 
-        // A task that stops on its teardown token returns cleanly and says
-        // nothing. One that died takes the head's only script source with it,
-        // and the taps' drop lines are not a diagnosis.
-        handle_scripter_exit(Ok(()), &handle);
-        let panicker = tokio::spawn(async { panic!("scripter boom") });
-        handle_scripter_exit(panicker.await, &handle);
+            handle_task_exit(event, Ok(()), &handle);
+            let panicker = tokio::spawn(async { panic!("task boom") });
+            handle_task_exit(event, panicker.await, &handle);
 
-        drop(handle);
-        join.await.unwrap();
-        let lines = read_lines(&path);
-        let exited = events_named(&lines, "script_task_exited");
-        assert_eq!(exited.len(), 1);
-        assert_eq!(exited[0]["reason"], "panic");
-        assert!(
-            exited[0]["detail"].as_str().unwrap().contains("panic"),
-            "detail names the panic: {:?}",
-            exited[0]["detail"]
-        );
+            drop(handle);
+            join.await.unwrap();
+            let lines = read_lines(&path);
+            let exited = events_named(&lines, event);
+            assert_eq!(exited.len(), 1, "{event}: the clean return said nothing");
+            assert_eq!(exited[0]["reason"], "panic");
+            assert!(
+                exited[0]["detail"].as_str().unwrap().contains("panic"),
+                "{event}: detail names the panic: {:?}",
+                exited[0]["detail"]
+            );
+        }
     }
 
     /// The taps' queue and the task that drains it are wired from this one
@@ -4334,30 +4625,6 @@ mod tests {
         let absent = events_named(&lines, "presence_absent");
         assert_eq!(absent.len(), 1, "one line, from the middle case only");
         assert_eq!(absent[0]["reason"], "no presence_channel");
-    }
-
-    #[tokio::test]
-    async fn handle_driver_exit_reports_a_panicked_driver() {
-        let dir = tempfile::tempdir().unwrap();
-        let (handle, join, path) = jsonl_file(dir.path()).await;
-
-        // A clean return says nothing. A panic is the task itself dying, which
-        // nothing else names.
-        handle_driver_exit(Ok(()), &handle);
-        let panicker = tokio::spawn(async { panic!("driver boom") });
-        handle_driver_exit(panicker.await, &handle);
-
-        drop(handle);
-        join.await.unwrap();
-        let lines = read_lines(&path);
-        let exited = events_named(&lines, "brenn_driver_exited");
-        assert_eq!(exited.len(), 1);
-        assert_eq!(exited[0]["reason"], "panic");
-        assert!(
-            exited[0]["detail"].as_str().unwrap().contains("panic"),
-            "detail names the panic: {:?}",
-            exited[0]["detail"]
-        );
     }
 
     #[tokio::test]

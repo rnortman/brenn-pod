@@ -3,6 +3,7 @@
 //! config, server, recorder, pruning, JSONL sink, and the pipeline task — that
 //! the binaries assemble.
 
+pub mod alerts;
 mod barge;
 pub mod brenn;
 pub mod clip;
@@ -19,6 +20,8 @@ pub mod scripter;
 pub mod server;
 mod time;
 
+/// The operator-alert seam a composing process raises through.
+pub use alerts::{ALERT_QUEUE_DEPTH, Alert, AlertInbox, AlertRaiser, AlertRefused, alert_seam};
 /// The ledger reading the scripter schedules from; part of [`scripter::ScriptInput`].
 pub use barge::TurnAudio;
 pub use brenn::driver::{BridgeDriver, DriverIo, DriverTokens, IntentSink};
