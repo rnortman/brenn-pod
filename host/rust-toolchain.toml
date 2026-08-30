@@ -1,7 +1,20 @@
-# Workspace-scoped toolchain: stable for the host-architecture crates.
+# Workspace-scoped toolchain: an exact release for the host-architecture crates.
 # firmware/rust-toolchain.toml covers only the firmware workspace (rustup resolves
 # toolchain files from the invocation directory upward, and host/ is a sibling of
 # firmware/), so host/ needs its own pin — otherwise check-host-arch would run under
 # the machine's drifting rustup default, possibly the esp channel.
+#
+# An exact version rather than `stable`, which is an alias resolving to whatever the
+# machine running the gate happens to have. Clippy's default warn set grows with each
+# release, so under an alias the same tree lints clean on a developer's machine and
+# reds in CI on a lint the runner's newer compiler emits — the drift this file's
+# neighbours in .github/workflows/ci.yml already pin shellcheck and gitleaks against.
+# 1.97.1 is what brenn-reachy's `RUST_VERSION` says today, so both repos' gates run
+# one rustc -- a convention kept by hand, since nothing in either repo can check the
+# other. What is checked here is that this file, firmware/rust-toolchain.toml and the
+# toolchain ci.yml installs name one release: scripts/check-toolchain-pin.sh.
+# Bumping it is a deliberate commit that runs the full gate under the new compiler and
+# fixes what its lint set finds. rustup installs an exact-version toolchain on demand,
+# so a machine without it is healed by the next cargo invocation here.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"

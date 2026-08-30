@@ -14,8 +14,11 @@ pod-secrets = { path = "../../../firmware/crates/pod-secrets" }
 # manifest; the dependency edge still points one way — pod depends on brenn.
 brenn-bridge = { path = "../../../firmware/crates/brenn-bridge" }
 # The motion-script vocabulary: the timelines this side authors, and the
-# sequence-number rule both ends share.
-motion-proto = { path = "../../../firmware/crates/motion-proto" }
+# sequence-number rule both ends share. brenn-reachy owns the contract — the
+# process that executes a timeline is there — so this is a pin by revision rather
+# than a second editable copy. The edge points one way: this repo reads a schema
+# from that one, nothing there depends back.
+motion-proto = { git = "https://github.com/rnortman/brenn-reachy", rev = "fe67c1ff0f0e9215075db787082e8c86bcf8bb59" }
 # Wire decode (`decode_frame`) for replaying recorded frame logs offline.
 audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std"] }
 # The link's TLS-PSK parameters, shared with the device clients; re-exported as

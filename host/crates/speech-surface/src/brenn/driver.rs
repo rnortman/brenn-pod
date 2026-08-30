@@ -333,10 +333,15 @@ impl BridgeDriver {
     /// Decide what this run holds: the response channel always, and the motion
     /// intent channel when a sink is wired to take what arrives on it.
     ///
-    /// A configured channel with no sink is said out loud. Silently ignoring the
-    /// key would leave an operator who set it — or a wiring regression that
-    /// dropped the sink — with a head that never moves and a clean log, which is
-    /// the one diagnosis this stream exists to prevent.
+    /// Both halves of the mismatch are said out loud: a configured channel with
+    /// no sink, and a sink with no channel configured. Either way no remote
+    /// intent reaches the body, and silence would leave an operator who set the
+    /// key — or a deployment whose TOML omits it — with a head that never moves
+    /// for a remote sender and a clean log, which is the one diagnosis this
+    /// stream exists to prevent. Neither is fatal: the second is also the
+    /// ordinary shape of a deployment that scripts its own head and wants
+    /// nothing from the bus, so the line says what is not subscribed rather
+    /// than that something is wrong.
     fn state_holds(&mut self) {
         self.holds.push(Hold::new(
             self.response_channel.clone(),
@@ -352,7 +357,11 @@ impl BridgeDriver {
                 "brenn_motion_channel_unwired",
                 &json!({ "channel": channel }),
             ),
-            (None, _) => {}
+            (None, true) => self.jsonl.emit(
+                "brenn_motion_intents_unwired",
+                &json!({ "reason": "no brenn.motion_channel configured" }),
+            ),
+            (None, false) => {}
         }
     }
 
@@ -1435,6 +1444,12 @@ mod tests {
         .await;
         let line = expect_line(&fx.path, "brenn_motion_channel_unwired").await;
         assert_eq!(line["channel"], MOTION);
+        assert!(
+            lines(&fx.path)
+                .iter()
+                .all(|line| line["event"] != "brenn_motion_intents_unwired"),
+            "the other half of the mismatch is a different line"
+        );
         let _peer = fx.attached().await;
         expect_line(&fx.path, "brenn_subscribed").await;
 
@@ -1449,11 +1464,15 @@ mod tests {
 
     /// Unconfigured, nothing changes: a sink handed to a driver whose config
     /// names no motion channel buys no subscription, so only the response hold
-    /// is ever stated and nothing reaches the sink.
+    /// is ever stated and nothing reaches the sink — and the mirror of the
+    /// channel-with-no-sink line says so, because a host wired for remote intent
+    /// whose TOML omits the key has a dead path and no other trace of it.
     #[tokio::test]
     async fn no_motion_channel_states_no_subscription() {
         let sink = Arc::new(Intents::default());
         let mut fx = fixture_with(&[Attempt::Open], brenn_config(""), Some(sink.clone())).await;
+        let unwired = expect_line(&fx.path, "brenn_motion_intents_unwired").await;
+        assert_eq!(unwired["reason"], "no brenn.motion_channel configured");
         let _peer = fx.attached().await;
         expect_line(&fx.path, "brenn_subscribed").await;
 

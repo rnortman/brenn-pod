@@ -25,8 +25,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Both workspaces' rust-toolchain.toml name an exact release, so the gate's
+      # compiler is the tree's choice rather than the runner image's. Installed
+      # here with the two components `make check` runs, explicitly: relying on
+      # rustup's auto-install to carry rustfmt and clippy is the image-dependent
+      # behaviour the pin exists to remove. Swatinem/rust-cache keys on the rustc
+      # version, so a bump self-corrects the cache.
       - name: Install Rust
-        run: rustup component add rustfmt clippy
+        run: rustup toolchain install 1.97.1 --component rustfmt --component clippy
 
       # psk-link links openssl and reachy-pod links libusb and libasound, and
       # `make check`'s workspace-wide clippy/test builds all of them whether or not
@@ -148,9 +154,11 @@ jobs:
       ESPUP_VERSION: 0.17.1
       ESPUP_SHA256: dbe54e9907b687809dbe1b955731569ed6df2b525362710d676256c5c8cf9ccd
       # The Xtensa Rust toolchain espup installs under the name `esp`. Local dev runs a
-      # plain unpinned `espup install` and rust-toolchain.toml names only the channel, so
-      # pinning here changes nothing outside CI — it just keeps the lint verdict tied to
-      # a version a developer can install rather than to whatever shipped that morning.
+      # plain unpinned `espup install` and the device crate's rust-toolchain.toml names
+      # the `esp` channel without a version, so pinning here changes nothing outside CI —
+      # it just keeps the lint verdict tied to a version a developer can install rather
+      # than to whatever shipped that morning. The two stable workspaces get the same
+      # treatment from their own toolchain files, which name an exact release.
       ESP_TOOLCHAIN_VERSION: 1.96.0.0
       # Must match ESP_IDF_VERSION in the device crate's .cargo/config.toml, which
       # decides the installed ESP-IDF. Used here only to key the ~/.espressif cache;

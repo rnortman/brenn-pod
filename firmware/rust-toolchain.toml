@@ -1,5 +1,13 @@
-# Workspace-scoped toolchain: stable for host/library crates.
+# Workspace-scoped toolchain: an exact release for host/library crates.
 # The device crate overrides this with its own rust-toolchain.toml (channel = "esp")
 # when invoked from the crate directory.
+#
+# An exact version rather than `stable`, for the reason host/rust-toolchain.toml
+# states at length: `stable` is an alias, clippy's default warn set grows with each
+# release, and a gate whose compiler is whatever the runner shipped that morning is
+# not reproducible. 1.97.1 matches the host workspace -- which
+# scripts/check-toolchain-pin.sh holds it to, together with the toolchain ci.yml
+# installs -- and brenn-reachy's `RUST_VERSION`, which is a convention kept by hand
+# because nothing in either repo can read the other. rustup installs it on demand.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"

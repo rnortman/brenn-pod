@@ -1,7 +1,8 @@
 # firmware/Makefile — dev inner loop for the firmware workspace.
 #
-# Run from firmware/ (workspace root). The root rust-toolchain.toml pins stable,
-# so host targets run under stable Rust with no espup required.
+# Run from firmware/ (workspace root). The root rust-toolchain.toml pins an exact
+# stable release, so host targets run under that Rust with no espup required and
+# the gate's verdict does not move with the machine's rustup default.
 #
 # cargo's default-members ensures no-flag invocations build/test only host crates.
 #

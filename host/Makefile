@@ -1,7 +1,8 @@
 # host/Makefile — dev inner loop for the host-architecture workspace.
 #
-# Run from host/ (workspace root). host/rust-toolchain.toml pins stable, so every
-# target runs under stable Rust with no espup required. host/ is a standalone
+# Run from host/ (workspace root). host/rust-toolchain.toml pins an exact stable
+# release, so every target runs under that Rust with no espup required and the
+# gate's verdict does not move with the machine's rustup default. host/ is a standalone
 # workspace beside firmware/; the cross-workspace edge points one way only
 # (host consumes firmware/crates/audio-pipeline by path). firmware/Makefile's
 # check delegates here so a firmware-side change that breaks host is still caught.

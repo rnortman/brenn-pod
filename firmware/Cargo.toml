@@ -7,7 +7,6 @@ members = [
     "crates/device-protocol",
     "crates/build-id",
     "crates/hil-host",
-    "crates/motion-proto",
     "crates/pod-jsonl",
     "crates/pod-secrets",
     "crates/pod-streamer",
@@ -33,7 +32,7 @@ members = [
 # under --workspace, and its only consumer lives in host/, which is a separate workspace
 # covered by its own lane. pod-jsonl and pod-secrets are in: they are small, pure-Rust,
 # and everything else here can depend on them freely.
-default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/motion-proto", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
+default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
 resolver = "2"
 
 [workspace.package]

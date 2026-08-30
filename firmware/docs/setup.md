@@ -75,8 +75,9 @@ automatically in new shells.
 ## Dev loop: checks and tests
 
 All Makefile targets below run from `firmware/` (the workspace root). The workspace
-`rust-toolchain.toml` pins stable Rust, so host targets run on stock stable with no
-espup required. Only the device targets need the esp channel (resolved from
+`rust-toolchain.toml` pins an exact stable release (1.97.1), so host targets run on
+stock Rust with no espup required, and clippy's verdict is the same on every machine.
+rustup installs the pinned toolchain on demand. Only the device targets need the esp channel (resolved from
 `devices/respeaker-pod/rust-toolchain.toml`).
 
 ### `make check` (default)

@@ -1435,15 +1435,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "motion-proto"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

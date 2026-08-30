@@ -40,4 +40,10 @@ scripts/test-check-edition.sh
 echo "scripts/check.sh: running scripts/check-edition.sh"
 scripts/check-edition.sh
 
+echo "scripts/check.sh: running scripts/test-check-toolchain-pin.sh"
+scripts/test-check-toolchain-pin.sh
+
+echo "scripts/check.sh: running scripts/check-toolchain-pin.sh"
+scripts/check-toolchain-pin.sh
+
 run_shellcheck

@@ -50,7 +50,7 @@ use speech_pipeline::{
 
 use crate::barge::TurnLedger;
 use crate::brenn::BridgeLink;
-use crate::brenn::driver::{BridgeDriver, DriverIo, DriverTokens};
+use crate::brenn::driver::{BridgeDriver, DriverIo, DriverTokens, IntentSink};
 use crate::clip::{ClipError, load_clip};
 use crate::config::{BrainMode, Config, PskTable, SttBackend, SttConfig, TtsBackend};
 use crate::iso8601_ms;
@@ -61,7 +61,7 @@ use crate::playback_router::{
 };
 use crate::prune::{PruneOutcome, PruneRequest, prune};
 use crate::recorder::{OpenLogs, Recorder, RecorderShared};
-use crate::scripter::{ScriptHandle, ScriptInbox};
+use crate::scripter::{ScriptHandle, ScriptInbox, ScriptSink};
 
 /// Deadline for an accepted connection to send its first decodable frame. Until
 /// a valid `Hello` lands a connection holds an accept-gate permit but cannot be
@@ -327,6 +327,34 @@ impl PruneCoordinator {
     }
 }
 
+/// The seams a process composing this server fills in place of the bus.
+///
+/// Both are `None` for the pod daemon, which is the deployment this server was
+/// written for: its scripter publishes motion intent on the bus and it hears
+/// none. A process that holds a body of its own on the same machine as the
+/// scripter — the robot's voice host — supplies them instead, and the two sides
+/// of one motion path then meet in-process rather than crossing a bus that is
+/// not on this machine.
+///
+/// `Arc<dyn>` rather than a generic: the server holds one of each for the life
+/// of the run and hands it to a spawned task, and a type parameter would spread
+/// through every caller of [`Server::bind`] for nothing.
+#[derive(Clone, Default)]
+pub struct Sinks {
+    /// Where the scripter's decisions go instead of the bus publisher. Supplied,
+    /// it also *enables* the scripter, so a deployment that consumes its own
+    /// scripts need not name a channel it will never publish on. It still needs
+    /// the bus brain the draining task is spawned beside; a sink supplied
+    /// without one is unused, and says so (`presence_sink_unused`).
+    pub scripts: Option<Arc<dyn ScriptSink>>,
+    /// Where a motion intent body delivered on the bus goes. Wired only when the
+    /// configuration also names `brenn.motion_channel`: without the channel
+    /// there is no subscription and nothing to deliver, and a sink supplied
+    /// without one is reported (`brenn_motion_intents_unwired`) rather than
+    /// left silently dead.
+    pub intents: Option<Arc<dyn IntentSink>>,
+}
+
 /// A bound TCP listener plus the shared config and observability sink. Split
 /// from `run` so an ephemeral-port bind exposes its address before serving
 /// (the accept loop can then be driven and shut down in tests).
@@ -335,6 +363,7 @@ pub struct Server {
     config: Arc<Config>,
     jsonl: JsonlHandle,
     tls: TlsAccept,
+    sinks: Sinks,
     // A test-supplied router join handle that stands in for the real router task,
     // so a mid-run router exit can be driven without a live brain and channel.
     #[cfg(test)]
@@ -394,6 +423,7 @@ impl Server {
                 ssl: Arc::new(ssl),
                 deadline: TLS_HANDSHAKE_DEADLINE,
             },
+            sinks: Sinks::default(),
             #[cfg(test)]
             router_override: None,
             #[cfg(test)]
@@ -403,6 +433,13 @@ impl Server {
             #[cfg(test)]
             driver_override: None,
         })
+    }
+
+    /// Run with the caller's own motion seams instead of the bus.
+    #[must_use]
+    pub fn with_sinks(mut self, sinks: Sinks) -> Self {
+        self.sinks = sinks;
+        self
     }
 
     #[cfg(test)]
@@ -480,6 +517,7 @@ impl Server {
             config,
             jsonl,
             tls,
+            sinks,
             ..
         } = self;
 
@@ -570,9 +608,8 @@ impl Server {
         // utterance).
         let turn_ledger = Arc::new(TurnLedger::new());
 
-        // The head's taps, on the one condition that also decides whether the
-        // task owning the queue's other end is spawned.
-        let (script_channel, script_handle, script_inbox) = build_scripter(&config, &jsonl);
+        let scripter = build_scripter(&config, &jsonl, sinks.scripts.clone());
+        let script_handle = scripter.as_ref().map(|scripter| scripter.handle.clone());
 
         // Turns each writer's `PlaybackEvent`s into JSONL lines, and fans the same
         // events out to the listener's playback floor and the ledger. Built once
@@ -743,14 +780,36 @@ impl Server {
         let mut script_join: Option<tokio::task::JoinHandle<()>> = None;
         let driver_join = match (brenn_parts, brenn_brain) {
             (Some(parts), Some(brain)) => {
-                if let (Some(inbox), Some(channel)) = (script_inbox, script_channel) {
-                    let task = crate::scripter::ScriptTask::new(
-                        parts.config,
-                        channel,
-                        parts.bridge.handle.clone(),
-                        inbox,
-                        jsonl.clone(),
-                    );
+                if let Some(Scripter { wiring, inbox, .. }) = scripter {
+                    let task = match wiring {
+                        ScripterWiring::Sink {
+                            sink,
+                            unpublished_channel,
+                        } => {
+                            // Said once, because a channel named and never
+                            // published on is otherwise a silence nothing
+                            // explains.
+                            if let Some(channel) = unpublished_channel {
+                                jsonl.emit(
+                                    "presence_sink_wired",
+                                    &json!({ "unpublished_channel": channel }),
+                                );
+                            }
+                            crate::scripter::ScriptTask::with_sink(
+                                parts.config,
+                                sink,
+                                inbox,
+                                jsonl.clone(),
+                            )
+                        }
+                        ScripterWiring::Bus(channel) => crate::scripter::ScriptTask::new(
+                            parts.config,
+                            channel,
+                            parts.bridge.handle.clone(),
+                            inbox,
+                            jsonl.clone(),
+                        ),
+                    };
                     script_join = Some(tokio::spawn(task.run(bridge_teardown.clone())));
                 }
                 let driver = BridgeDriver::new(
@@ -764,6 +823,10 @@ impl Server {
                     },
                     jsonl.clone(),
                 );
+                let driver = match sinks.intents.clone() {
+                    Some(sink) => driver.with_intents(sink),
+                    None => driver,
+                };
                 Some(tokio::spawn(driver.run(DriverIo {
                     events: parts.bridge.events,
                     notices: parts.notices,
@@ -1125,49 +1188,111 @@ fn listener_absent_reason(config: &Config) -> &'static str {
     }
 }
 
-/// The head's scripting pieces. All three come from the single
-/// [`presence_channel`] answer, so the site that mints the queue and the site
-/// that spawns its drain cannot disagree.
+/// Where a scripter's decisions go: the bus channel they are published on, or
+/// the sink the composing process handed in.
 ///
-/// The `None` path emits `presence_absent` when the bus brain is configured
-/// without a channel — without it, the head is silently unscripted and a
-/// bring-up bench gives no clue why. No line when `[brenn]` is absent
-/// entirely: the pod's own absence lines already cover that.
+/// One value rather than a channel and a sink read separately, because the two
+/// are alternatives and the site that spawns the drain has to pick exactly one.
+enum ScripterWiring {
+    /// Published on this channel, over the bus brain's bridge.
+    Bus(String),
+    /// Handed to this sink in-process. `unpublished_channel` is the channel the
+    /// configuration also named and this deployment will not publish on — the
+    /// sink wins, because the wiring is code and the channel is a file.
+    Sink {
+        sink: Arc<dyn ScriptSink>,
+        unpublished_channel: Option<String>,
+    },
+}
+
+/// The head's scripting pieces.
+///
+/// One value, so the queue, its other end and the wiring they serve cannot be
+/// half-present: a minted queue whose drain was never spawned turns every tap
+/// into a `script_input_dropped` line for the life of the process, and holding
+/// the three in separate `Option`s is what would let that happen.
+struct Scripter {
+    wiring: ScripterWiring,
+    handle: ScriptHandle,
+    inbox: ScriptInbox,
+}
+
+/// Decide the head's scripting: a supplied sink over the bus brain, else a
+/// configured presence channel, else nothing.
+///
+/// Both conditions require a bus brain *and* a `[brenn]` table, because the task
+/// that drains the queue is spawned in the arm that builds the bridge, and that
+/// arm needs both; a head scripted without them would be a queue nothing reads.
+/// The pair is spelled out here rather than inherited from `presence_channel`,
+/// so the precondition sits in the function that depends on it instead of in
+/// `Config::validate`, which is free to change its own rules. A sink stands in
+/// for the channel because an embedder that consumes its own scripts has
+/// somewhere for them to go, and requiring it to name a bus channel it never
+/// publishes on would be a fiction in every operator's configuration file.
+///
+/// The `None` path is never silent when there was something to say. A supplied
+/// sink that goes unused is `presence_sink_unused` naming which half of the
+/// precondition is missing: the embedder asked for a scripted head, got none,
+/// and the sink is never even started. A configured bus brain with no channel
+/// and no sink is `presence_absent`. No line when `[brenn]` is absent entirely
+/// and nobody supplied a sink: the pod's own absence lines already cover that.
 fn build_scripter(
     config: &Config,
     jsonl: &JsonlHandle,
-) -> (Option<String>, Option<ScriptHandle>, Option<ScriptInbox>) {
-    match presence_channel(config) {
-        Some(channel) => {
-            let channel = channel.to_owned();
-            let (handle, inbox) = crate::scripter::channel(jsonl.clone());
-            (Some(channel), Some(handle), Some(inbox))
+    sink: Option<Arc<dyn ScriptSink>>,
+) -> Option<Scripter> {
+    let channel = presence_channel(config).map(ToOwned::to_owned);
+    let sink_supplied = sink.is_some();
+    let wiring = match (sink, channel) {
+        (Some(sink), unpublished_channel) if bus_brain(config) && config.brenn.is_some() => {
+            ScripterWiring::Sink {
+                sink,
+                unpublished_channel,
+            }
         }
-        None => {
-            if config.brenn.is_some() {
+        (_, Some(channel)) => ScripterWiring::Bus(channel),
+        _ => {
+            if sink_supplied {
+                let reason = if bus_brain(config) {
+                    "no [brenn] table"
+                } else {
+                    "no bus brain"
+                };
+                jsonl.emit("presence_sink_unused", &json!({ "reason": reason }));
+            } else if config.brenn.is_some() {
                 jsonl.emit(
                     "presence_absent",
                     &json!({ "reason": "no presence_channel" }),
                 );
             }
-            (None, None, None)
+            return None;
         }
-    }
+    };
+    let (handle, inbox) = crate::scripter::channel(jsonl.clone());
+    Some(Scripter {
+        wiring,
+        handle,
+        inbox,
+    })
+}
+
+/// Whether the brain answers over the bus.
+///
+/// The condition behind both halves of the scripter's existence: the task is
+/// spawned in the arm that builds the bridge, so a head scripted in any other
+/// mode would be a queue with nothing draining it.
+fn bus_brain(config: &Config) -> bool {
+    config.brain.as_ref().map(|brain| brain.mode) == Some(BrainMode::Brenn)
 }
 
 /// The channel motion scripts are published on, or `None` when the head is not
 /// scripted.
 ///
-/// One derivation, read by both the site that mints the taps' queue and the
-/// site — a couple of hundred lines away, inside the bus-brain arm — that
-/// spawns the task owning its other end. Two derivations of the same condition
-/// can drift, and drift here is silent: a queue whose receiver was never
-/// spawned turns every tap into a `script_input_dropped` line, for every wake
-/// and every playback event, for the life of the process. The brenn-mode
-/// condition is part of it because the task publishes over the bus brain's
-/// bridge, and nothing else builds one.
+/// One of the two answers [`build_scripter`] decides the wiring from, the other
+/// being a supplied sink. The brenn-mode condition is part of it because the
+/// task publishes over the bus brain's bridge, and nothing else builds one.
 fn presence_channel(config: &Config) -> Option<&str> {
-    if config.brain.as_ref().map(|brain| brain.mode) != Some(BrainMode::Brenn) {
+    if !bus_brain(config) {
         return None;
     }
     config.brenn.as_ref()?.presence_channel.as_deref()
@@ -3596,6 +3721,398 @@ mod tests {
         assert_eq!(exit[0]["fatal"], true);
     }
 
+    /// A sink standing where the bus would be, for both motion directions:
+    /// scripts the scripter decided, and intent bodies the bus delivered.
+    #[derive(Default)]
+    struct Recording {
+        started: AtomicBool,
+        closed: AtomicBool,
+        bodies: Mutex<Vec<String>>,
+        scripts: Mutex<Vec<crate::scripter::ScriptOut>>,
+    }
+
+    impl ScriptSink for Recording {
+        fn start(&self) {
+            self.started.store(true, Ordering::SeqCst);
+        }
+
+        fn offer(&self, out: crate::scripter::ScriptOut) {
+            self.scripts.lock().expect("the sink's lock").push(out);
+        }
+
+        fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl IntentSink for Recording {
+        fn deliver(&self, body: &str) -> Result<(), &'static str> {
+            self.bodies
+                .lock()
+                .expect("the sink's lock")
+                .push(body.to_owned());
+            Ok(())
+        }
+    }
+
+    /// A running server whose motion path is `sinks` instead of the bus, over a
+    /// scripted peer. `extra` goes into the `[brenn]` table.
+    ///
+    /// Everything but the bus socket is the production wiring: the same
+    /// `Server::run`, the same scripter spawn, the same driver.
+    async fn brenn_server_with_sinks(
+        dir: &Path,
+        extra: &str,
+        sinks: Sinks,
+        jsonl: JsonlHandle,
+    ) -> (
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        crate::brenn::scripted::Peer,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let token = dir.join("bus.token");
+        crate::psk::write_secret_file(&token, "a-bearer-token\n").expect("write token");
+        let text = brenn_text(dir, &token, extra);
+        let cfg = test_config(&text).expect("config parses");
+        cfg.validate().expect("the daemon would accept it");
+
+        let (bridge, bridge_handle, events, mut peers) =
+            crate::brenn::scripted::scripted(&[crate::brenn::scripted::Attempt::Open], 3);
+        let (server, _addr, stop_tx, stop_rx) = bind_with_stop(Arc::new(cfg), jsonl, None).await;
+        let server = server
+            .with_brenn_override(tokio::spawn(bridge.run()), bridge_handle, events)
+            .with_sinks(sinks);
+        let run = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+        let mut peer = peers.pop_front().expect("the script opens a socket");
+        peer.handshake().await;
+        (run, peer, stop_tx)
+    }
+
+    /// The seam's first half: a supplied script sink is the one the scripter
+    /// task runs over, and it needs no `presence_channel` to exist. Without the
+    /// sink this configuration scripts nothing at all — the `presence_absent`
+    /// assertion is what pins that the sink is why the task is there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_supplied_script_sink_scripts_a_head_with_no_channel_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let sink = Arc::new(Recording::default());
+
+        let (run, _peer, stop) = brenn_server_with_sinks(
+            dir.path(),
+            "",
+            Sinks {
+                scripts: Some(sink.clone()),
+                intents: None,
+            },
+            handle.clone(),
+        )
+        .await;
+
+        poll_until("the supplied sink is started", || {
+            sink.started.load(Ordering::SeqCst).then_some(())
+        })
+        .await;
+
+        stop.send(()).unwrap();
+        run.await.unwrap().expect("a requested stop");
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        assert!(
+            events_named(&lines, "presence_absent").is_empty(),
+            "a sink is somewhere for scripts to go: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "presence_sink_wired").is_empty(),
+            "nothing to say with no channel configured: {lines:?}"
+        );
+        assert!(
+            sink.closed.load(Ordering::SeqCst),
+            "the task closed the sink it was started over"
+        );
+    }
+
+    /// A channel named beside a supplied sink: the sink wins, and the channel
+    /// that will never carry a script is named once. Silence here would be a
+    /// head that moves while an operator watches a bus channel for the reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sink_beside_a_configured_channel_says_which_channel_goes_unpublished() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let sink = Arc::new(Recording::default());
+
+        let (run, _peer, stop) = brenn_server_with_sinks(
+            dir.path(),
+            "presence_channel = \"brenn:pod.presence\"\n",
+            Sinks {
+                scripts: Some(sink.clone()),
+                intents: None,
+            },
+            handle.clone(),
+        )
+        .await;
+
+        let said = wait_for_event(&path, "the unpublished channel", |v| {
+            v["event"] == "presence_sink_wired"
+        })
+        .await;
+        assert_eq!(said["unpublished_channel"], "brenn:pod.presence");
+        assert!(
+            sink.started.load(Ordering::SeqCst),
+            "the sink, not the publisher, is what the task runs over"
+        );
+
+        stop.send(()).unwrap();
+        run.await.unwrap().expect("a requested stop");
+        drop(handle);
+        join.await.unwrap();
+    }
+
+    /// The seam's other half: a body delivered on the configured motion channel
+    /// reaches the supplied intent sink verbatim, through the production driver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_motion_delivery_reaches_the_supplied_intent_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let sink = Arc::new(Recording::default());
+
+        let (run, mut peer, stop) = brenn_server_with_sinks(
+            dir.path(),
+            "motion_channel = \"brenn:pod.motion\"\n",
+            Sinks {
+                scripts: None,
+                intents: Some(sink.clone()),
+            },
+            handle.clone(),
+        )
+        .await;
+
+        // Two holds, stated in the plane's own order: the response channel and
+        // the motion one.
+        peer.answer_subscribe_with(|_| "Ok").await;
+        peer.answer_subscribe_with(|_| "Ok").await;
+        let body = r#"{"pod":"kitchen-reachy","seq":7,"steps":[],"timeout_ms":13000}"#;
+        peer.deliver("brenn:pod.motion", body, 1);
+
+        let taken = poll_until("the delivered body", || {
+            sink.bodies
+                .lock()
+                .expect("the sink's lock")
+                .first()
+                .cloned()
+        })
+        .await;
+        assert_eq!(taken, body, "the sink sees the body the bus carried");
+
+        stop.send(()).unwrap();
+        run.await.unwrap().expect("a requested stop");
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        assert!(
+            events_named(&lines, "brenn_delivery_dropped").is_empty(),
+            "a body the sink took is not a drop: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "brenn_motion_channel_unwired").is_empty(),
+            "the sink is wired: {lines:?}"
+        );
+    }
+
+    /// A sink supplied where the brain does not answer over the bus scripts
+    /// nothing: the task that would drain the queue is spawned in the arm that
+    /// builds the bridge, so a queue minted here would be one nothing reads.
+    ///
+    /// It is said out loud. The embedder supplied a sink, gets a head that never
+    /// moves, and the sink is never even started — with no line, the whole
+    /// diagnosis is a robot that talks and does not look up.
+    #[tokio::test]
+    async fn a_sink_without_a_bus_brain_mints_no_scripter_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&dir.path().join("store"), false);
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let sink: Arc<dyn ScriptSink> = Arc::new(Recording::default());
+        assert!(build_scripter(&cfg, &handle, Some(sink)).is_none());
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let unused = events_named(&lines, "presence_sink_unused");
+        assert_eq!(unused.len(), 1, "the unused sink is named once: {lines:?}");
+        assert_eq!(unused[0]["reason"], "no bus brain");
+    }
+
+    /// The other half of the same precondition: `mode = "brenn"` with no
+    /// `[brenn]` table. `Config::validate` refuses that shape, so the server
+    /// never reaches here with it — but the arm that spawns the draining task
+    /// needs the table, and the rule that keeps it out lives in another module.
+    /// Asserted here so the two cannot part company silently.
+    #[tokio::test]
+    async fn a_sink_in_bus_mode_with_no_brenn_table_mints_no_scripter_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "listen_addr = \"127.0.0.1:0\"\n\
+             [record]\nenabled = false\ndir = {:?}\n\
+             [brain]\nmode = \"brenn\"\n",
+            dir.path().join("store").to_str().unwrap(),
+        );
+        let cfg = test_config(&text).expect("config parses");
+        cfg.validate()
+            .expect_err("the daemon refuses brenn mode with no [brenn] table");
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let sink: Arc<dyn ScriptSink> = Arc::new(Recording::default());
+        assert!(build_scripter(&cfg, &handle, Some(sink)).is_none());
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let unused = events_named(&lines, "presence_sink_unused");
+        assert_eq!(unused.len(), 1, "the unused sink is named once: {lines:?}");
+        assert_eq!(unused[0]["reason"], "no [brenn] table");
+    }
+
+    /// The queue [`build_scripter`] mints is drained by the task it hands the
+    /// other end to. A `Scripter` carries one `channel()`'s two ends, and the
+    /// spawn site clones the handle into the taps and gives the inbox to the
+    /// task — so a decision sent on that handle has to come out of the sink.
+    /// Mismatch them and every tap is a `script_input_dropped` line for the life
+    /// of the process, with a started, closed, never-offered sink to show for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_minted_queue_is_the_one_the_sink_task_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = brenn_config(dir.path());
+        let (handle, join, _path) = jsonl_file(dir.path()).await;
+        let sink = Arc::new(Recording::default());
+
+        let Scripter {
+            handle: taps,
+            inbox,
+            ..
+        } = build_scripter(&cfg, &handle, Some(sink.clone()))
+            .expect("a sink over a bus brain scripts the head");
+        let teardown = CancellationToken::new();
+        let task = crate::scripter::ScriptTask::with_sink(
+            cfg.brenn.as_ref().expect("the bus brain's table"),
+            sink.clone(),
+            inbox,
+            handle.clone(),
+        );
+        let run = tokio::spawn(task.run(teardown.clone()));
+
+        taps.send(crate::scripter::ScriptInput::Wake(PodId(String::from(
+            "pod-srv",
+        ))));
+
+        let out = poll_until("the wake's script reaches the sink", || {
+            sink.scripts
+                .lock()
+                .expect("the sink's lock")
+                .first()
+                .cloned()
+        })
+        .await;
+        let body: serde_json::Value =
+            serde_json::from_str(&out.body).expect("the offered body is JSON");
+        assert_eq!(body["pod"], "pod-srv");
+        assert_eq!(body["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+
+        teardown.cancel();
+        run.await.unwrap();
+        // The taps' end of the queue holds a JSONL handle of its own, and the
+        // writer joins only when the last one is gone.
+        drop(taps);
+        drop(handle);
+        join.await.unwrap();
+    }
+
+    /// Both seams filled at once — the shape `Sinks` exists for, and the one the
+    /// robot's voice host runs. Each half is asserted elsewhere in isolation;
+    /// what this one adds is that neither suppresses the other when the config
+    /// names a presence channel and a motion channel together.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn both_motion_seams_are_wired_in_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let sink = Arc::new(Recording::default());
+
+        let (run, mut peer, stop) = brenn_server_with_sinks(
+            dir.path(),
+            "presence_channel = \"brenn:pod.presence\"\n\
+             motion_channel = \"brenn:pod.motion\"\n",
+            Sinks {
+                scripts: Some(sink.clone()),
+                intents: Some(sink.clone()),
+            },
+            handle.clone(),
+        )
+        .await;
+
+        // Three holds in the plane's own order: the response channel, then the
+        // motion one. The presence channel is published on, never subscribed.
+        peer.answer_subscribe_with(|_| "Ok").await;
+        peer.answer_subscribe_with(|_| "Ok").await;
+
+        let said = wait_for_event(&path, "the unpublished channel", |v| {
+            v["event"] == "presence_sink_wired"
+        })
+        .await;
+        assert_eq!(said["unpublished_channel"], "brenn:pod.presence");
+
+        poll_until("the script sink is started", || {
+            sink.started.load(Ordering::SeqCst).then_some(())
+        })
+        .await;
+
+        let body = r#"{"pod":"kitchen-reachy","seq":9,"steps":[],"timeout_ms":13000}"#;
+        peer.deliver("brenn:pod.motion", body, 1);
+        let taken = poll_until("the delivered body", || {
+            sink.bodies
+                .lock()
+                .expect("the sink's lock")
+                .first()
+                .cloned()
+        })
+        .await;
+        assert_eq!(
+            taken, body,
+            "the intent seam carries while the script seam is wired"
+        );
+
+        stop.send(()).unwrap();
+        run.await.unwrap().expect("a requested stop");
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        assert!(
+            events_named(&lines, "brenn_motion_channel_unwired").is_empty(),
+            "both seams are wired: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "brenn_motion_intents_unwired").is_empty(),
+            "both seams are wired: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "presence_sink_unused").is_empty(),
+            "the script sink is the one the task runs over: {lines:?}"
+        );
+        assert!(
+            sink.closed.load(Ordering::SeqCst),
+            "the task closed the sink it was started over"
+        );
+    }
+
     #[tokio::test]
     async fn build_transcriber_absent_returns_none_and_emits_line() {
         let dir = tempfile::tempdir().unwrap();
@@ -3782,18 +4299,18 @@ mod tests {
             "presence_channel = \"brenn:head\"\n",
         ))
         .expect("config parses");
-        let (channel, taps, inbox) = build_scripter(&with, &handle);
-        assert_eq!(channel.as_deref(), Some("brenn:head"));
-        assert!(taps.is_some() && inbox.is_some());
-        drop((taps, inbox));
+        let scripter = build_scripter(&with, &handle, None).expect("a named channel scripts");
+        assert!(
+            matches!(&scripter.wiring, ScripterWiring::Bus(channel) if channel == "brenn:head"),
+            "a channel and no sink publishes on the bus"
+        );
+        drop(scripter);
 
         let without = test_config(&brenn_text(dir.path(), &token, "")).expect("config parses");
-        let (channel, taps, inbox) = build_scripter(&without, &handle);
-        assert!(channel.is_none() && taps.is_none() && inbox.is_none());
+        assert!(build_scripter(&without, &handle, None).is_none());
 
         let no_brenn = config(&dir.path().join("store"), false);
-        let (channel, taps, inbox) = build_scripter(&no_brenn, &handle);
-        assert!(channel.is_none() && taps.is_none() && inbox.is_none());
+        assert!(build_scripter(&no_brenn, &handle, None).is_none());
 
         // The fourth shape, and the premise the reason above rests on: a
         // `[brenn]` table carrying a channel under another brain mode wires

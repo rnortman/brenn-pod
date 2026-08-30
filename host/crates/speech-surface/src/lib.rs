@@ -41,6 +41,8 @@ pub use scripter::{
     BusSink, Cause, Now, SCRIPT_QUEUE_DEPTH, ScriptHandle, ScriptInbox, ScriptInput, ScriptOut,
     ScriptPublish, ScriptSink, ScriptTask, ScriptTiming, Scripter,
 };
+/// The motion seams a composing process fills in place of the bus.
+pub use server::Sinks;
 
 /// Shared `Segment` builder for the crate's test modules. `Segment` grows a
 /// field per increment (`StageTimings` especially), so keeping one constructor
