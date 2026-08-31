@@ -21,7 +21,9 @@ pub mod server;
 mod time;
 
 /// The operator-alert seam a composing process raises through.
-pub use alerts::{ALERT_QUEUE_DEPTH, Alert, AlertInbox, AlertRaiser, AlertRefused, alert_seam};
+pub use alerts::{
+    ALERT_QUEUE_DEPTH, Alert, AlertInbox, AlertRaiser, AlertRefused, AlertSeverity, alert_seam,
+};
 /// The ledger reading the scripter schedules from; part of [`scripter::ScriptInput`].
 pub use barge::TurnAudio;
 pub use brenn::driver::{BridgeDriver, DriverIo, DriverTokens, IntentSink};

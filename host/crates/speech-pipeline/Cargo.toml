@@ -39,6 +39,9 @@ regex = "1"
 
 [dev-dependencies]
 serde_json = "1"
+# Hashes the committed Silero graph so a re-fetch that lands different bytes reds
+# the gate rather than degrading endpointing in the field.
+sha2 = "0.10"
 # `AudioSpan::resolve` tests plant a frame log in a scratch store root.
 tempfile = "3"
 # Shared frame-log/wire-frame test fixtures (`test_fixtures`).

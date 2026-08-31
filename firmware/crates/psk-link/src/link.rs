@@ -1643,18 +1643,31 @@ mod tests {
     /// signal that lands before the wait is entered leaves every assertion below
     /// true while the resume loop never runs. Two things stop that from passing
     /// silently: the waker keeps signalling for as long as the wait lasts, and
-    /// the handler timestamps its delivery against the wait, so a run where no
-    /// signal fell inside it fails and names itself.
+    /// the handler counts and timestamps its deliveries against the wait, so a
+    /// run whose deliveries all beat the wait fails and names itself.
+    ///
+    /// The evidence is plural on purpose. The handler's origin is stored on this
+    /// thread a few instructions before the syscall, so a delivery counted as
+    /// post-origin may still have landed in that gap — one such delivery proves
+    /// nothing, while `MIN_INSIDE` of them would need a preemption right there
+    /// spanning several `SIGNAL_GAP`s.
     #[test]
     fn a_signal_during_a_wait_resumes_instead_of_faulting() {
         /// The signal this test delivers to its own thread. Nothing else in the
         /// tree sends it, and the disposition is restored before returning.
         const SIG: libc::c_int = libc::SIGUSR1;
+        // TODO(gate-only-single-sighting-flakes) — this budget is load-bearing,
+        // do not widen it.
         const BUDGET: Duration = Duration::from_millis(300);
         /// Gap between signals. Small against `BUDGET` so the waker gets many
         /// attempts at the wait rather than one, whatever the scheduler does with
         /// either thread.
         const SIGNAL_GAP: Duration = Duration::from_millis(20);
+        /// Post-origin deliveries a run must show. An undisturbed wait gets
+        /// `BUDGET / SIGNAL_GAP` (~15) of them, so three leaves the waker five
+        /// times its pace before this reds; a delivery counted between the origin
+        /// store and the syscall arrives one or two at most.
+        const MIN_INSIDE: u32 = 3;
         /// `CLOCK_MONOTONIC` nanoseconds at the instant the wait was entered, or
         /// 0 until then.
         static WAIT_ORIGIN: AtomicU64 = AtomicU64::new(0);
@@ -1662,6 +1675,9 @@ mod tests {
         /// or 0 if every delivery beat the wait.
         static DELIVERED_AT: AtomicU64 = AtomicU64::new(0);
         static DELIVERED: AtomicU32 = AtomicU32::new(0);
+        /// Deliveries that followed `WAIT_ORIGIN`, which is all but the ones that
+        /// beat the wait's own instant.
+        static DELIVERED_INSIDE: AtomicU32 = AtomicU32::new(0);
         /// Set once the wait has returned; stops the waker signalling a thread
         /// that may be about to unwind.
         static WAIT_RETURNED: AtomicBool = AtomicBool::new(false);
@@ -1684,6 +1700,7 @@ mod tests {
             DELIVERED.fetch_add(1, Ordering::Relaxed);
             let origin = WAIT_ORIGIN.load(Ordering::Relaxed);
             if origin != 0 {
+                DELIVERED_INSIDE.fetch_add(1, Ordering::Relaxed);
                 // Floored at 1 ns: 0 is the "never landed inside the wait"
                 // sentinel, so a delivery in the same nanosecond must not read as
                 // one. Only the first post-origin delivery is kept.
@@ -1768,6 +1785,7 @@ mod tests {
 
         let delivered = DELIVERED.load(Ordering::Relaxed);
         let delivered_at = DELIVERED_AT.load(Ordering::Relaxed);
+        let inside = DELIVERED_INSIDE.load(Ordering::Relaxed);
         assert!(
             delivered >= 1,
             "the waker never delivered a signal, so nothing was interrupted and \
@@ -1782,6 +1800,13 @@ mod tests {
             delivered_at < waited,
             "the first signal to reach the wait landed {delivered_at} ns in, past \
              the wait's own {waited} ns — nothing was interrupted"
+        );
+        assert!(
+            inside >= MIN_INSIDE,
+            "only {inside} of {delivered} signals followed the wait's own instant, \
+             under the {MIN_INSIDE} this test needs to say any of them reached the \
+             syscall rather than the gap before it — a starved waker under load, or \
+             a preemption between the origin store and the wait"
         );
         assert!(
             matches!(readiness, Readiness::TimedOut),
@@ -1840,7 +1865,14 @@ mod tests {
     #[test]
     fn a_refused_connect_reports_the_tcp_stage_and_its_kind() {
         // Bind and drop, so the port is almost certainly unused and nothing is
-        // listening on it.
+        // listening on it. Two things can still let the TCP connect below
+        // succeed: another binder taking the port in the gap and listening on
+        // it, or a self-connect — the kernel drawing this connect's source port
+        // from the same ephemeral range and picking the destination port, which
+        // completes a simultaneous open against the socket itself with no peer
+        // at all.
+        // TODO(gate-only-single-sighting-flakes) — a parallel binder and a
+        // loopback self-connect are the two candidate mechanisms.
         let addr = {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             listener.local_addr().expect("local addr")

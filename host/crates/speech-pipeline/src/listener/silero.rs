@@ -214,6 +214,47 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/silero/silero_vad.onnx")
     }
 
+    /// The identity of the committed graph: the sha256 and byte count
+    /// `host/models/silero/README.md` records for the upstream commit these
+    /// bytes were fetched at.
+    const GRAPH_SHA256: &str = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3";
+    const GRAPH_BYTES: usize = 2_327_524;
+
+    /// The committed file is the graph the README names, byte for byte.
+    ///
+    /// Upstream ships successive graphs at one path and its tags carry different
+    /// bytes there, so a re-fetch by version name can land a neighbouring model
+    /// that loads, runs, and answers plausibly: the behavioural tests below are
+    /// thresholds on synthetic audio, and a graph with the same I/O signature
+    /// would plausibly clear all of them. This is the only check that names the
+    /// bytes, and the field symptom it stands in front of is degraded
+    /// endpointing nobody attributes to the model.
+    #[test]
+    fn the_committed_graph_is_the_pinned_bytes() {
+        use sha2::{Digest, Sha256};
+
+        /// What a mismatch means and what to do about it. The README's paragraph,
+        /// said where the assertion fires.
+        const REMEDY: &str = "re-fetch by commit, not by version name — \
+                              host/models/silero/README.md carries the commit and this hash";
+
+        let bytes = std::fs::read(model_path()).expect("read committed silero model");
+        assert_eq!(
+            bytes.len(),
+            GRAPH_BYTES,
+            "the committed graph is {} bytes, not the pinned {GRAPH_BYTES}: {REMEDY}",
+            bytes.len()
+        );
+        let hex: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex, GRAPH_SHA256,
+            "the committed graph hashes {hex}: {REMEDY}"
+        );
+    }
+
     fn test_model() -> SileroModel {
         SileroModel::load(&SileroConfig {
             model: model_path(),

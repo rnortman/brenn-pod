@@ -207,6 +207,22 @@ impl Config {
         Ok(())
     }
 
+    /// Whether a run composed from this configuration drains an alert seam.
+    ///
+    /// The condition the server spawns its drain under, asked here so an
+    /// embedding process does not re-spell it against a pinned revision of this
+    /// crate: only the bus brain builds an attachment, and an alert seam with no
+    /// attachment behind it is a queue nothing reads. [`Config::validate`] ties
+    /// `mode = "brenn"` and the `[brenn]` table to each other in both
+    /// directions, so the mode is the whole of the answer.
+    ///
+    /// What an embedder does with `false` is keep no raising end: the run drops
+    /// its own, so every raise against it refuses and says so for nothing.
+    #[must_use]
+    pub fn carries_alerts(&self) -> bool {
+        self.brain.as_ref().map(|brain| brain.mode) == Some(BrainMode::Brenn)
+    }
+
     /// Resolve a pod's room. A pod absent from the map is [`RoomLookup::Unmapped`]
     /// — the caller warns on it but never rejects the pod.
     pub fn room_for(&self, pod_id: &str) -> RoomLookup {

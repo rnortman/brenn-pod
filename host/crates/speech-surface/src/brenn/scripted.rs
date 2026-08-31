@@ -82,16 +82,37 @@ impl TransportConnection for ScriptedConnection {
 pub(crate) struct Peer {
     inbound: UnboundedSender<TransportEvent>,
     sent: UnboundedReceiver<String>,
+    /// Every frame this peer has handed back, in order. A frame that never
+    /// arrives is diagnosed from the ones that did, so the failure paths below
+    /// carry these rather than reporting a bare timeout.
+    seen: Vec<Value>,
 }
 
 impl Peer {
+    /// The next frame the bridge wrote, or `None` if it wrote nothing within
+    /// [`WAIT`] — for a caller with failure context of its own to add.
+    pub(crate) async fn try_next_frame(&mut self) -> Option<Value> {
+        let text = tokio::time::timeout(WAIT, self.sent.recv()).await.ok()?;
+        let text = text.expect("the bridge's socket is still open");
+        let frame: Value = serde_json::from_str(&text).expect("the bridge writes parseable frames");
+        self.seen.push(frame.clone());
+        Some(frame)
+    }
+
     /// The next frame the bridge wrote, as JSON.
     pub(crate) async fn next_frame(&mut self) -> Value {
-        let text = tokio::time::timeout(WAIT, self.sent.recv())
-            .await
-            .expect("the bridge wrote a frame before the timeout")
-            .expect("the bridge's socket is still open");
-        serde_json::from_str(&text).expect("the bridge writes parseable frames")
+        match self.try_next_frame().await {
+            Some(frame) => frame,
+            None => panic!(
+                "the bridge wrote no further frame within {WAIT:?}; it wrote: {:?}",
+                self.seen
+            ),
+        }
+    }
+
+    /// The frames this peer has handed back so far, oldest first.
+    pub(crate) fn seen(&self) -> &[Value] {
+        &self.seen
     }
 
     /// The next frame, asserted to be of `kind`.
@@ -268,6 +289,7 @@ pub(crate) fn scripted(
                 peers.push_back(Peer {
                     inbound: inbound_tx,
                     sent: sent_rx,
+                    seen: Vec::new(),
                 });
             }
         }

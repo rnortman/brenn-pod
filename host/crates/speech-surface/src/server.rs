@@ -1324,9 +1324,11 @@ fn build_scripter(
 ///
 /// The condition behind both halves of the scripter's existence: the task is
 /// spawned in the arm that builds the bridge, so a head scripted in any other
-/// mode would be a queue with nothing draining it.
+/// mode would be a queue with nothing draining it. The same condition decides
+/// the alert drain below, and [`Config::carries_alerts`] is where it is
+/// spelled, so an embedding process and this file cannot answer it differently.
 fn bus_brain(config: &Config) -> bool {
-    config.brain.as_ref().map(|brain| brain.mode) == Some(BrainMode::Brenn)
+    config.carries_alerts()
 }
 
 /// The channel motion scripts are published on, or `None` when the head is not
@@ -1854,6 +1856,10 @@ async fn drain_alerts(
                 None => break,
             },
         };
+        // TODO(alert-dropped-while-detached): this line says an alert was raised,
+        // not that it reached the bus. A frame handed to the bridge while it is
+        // between attachments is dropped and `alert` still answers `Ok`, so an
+        // alert raised in that window is gone with the log claiming otherwise.
         jsonl.emit(
             "alert_raised",
             &json!({ "severity": severity, "title": title }),
@@ -4036,6 +4042,30 @@ mod tests {
         );
     }
 
+    /// The question a composing process asks before it hands a seam over, and
+    /// the condition this file spawns the drain under, are one expression.
+    ///
+    /// Asserted over the two fixtures the alert cases below compose from, so
+    /// that a narrowed or widened drain condition reddens here rather than
+    /// leaving an embedder raising alerts onto a queue nothing reads.
+    #[test]
+    fn what_carries_alerts_is_what_the_run_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = brenn_config(dir.path());
+        assert!(
+            bus.carries_alerts(),
+            "the arm that builds the attachment is the arm that spawns the drain"
+        );
+        assert_eq!(bus_brain(&bus), bus.carries_alerts());
+
+        let plain = config(&dir.path().join("store"), false);
+        assert!(
+            !plain.carries_alerts(),
+            "no bridge is nothing to drain onto"
+        );
+        assert_eq!(bus_brain(&plain), plain.carries_alerts());
+    }
+
     /// The alert seam's whole point: what a composing process raises reaches the
     /// bus on the attachment this server already holds, so the robot keeps one.
     #[tokio::test(flavor = "multi_thread")]
@@ -4053,6 +4083,18 @@ mod tests {
         )
         .await;
 
+        // The raise must follow the attachment: an alert handed to the bridge
+        // before it is live is silently dropped, and the raiser is not told.
+        // The first `Subscribe` proves the attachment landed — the subscription
+        // plane states its holds only after the `Welcome` exchange completes.
+        let subscribe = peer.expect_frame("Subscribe").await;
+        peer.say(json!({
+            "type": "SubscribeResult",
+            "channel": subscribe["channel"].clone(),
+            "outcome": { "kind": "Ok" },
+            "replay_count": 0,
+        }));
+
         raiser
             .raise(crate::alerts::Alert {
                 severity: brenn_bridge::AlertSeverity::Critical,
@@ -4061,10 +4103,16 @@ mod tests {
             })
             .expect("the seam is live");
 
-        // Frame ordering between the driver's startup and the alert is
-        // nondeterministic; loop until the alert lands.
+        // Any further startup frame may still be in flight ahead of the alert,
+        // so loop until it lands.
         let frame = loop {
-            let frame = peer.next_frame().await;
+            let Some(frame) = peer.try_next_frame().await else {
+                panic!(
+                    "no Alert frame arrived; the bridge wrote: {:?}\nlog so far: {}",
+                    peer.seen(),
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                );
+            };
             match frame["type"].as_str() {
                 Some("Alert") => break frame,
                 Some("Subscribe") => {
@@ -4078,7 +4126,12 @@ mod tests {
                         "replay_count": 0,
                     }));
                 }
-                other => panic!("unexpected frame before the alert: {other:?}"),
+                _ => panic!(
+                    "unexpected frame before the alert: {frame}\nthe bridge wrote: {:?}\n\
+                     log so far: {}",
+                    peer.seen(),
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                ),
             }
         };
         assert_eq!(frame["severity"], "critical");
@@ -4119,6 +4172,13 @@ mod tests {
         let (raiser, inbox) = crate::alerts::alert_seam(1);
 
         let cfg = config(&dir.path().join("store"), false);
+        // The same answer the composing process gets before it composes
+        // anything: what this run then says about the seam is that answer
+        // arriving the expensive way.
+        assert!(
+            !cfg.carries_alerts(),
+            "no bus brain, so no attachment to drain onto"
+        );
         let (server, _addr, stop_tx, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
         let server = server.with_alerts(inbox);
         let run = tokio::spawn(async move {

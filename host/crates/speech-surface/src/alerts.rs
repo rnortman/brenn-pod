@@ -16,8 +16,15 @@
 //!
 //! [`Server::run`]: crate::server::Server::run
 
-use brenn_bridge::AlertSeverity;
 use tokio::sync::mpsc;
+
+/// The loudness an [`Alert`] carries, as the bus plane spells it.
+///
+/// Re-exported because it is half of this seam's vocabulary: an embedder that
+/// fills in an [`Alert`] cannot say anything without it, and reaching it any
+/// other way costs a build edge onto the attachment crate for one enum — a
+/// dependency footprint larger than the seam being used.
+pub use brenn_bridge::AlertSeverity;
 
 /// A depth that suits a table raising each condition once per run: enough that
 /// a burst at startup survives a reattach, small enough that what does survive

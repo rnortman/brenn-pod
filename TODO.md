@@ -469,3 +469,136 @@ above). The account in this entry is the current one.
 See `TODO(barge-in-flake)` at
 `barge_in_flushes_playback_and_chains_the_interrupted_turn` in
 `host/crates/speech-surface/tests/barge_integration.rs`.
+
+## `gate-only-single-sighting-flakes` — not blocked as of 2026-08-31 (two single observations left; the next failing gate run is the sample)
+
+Three tests had each failed exactly once under a `make check` whose other lanes were
+building at the same time, and each passed standalone and on an immediate re-run of the
+same tree, with nothing disabled and no `--no-verify`. **The third is diagnosed and
+repaired** (the alert test, below); two are open:
+
+- `a_signal_during_a_wait_resumes_instead_of_faulting` and
+  `a_refused_connect_reports_the_tcp_stage_and_its_kind`
+  (`firmware/crates/psk-link/src/link.rs`), red together in one run. Both were in a crate
+  the commit under test did not touch.
+- `a_raised_alert_reaches_the_bus_on_the_server_s_own_attachment`
+  (`host/crates/speech-surface/src/server.rs`), a timeout in a later run — **closed**,
+  see below.
+
+What they shared is the gate's parallel load and a single sighting each. They do **not**
+share a mechanism, and each reads differently once walked:
+
+- **The signal test is the one with a load-sensitive budget.** It gives the whole
+  interrupted wait 300 ms (`BUDGET`) and paces its waker 20 ms apart (`SIGNAL_GAP`), so a
+  scheduler that does not run the waker thread for one of those gaps costs a measurable
+  fraction of the budget. Its own self-check reds a run whose deliveries all beat the
+  wait, and — since the wait's origin is stored a few instructions before the syscall, so
+  one post-origin delivery could still have landed in that gap — it also reds a run
+  showing fewer than `MIN_INSIDE` (3) of them. A starved waker is exactly what those two
+  would report.
+- **The refused-connect test cannot be redded by its budget**, and no reader should spend
+  a captured failure measuring one. There is no read: `with_timeouts(200 ms, 200 ms)` sets
+  the connect and handshake budgets, and `connect()` fails at `open_link_socket` without
+  ever reaching the handshake. Blowing the connect budget does not red it either —
+  `open_link_socket` preserves `e.kind()` and prefixes the message with `"tcp connect to
+  {peer} after {} ms"`, and the test's `matches!` already accepts `io::ErrorKind::TimedOut`
+  beside `ConnectionRefused`, so both assertions hold under an arbitrarily slow connect.
+  The ways it can red are a TCP connect that succeeds where nothing is listening, or an
+  `ErrorKind` outside that pair. Two mechanisms produce the first, and they are told apart
+  by which assertion fired:
+
+  - **A parallel binder** taking the ephemeral port between the bind-and-drop that chose
+    it and the connect, and *listening* on it — a bind alone still yields
+    `ECONNREFUSED` and the test passes. The kernel avoids re-issuing a port it has just
+    handed out, so the window is narrow.
+  - **A loopback self-connect.** The destination port came from `bind("127.0.0.1:0")`,
+    i.e. from the ephemeral range `connect_timeout` also draws its source port from; when
+    the kernel picks source == destination on one address, the SYN completes a
+    simultaneous open against the socket itself with no peer at all. This needs no second
+    party, so it is at least as plausible as the binder. The socket then reads back its
+    own ClientHello and the run reds on the *first* assertion, the failing stage not being
+    named `"tcp connect"`.
+
+  A captured sighting's assertion identity discriminates: `expect_err` or the kind
+  assertion points at the binder, the stage assertion at self-connect. The repair to reach
+  for is re-picking the port on a surprising success rather than holding the listener
+  longer — a held listener means something *is* listening and reds the test every run, and
+  a bind-hold-drop with nothing in the gap narrows the window without closing either
+  mechanism. Detecting self-connect wants its own check: after a probe connect that
+  succeeds, `local_addr() == peer_addr()` says which one happened, and the re-pick loop
+  must be bounded.
+- **The alert test is diagnosed and repaired — a test-construction race, and a real
+  behaviour worth its own entry.** It set no budget of its own; its only timeout is
+  `scripted::WAIT` (`host/crates/speech-surface/src/brenn/scripted.rs`), 10 seconds per
+  frame, so reaching it meant a frame that was never written. It was reproduced on
+  2026-08-31 once the loop's failure paths were made to print the frames the peer read
+  and the daemon's JSONL, which is exactly what named it: the log showed `alert_raised`
+  *before* `brenn_attached`, and no `Alert` frame ever reached the wire. The test composed
+  the server and raised in one breath, so the drain could hand the alert to a bridge that
+  had not attached yet — and `Core::emit` (`firmware/crates/brenn-bridge/src/bridge.rs`)
+  drops frames written while detached, with `BridgeHandle::alert` still answering `Ok`.
+  The repair is at the construction: the test now reads the driver's first `Subscribe`,
+  which the subscription plane states only once attached, and raises after that. The
+  instrumentation stays. That the daemon can log an alert as raised which never left is
+  its own defect, filed as `alert-dropped-while-detached` below.
+
+**This is an observation, not a diagnosis.** Nobody has reproduced any of the three on
+demand, and one failure each is not enough to say what showed. It is filed together
+because a single sighting recorded nowhere is a sighting that gets re-discovered from
+scratch — which is what the `barge-in-flake` entry above exists to stop happening a second
+time. The two entries are deliberately separate: that flake has a reproduction history and
+two competing readings, and folding these in would dilute an account that is doing work.
+
+Not fixed by widening budgets on sight. For the signal test the budget is load-bearing —
+it bounds the window the waker must land a signal inside. For the refused-connect test
+widening is worse than useless: its assertions already tolerate a timeout. The alert
+sighting is the standing evidence for that rule — widening `scripted::WAIT` would have
+buried a real dropped frame in a longer wait, where printing what the run saw named it.
+
+Done = each of the two remaining either shown to have a real defect behind it (fixed, with
+a pinning test) or shown to be a test-construction fault and repaired at the construction
+(the port-reuse race and the loopback self-connect being the standing candidates for the
+refused-connect one); and, where a
+wall-clock budget turns out to be the mechanism, that budget derived from something
+measured rather than chosen, with the derivation stated where the constant is. A
+multi-cycle `make check` loop in gate shape green afterwards.
+
+See `TODO(gate-only-single-sighting-flakes)` at `BUDGET` in
+`a_signal_during_a_wait_resumes_instead_of_faulting` and at the bind-and-drop block in
+`a_refused_connect_reports_the_tcp_stage_and_its_kind`, both in
+`firmware/crates/psk-link/src/link.rs`. The alert test carries no marker any more: its
+sighting is closed, and what it uncovered is marked at its own site under
+`alert-dropped-while-detached`.
+
+## `alert-dropped-while-detached` — not blocked as of 2026-08-31
+
+An alert handed to the bridge while it is between attachments is dropped, and the raiser
+is told nothing: `Core::emit` (`firmware/crates/brenn-bridge/src/bridge.rs`) writes
+nothing when the driver is inactive, `BridgeHandle::alert` answers `Ok`, and
+`drain_alerts` (`host/crates/speech-surface/src/server.rs`) has already emitted
+`alert_raised`. So the daemon's own log records an alert that never left the machine, and
+an operator reading it cannot tell the two apart.
+
+The drop is deliberate for the frames it was reasoned about — a subscription dropped
+while detached is re-stated at the next attachment, so nothing is lost. An alert has no
+such re-statement: it is a one-shot report of something that already happened.
+
+The window is small but real, and it is exactly the window that matters: startup before
+the first attachment, and a reconnect gap. The robot's fault and park alerts ride this
+path (`brenn-reachy`'s host raises `Critical` off timeline rows), and the design that put
+them there already accepts that a *crashed* host carries no alert, because reaching the
+Minimum Risk Condition is autonomous — this is the narrower case where the host is alive
+and believes it reported.
+
+What to do is a decision, not a repair: hold alerts until the attachment is live (a queue
+with a depth and a discard rule), or report the drop truthfully so the raiser and the log
+say "not carried", or accept it and make `alert_raised` stop claiming otherwise. The
+first two change `brenn-bridge`'s contract and want a design cycle; a bus attachment that
+buffers is a different promise from one that does not.
+
+Done = an alert raised while detached either reaches the bus at the next attachment or is
+reported as not carried, with the daemon's log saying which; and a test driving the
+detached window.
+
+See `TODO(alert-dropped-while-detached)` at `drain_alerts` in
+`host/crates/speech-surface/src/server.rs`.
