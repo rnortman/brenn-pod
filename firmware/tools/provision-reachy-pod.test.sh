@@ -292,18 +292,56 @@ check "relative-psk-file-filed-in-the-assembly-directory" \
 	"$(yes_no [ -f "$TREE/assembly/pod-psk.toml" ])" \
 	"assembly directory holds: $(ls -A -- "$TREE/assembly")"
 
+# Both relaxations at once, which is the only arrangement the flag exists for:
+# an assembly directory whose config dials loopback because the daemon is on the
+# unit, and whose key table sits beside it because that directory is copied into
+# the payload the daemon runs from. The isolated cases above each leave the other
+# gate untripped, so a gate that fires only when both conditions hold — or a
+# variable one branch clobbers for the next — would pass them and be found at the
+# bench with a robot in front of somebody.
+new_tree
+mkdir -p "$TREE/assembly"
+{
+	printf 'listen_addr = "127.0.0.1:7380"\n'
+	printf 'pod_psk_file = "pod-psk.toml"\n'
+} >"$TREE/assembly/speech.toml"
+run_tool "$TREE/assembly/speech.toml" --on-unit
+expect_ok "on-robot-arrangement-provisions" "filed a new key"
+check "on-robot-arrangement-files-the-table-beside-the-config" \
+	"$(yes_no grep -qxF "\"reachy00\" = \"${KEY_NEW}\"" -- "$TREE/assembly/pod-psk.toml")" \
+	"table holds: $(cat -- "$TREE/assembly/pod-psk.toml" 2>&1)"
+check "on-robot-arrangement-pushes-the-loopback-address" \
+	"$(yes_no grep -qxF 'ADDR=127.0.0.1:7380' -- "$PUSHED")" \
+	"pushed: $(cat -- "$PUSHED")"
+check "on-robot-arrangement-pushes-the-key-just-filed" \
+	"$(yes_no grep -qF "$KEY_NEW" -- "$PUSHED")" \
+	"pushed: $(cat -- "$PUSHED")"
+
 # Without the flag the daemon's working directory is somebody else's business —
 # the standalone runbook starts it from host/ with --config config/parrot.toml,
 # one level away from the directory this would have resolved against — so the
 # spelling is refused rather than filed where nothing reads it.
+#
+# The config is named on the command line rather than left to the default, so
+# the re-run line the refusal hands back is checked against a path only the
+# config that was read could have produced: this branch prints the same
+# `SPEECH_CONFIG=` line the loopback one does, and a regression to the hardcoded
+# default is invisible against a default-path fixture.
 new_tree
-host_config "listen_addr = \"192.168.1.20:7380\"" "pod_psk_file = \"pod-psk.toml\""
-run_tool
+mkdir -p "$TREE/assembly"
+{
+	printf 'listen_addr = "192.168.1.20:7380"\n'
+	printf 'pod_psk_file = "pod-psk.toml"\n'
+} >"$TREE/assembly/speech.toml"
+run_tool "$TREE/assembly/speech.toml"
 expect_die "gate-relative-psk-file-without-opt-in" "is not an absolute path"
 check "gate-relative-psk-file-names-the-opt-in" \
 	"$(yes_no grep -q 'ON_UNIT=1' <<<"$OUT")" "output was: $OUT"
+check "gate-relative-psk-file-re-run-names-the-config-it-read" \
+	"$(yes_no grep -qF "SPEECH_CONFIG=\"${TREE}/assembly/speech.toml\"" <<<"$OUT")" \
+	"output was: $OUT"
 check "gate-relative-psk-file-wrote-no-table" \
-	"$(yes_no [ ! -e "$TREE/host/config/pod-psk.toml" ])" \
+	"$(yes_no [ ! -e "$TREE/assembly/pod-psk.toml" ])" \
 	"a table was written beside the config"
 check "gate-relative-psk-file-device-untouched" \
 	"$(yes_no [ ! -e "$PUSHED" ])" "something was pushed"
@@ -347,7 +385,7 @@ mkdir -p "$TREE/assembly"
 run_tool "$TREE/assembly/speech.toml"
 expect_die "gate-loopback-with-a-named-config" "is not an address the pod can dial"
 check "gate-loopback-re-run-names-the-config-it-read" \
-	"$(yes_no grep -qF "SPEECH_CONFIG=${TREE}/assembly/speech.toml" <<<"$OUT")" \
+	"$(yes_no grep -qF "SPEECH_CONFIG=\"${TREE}/assembly/speech.toml\"" <<<"$OUT")" \
 	"output was: $OUT"
 
 # The flag lifts one refusal and not the others: an address naming no host is
@@ -556,5 +594,51 @@ expect_ok "hash-in-table-path-reads-the-real-table" "reusing its key"
 check "hash-in-table-path-no-truncated-sibling" \
 	"$(yes_no [ ! -e "$TREE/keys/psk" ])" \
 	"a table was created at the truncated path"
+
+# ── Layer 3: the Makefile's half of the opt-in ────────────────────────────────
+#
+# The flag above is reached through `make reachy-provision ON_UNIT=1`, and the
+# guard deciding which spellings mean "yes" lives in the Makefile, not in this
+# tool. `ON_UNIT=0` is what a person types to mean "not this time": taken as the
+# opt-in it lifts the loopback and relative-key refusals they were relying on,
+# and the provision run reports success either way. `make -n` runs none of it —
+# the emitted command line is the whole contract here.
+FIRMWARE="$(cd -- "$HERE/.." && pwd)"
+
+# make_provision <var=value>... — what the recipe would run, and make's own
+# status. No target is built and no device is touched.
+make_provision() {
+	set +e
+	OUT=$(make -n -C "$FIRMWARE" reachy-provision "$@" 2>&1)
+	EC=$?
+	set -e
+}
+
+make_provision ON_UNIT=1
+expect_ok "make-on-unit-1-is-the-opt-in"
+check "make-on-unit-1-passes-the-flag" \
+	"$(yes_no grep -q -- '--on-unit' <<<"$OUT")" "output was: $OUT"
+
+make_provision
+expect_ok "make-unset-provisions-the-standalone-arrangement"
+check "make-unset-passes-no-flag" \
+	"$(no_yes grep -q -- '--on-unit' <<<"$OUT")" "output was: $OUT"
+
+# Anything but 1 or empty is refused rather than guessed at, and the refusal is
+# make's, before the recipe exists to run.
+for spelling in 0 yes true 2; do
+	make_provision "ON_UNIT=${spelling}"
+	expect_die "make-on-unit-${spelling}-refused" "the only opt-in spelling is ON_UNIT=1"
+	check "make-on-unit-${spelling}-runs-nothing" \
+		"$(no_yes grep -q provision-reachy-pod.sh <<<"$OUT")" "output was: $OUT"
+done
+
+# The config path reaches the tool as one argument: the refusals print this
+# command for pasting, and a path with a space in it split into two positionals
+# is "too many arguments" from a line the operator copied verbatim.
+make_provision ON_UNIT=1 'SPEECH_CONFIG=/tmp/an assembly/speech.toml'
+expect_ok "make-spaced-config-path-is-accepted"
+check "make-quotes-the-config-path" \
+	"$(yes_no grep -qF '"/tmp/an assembly/speech.toml"' <<<"$OUT")" "output was: $OUT"
 
 test_summary provision-reachy-pod.test.sh

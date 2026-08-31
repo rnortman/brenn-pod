@@ -205,7 +205,7 @@ case "${listen_addr%:*}" in
 			"A pod on a different machine cannot reach the workstation's loopback." \
 			"Name the workstation's LAN address: ip -4 addr show scope global" \
 			"Or, if the daemon runs on the unit itself, say so:" \
-			"    make reachy-provision ON_UNIT=1 SPEECH_CONFIG=${speech_config_arg}"
+			"    make reachy-provision ON_UNIT=1 SPEECH_CONFIG=\"${speech_config_arg}\""
 		;;
 esac
 
@@ -227,7 +227,7 @@ case "$psk_file" in
 			"pod_psk_file ${psk_file} in ${host_config} is not an absolute path" \
 			"The daemon resolves it relative to wherever it was started; name it literally." \
 			"Or, if the daemon runs on the unit itself from an assembly directory, say so:" \
-			"    make reachy-provision ON_UNIT=1 SPEECH_CONFIG=${speech_config_arg}"
+			"    make reachy-provision ON_UNIT=1 SPEECH_CONFIG=\"${speech_config_arg}\""
 		psk_file="$(dirname -- "$host_config")/${psk_file}"
 		;;
 esac

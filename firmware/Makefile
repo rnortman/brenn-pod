@@ -250,7 +250,7 @@ on_unit_flag := $(if $(ON_UNIT),--on-unit,)
 # docs/runbooks/reachy-end-to-end.md walks through.
 .PHONY: reachy-provision
 reachy-provision: reachy-host
-	tools/provision-reachy-pod.sh $(REACHY_HOST) $(SPEECH_CONFIG) $(on_unit_flag)
+	tools/provision-reachy-pod.sh $(REACHY_HOST) "$(SPEECH_CONFIG)" $(on_unit_flag)
 
 # Build, push into the payload store, and activate — which checks the contract,
 # switches the current symlink and restarts the application onto it.
