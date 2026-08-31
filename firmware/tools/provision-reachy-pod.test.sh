@@ -174,11 +174,18 @@ new_tree() {
 	unset STUB_NO_MOUNT STUB_PUSH_FAIL
 }
 
-run_tool() {
+# The subject with the whole argument vector spelled by the caller: what a case
+# about argument handling needs is the order the words arrive in.
+run_argv() {
 	set +e
-	OUT=$(PATH="$STUBS:$PATH" "$TREE/firmware/tools/$(basename -- "$TOOL")" reachy-dev "$@" 2>&1)
+	OUT=$(PATH="$STUBS:$PATH" "$TREE/firmware/tools/$(basename -- "$TOOL")" "$@" 2>&1)
 	EC=$?
 	set -e
+}
+
+# The ordinary shape every other case wants: the unit first, the rest after it.
+run_tool() {
+	run_argv reachy-dev "$@"
 }
 
 new_tree
@@ -255,14 +262,14 @@ done
 
 # ── the two arrangements: a workstation daemon, and one on the unit ───────────
 
-# A relative pod_psk_file is the key table beside the config that names it. The
-# assembly-directory arrangement depends on this: the daemon resolves the same
-# spelling against the directory the config and its credentials travel in, so a
-# provision run that resolved it somewhere else would file the key in a table
-# nothing reads and report success.
+# Under the flag, a relative pod_psk_file is the key table beside the config that
+# names it. The assembly-directory arrangement depends on this: that directory is
+# copied into the payload the daemon runs from, so the file beside the config is
+# the file the daemon opens, and a provision run that resolved it somewhere else
+# would file the key in a table nothing reads and report success.
 new_tree
 host_config "listen_addr = \"192.168.1.20:7380\"" "pod_psk_file = \"pod-psk.toml\""
-run_tool
+run_tool --on-unit
 expect_ok "relative-psk-file-resolved-beside-the-config" "filed a new key for reachy00"
 check "relative-psk-file-table-is-beside-the-config" \
 	"$(yes_no grep -qxF "\"reachy00\" = \"${KEY_NEW}\"" -- "$TREE/host/config/pod-psk.toml")" \
@@ -279,11 +286,27 @@ mkdir -p "$TREE/assembly"
 	printf 'listen_addr = "192.168.1.97:7380"\n'
 	printf 'pod_psk_file = "pod-psk.toml"\n'
 } >"$TREE/assembly/speech.toml"
-run_tool "$TREE/assembly/speech.toml"
+run_tool "$TREE/assembly/speech.toml" --on-unit
 expect_ok "relative-psk-file-follows-an-absolute-config" "filed a new key"
 check "relative-psk-file-filed-in-the-assembly-directory" \
 	"$(yes_no [ -f "$TREE/assembly/pod-psk.toml" ])" \
 	"assembly directory holds: $(ls -A -- "$TREE/assembly")"
+
+# Without the flag the daemon's working directory is somebody else's business —
+# the standalone runbook starts it from host/ with --config config/parrot.toml,
+# one level away from the directory this would have resolved against — so the
+# spelling is refused rather than filed where nothing reads it.
+new_tree
+host_config "listen_addr = \"192.168.1.20:7380\"" "pod_psk_file = \"pod-psk.toml\""
+run_tool
+expect_die "gate-relative-psk-file-without-opt-in" "is not an absolute path"
+check "gate-relative-psk-file-names-the-opt-in" \
+	"$(yes_no grep -q 'ON_UNIT=1' <<<"$OUT")" "output was: $OUT"
+check "gate-relative-psk-file-wrote-no-table" \
+	"$(yes_no [ ! -e "$TREE/host/config/pod-psk.toml" ])" \
+	"a table was written beside the config"
+check "gate-relative-psk-file-device-untouched" \
+	"$(yes_no [ ! -e "$PUSHED" ])" "something was pushed"
 
 # An absolute pod_psk_file still stands as written — every other fixture in this
 # suite spells one, and this is the case that says so on purpose.
@@ -312,6 +335,21 @@ for local_addr in "127.0.0.1:7380" "localhost:7380" "[::1]:7380"; do
 		"pushed: $(cat -- "$PUSHED")"
 done
 
+# The command a refusal hands back has to name the config that was read, not the
+# default: an operator re-running the printed line against a different file
+# provisions from something they never looked at.
+new_tree
+mkdir -p "$TREE/assembly"
+{
+	printf 'listen_addr = "127.0.0.1:7380"\n'
+	printf 'pod_psk_file = "%s"\n' "$PSK_FILE"
+} >"$TREE/assembly/speech.toml"
+run_tool "$TREE/assembly/speech.toml"
+expect_die "gate-loopback-with-a-named-config" "is not an address the pod can dial"
+check "gate-loopback-re-run-names-the-config-it-read" \
+	"$(yes_no grep -qF "SPEECH_CONFIG=${TREE}/assembly/speech.toml" <<<"$OUT")" \
+	"output was: $OUT"
+
 # The flag lifts one refusal and not the others: an address naming no host is
 # nothing to dial from anywhere, loopback included.
 for wild in "0.0.0.0:7380" "[::]:7380"; do
@@ -326,10 +364,7 @@ done
 # do is be read as the speech config.
 new_tree
 host_config "listen_addr = \"127.0.0.1:7380\"" "pod_psk_file = \"${PSK_FILE}\""
-set +e
-OUT=$(PATH="$STUBS:$PATH" "$TREE/firmware/tools/$(basename -- "$TOOL")" --on-unit reachy-dev 2>&1)
-EC=$?
-set -e
+run_argv --on-unit reachy-dev
 expect_ok "on-unit-may-lead" "provisioned"
 
 # A misspelt flag taken as a hostname would provision nothing and say it had.

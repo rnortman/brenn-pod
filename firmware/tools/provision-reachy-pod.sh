@@ -19,8 +19,10 @@
 # address is a link that never comes up and is refused. In the on-unit one the
 # daemon runs on the robot beside the pod and dialling loopback is the point,
 # which is what --on-unit says (ON_UNIT=1 through firmware/Makefile). It is a
-# flag rather than a default because the refusal it lifts is right everywhere
-# else, and an address the pod cannot reach is otherwise found only at the bench.
+# flag rather than a default because the refusals it lifts — a loopback address,
+# and a key table named relative to the config rather than literally — are right
+# everywhere else, and a link that never comes up is otherwise found only at the
+# bench.
 #
 # The key itself is generated once and reused on every later run: this command is
 # idempotent, and a re-run after a reboot is the whole re-provisioning story. To
@@ -77,9 +79,14 @@ host=${1:-}
 [ -n "$host" ] || die "$usage"
 [ $# -le 2 ] || die "too many arguments" "$usage"
 
+# What the operator named, kept as they wrote it: refusals below hand back a
+# command to re-run, and a path re-derived from the positionals a second time is
+# a message that can name a different file than the one just read.
+speech_config_arg=${2:-$default_speech_config}
+
 # An absolute path stands; a relative one is from the repository root, so the
 # Makefile variable reads the way a path in this repository is written.
-host_config=${2:-$default_speech_config}
+host_config=$speech_config_arg
 case "$host_config" in
 	/*) ;;
 	*) host_config="${repo_root}/${host_config}" ;;
@@ -198,18 +205,31 @@ case "${listen_addr%:*}" in
 			"A pod on a different machine cannot reach the workstation's loopback." \
 			"Name the workstation's LAN address: ip -4 addr show scope global" \
 			"Or, if the daemon runs on the unit itself, say so:" \
-			"    make reachy-provision ON_UNIT=1 SPEECH_CONFIG=${2:-$default_speech_config}"
+			"    make reachy-provision ON_UNIT=1 SPEECH_CONFIG=${speech_config_arg}"
 		;;
 esac
 
 # The key table is this command's own artifact, written once and reused. An
-# absolute path stands. A relative one is from the speech config's own directory
-# — which is where the daemon resolves it too when that config and its
-# credentials travel together as one directory, so both sides of the link keep
-# deriving from one place.
+# absolute path stands.
+#
+# A relative one has no single answer: the daemon resolves it against its own
+# working directory, which this script cannot know. Under --on-unit it can, and
+# only there: that arrangement's config is an assembly directory whose
+# credentials sit beside it and are copied into the payload the daemon runs
+# from, so the file beside the config is the file the daemon opens. Everywhere
+# else the two rules differ by however many levels separate the config from the
+# daemon's CWD, and a table filed where nothing reads it is a provision run that
+# reports success and a handshake that fails at the bench.
 case "$psk_file" in
 	/*) ;;
-	*) psk_file="$(dirname -- "$host_config")/${psk_file}" ;;
+	*)
+		[ -n "$on_unit" ] || die \
+			"pod_psk_file ${psk_file} in ${host_config} is not an absolute path" \
+			"The daemon resolves it relative to wherever it was started; name it literally." \
+			"Or, if the daemon runs on the unit itself from an assembly directory, say so:" \
+			"    make reachy-provision ON_UNIT=1 SPEECH_CONFIG=${speech_config_arg}"
+		psk_file="$(dirname -- "$host_config")/${psk_file}"
+		;;
 esac
 
 # ── Who the pod is: its own hostname, which is its PSK identity ───────────────

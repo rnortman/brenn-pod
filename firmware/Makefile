@@ -231,7 +231,17 @@ SPEECH_CONFIG ?= host/config/parrot.toml
 # instead of a link that never comes up. Empty by default: the standalone
 # arrangement is what a bare `make reachy-provision` provisions, and the on-robot
 # one says so per invocation.
+#
+# `ON_UNIT=1` is the only opt-in spelling. It reads as a boolean, so `ON_UNIT=0`
+# is what someone types to mean "not this time" — and a plain emptiness test
+# would take that as the opt-in and lift the refusal they were relying on.
+# Anything but 1 or empty is refused rather than guessed at.
 ON_UNIT ?=
+ifneq ($(filter-out 1,$(ON_UNIT)),)
+$(error ON_UNIT is $(ON_UNIT); the only opt-in spelling is ON_UNIT=1, and leaving it \
+unset provisions the standalone arrangement)
+endif
+on_unit_flag := $(if $(ON_UNIT),--on-unit,)
 
 # Give the unit its configuration: the address it dials and the key it presents,
 # derived from the speech daemon's config and pushed into the same tmpfs the
@@ -240,7 +250,7 @@ ON_UNIT ?=
 # docs/runbooks/reachy-end-to-end.md walks through.
 .PHONY: reachy-provision
 reachy-provision: reachy-host
-	tools/provision-reachy-pod.sh $(REACHY_HOST) $(SPEECH_CONFIG) $(if $(ON_UNIT),--on-unit,)
+	tools/provision-reachy-pod.sh $(REACHY_HOST) $(SPEECH_CONFIG) $(on_unit_flag)
 
 # Build, push into the payload store, and activate — which checks the contract,
 # switches the current symlink and restarts the application onto it.
