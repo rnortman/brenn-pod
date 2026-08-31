@@ -2,7 +2,7 @@
 #
 # Give one Reachy pod the configuration it needs to reach the audio host.
 #
-#   tools/provision-reachy-pod.sh <host> [speech-config]
+#   tools/provision-reachy-pod.sh [--on-unit] <host> [speech-config]
 #
 # Everything is derived; the operator types nothing but the unit. The pod id is
 # the device's own hostname, which is also its TLS-PSK identity. The address it
@@ -13,6 +13,14 @@
 # firmware/Makefile names it, defaulting to the rung example a fresh checkout
 # can run, and a workstation running a config from somewhere else sets it in
 # .local/reachy.conf. A relative path is taken from the repository root.
+#
+# Two arrangements are provisioned from here. In the standalone one the daemon
+# runs on a workstation and the pod dials it across the LAN, so a loopback
+# address is a link that never comes up and is refused. In the on-unit one the
+# daemon runs on the robot beside the pod and dialling loopback is the point,
+# which is what --on-unit says (ON_UNIT=1 through firmware/Makefile). It is a
+# flag rather than a default because the refusal it lifts is right everywhere
+# else, and an address the pod cannot reach is otherwise found only at the bench.
 #
 # The key itself is generated once and reused on every later run: this command is
 # idempotent, and a re-run after a reboot is the whole re-provisioning story. To
@@ -47,8 +55,27 @@ extra_conf="${firmware_root}/.local/audio.conf.extra"
 conf_dir="${store_mount}/conf"
 conf_file="${conf_dir}/audio.conf"
 
+usage="usage: ${prog} [--on-unit] <host> [speech-config]"
+
+# The flag may stand anywhere among the two positionals: the Makefile appends it
+# after them, and an operator typing the command reaches for it first. An
+# unknown word starting with a dash is refused rather than taken as a hostname —
+# a misspelt flag silently provisioning a unit named "--on-unti" is a link that
+# comes up nowhere.
+on_unit=
+positional=()
+for arg in "$@"; do
+	case "$arg" in
+	--on-unit) on_unit=1 ;;
+	-*) die "unknown option ${arg}" "$usage" ;;
+	*) positional+=("$arg") ;;
+	esac
+done
+set -- ${positional[@]+"${positional[@]}"}
+
 host=${1:-}
-[ -n "$host" ] || die "usage: ${prog} <host> [speech-config]"
+[ -n "$host" ] || die "$usage"
+[ $# -le 2 ] || die "too many arguments" "$usage"
 
 # An absolute path stands; a relative one is from the repository root, so the
 # Makefile variable reads the way a path in this repository is written.
@@ -153,16 +180,36 @@ case "$listen_addr" in
 	*) die "listen_addr ${listen_addr} in ${host_config} names no port" \
 		"The pod dials an address and a port, e.g. 192.168.1.20:7380." ;;
 esac
+# A wildcard or empty address names no host at all, so it is refused whatever
+# the arrangement — the daemon refuses to bind 0.0.0.0 for its own reasons and
+# there is nothing here for the pod to dial either.
 case "${listen_addr%:*}" in
-	127.* | localhost | ::1 | "[::1]" | 0.0.0.0 | "" | "[::]")
+	0.0.0.0 | "" | "[::]")
 		die "listen_addr ${listen_addr} in ${host_config} is not an address the pod can dial" \
-			"Name the workstation's LAN address: ip -4 addr show scope global"
+			"Name the address the pod reaches the daemon on: ip -4 addr show scope global"
 		;;
 esac
+# Loopback is right in exactly one arrangement, and the flag is where the
+# operator says which one this is.
+case "${listen_addr%:*}" in
+	127.* | localhost | ::1 | "[::1]")
+		[ -n "$on_unit" ] || die \
+			"listen_addr ${listen_addr} in ${host_config} is not an address the pod can dial" \
+			"A pod on a different machine cannot reach the workstation's loopback." \
+			"Name the workstation's LAN address: ip -4 addr show scope global" \
+			"Or, if the daemon runs on the unit itself, say so:" \
+			"    make reachy-provision ON_UNIT=1 SPEECH_CONFIG=${2:-$default_speech_config}"
+		;;
+esac
+
+# The key table is this command's own artifact, written once and reused. An
+# absolute path stands. A relative one is from the speech config's own directory
+# — which is where the daemon resolves it too when that config and its
+# credentials travel together as one directory, so both sides of the link keep
+# deriving from one place.
 case "$psk_file" in
 	/*) ;;
-	*) die "pod_psk_file ${psk_file} in ${host_config} is not an absolute path" \
-		"The daemon resolves it relative to wherever it was started; name it literally." ;;
+	*) psk_file="$(dirname -- "$host_config")/${psk_file}" ;;
 esac
 
 # ── Who the pod is: its own hostname, which is its PSK identity ───────────────

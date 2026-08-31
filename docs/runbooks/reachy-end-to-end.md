@@ -7,6 +7,30 @@ accounts — everything runs locally.
 Assumes a checkout of this repo, a Reachy Mini on the same LAN with brenn-os on it, and
 SSH-as-root to that unit.
 
+## Scope: the standalone arrangement, with the daemon on your workstation
+
+Everything below runs `speech-surface` as a foreground process on your machine, with the
+pod dialling it across the LAN. That is one of two arrangements, and it is the one for
+bringing a pod up on its own — an ESP unit, or a Reachy Mini whose head is not in play.
+
+The other runs the whole speech pipeline **on the robot**, in the same launcher as the
+motion stack, with the pod dialling loopback. Nothing here describes it, and following
+these steps for a robot leaves the daemon on the wrong machine. Its procedure — assembling
+the configuration, deploying it, and running a supervised session — is the speech-run
+section of brenn-reachy's `docs/bench-runbook.md`.
+
+The one piece this repository still owns in that arrangement is the pod's own
+configuration, which the on-robot procedure sends you back here for:
+
+```
+make -C firmware reachy-provision ON_UNIT=1 SPEECH_CONFIG=<the robot's speech config>
+```
+
+`ON_UNIT=1` says the daemon runs on the unit, which is what makes the loopback address in
+that config the right answer rather than a link that never comes up. The key table that
+config names is written beside it, so both sides of the link keep deriving from one
+directory.
+
 Steps 1–5 are the whole runbook, and they are the whole of what this repository puts on a
 unit. The head is the other half of a robot and it is another repository's: brenn-reachy
 owns the motion stack, its payload, its deploy tooling and its runbook

@@ -226,6 +226,13 @@ reachy-pod:
 # drifting apart is invisible until a pod cannot connect.
 SPEECH_CONFIG ?= host/config/parrot.toml
 
+# Set when the speech daemon runs on the unit itself rather than on a
+# workstation, which is what makes a loopback listen_addr the right answer
+# instead of a link that never comes up. Empty by default: the standalone
+# arrangement is what a bare `make reachy-provision` provisions, and the on-robot
+# one says so per invocation.
+ON_UNIT ?=
+
 # Give the unit its configuration: the address it dials and the key it presents,
 # derived from the speech daemon's config and pushed into the same tmpfs the
 # payload lands in. Needs no payload and no build, so it can run before or after
@@ -233,7 +240,7 @@ SPEECH_CONFIG ?= host/config/parrot.toml
 # docs/runbooks/reachy-end-to-end.md walks through.
 .PHONY: reachy-provision
 reachy-provision: reachy-host
-	tools/provision-reachy-pod.sh $(REACHY_HOST) $(SPEECH_CONFIG)
+	tools/provision-reachy-pod.sh $(REACHY_HOST) $(SPEECH_CONFIG) $(if $(ON_UNIT),--on-unit,)
 
 # Build, push into the payload store, and activate — which checks the contract,
 # switches the current symlink and restarts the application onto it.

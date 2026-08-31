@@ -253,10 +253,94 @@ for bad in "127.0.0.1:7380" "localhost:7380" "[::1]:7380" "0.0.0.0:7380" "[::]:7
 	expect_die "gate-unreachable-listen-addr-${bad}" "is not an address the pod can dial"
 done
 
+# ── the two arrangements: a workstation daemon, and one on the unit ───────────
+
+# A relative pod_psk_file is the key table beside the config that names it. The
+# assembly-directory arrangement depends on this: the daemon resolves the same
+# spelling against the directory the config and its credentials travel in, so a
+# provision run that resolved it somewhere else would file the key in a table
+# nothing reads and report success.
 new_tree
-host_config "listen_addr = \"192.168.1.20:7380\"" "pod_psk_file = \"keys/psk.toml\""
+host_config "listen_addr = \"192.168.1.20:7380\"" "pod_psk_file = \"pod-psk.toml\""
 run_tool
-expect_die "gate-relative-psk-file" "is not an absolute path"
+expect_ok "relative-psk-file-resolved-beside-the-config" "filed a new key for reachy00"
+check "relative-psk-file-table-is-beside-the-config" \
+	"$(yes_no grep -qxF "\"reachy00\" = \"${KEY_NEW}\"" -- "$TREE/host/config/pod-psk.toml")" \
+	"table holds: $(cat -- "$TREE/host/config/pod-psk.toml" 2>&1)"
+check "relative-psk-file-nothing-at-the-repo-root" \
+	"$(yes_no [ ! -e "$TREE/pod-psk.toml" ])" \
+	"a table was written at the repository root"
+
+# The same spelling, with the config named from somewhere else entirely: the
+# directory that decides is the config's, not the caller's and not the repo's.
+new_tree
+mkdir -p "$TREE/assembly"
+{
+	printf 'listen_addr = "192.168.1.97:7380"\n'
+	printf 'pod_psk_file = "pod-psk.toml"\n'
+} >"$TREE/assembly/speech.toml"
+run_tool "$TREE/assembly/speech.toml"
+expect_ok "relative-psk-file-follows-an-absolute-config" "filed a new key"
+check "relative-psk-file-filed-in-the-assembly-directory" \
+	"$(yes_no [ -f "$TREE/assembly/pod-psk.toml" ])" \
+	"assembly directory holds: $(ls -A -- "$TREE/assembly")"
+
+# An absolute pod_psk_file still stands as written — every other fixture in this
+# suite spells one, and this is the case that says so on purpose.
+new_tree
+run_tool
+expect_ok "absolute-psk-file-stands" "filed a new key"
+check "absolute-psk-file-is-where-it-was-named" \
+	"$(yes_no [ -f "$PSK_FILE" ])" "no table at ${PSK_FILE}"
+
+# Loopback is refused for a workstation daemon — the pod is a different machine
+# — and the refusal names the way to say it is not one.
+for local_addr in "127.0.0.1:7380" "localhost:7380" "[::1]:7380"; do
+	new_tree
+	host_config "listen_addr = \"${local_addr}\"" "pod_psk_file = \"${PSK_FILE}\""
+	run_tool
+	expect_die "gate-loopback-without-opt-in-${local_addr}" "is not an address the pod can dial"
+	check "gate-loopback-names-the-opt-in-${local_addr}" \
+		"$(yes_no grep -q 'ON_UNIT=1' <<<"$OUT")" "output was: $OUT"
+
+	new_tree
+	host_config "listen_addr = \"${local_addr}\"" "pod_psk_file = \"${PSK_FILE}\""
+	run_tool --on-unit
+	expect_ok "on-unit-accepts-loopback-${local_addr}" "provisioned"
+	check "on-unit-pushes-loopback-${local_addr}" \
+		"$(yes_no grep -qxF "ADDR=${local_addr}" -- "$PUSHED")" \
+		"pushed: $(cat -- "$PUSHED")"
+done
+
+# The flag lifts one refusal and not the others: an address naming no host is
+# nothing to dial from anywhere, loopback included.
+for wild in "0.0.0.0:7380" "[::]:7380"; do
+	new_tree
+	host_config "listen_addr = \"${wild}\"" "pod_psk_file = \"${PSK_FILE}\""
+	run_tool --on-unit
+	expect_die "gate-wildcard-refused-even-on-unit-${wild}" "is not an address the pod can dial"
+	check "gate-wildcard-nothing-pushed-${wild}" "$(yes_no [ ! -e "$PUSHED" ])" "something was pushed"
+done
+
+# The flag may lead, because that is how an operator types it. What it must not
+# do is be read as the speech config.
+new_tree
+host_config "listen_addr = \"127.0.0.1:7380\"" "pod_psk_file = \"${PSK_FILE}\""
+set +e
+OUT=$(PATH="$STUBS:$PATH" "$TREE/firmware/tools/$(basename -- "$TOOL")" --on-unit reachy-dev 2>&1)
+EC=$?
+set -e
+expect_ok "on-unit-may-lead" "provisioned"
+
+# A misspelt flag taken as a hostname would provision nothing and say it had.
+new_tree
+run_tool --on-unti
+expect_die "unknown-option-refused" "unknown option --on-unti"
+check "unknown-option-device-untouched" "$(yes_no [ ! -e "$PUSHED" ])" "something was pushed"
+
+new_tree
+run_tool "$TREE/host/config/parrot.toml" extra
+expect_die "too-many-arguments-refused" "too many arguments"
 
 new_tree
 key_table 640 ''
