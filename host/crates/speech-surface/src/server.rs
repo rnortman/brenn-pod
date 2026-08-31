@@ -1833,9 +1833,15 @@ fn handle_task_exit(event: &str, result: Result<(), tokio::task::JoinError>, jso
 /// Carry the composing process's alerts onto the bus until the seam closes or
 /// the bridge is torn down.
 ///
-/// Every alert is one line here as well as one frame on the wire: the composer
-/// narrates on a stream nobody on the bus reads, and this daemon's own log is
-/// where an operator looks when the two disagree about what was raised.
+/// Every alert is one line here and one frame handed to the bridge. The line
+/// says the alert was handed off and that delivery is unconfirmed, because that
+/// is all this seam can know: an alert raised while the bridge is between
+/// attachments never reaches the bus, and nothing says so. The line is what
+/// survives that, and this daemon's own log is where an operator looks.
+///
+/// The one run where more is known is a bridge that is already gone: the
+/// hand-off itself failed, so no hand-off is claimed and the alert rides the
+/// line that ends the seam instead.
 async fn drain_alerts(
     mut inbox: AlertInbox,
     handle: brenn_bridge::BridgeHandle,
@@ -1856,23 +1862,36 @@ async fn drain_alerts(
                 None => break,
             },
         };
-        // TODO(alert-dropped-while-detached): this line says an alert was raised,
-        // not that it reached the bus. A frame handed to the bridge while it is
-        // between attachments is dropped and `alert` still answers `Ok`, so an
-        // alert raised in that window is gone with the log claiming otherwise.
-        jsonl.emit(
-            "alert_raised",
-            &json!({ "severity": severity, "title": title }),
-        );
-        if handle.alert(severity, title, body).await.is_err() {
-            // The bridge is gone; this alert is dropped and no further one
-            // can land.
+        if handle
+            .alert(severity, title.as_str(), body.as_str())
+            .await
+            .is_err()
+        {
+            // Carried here rather than on a hand-off line that would claim a
+            // hand-off that provably did not happen.
             jsonl.emit(
                 "alert_seam_ended",
-                &json!({ "reason": "the bridge is gone" }),
+                &json!({
+                    "reason": "the bridge is gone",
+                    "severity": severity,
+                    "title": &title,
+                    "body": &body,
+                }),
             );
             break;
         }
+        // The line must carry the whole alert: `alert` answers `Ok` once the
+        // frame reaches the driver task, which may still drop it silently while
+        // detached, so the line is the only surviving record in that case.
+        jsonl.emit(
+            "alert_handed_off",
+            &json!({
+                "severity": severity,
+                "title": &title,
+                "body": &body,
+                "delivery": "unconfirmed",
+            }),
+        );
     }
 }
 
@@ -4144,14 +4163,20 @@ mod tests {
         join.await.unwrap();
 
         let lines = read_lines(&path);
-        let raised = events_named(&lines, "alert_raised");
+        let raised = events_named(&lines, "alert_handed_off");
         assert_eq!(
             raised.len(),
             1,
             "the daemon's own log has it too: {lines:?}"
         );
-        assert_eq!(raised[0]["severity"], "critical");
-        assert_eq!(raised[0]["title"], "the head is parked");
+        // The line claims a hand-off and no more, even in the run where the
+        // frame demonstrably reached the peer.
+        assert_alert_line(
+            raised[0],
+            "critical",
+            "the head is parked",
+            "a fault row ended the session",
+        );
         assert!(
             events_named(&lines, "alert_seam_unused").is_empty(),
             "the seam was drained: {lines:?}"
@@ -4226,10 +4251,11 @@ mod tests {
     ///
     /// Driven against a handle whose bridge was never run and then dropped, so
     /// the command channel is closed and every publish answers `BridgeGone`.
-    /// The end is said once with its reason, and the loop *stops* rather than
-    /// turning every further alert into a log line and a failed publish. A
-    /// drain that kept going would be a busy loop in exactly the condition it
-    /// exists to report.
+    /// The end is said once with its reason and with the alert that met it, and
+    /// the loop *stops* rather than turning every further alert into a log line
+    /// and a failed publish. A drain that kept going would be a busy loop in
+    /// exactly the condition it exists to report. Nothing claims a hand-off in
+    /// this run: there was none.
     #[tokio::test]
     async fn an_alert_drain_whose_bridge_is_gone_says_so_once_and_stops() {
         let dir = tempfile::tempdir().unwrap();
@@ -4264,10 +4290,187 @@ mod tests {
         let ended = events_named(&lines, "alert_seam_ended");
         assert_eq!(ended.len(), 1, "said once: {lines:?}");
         assert_eq!(ended[0]["reason"], "the bridge is gone");
+        // The first alert, not the second: the loop broke on the failed
+        // hand-off rather than draining the queue.
+        assert_eq!(ended[0]["severity"], "critical");
+        assert_eq!(ended[0]["title"], "the head is parked");
+        assert_eq!(ended[0]["body"], "a fault row ended the session");
+        assert!(
+            events_named(&lines, "alert_handed_off").is_empty(),
+            "nothing was handed off: {lines:?}"
+        );
+    }
+
+    /// The detached window: an alert handed to a live bridge that has not
+    /// attached reaches no bus, and nothing tells the drain so.
+    ///
+    /// The peer leaves the bridge's `Hello` unanswered, so no attachment forms.
+    /// The alert still answers `Ok`, the loop still runs, and the only account
+    /// of the alert that survives is the log line — which is why it carries the
+    /// body and claims nothing about delivery.
+    #[tokio::test]
+    async fn an_alert_raised_while_detached_reaches_no_bus_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let (raiser, inbox) = crate::alerts::alert_seam(1);
+        let (bridge, bridge_handle, _events, mut peers) =
+            crate::brenn::scripted::scripted(&[crate::brenn::scripted::Attempt::Open], 1);
+        let bridge_task = tokio::spawn(bridge.run());
+        let mut peer = peers.pop_front().expect("one scripted socket");
+
+        // Leaving the `Hello` unanswered holds the driver short of attachment.
+        peer.expect_frame("Hello").await;
+
+        raiser
+            .raise(crate::alerts::Alert {
+                severity: brenn_bridge::AlertSeverity::Critical,
+                title: "the head is parked".to_owned(),
+                body: "a fault row ended the session".to_owned(),
+            })
+            .expect("the seam is live");
+        drop(raiser);
+
+        let teardown = CancellationToken::new();
+        let probe = bridge_handle.clone();
+        drain_alerts(inbox, bridge_handle, teardown, handle.clone()).await;
+
+        // A publish sequenced after the alert: it can only complete once the
+        // alert has been processed. `Lost` confirms the detached state the
+        // alert met — the same silent drop, but publish reports it.
         assert_eq!(
-            events_named(&lines, "alert_raised").len(),
+            probe_publish(&probe, &mut peer).await,
+            brenn_bridge::PublishError::Lost
+        );
+        assert!(
+            peer.wrote_nothing(),
+            "no frame followed the Hello: {:?}",
+            peer.seen()
+        );
+
+        bridge_task.abort();
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        let handed = events_named(&lines, "alert_handed_off");
+        assert_eq!(handed.len(), 1, "one hand-off: {lines:?}");
+        // The whole alert is on the line, because the line is all there is.
+        assert_alert_line(
+            handed[0],
+            "critical",
+            "the head is parked",
+            "a fault row ended the session",
+        );
+        assert!(
+            events_named(&lines, "alert_seam_ended").is_empty(),
+            "the alert answered Ok: {lines:?}"
+        );
+    }
+
+    /// The other detached window: the reconnect gap. An alert raised after a
+    /// live attachment died and before the next one formed reaches no bus, and
+    /// the reattachment does not carry it late.
+    ///
+    /// The bridge re-states its *subscriptions* at a new attachment because a
+    /// subscription is a standing request; an alert is a one-shot report and is
+    /// held by nothing. This case pins that: the second socket sees the
+    /// handshake and a publish and no `Alert` at any point.
+    #[tokio::test]
+    async fn an_alert_raised_in_a_reconnect_gap_never_reaches_the_next_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let (raiser, inbox) = crate::alerts::alert_seam(1);
+        let (bridge, bridge_handle, mut events, mut peers) = crate::brenn::scripted::scripted(
+            &[
+                crate::brenn::scripted::Attempt::Open,
+                crate::brenn::scripted::Attempt::Open,
+            ],
             1,
-            "the loop broke on the first failed publish: {lines:?}"
+        );
+        let bridge_task = tokio::spawn(bridge.run());
+        let mut first = peers.pop_front().expect("two scripted sockets");
+        let mut second = peers.pop_front().expect("two scripted sockets");
+
+        // A live attachment first, so the alert below lands in a gap rather than
+        // in the startup window the sibling case drives.
+        first.handshake().await;
+        assert!(
+            matches!(
+                next_event(&mut events).await,
+                brenn_bridge::BridgeEvent::Attached(_)
+            ),
+            "the first socket attached"
+        );
+        first.close();
+        assert!(
+            matches!(
+                next_event(&mut events).await,
+                brenn_bridge::BridgeEvent::Detached { .. }
+            ),
+            "the gap is open"
+        );
+
+        raiser
+            .raise(crate::alerts::Alert {
+                severity: brenn_bridge::AlertSeverity::Critical,
+                title: "the head is parked".to_owned(),
+                body: "a fault row ended the session".to_owned(),
+            })
+            .expect("the seam is live");
+        drop(raiser);
+
+        let teardown = CancellationToken::new();
+        let probe = bridge_handle.clone();
+        drain_alerts(inbox, bridge_handle, teardown, handle.clone()).await;
+
+        // Sequenced behind the alert on the same command channel, and answered
+        // from the driver's own loop: `Lost` proves the alert was processed in
+        // the gap, before the second socket could be answered into life.
+        assert_eq!(
+            probe_publish(&probe, &mut second).await,
+            brenn_bridge::PublishError::Lost
+        );
+
+        // A publish across the reattachment is the barrier for the assertion
+        // after it: anything the reattachment would have written is already at
+        // the peer by the time this is answered.
+        second.handshake().await;
+        assert!(
+            matches!(
+                next_event(&mut events).await,
+                brenn_bridge::BridgeEvent::Attached(_)
+            ),
+            "the second socket attached"
+        );
+        let (answer, _) = tokio::join!(probe.publish(probe_request()), second.answer_publish("Ok"));
+        answer.expect("the second attachment carries a publish");
+        assert!(
+            second.wrote_nothing(),
+            "the reattachment wrote nothing further: {:?}",
+            second.seen()
+        );
+        assert!(
+            !second.seen().iter().any(|frame| frame["type"] == "Alert"),
+            "no alert reached the second socket: {:?}",
+            second.seen()
+        );
+
+        bridge_task.abort();
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        let handed = events_named(&lines, "alert_handed_off");
+        assert_eq!(handed.len(), 1, "one hand-off: {lines:?}");
+        assert_alert_line(
+            handed[0],
+            "critical",
+            "the head is parked",
+            "a fault row ended the session",
+        );
+        assert!(
+            events_named(&lines, "alert_seam_ended").is_empty(),
+            "the alert answered Ok: {lines:?}"
         );
     }
 
@@ -4950,6 +5153,55 @@ mod tests {
 
     fn events_named<'a>(lines: &'a [Value], event: &str) -> Vec<&'a Value> {
         lines.iter().filter(|v| v["event"] == event).collect()
+    }
+
+    /// The whole shape of an `alert_handed_off` line: the alert's full content,
+    /// plus the `delivery` the drain is entitled to claim. One place, because
+    /// the line is the surviving record of a dropped alert and both runs that
+    /// read it must read the same contract.
+    fn assert_alert_line(line: &Value, severity: &str, title: &str, body: &str) {
+        assert_eq!(line["severity"], severity);
+        assert_eq!(line["title"], title);
+        assert_eq!(line["body"], body);
+        assert_eq!(line["delivery"], "unconfirmed");
+    }
+
+    /// The bridge's next event, bounded so a bridge that reports nothing fails
+    /// the case instead of parking it.
+    async fn next_event(
+        events: &mut tokio::sync::mpsc::Receiver<brenn_bridge::BridgeEvent>,
+    ) -> brenn_bridge::BridgeEvent {
+        let wait = crate::brenn::scripted::WAIT;
+        match tokio::time::timeout(wait, events.recv()).await {
+            Ok(event) => event.expect("the bridge is still running"),
+            Err(_) => panic!("the bridge reported no event within {wait:?}"),
+        }
+    }
+
+    /// A publish on a bridge expected to refuse it, bounded the same way the
+    /// peer's frame reads are: a driver that answers nothing must fail the case
+    /// with the peer's frames as the diagnosis, not wedge the run.
+    async fn probe_publish(
+        handle: &brenn_bridge::BridgeHandle,
+        peer: &mut crate::brenn::scripted::Peer,
+    ) -> brenn_bridge::PublishError {
+        let wait = crate::brenn::scripted::WAIT;
+        match tokio::time::timeout(wait, handle.publish(probe_request())).await {
+            Ok(answer) => answer.expect_err("nothing is attached"),
+            Err(_) => panic!(
+                "the probe publish went unanswered within {wait:?}; the peer saw: {:?}",
+                peer.seen()
+            ),
+        }
+    }
+
+    fn probe_request() -> brenn_bridge::PublishRequest {
+        brenn_bridge::PublishRequest {
+            channel: "brenn:probe".to_owned(),
+            attribution: None,
+            body: "{}".to_owned(),
+            urgency: brenn_bridge::Urgency::Normal,
+        }
     }
 
     /// Poll `probe` every 10ms up to 500 times, yielding its first `Some`, or

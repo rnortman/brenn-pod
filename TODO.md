@@ -532,15 +532,20 @@ share a mechanism, and each reads differently once walked:
   `scripted::WAIT` (`host/crates/speech-surface/src/brenn/scripted.rs`), 10 seconds per
   frame, so reaching it meant a frame that was never written. It was reproduced on
   2026-08-31 once the loop's failure paths were made to print the frames the peer read
-  and the daemon's JSONL, which is exactly what named it: the log showed `alert_raised`
-  *before* `brenn_attached`, and no `Alert` frame ever reached the wire. The test composed
-  the server and raised in one breath, so the drain could hand the alert to a bridge that
-  had not attached yet — and `Core::emit` (`firmware/crates/brenn-bridge/src/bridge.rs`)
-  drops frames written while detached, with `BridgeHandle::alert` still answering `Ok`.
+  and the daemon's JSONL, which is exactly what named it: the log showed the drain's
+  hand-off line — `alert_handed_off` today, spelled `alert_raised` at the time of the
+  sighting — *before* `brenn_attached`, and no `Alert` frame ever reached the wire. The
+  test composed the server and raised in one breath, so the drain could hand the alert to
+  a bridge that had not attached yet — and `Core::emit`
+  (`firmware/crates/brenn-bridge/src/bridge.rs`) drops frames written while detached, with
+  `BridgeHandle::alert` still answering `Ok`.
   The repair is at the construction: the test now reads the driver's first `Subscribe`,
   which the subscription plane states only once attached, and raises after that. The
-  instrumentation stays. That the daemon can log an alert as raised which never left is
-  its own defect, filed as `alert-dropped-while-detached` below.
+  instrumentation stays. That the daemon could log an alert as raised which never left was
+  its own defect, and it is decided and closed: the detached window is accepted, and the
+  drain's line now says the alert was handed off with delivery unconfirmed and carries the
+  whole alert, so the line is the surviving record when the frame is dropped
+  (`drain_alerts`, `host/crates/speech-surface/src/server.rs`).
 
 **This is an observation, not a diagnosis.** Nobody has reproduced any of the three on
 demand, and one failure each is not enough to say what showed. It is filed together
@@ -567,38 +572,4 @@ See `TODO(gate-only-single-sighting-flakes)` at `BUDGET` in
 `a_signal_during_a_wait_resumes_instead_of_faulting` and at the bind-and-drop block in
 `a_refused_connect_reports_the_tcp_stage_and_its_kind`, both in
 `firmware/crates/psk-link/src/link.rs`. The alert test carries no marker any more: its
-sighting is closed, and what it uncovered is marked at its own site under
-`alert-dropped-while-detached`.
-
-## `alert-dropped-while-detached` — not blocked as of 2026-08-31
-
-An alert handed to the bridge while it is between attachments is dropped, and the raiser
-is told nothing: `Core::emit` (`firmware/crates/brenn-bridge/src/bridge.rs`) writes
-nothing when the driver is inactive, `BridgeHandle::alert` answers `Ok`, and
-`drain_alerts` (`host/crates/speech-surface/src/server.rs`) has already emitted
-`alert_raised`. So the daemon's own log records an alert that never left the machine, and
-an operator reading it cannot tell the two apart.
-
-The drop is deliberate for the frames it was reasoned about — a subscription dropped
-while detached is re-stated at the next attachment, so nothing is lost. An alert has no
-such re-statement: it is a one-shot report of something that already happened.
-
-The window is small but real, and it is exactly the window that matters: startup before
-the first attachment, and a reconnect gap. The robot's fault and park alerts ride this
-path (`brenn-reachy`'s host raises `Critical` off timeline rows), and the design that put
-them there already accepts that a *crashed* host carries no alert, because reaching the
-Minimum Risk Condition is autonomous — this is the narrower case where the host is alive
-and believes it reported.
-
-What to do is a decision, not a repair: hold alerts until the attachment is live (a queue
-with a depth and a discard rule), or report the drop truthfully so the raiser and the log
-say "not carried", or accept it and make `alert_raised` stop claiming otherwise. The
-first two change `brenn-bridge`'s contract and want a design cycle; a bus attachment that
-buffers is a different promise from one that does not.
-
-Done = an alert raised while detached either reaches the bus at the next attachment or is
-reported as not carried, with the daemon's log saying which; and a test driving the
-detached window.
-
-See `TODO(alert-dropped-while-detached)` at `drain_alerts` in
-`host/crates/speech-surface/src/server.rs`.
+sighting is closed, and the behaviour it uncovered is closed too — see the bullet above.
