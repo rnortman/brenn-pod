@@ -775,14 +775,31 @@ fn tts_wav_body(n: usize) -> Vec<u8> {
 /// `[stt]`/`[tts]` tables point at a single URL. Each request arrives on its own
 /// connection (responses carry `Connection: close`). Returns the base URL; the
 /// listener lives on a detached thread reaped at process exit.
+///
+/// TTS answers immediately. A test whose ordering depends on synthesis taking
+/// real time uses [`spawn_fake_speaches_with_tts_delay`].
 pub fn spawn_fake_speaches(tts_samples: usize) -> String {
+    spawn_fake_speaches_with_tts_delay(tts_samples, Duration::ZERO)
+}
+
+/// [`spawn_fake_speaches`] whose `/v1/audio/speech` route holds each response
+/// for `tts_delay` before writing it, so synthesis takes about as long as a real
+/// backend's would instead of returning in the same scheduler tick. STT stays
+/// immediate.
+///
+/// The server thread serves one connection at a time, so a request that arrives
+/// during the hold waits behind it — including an STT request. Fit for scenarios
+/// in which the daemon has at most one TTS request in flight and no STT call
+/// overlaps a TTS hold; a scenario with concurrent requests would see them
+/// serialized.
+pub fn spawn_fake_speaches_with_tts_delay(tts_samples: usize, tts_delay: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake speaches");
     let addr = listener.local_addr().expect("fake speaches addr");
     let tts_body = tts_wav_body(tts_samples);
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
-                Ok(mut s) => serve_fake_speaches(&mut s, &tts_body),
+                Ok(mut s) => serve_fake_speaches(&mut s, &tts_body, tts_delay),
                 Err(_) => break,
             }
         }
@@ -793,7 +810,7 @@ pub fn spawn_fake_speaches(tts_samples: usize) -> String {
 /// Read one framed HTTP request, route on its path, and write the canned
 /// response. A request to neither known endpoint gets a `404` so a mis-pathed
 /// call fails loudly rather than being answered as if it hit the right route.
-fn serve_fake_speaches(stream: &mut TcpStream, tts_body: &[u8]) {
+fn serve_fake_speaches(stream: &mut TcpStream, tts_body: &[u8], tts_delay: Duration) {
     let req = read_http_request(stream);
     let head = String::from_utf8_lossy(&req);
     let request_line = head.lines().next().unwrap_or("");
@@ -804,6 +821,7 @@ fn serve_fake_speaches(stream: &mut TcpStream, tts_body: &[u8]) {
             format!("{{\"text\":\"{FAKE_TRANSCRIPT}\"}}").into_bytes(),
         )
     } else if request_line.contains("/v1/audio/speech") {
+        thread::sleep(tts_delay);
         ("audio/wav", tts_body.to_vec())
     } else {
         let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";

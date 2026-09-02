@@ -386,99 +386,6 @@ ASR tuning is the expected pick for a host-side wake-word/STT consumer).
 See `TODO(reachy-beam-mapping)` at `beam_energy_speech` in
 `firmware/devices/reachy-pod/src/beam.rs`.
 
-## `barge-in-flake` — not blocked as of 2026-08-13 (un-reproduced; the next failing gate run is the sample)
-
-`barge_in_flushes_playback_and_chains_the_interrupted_turn`
-(`host/crates/speech-surface/tests/barge_integration.rs`) fails when the machine it runs
-on is busy or has recently been busy, and passes when the machine is quiet. It has been
-rejecting commits in both workspaces since 2026-08-02, always green on an immediate
-re-run of the same tree with nothing disabled and no `--no-verify`.
-
-**What has reproduced it, and what no longer does.** Every failure on the record is a
-failure of a workspace-parallel test run: the first two `make -C firmware check-host`
-runs that competed with a cold firmware build (the third passed, against zero failures in
-~18 warm or solo runs at the same HEAD), and later four consecutive failures of `cargo
-test -p speech-surface --test barge_integration` immediately after a full `make -C
-firmware check` on a docs-only tree, with `-- --nocapture` passing once and five plain
-runs a minute later green.
-
-A deliberate localization run on 2026-08-13 reproduced nothing: 26 runs on that same
-workstation, all green, across three shapes — the recipe as it was written here, a
-corrected variant that generated real load (target directories wiped, 3.5 G rebuilt), and
-six cycles of the gate's own shape, including one from a cold 239-crate target directory
-(brenn-ops
-`docs/adr/2026/08/12-multi--head-presence-safety-gate-convergence-contd/barge-localization/results.md`).
-The run also found two defects in the recipe: on a clean tree the warm-up step is a
-16-second cache hit that generates no load — warming from clean means deleting the target
-directories first — and the standalone `cargo test -p speech-surface` invocation is not
-the shape any failure has ever occurred in. Any future attempt runs in gate shape, `make
--C host check`.
-
-**Sighting, 2026-09-01, standalone shape, distinct symptom.** `cargo test -p
-speech-surface --test barge_integration` run on its own fails to connect its fake pod,
-deterministically, at both `480e097` (unmodified upstream) and `77bb345`; the same test
-passes under `make check`, which builds the whole workspace first. Attributed at the time
-to a stale-binary artifact of the standalone invocation, unconfirmed. This amends the
-paragraph above: the standalone shape does produce a failure, but a reproducible
-connect-side one on a tree that is otherwise green, not the load-correlated flake this
-entry tracks, and it predates this work rather than regressing from it.
-
-So the flake is not available on demand, and the ordinary gate is the only instrument
-known to produce a failing sample. **Next action: when the gate next rejects on this
-test, save that run's full output before any re-run** and file it in the ADR of whatever
-work tripped it. The failure carries its own evidence — every assertion interpolates
-`daemon.diagnostics()` (the daemon's JSONL, stdout and stderr, printed in the panic) and
-the pod tally covers the wire side.
-
-**What is ruled out.** Any diff of ours: the two reproductions above were on trees whose
-`host/` workspace was byte-identical to a green base, one of them docs-only. And solo
-looping on an idle machine — about 29 cumulative clean isolated runs have produced
-nothing, so the several-hundred-iteration idle loop this entry used to ask for is the
-wrong instrument.
-
-**The two open readings.** (a) A daemon race: a judge attributed a ~1-in-12 reproduction
-to the `playback_no_pod` path when the client disconnects before synthesis lands, i.e.
-the `None` arm of `emit_outcome` at
-`host/crates/speech-surface/src/playback_router.rs:408` (the arm itself at `:420-426`).
-(b) A harness-side timing race: the `-- --nocapture` contrast puts libtest's own output capture in the timing,
-which (a) does not explain. Neither is established. Whatever slips, it slips by a lot —
-every wait in the test rests on an observed wire or JSONL event with a 20 s deadline,
-not on a sleep.
-
-**Stakes.** Under (b) the cost is commits rejected at random and everyone trained to
-re-run a red gate rather than read it — observed a fourth time in 2026-08, where a full
-`make check` failed here and was re-run to green. That reflex is how a genuine
-`speech-surface` regression gets waved through, because "green on a re-run" looks
-identical. Under (a) barge-in occasionally misbehaves on live hardware, where nothing
-re-runs it.
-
-**The gate keeps this test.** Quarantining it behind a lane carrying this slug was
-considered and rejected twice: while a reproduction looked cheap, because under reading
-(a) this test failing is the only signal the project has of a barge-in defect that would
-misbehave on live hardware, where nothing re-runs anything; and again once the
-reproduction vanished, because the gate is then also the only collector of failing
-samples, and quarantining would retire it. The accelerant available on request, and the
-one instrument never yet tried in the shape that fails, is a several-hundred-cycle
-overnight `make -C host check` loop.
-
-Done = the slip localized to the daemon or to the harness, fixed, with a pinning test
-for whichever it was; the test running in the ordinary gate; and a post-fix soak in gate
-shape — a multi-cycle `make -C host check` loop — green, with the test riding the
-ordinary gate without a rejection.
-
-History: the five dated fact/inference notes this entry accreted between 2026-08-02 and
-2026-08-12 are archived in the ADR implementation logs and judge verdicts they came from
-— brenn-ops `docs/adr/2026/08/03-multi--brenn-brain-bridge-integration/` (the
-`playback_no_pod` attribution), `2026/08/07-multi--wake-driven-head-presence/` (three
-gate rejections in one feature, two of them mute and still unattributed to anything, so
-not evidence for this flake either way), and
-`2026/08/12-multi--head-presence-safety-gate-convergence-contd/` (both reproductions
-above). The account in this entry is the current one.
-
-See `TODO(barge-in-flake)` at
-`barge_in_flushes_playback_and_chains_the_interrupted_turn` in
-`host/crates/speech-surface/tests/barge_integration.rs`.
-
 ## `gate-only-single-sighting-flakes` — not blocked as of 2026-08-31 (two single observations left; the next failing gate run is the sample)
 
 Three tests had each failed exactly once under a `make check` whose other lanes were
@@ -559,9 +466,9 @@ share a mechanism, and each reads differently once walked:
 **This is an observation, not a diagnosis.** Nobody has reproduced any of the three on
 demand, and one failure each is not enough to say what showed. It is filed together
 because a single sighting recorded nowhere is a sighting that gets re-discovered from
-scratch — which is what the `barge-in-flake` entry above exists to stop happening a second
-time. The two entries are deliberately separate: that flake has a reproduction history and
-two competing readings, and folding these in would dilute an account that is doing work.
+scratch — the retired `barge-in-flake` entry existed to stop that happening a second time,
+and it paid off: the one saved failing run localized that race (the harness read its
+verdict before the daemon wrote it; brenn-ops `docs/adr/2026/09/02-pod--ci-failure/`).
 
 Not fixed by widening budgets on sight. For the signal test the budget is load-bearing —
 it bounds the window the waker must land a signal inside. For the refused-connect test

@@ -12,7 +12,9 @@
 //! carrying the interrupted turn's context chain; the echo brain reads that back
 //! as *"I think you interrupted me after …"*. The assertion is both JSONL-side
 //! (the `barge_in` → `playback_flushed` sequence and utterance 2's chain) and
-//! device-side (the `FlushPlayback` actually crossed the wire).
+//! device-side (the `FlushPlayback` actually crossed the wire). The test waits
+//! for the readback to reach the wire before it closes the pod, so the JSONL it
+//! reads after teardown already holds utterance 2's synthesis.
 
 mod common;
 
@@ -40,13 +42,18 @@ const PLAIN_ECHO_CHARS: u64 = common::FAKE_TRANSCRIPT.len() as u64;
 const AUDIO_DEADLINE: Duration = Duration::from_secs(20);
 const FLUSH_DEADLINE: Duration = Duration::from_secs(20);
 
-// TODO(barge-in-flake): fails on a machine still warm from a build and passes on a quiet
-// one, roughly two in three; the one `-- --nocapture` run tried so far passed, which is
-// too little to rule either a daemon race or a harness-side one out. The recipe, the
-// evidence and the pending decision live in TODO.md — read it first.
+/// How long the fake TTS holds each `/v1/audio/speech` response. Sized so that,
+/// were the test to read the JSONL before utterance 2's `synth` line lands, it
+/// would do so every run rather than one run in three: the window between the
+/// `utterance` line and the `synth` line is otherwise single-digit ms, the same
+/// order as a poll interval plus a close and a file read; 250 ms dwarfs that
+/// under any load the gate produces, and is also the order of a real TTS
+/// backend's latency, which a zero-latency fake misrepresents.
+const TTS_DELAY: Duration = Duration::from_millis(250);
+
 #[test]
 fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
-    let speaches_url = common::spawn_fake_speaches(TTS_SAMPLES);
+    let speaches_url = common::spawn_fake_speaches_with_tts_delay(TTS_SAMPLES, TTS_DELAY);
     let mut daemon = common::spawn_daemon(&common::echo_parrot_config(&speaches_url));
     let jsonl_path = daemon.jsonl_path.clone();
     let addr = daemon.listen_addr();
@@ -82,11 +89,29 @@ fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
         daemon.diagnostics()
     );
 
-    // Utterance 2 carries the barge chain; wait for its `utterance` line (the one
-    // with a `barge_in` block) before tearing down.
-    common::wait_for_event(&daemon, "barge utterance", common::EVENT_DEADLINE, |v| {
-        v["event"] == "utterance" && v.get("barge_in").is_some()
-    });
+    // The barge utterance is the `utterance` line carrying a `barge_in` block;
+    // its daemon-minted id is read from that line rather than assumed, so the
+    // wait below keys on the turn the barge actually carved.
+    let barge_utt =
+        common::wait_for_event(&daemon, "barge utterance", common::EVENT_DEADLINE, |v| {
+            v["event"] == "utterance" && v.get("barge_in").is_some()
+        });
+    let barge_id = barge_utt["id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("barge utterance id is numeric\n{}", daemon.diagnostics()));
+
+    // Wait for that utterance's readback to reach the wire before tearing down.
+    // The `synth` assertion below reads the JSONL after teardown, so the JSONL
+    // must hold the barge utterance's `synth` line before the pod closes.
+    // `playback_started` implies `synth`, `utterance`, and `speak_rx` have
+    // already been written (one ordered sink, `src/jsonl.rs`); waiting on
+    // `utterance` alone would leave the synthesis round trip racing the close.
+    common::wait_for_event(
+        &daemon,
+        "barge readback playing",
+        common::EVENT_DEADLINE,
+        |v| v["event"] == "playback_started" && v["utterance"] == barge_id,
+    );
 
     let tally = pod.finish();
     assert!(
@@ -162,11 +187,32 @@ fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
     // (the `I think you interrupted me after "…"` scaffolding alone dwarfs it).
     // The readback text is not itself on the JSONL, so its character count stands
     // in for it: only the barge branch produces a reply this long.
-    let synth_chars: Vec<u64> = events
+    let synths: Vec<&serde_json::Value> = events.iter().filter(|v| v["event"] == "synth").collect();
+    let synth_chars: Vec<u64> = synths
         .iter()
-        .filter(|v| v["event"] == "synth")
         .filter_map(|v| v["input_chars"].as_u64())
         .collect();
+    // The fake TTS holds every response for `TTS_DELAY`; each synth's measured
+    // round trip must show at least that hold, or the fake is not taking the
+    // real time the teardown ordering above is proved against.
+    let synth_us: Vec<u64> = synths
+        .iter()
+        .filter_map(|v| v["synth_us"].as_u64())
+        .collect();
+    assert_eq!(
+        synth_us.len(),
+        synths.len(),
+        "every synth line carries a measured synth_us\n{}",
+        daemon.diagnostics()
+    );
+    assert!(
+        !synth_us.is_empty()
+            && synth_us
+                .iter()
+                .all(|&us| us >= TTS_DELAY.as_micros() as u64),
+        "the fake TTS holds each response for {TTS_DELAY:?}, so every synth must take at least that long, got synth_us {synth_us:?}\n{}",
+        daemon.diagnostics()
+    );
     assert!(
         synth_chars.contains(&PLAIN_ECHO_CHARS),
         "utterance 1 echoed the transcript verbatim ({PLAIN_ECHO_CHARS} chars), got {synth_chars:?}\n{}",
