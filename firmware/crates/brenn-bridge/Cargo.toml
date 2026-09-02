@@ -16,9 +16,9 @@ license.workspace = true
 # a bridge built against an older rev keeps working against a newer server for
 # as long as the negotiated window allows. Move all three together — they are one
 # workspace upstream and their internal path deps must agree.
-brenn-attach-client = { git = "https://github.com/rnortman/brenn.git", rev = "5f7cd2cd01215e93584a93f5c1e9d044f66b4d66" }
-brenn-attach-proto = { git = "https://github.com/rnortman/brenn.git", rev = "5f7cd2cd01215e93584a93f5c1e9d044f66b4d66" }
-brenn-envelope = { git = "https://github.com/rnortman/brenn.git", rev = "5f7cd2cd01215e93584a93f5c1e9d044f66b4d66" }
+brenn-attach-client = { git = "https://github.com/rnortman/brenn.git", rev = "774aaf1981b256c3ebda0ccfafb7afbedf2915b7" }
+brenn-attach-proto = { git = "https://github.com/rnortman/brenn.git", rev = "774aaf1981b256c3ebda0ccfafb7afbedf2915b7" }
+brenn-envelope = { git = "https://github.com/rnortman/brenn.git", rev = "774aaf1981b256c3ebda0ccfafb7afbedf2915b7" }
 pod-secrets = { path = "../pod-secrets" }
 pod-jsonl = { path = "../pod-jsonl" }
 # TLS backend for the `wss://` dial. No code in this crate calls it; naming it

@@ -351,6 +351,10 @@ async fn an_attachment_carries_a_subscription_and_its_deliveries_to_the_embedder
     let outcome = task.await.expect("the task joins");
     assert_eq!(outcome, BridgeOutcome::Closed);
     assert_eq!(outcome.exit_code(), 0);
+    assert!(
+        outcome.commanded(),
+        "a shutdown that was acted on is the one commanded ending"
+    );
 }
 
 #[tokio::test]
@@ -618,6 +622,7 @@ async fn no_version_in_common_ends_the_bridge_with_its_own_exit_code() {
         }
     );
     assert_eq!(outcome.exit_code(), crate::exit::VERSION_INCOMPATIBLE);
+    assert!(!outcome.commanded(), "nobody commands a version refusal");
     let rendered = outcome.to_string();
     assert!(
         rendered.contains(&format!("{}", SUPPORTED_VERSIONS.max))
@@ -654,6 +659,7 @@ async fn a_frame_this_bridge_cannot_own_is_fatal() {
         other => panic!("expected a protocol error, got {other:?}"),
     }
     assert_eq!(outcome.exit_code(), crate::exit::HARD_FAILURE);
+    assert!(!outcome.commanded(), "nobody commands a protocol error");
 }
 
 #[tokio::test]
@@ -690,6 +696,10 @@ async fn a_run_of_attachments_answered_nothing_ends_the_bridge() {
         .expect("the task joins");
     assert_eq!(outcome, BridgeOutcome::Futile { attachments: 2 });
     assert_eq!(outcome.exit_code(), crate::exit::HARD_FAILURE);
+    assert!(
+        !outcome.commanded(),
+        "giving up on a silent peer is nobody's command"
+    );
     // The budget is a bound on attempts, not just an ending: a dialed socket
     // receives a `Hello` immediately, so silence on the third scripted wire is
     // proof the third attachment was never made.
@@ -882,6 +892,10 @@ async fn a_close_on_the_declared_terminal_code_ends_the_bridge() {
     }
     assert_eq!(outcome.exit_code(), crate::exit::HARD_FAILURE);
     assert!(
+        !outcome.commanded(),
+        "the peer's terminal close is not the embedder's command"
+    );
+    assert!(
         outcome.to_string().contains("4001"),
         "the operator is told which code stopped the pod: {outcome}"
     );
@@ -1036,6 +1050,10 @@ async fn an_idle_attachment_that_drops_is_not_futile() {
         .expect("the task joins");
     assert_eq!(outcome, BridgeOutcome::EmbedderGone);
     assert_eq!(outcome.exit_code(), 0);
+    assert!(
+        !outcome.commanded(),
+        "orderly, but nobody asked: the embedder vanished"
+    );
 }
 
 #[tokio::test]
@@ -1098,10 +1116,13 @@ async fn an_alert_reaches_the_wire_unanswered() {
             severity,
             title,
             body,
+            attribution,
         } => {
             assert_eq!(severity, AlertSeverity::Warning);
             assert_eq!(title, "pod-kitchen");
             assert_eq!(body, "the mic array is mute");
+            // Absent, so the alert on the wire is what a wire-3 peer read.
+            assert_eq!(attribution, None);
         }
         other => panic!("expected an Alert, got {other:?}"),
     }

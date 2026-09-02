@@ -414,6 +414,15 @@ directories first — and the standalone `cargo test -p speech-surface` invocati
 the shape any failure has ever occurred in. Any future attempt runs in gate shape, `make
 -C host check`.
 
+**Sighting, 2026-09-01, standalone shape, distinct symptom.** `cargo test -p
+speech-surface --test barge_integration` run on its own fails to connect its fake pod,
+deterministically, at both `480e097` (unmodified upstream) and `77bb345`; the same test
+passes under `make check`, which builds the whole workspace first. Attributed at the time
+to a stale-binary artifact of the standalone invocation, unconfirmed. This amends the
+paragraph above: the standalone shape does produce a failure, but a reproducible
+connect-side one on a tree that is otherwise green, not the load-correlated flake this
+entry tracks, and it predates this work rather than regressing from it.
+
 So the flake is not available on demand, and the ordinary gate is the only instrument
 known to produce a failing sample. **Next action: when the gate next rejects on this
 test, save that run's full output before any re-run** and file it in the ADR of whatever
@@ -573,3 +582,55 @@ See `TODO(gate-only-single-sighting-flakes)` at `BUDGET` in
 `a_refused_connect_reports_the_tcp_stage_and_its_kind`, both in
 `firmware/crates/psk-link/src/link.rs`. The alert test carries no marker any more: its
 sighting is closed, and the behaviour it uncovered is closed too — see the bullet above.
+
+## `driver-death-ends-its-bridge` — DEFERRED as of 2026-09-01 (needs a server fixture with an injectable driver over a real bridge)
+
+A bridge driver that ends *because its bridge ended* leaves no bridge, so every publish after it
+is refused at once and each turn speaks the configured failure message immediately. A driver that
+dies *on its own* — a panic — leaves the bridge task running with nobody draining its bounded
+event channel. That bridge ends itself at the first event it cannot hand over (the embedder's
+receiver is gone with the task that held it, so the send fails and the outcome is
+`EmbedderGone`), but on a quiet bus that first event may be the reply to the very turn that is
+waiting: the turn publishes, nothing can route an answer to it, and it apologises only when its
+whole response window closes. A pod whose driver panicked therefore answers every turn a
+response-window late until something on the bus wakes the bridge.
+
+Not a wedge — `a_turn_after_the_driver_itself_died_still_answers`
+(`host/crates/speech-surface/src/brenn/driver.rs`) pins that the turn does end on the configured
+failure message — and not silent, since the death itself is a loud `brenn_driver_exited` line.
+What is missing is promptness.
+
+The shape is decided: a driver that dies on its own **ends its bridge**, so publishes after
+that death are refused `Gone` at once, exactly as when the driver followed its bridge down. The
+server has to keep two handles it deliberately hands away today: the command `BridgeHandle`
+that sends the shutdown, and the bridge task's `JoinHandle<BridgeOutcome>` that reads the ending.
+Today the task handle rides into the driver task in `DriverIo`, so a driver panic drops it and
+detaches the bridge; the server then has nothing to join, and the ending line below cannot be
+made without that outcome in hand. The rejected alternative was
+making a self-died driver fatal to the pipeline: the loss a driver panic leaves is the loss a
+terminal bridge exit leaves, and nothing on this fleet restarts a process that exits, so a fatal
+ending would only trade a bus-less pod for a deaf one.
+
+What remains is implementation, and it needs a server fixture that composes a real bridge behind
+an injectable driver, which today's driver-override fixture is not.
+
+One constraint on that implementation from a downstream reader. brenn-reachy's speech run report
+fails a run on any `brenn_driver_exited` line and on any `brenn_bridge_exit` line whose
+`unexpected` field is true, and reports each as its own finding — it does not fold the two into
+one loss. The bridge shutdown this work adds is an ending the server asked for, so an ending line
+emitted for it, if any, **must carry `unexpected: false`**: that report ignores such a line, and
+the death line already names the loss. The field means "nobody commanded this ending".
+`finish()` reads the field as the negation of `BridgeOutcome::commanded()` on the outcome it
+joined — `Closed` is the one commanded ending the bridge knows — and an ending line emitted for
+this work's shutdown asks the same predicate of the outcome the server joins, which is answered by
+that outcome and nothing else; hand-setting `false` because the server issued the command would
+mislabel an ending the bridge had already reached on its own. An
+`unexpected: true` ending emitted for a commanded shutdown costs a second finding for one loss. The driver's `finish()` is the only emitter of `brenn_bridge_exit` today
+and a dead driver never runs it, so the shutdown emits nothing unless this work adds a line.
+
+Done = a driver that dies on its own ends its bridge, so publishes after that death are refused
+at once; a server-level test submits a turn after that death and asserts the failure message; and
+the qualifying paragraph on `handle_driver_exit_midrun` is retired.
+
+See `TODO(driver-death-ends-its-bridge)` at `handle_driver_exit_midrun` in
+`host/crates/speech-surface/src/server.rs`.

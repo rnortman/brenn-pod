@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use audio_pipeline::wire::{MAX_FRAME_BYTES, decode_frame};
@@ -51,7 +51,7 @@ use speech_pipeline::{
 use crate::alerts::{Alert, AlertInbox};
 use crate::barge::TurnLedger;
 use crate::brenn::BridgeLink;
-use crate::brenn::driver::{BridgeDriver, DriverIo, DriverTokens, IntentSink};
+use crate::brenn::driver::{BridgeDriver, DriverIo, IntentSink};
 use crate::clip::{ClipError, load_clip};
 use crate::config::{BrainMode, Config, PskTable, SttBackend, SttConfig, TtsBackend};
 use crate::iso8601_ms;
@@ -785,10 +785,6 @@ impl Server {
         // publishing into a dead bridge. `run` cancels this one after the pipeline
         // has joined, when no further turn can be dispatched.
         let bridge_teardown = CancellationToken::new();
-        // Set by the driver when the bridge ends mid-run. Read by the router
-        // supervision arms below, so the process's exit names the bridge outcome
-        // rather than the task exits that cancel provokes downstream.
-        let bridge_fatal: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
         // The subscription plane holds subscriptions across attachments, so
         // no subscribe call is needed here.
         //
@@ -849,11 +845,7 @@ impl Server {
                     parts.config,
                     parts.bridge.handle,
                     brain,
-                    DriverTokens {
-                        teardown: bridge_teardown.clone(),
-                        shutdown: shutdown_token.clone(),
-                        fatal: bridge_fatal.clone(),
-                    },
+                    bridge_teardown.clone(),
                     jsonl.clone(),
                 );
                 let driver = match sinks.intents.clone() {
@@ -1043,17 +1035,20 @@ impl Server {
                         handle_pipeline_result(pipeline_result, &jsonl, &mut pipeline_fatal);
                         pipeline_joined = true;
                     }
-                    handle_router_exit_midrun(result, &bridge_fatal, &jsonl, &mut pipeline_fatal);
+                    handle_router_exit_midrun(result, &jsonl, &mut pipeline_fatal);
                     break;
                 }
                 result = async { driver_join.as_mut().expect("guarded by is_some").await },
                         if driver_join.is_some() && !driver_joined => {
                     // A mid-run driver exit means the bus brain can never answer
-                    // another turn — a fault reported here rather than discovered
-                    // at the shutdown join, which nothing would reach on its own.
+                    // another turn, and the daemon keeps serving anyway: wake,
+                    // endpointing, recording and STT need no bus, and each turn
+                    // fails on its own against a dead bridge, speaking the
+                    // configured failure message. The arm exists to report a
+                    // driver that died on its own — nothing else joins it — and
+                    // then to stop selecting on a finished handle.
                     driver_joined = true;
-                    handle_driver_exit_midrun(result, &bridge_fatal, &jsonl, &mut pipeline_fatal);
-                    break;
+                    handle_driver_exit_midrun(result, &jsonl);
                 }
                 accepted = listener.accept() => {
                     let (stream, peer) = match accepted {
@@ -1768,29 +1763,7 @@ fn emit_router_exited(jsonl: &JsonlHandle, reason: &str, detail: &str) {
 /// did not already observe the exit.
 fn handle_router_exit(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
     if let Err(e) = result {
-        // A `JoinError` is a panic unless the task was aborted. Nothing aborts
-        // the router today, but label a cancellation honestly rather than
-        // reporting it as a panic if that ever changes.
-        let reason = if e.is_cancelled() {
-            "cancelled"
-        } else {
-            "panic"
-        };
-        emit_router_exited(jsonl, reason, &e.to_string());
-    }
-}
-
-/// Take the bridge's fault, if it left one, as the process's exit reason.
-///
-/// A bridge that ends mid-run cancels the shutdown token and ends its driver;
-/// both of the supervision arms downstream of that see only a task exiting. The
-/// bridge outcome is the fault and those exits are the symptom, so it goes in
-/// first and the first-writer-wins slot keeps it.
-fn adopt_bridge_fault(bridge_fatal: &OnceLock<String>, fatal: &mut Option<PipelineFatal>) {
-    if let Some(detail) = bridge_fatal.get() {
-        fatal.get_or_insert(PipelineFatal {
-            detail: detail.clone(),
-        });
+        emit_router_exited(jsonl, task_exit_reason(&e), &e.to_string());
     }
 }
 
@@ -1826,7 +1799,7 @@ fn emit_task_exit(jsonl: &JsonlHandle, event: &str, reason: &str, detail: &str) 
 /// until the incident that reads these lines.
 fn handle_task_exit(event: &str, result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
     if let Err(e) = result {
-        emit_task_exit(jsonl, event, driver_exit_reason(&e), &e.to_string());
+        emit_task_exit(jsonl, event, task_exit_reason(&e), &e.to_string());
     }
 }
 
@@ -1896,9 +1869,12 @@ async fn drain_alerts(
 }
 
 /// A `JoinError` is a panic unless the task was aborted. Nothing aborts the
-/// driver today, but label a cancellation honestly rather than reporting it as a
-/// panic if that ever changes.
-fn driver_exit_reason(e: &tokio::task::JoinError) -> &'static str {
+/// router or any of the three composed tasks today, but label a cancellation
+/// honestly rather than reporting it as a panic if that ever changes.
+/// `brenn_driver_exited` means the bus was lost, whatever its `reason` says —
+/// a run is failed on the line's presence, never on the label — so callers
+/// must not emit it for a commanded abort; suppress the event entirely.
+fn task_exit_reason(e: &tokio::task::JoinError) -> &'static str {
     if e.is_cancelled() {
         "cancelled"
     } else {
@@ -1906,32 +1882,28 @@ fn driver_exit_reason(e: &tokio::task::JoinError) -> &'static str {
     }
 }
 
-/// Report a driver exit observed mid-run by the supervision arm, and latch the
-/// fault that makes `run` return `Err`.
+/// Report a driver exit observed mid-run by the supervision arm.
 ///
-/// A bridge that ended terminally latched its own detail before cancelling the
-/// shutdown token, and that root fault wins over anything named here — the
-/// driver following its bridge out is the symptom, and the `brenn_bridge_exit`
-/// line already reported it, so that case stays silent. A driver that died on
-/// its own leaves no such account: it owns the bridge join and every bus event,
-/// so its death is reported here or nowhere.
-fn handle_driver_exit_midrun(
-    result: Result<(), tokio::task::JoinError>,
-    bridge_fatal: &OnceLock<String>,
-    jsonl: &JsonlHandle,
-    fatal: &mut Option<PipelineFatal>,
-) {
-    adopt_bridge_fault(bridge_fatal, fatal);
-    let (reason, detail) = match result {
-        Ok(()) if bridge_fatal.get().is_some() => return,
-        Ok(()) => ("clean_exit", "bridge driver exited mid-run".to_string()),
-        Err(e) => (
-            driver_exit_reason(&e),
-            format!("bridge driver died mid-run: {e}"),
-        ),
-    };
-    emit_task_exit(jsonl, DRIVER_EXITED, reason, &detail);
-    fatal.get_or_insert(PipelineFatal { detail });
+/// A driver that returned cleanly followed its bridge out, and the
+/// `brenn_bridge_exit` line has already said what happened to it, so that case
+/// stays silent. A driver that died on its own leaves no such account — it owns
+/// the bridge join and every bus event, so its death is reported here or nowhere.
+///
+/// Neither ending stops the daemon. What is gone is the bus brain, not the
+/// machine: turns fail one at a time and speak the configured failure message,
+/// and everything upstream of the brain is untouched.
+///
+/// The two endings pay differently for that. A driver that followed its bridge
+/// out leaves no bridge, so a publish is refused at once. A driver that died on
+/// its own leaves the bridge running with nobody draining its events: it ends
+/// itself at the first event it cannot hand over, and until then a turn spends
+/// its whole response window waiting for a reply nothing can route before it
+/// apologises. TODO(driver-death-ends-its-bridge)
+fn handle_driver_exit_midrun(result: Result<(), tokio::task::JoinError>, jsonl: &JsonlHandle) {
+    if let Err(e) = result {
+        let detail = format!("bridge driver died mid-run: {e}");
+        emit_task_exit(jsonl, DRIVER_EXITED, task_exit_reason(&e), &detail);
+    }
 }
 
 /// Report a router exit observed mid-run by the supervision arm. Both a panic and
@@ -1940,18 +1912,14 @@ fn handle_driver_exit_midrun(
 /// `playback_router_exited` (distinguished by `reason`) and latch `pipeline_fatal`
 /// so `run` returns `Err` and a supervisor restarts the process.
 ///
-/// The bridge's fault is adopted first, and that ordering is the whole point of
-/// doing it here rather than at the call site: one way a router returns cleanly
-/// mid-run is a terminally-exited bridge cancelling the shutdown token, and the
-/// exit string must then name the bridge outcome, not the router's clean return
-/// downstream of it.
+/// A dead router is a machine that cannot speak, which no degraded posture
+/// covers — unlike a dead bridge, which leaves a pod that still hears and still
+/// answers with its failure message.
 fn handle_router_exit_midrun(
     result: Result<(), tokio::task::JoinError>,
-    bridge_fatal: &OnceLock<String>,
     jsonl: &JsonlHandle,
     fatal: &mut Option<PipelineFatal>,
 ) {
-    adopt_bridge_fault(bridge_fatal, fatal);
     let (reason, detail) = match result {
         Ok(()) => ("clean_exit", "playback router exited mid-run".to_string()),
         Err(e) => ("panic", format!("playback router panicked mid-run: {e}")),
@@ -3740,8 +3708,8 @@ mod tests {
         assert_eq!(events_named(&lines, "brain_brenn").len(), 1);
         let exit = events_named(&lines, "brenn_bridge_exit");
         assert_eq!(exit.len(), 1, "one exit line: {exit:?}");
-        // A requested stop, not a fault: nothing latched, nothing restarts.
-        assert_eq!(exit[0]["fatal"], false);
+        // A requested stop: nobody reading the log should read it as news.
+        assert_eq!(exit[0]["unexpected"], false);
         assert!(events_named(&lines, "brenn_driver_exited").is_empty());
         assert!(events_named(&lines, "pipeline_fatal").is_empty());
 
@@ -3785,20 +3753,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_terminal_bridge_exit_stops_the_server_naming_the_bridge() {
+    async fn a_terminal_bridge_exit_leaves_the_server_serving() {
         // The whole chain, through a real `Server::run`: a bridge that ends
-        // terminally latches its outcome and cancels the shutdown token, the
-        // supervision arms observe the tasks that stop downstream of that
-        // cancel, and the process exits nonzero naming the bridge — never the
-        // symptom. Every link but the peer is the production one.
+        // terminally says so and takes only its driver with it. Everything that
+        // needs no bus keeps running — a pod still handshakes afterwards, and
+        // the alert seam ends on its own content rather than holding a raiser
+        // up — and the orderly stop is still a clean one. Every link but the
+        // peer is the production one.
         let dir = tempfile::tempdir().unwrap();
         let cfg = brenn_config(dir.path());
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
         let (bridge, bridge_handle, events, mut peers) =
             crate::brenn::scripted::scripted(&[crate::brenn::scripted::Attempt::Open], 3);
-        let (server, _addr, _stop, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
-        let server = server.with_brenn_override(tokio::spawn(bridge.run()), bridge_handle, events);
+        let (raiser, inbox) = crate::alerts::alert_seam(crate::alerts::ALERT_QUEUE_DEPTH);
+        let (server, addr, stop, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
+        let server = server
+            .with_brenn_override(tokio::spawn(bridge.run()), bridge_handle, events)
+            .with_alerts(inbox);
         let run = tokio::spawn(async move {
             server
                 .run(async move {
@@ -3817,21 +3789,67 @@ mod tests {
             "entries": [],
         }));
 
-        let err = run
-            .await
+        wait_for_event(&path, "the bridge's terminal exit", |v| {
+            v["event"] == "brenn_bridge_exit"
+        })
+        .await;
+        // The proof that the daemon is alive rather than merely unjoined: a pod
+        // completes its handshake with no bus behind the brain.
+        let client = connect_pod(addr).await;
+
+        // The process outlives the bus for the rest of the session, so a
+        // blocking raiser or wedged drain would be a live hang on the fault-
+        // reporting path. The raise is non-blocking; the alert it carried
+        // survives on the line that ends the seam.
+        raiser
+            .raise(crate::alerts::Alert {
+                severity: brenn_bridge::AlertSeverity::Critical,
+                title: "the head is parked".to_owned(),
+                body: "a fault row ended the session".to_owned(),
+            })
+            .expect("the seam is live until the drain meets the dead bridge");
+        let ended = wait_for_event(&path, "the alert seam's end", |v| {
+            v["event"] == "alert_seam_ended"
+        })
+        .await;
+        assert_eq!(ended["title"], "the head is parked");
+        assert_eq!(ended["body"], "a fault row ended the session");
+        // And every later raise is refused rather than queued behind a drain
+        // that is gone. Bounded: the refusal follows the drain's own exit.
+        poll_until("the seam refusing a later alert", || {
+            raiser
+                .raise(crate::alerts::Alert {
+                    severity: brenn_bridge::AlertSeverity::Warning,
+                    title: "and again".to_owned(),
+                    body: "the same condition, later".to_owned(),
+                })
+                .err()
+        })
+        .await;
+
+        stop.send(()).unwrap();
+        run.await
             .unwrap()
-            .expect_err("a voice node with no brain transport does not keep serving");
-        assert!(
-            err.to_string().starts_with("brenn bridge exited:"),
-            "the exit names the bridge, not the router or driver it stopped: {err}"
-        );
+            .expect("a pod that lost its bus still stops cleanly");
+        drop(client);
 
         drop(handle);
         join.await.unwrap();
         let lines = read_lines(&path);
         let exit = events_named(&lines, "brenn_bridge_exit");
         assert_eq!(exit.len(), 1, "one exit line: {exit:?}");
-        assert_eq!(exit[0]["fatal"], true);
+        assert_eq!(
+            exit[0]["unexpected"], true,
+            "nobody asked for this ending: {exit:?}"
+        );
+        assert!(
+            events_named(&lines, "pipeline_fatal").is_empty(),
+            "a bus that went away is not a pipeline fault: {lines:?}"
+        );
+        assert!(
+            events_named(&lines, "brenn_driver_exited").is_empty(),
+            "a driver following its bridge out is already accounted for"
+        );
     }
 
     /// A sink standing where the bus would be, for both motion directions:
@@ -4770,12 +4788,13 @@ mod tests {
     /// Every task the server joins at teardown, under its own event name.
     ///
     /// One case over the three because one function reports them: a task that
-    /// stops on its teardown token returns cleanly and says nothing, and one
-    /// that died is named. What each death costs differs — the script task
-    /// takes the head's only source with it, the alert task takes the operator
-    /// surface, the driver takes every future bus event — and none of that is
-    /// visible in the line beyond which name it carries, which is what this
-    /// asserts.
+    /// stops on its teardown token returns cleanly and says nothing, one that
+    /// died is named, and one that was aborted is labelled `cancelled`. What
+    /// each death costs differs — the
+    /// script task takes the head's only source with it, the alert task takes
+    /// the operator surface, the driver takes every future bus event — and none
+    /// of that is visible in the line beyond which name it carries, which is
+    /// what this asserts.
     #[tokio::test]
     async fn handle_task_exit_reports_a_dead_task_under_its_own_name() {
         for event in [DRIVER_EXITED, SCRIPT_TASK_EXITED, ALERT_TASK_EXITED] {
@@ -4785,17 +4804,24 @@ mod tests {
             handle_task_exit(event, Ok(()), &handle);
             let panicker = tokio::spawn(async { panic!("task boom") });
             handle_task_exit(event, panicker.await, &handle);
+            let pending = tokio::spawn(std::future::pending::<()>());
+            pending.abort();
+            handle_task_exit(event, pending.await, &handle);
 
             drop(handle);
             join.await.unwrap();
             let lines = read_lines(&path);
             let exited = events_named(&lines, event);
-            assert_eq!(exited.len(), 1, "{event}: the clean return said nothing");
+            assert_eq!(exited.len(), 2, "{event}: the clean return said nothing");
             assert_eq!(exited[0]["reason"], "panic");
             assert!(
                 exited[0]["detail"].as_str().unwrap().contains("panic"),
                 "{event}: detail names the panic: {:?}",
                 exited[0]["detail"]
+            );
+            assert_eq!(
+                exited[1]["reason"], "cancelled",
+                "{event}: an aborted task is labelled as one, not as a panic"
             );
         }
     }
@@ -4891,66 +4917,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_bridge_fault_owns_the_exit_reason_over_the_router_symptom() {
-        // A terminal bridge exit cancels the shutdown token, the router returns
-        // cleanly, and the exit string must name the bridge rather than that
-        // clean return. The precedence lives inside the reporter, so this is the
-        // whole of the behaviour and not a re-enactment of a call order.
+    async fn a_router_exit_names_its_own_detail() {
+        // Nothing stands in front of a dead router: a machine that cannot speak
+        // is a fault of its own, and the bus being gone is a state it survives,
+        // so the router's own account is the exit reason in both shapes.
         let dir = tempfile::tempdir().unwrap();
         let (jsonl, _join, _path) = jsonl_file(dir.path()).await;
-        let bridge_fatal = OnceLock::new();
-        bridge_fatal
-            .set("brenn bridge exited: incompatible".to_string())
-            .unwrap();
-        let mut fatal = None;
 
-        handle_router_exit_midrun(Ok(()), &bridge_fatal, &jsonl, &mut fatal);
-        assert_eq!(
-            fatal.as_ref().map(|f| f.detail.as_str()),
-            Some("brenn bridge exited: incompatible")
-        );
-
-        // With no bridge fault latched, the router's own detail stands.
         let mut fatal = None;
-        handle_router_exit_midrun(Ok(()), &OnceLock::new(), &jsonl, &mut fatal);
+        handle_router_exit_midrun(Ok(()), &jsonl, &mut fatal);
         assert_eq!(
             fatal.as_ref().map(|f| f.detail.as_str()),
             Some("playback router exited mid-run")
         );
-    }
 
-    #[tokio::test]
-    async fn a_driver_that_dies_mid_run_is_reported_and_fatal() {
-        let dir = tempfile::tempdir().unwrap();
-        let (jsonl, join, path) = jsonl_file(dir.path()).await;
-
-        // A driver following its terminally-exited bridge out is the symptom:
-        // the bridge's own exit line named the fault, so this one stays silent
-        // and the latched detail is the bridge's.
-        let bridge_fatal = OnceLock::new();
-        bridge_fatal
-            .set("brenn bridge exited: incompatible".to_string())
-            .unwrap();
         let mut fatal = None;
-        handle_driver_exit_midrun(Ok(()), &bridge_fatal, &jsonl, &mut fatal);
-        assert_eq!(
-            fatal.as_ref().map(|f| f.detail.as_str()),
-            Some("brenn bridge exited: incompatible")
-        );
-
-        // A driver that died on its own leaves no other account: nothing else
-        // joins the bridge, drains its events, or reports its exit.
-        let mut fatal = None;
-        let panicker = tokio::spawn(async { panic!("driver boom") });
-        handle_driver_exit_midrun(panicker.await, &OnceLock::new(), &jsonl, &mut fatal);
+        let panicker = tokio::spawn(async { panic!("router boom") });
+        handle_router_exit_midrun(panicker.await, &jsonl, &mut fatal);
         assert!(
             fatal
                 .as_ref()
                 .unwrap()
                 .detail
-                .contains("bridge driver died mid-run"),
-            "the exit names the driver: {fatal:?}"
+                .contains("playback router panicked mid-run"),
+            "the exit names the router: {fatal:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_driver_that_dies_on_its_own_is_the_only_one_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, join, path) = jsonl_file(dir.path()).await;
+
+        // A driver following its ended bridge out is already accounted for by
+        // the bridge's own exit line, so this one stays silent.
+        handle_driver_exit_midrun(Ok(()), &jsonl);
+
+        // A driver that died on its own leaves no other account: nothing else
+        // joins the bridge, drains its events, or reports its exit.
+        let panicker = tokio::spawn(async { panic!("driver boom") });
+        handle_driver_exit_midrun(panicker.await, &jsonl);
 
         drop(jsonl);
         join.await.unwrap();
@@ -5053,17 +5059,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn driver_panic_midrun_is_prompt_and_fatal() {
+    async fn driver_panic_midrun_is_reported_promptly_and_survived() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store");
         let (handle, join, jsonl_path) = jsonl_file(dir.path()).await;
 
         // A panicking driver stands in for a mid-run driver death. Nothing else
-        // joins the bridge, drains its events, or publishes its notices, so an
-        // unsupervised death is a pod that answers every turn with its failure
-        // message forever — the limp-along the crisp stop exists to avoid.
+        // joins the bridge, drains its events, or publishes its notices, so the
+        // arm's report is the only account there will be — and the daemon keeps
+        // everything the bus was not carrying, which is every stage but the
+        // brain.
         let driver = tokio::spawn(async { panic!("driver boom") });
-        let (server, _addr, _stop, stop_rx) =
+        let (server, addr, stop, stop_rx) =
             bind_with_stop(config(&store, false), handle.clone(), None).await;
         let server = server.with_driver_override(driver);
         let run = tokio::spawn(async move {
@@ -5084,14 +5091,13 @@ mod tests {
             exited["detail"]
         );
 
-        let err = run
-            .await
+        // Still accepting: the arm reported and went back to the loop.
+        let client = connect_pod(addr).await;
+        stop.send(()).unwrap();
+        run.await
             .unwrap()
-            .expect_err("mid-run driver death is a nonzero exit");
-        assert!(
-            err.to_string().contains("bridge driver died mid-run"),
-            "the exit names the driver: {err}"
-        );
+            .expect("a dead driver is not a dead daemon");
+        drop(client);
 
         drop(handle);
         join.await.unwrap();

@@ -40,6 +40,17 @@ performed on a stable release — never a dev-cycle convenience. Do not propose
 persisting app state to `/persistent` (or anywhere else on flash) to make a
 dev workflow nicer; fix the deploy command instead.
 
+## Comments
+
+An event this repo emits for another process to read is an interface. Its
+doc — at the emission site, or on the helper whose result decides what the
+line says — states what the event's presence and its fields mean to a reader,
+including what a reader is entitled to conclude, and to do, on the line's
+presence alone. That is the promise this repo makes about its own output, not
+a description of a remote implementation, and it stays. What does not belong
+is how any particular consumer is built — its code and its structure — as
+distinct from what this repo's line entitles it to do.
+
 ## TODO System
 
 Two pieces that stay in sync:

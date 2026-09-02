@@ -139,6 +139,15 @@ pub enum BridgeOutcome {
 }
 
 impl BridgeOutcome {
+    /// Whether the embedder asked for this ending. Only `Closed` is: a
+    /// `shutdown()` that was acted on. `EmbedderGone` is orderly but not
+    /// commanded — nobody asked; the embedder vanished — and every terminal
+    /// outcome is the bridge's own verdict. A stop that arrived after the
+    /// bridge had already ended on its own did not command that ending.
+    pub fn commanded(&self) -> bool {
+        matches!(self, BridgeOutcome::Closed)
+    }
+
     /// The process exit code this outcome deserves. Zero for the two orderly
     /// endings; see [`crate::exit`] for the rest.
     pub fn exit_code(&self) -> u8 {
@@ -489,6 +498,9 @@ impl<C: TransportConnector> Core<C> {
                     severity,
                     title,
                     body,
+                    // Nothing on this fleet pages under a sub-identity. The
+                    // field is wire-optional, so the bytes are unchanged by it.
+                    attribution: None,
                 }])
                 .await;
             }

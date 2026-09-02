@@ -22,6 +22,15 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Changed
 
+- **The brenn bridge speaks wire version 4**, following the bus server's move
+  there. A pod built before this bump cannot attach to a v4 server at all.
+- **Losing the bus no longer stops a voice pod.** A bridge that ends terminally
+  — a version skew, a protocol error — is reported loudly and the pipeline keeps
+  waking, endpointing and transcribing; each turn then speaks the configured
+  `failure_message` instead of the whole daemon exiting. The `brenn_bridge_exit`
+  line's `fatal` field is now `unexpected`, which is what it always measured.
+- **`speech-surface` no longer exports `DriverTokens`.** `BridgeDriver::new` takes
+  the driver's teardown token directly; the one-field wrapper is gone.
 - **Rust edition 2024 pinned across both workspaces**, inherited per crate from
   `[workspace.package]`. Resolves a drift where the editor format hook ran
   `rustfmt --edition 2024` against edition-2021 manifests. `scripts/check-edition.sh`

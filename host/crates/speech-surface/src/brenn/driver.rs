@@ -5,7 +5,13 @@
 //! pump that renders what the attachment did and routes response messages into
 //! the brain, the forwarder that publishes the fire-and-forget notices the brain
 //! queued, the retry timer for any channel the peer would not serve, and the
-//! exit path that decides whether the bridge's ending is a shutdown or a fault.
+//! exit path that reports the bridge's ending and whether anyone asked for it.
+//!
+//! A bridge that ends takes nothing else with it: the pipeline around this
+//! driver keeps waking, endpointing and transcribing without a bus, and turns
+//! fail one at a time against a dead bridge, speaking the configured failure
+//! message. So this task reports its bridge's ending and returns — the loud
+//! line is the whole of the response.
 //!
 //! Two rules shape the loop, and both come from the bridge's event channel being
 //! bounded and *awaited*: an embedder that stops draining it back-pressures the
@@ -18,8 +24,8 @@
 //! - Handing a delivery to the brain is synchronous and cheap by the brain's own
 //!   contract (a scan and a queue push), so routing never parks the pump either.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use brenn_bridge::render::{attached_fields, detached_fields, gap_reason};
@@ -117,21 +123,6 @@ pub struct DriverIo {
     pub bridge: JoinHandle<BridgeOutcome>,
 }
 
-/// The three shutdown-related handles the driver holds.
-pub struct DriverTokens {
-    /// Cancelled to stop the driver. Deliberately *not* the server's shared
-    /// shutdown token: that one fires before the pipeline drains, and a bridge
-    /// torn down under draining turns would fail every one of them.
-    pub teardown: CancellationToken,
-    /// The server's shutdown token, cancelled when the bridge ends mid-run — a
-    /// voice node whose brain has no transport is inert, and a crisp stop that a
-    /// supervisor restarts beats a slow drip of failing turns.
-    pub shutdown: CancellationToken,
-    /// First-writer-wins slot for the fault detail, so the process's exit reason
-    /// names the bridge outcome rather than the symptom it caused downstream.
-    pub fatal: Arc<OnceLock<String>>,
-}
-
 /// The contract document and the state of getting it published.
 struct HelpDoc {
     channel: String,
@@ -183,7 +174,8 @@ pub struct BridgeDriver {
     intents: Option<Arc<dyn IntentSink>>,
     attribution: Option<String>,
     help: Option<HelpDoc>,
-    tokens: DriverTokens,
+    /// Cancelled to stop the driver.
+    teardown: CancellationToken,
     jsonl: JsonlHandle,
     /// Every channel this run holds. One rule per site: a channel that joins
     /// this list is stated at startup, gets its own refusal deadline, and is
@@ -195,11 +187,18 @@ impl BridgeDriver {
     /// Assemble the driver. The help document is rendered here, once per process
     /// run, so the loop never pays for it and both publishes of a retried
     /// document carry identical bytes.
+    ///
+    /// `teardown` is what this driver stops on, and deliberately *not* the
+    /// server's shared shutdown token: that one fires before the pipeline
+    /// drains, and a bridge torn down under draining turns would fail every one
+    /// of them. Nothing runs the other way — a bridge that ends stops this
+    /// driver and nothing else, so the driver holds no handle on the server's
+    /// lifetime.
     pub fn new(
         config: &BrennConfig,
         handle: BridgeHandle,
         brain: Arc<BrennBrain>,
-        tokens: DriverTokens,
+        teardown: CancellationToken,
         jsonl: JsonlHandle,
     ) -> Self {
         let help = config.help_channel.as_ref().map(|channel| HelpDoc {
@@ -222,7 +221,7 @@ impl BridgeDriver {
             intents: None,
             attribution: config.attribution.clone(),
             help,
-            tokens,
+            teardown,
             jsonl,
             holds: Vec::new(),
         }
@@ -252,9 +251,9 @@ impl BridgeDriver {
             mut notices,
             bridge,
         } = io;
-        // Cloned out of `tokens`: the loop's own arm cannot hold a borrow of
+        // Cloned out of `self`: the loop's own arm cannot hold a borrow of
         // `self` while the other arms' handlers take it mutably.
-        let teardown = self.tokens.teardown.clone();
+        let teardown = self.teardown.clone();
         self.state_holds();
         for hold in &self.holds {
             self.subscribe(hold.channel.clone(), hold.depths, hold.resume)
@@ -283,8 +282,7 @@ impl BridgeDriver {
         self.finish(events, bridge).await;
     }
 
-    /// Join the bridge, report its outcome, and decide whether that outcome is a
-    /// fault.
+    /// Join the bridge and report its outcome.
     ///
     /// Events keep being drained while the join is awaited. They must be: the
     /// event channel is awaited by the bridge, so a driver that stopped reading
@@ -305,29 +303,22 @@ impl BridgeDriver {
                 },
             }
         };
-        let outcome = match joined {
+        let outcome = match &joined {
             Ok(outcome) => outcome.to_string(),
             // A panicked bridge task is as terminal as any fatal outcome, and
             // silently reporting nothing would be the one way to lose it.
             Err(err) => format!("the bridge task did not finish: {err}"),
         };
-        // Nobody asked it to stop, so it gave up: reconnection is internal to the
-        // bridge and already exhausted by the time an outcome exists.
-        let fatal = !self.tokens.teardown.is_cancelled();
+        // The bridge says whether its ending was commanded; a bridge task that
+        // did not finish was commanded by nobody. The teardown token says a
+        // stop was issued, not that it ended the bridge, so it does not decide
+        // this. The line is loud either way; what the field distinguishes is
+        // whether an operator should read it as news.
+        let unexpected = !joined.as_ref().is_ok_and(BridgeOutcome::commanded);
         self.jsonl.emit(
             "brenn_bridge_exit",
-            &json!({ "outcome": outcome, "fatal": fatal }),
+            &json!({ "outcome": outcome, "unexpected": unexpected }),
         );
-        if fatal {
-            // First writer wins: whatever fault the process ultimately reports,
-            // this is the root one, and the downstream symptom (a router seeing
-            // its shutdown token) must not overwrite it.
-            let _ = self
-                .tokens
-                .fatal
-                .set(format!("brenn bridge exited: {outcome}"));
-            self.tokens.shutdown.cancel();
-        }
     }
 
     /// Decide what this run holds: the response channel always, and the motion
@@ -656,20 +647,25 @@ mod tests {
 
     /// Everything one driver test drives: the peers behind the scripted socket,
     /// the link the brain publishes through, and the JSONL file the driver's
-    /// judgement lands in.
-    struct Fixture {
+    /// judgement lands in. `D` is the driver slot: the spawned task once the
+    /// driver runs, or the [`Unrun`] pair before its first poll. The three
+    /// `_`-prefixed holders must outlive the driver for its lines to land.
+    struct Fixture<D = JoinHandle<()>> {
         link: BridgeLink,
         brain: Arc<BrennBrain>,
         peers: std::collections::VecDeque<Peer>,
-        driver: JoinHandle<()>,
+        driver: D,
         teardown: CancellationToken,
-        shutdown: CancellationToken,
-        fatal: Arc<OnceLock<String>>,
         path: PathBuf,
         _dir: tempfile::TempDir,
         _jsonl: JsonlHandle,
         _writer: JoinHandle<()>,
     }
+
+    /// A driver built but not yet polled, with what it will run over. The
+    /// bridge task inside `io` is already running, so a test can put the bridge
+    /// into a state before the driver's first poll.
+    type Unrun = (BridgeDriver, DriverIo);
 
     async fn fixture(script: &[Attempt], config: BrennConfig) -> Fixture {
         fixture_with(script, config, None).await
@@ -680,6 +676,14 @@ mod tests {
         config: BrennConfig,
         intents: Option<Arc<dyn IntentSink>>,
     ) -> Fixture {
+        compose(script, config, intents).await.spawn()
+    }
+
+    async fn compose(
+        script: &[Attempt],
+        config: BrennConfig,
+        intents: Option<Arc<dyn IntentSink>>,
+    ) -> Fixture<Unrun> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::File(path.clone()))
@@ -702,36 +706,28 @@ mod tests {
             Arc::new(BrainStats::default()),
         ));
         let teardown = CancellationToken::new();
-        let shutdown = CancellationToken::new();
-        let fatal: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
         let driver = BridgeDriver::new(
             &config,
             handle,
             brain.clone(),
-            DriverTokens {
-                teardown: teardown.clone(),
-                shutdown: shutdown.clone(),
-                fatal: fatal.clone(),
-            },
+            teardown.clone(),
             jsonl.clone(),
         );
         let driver = match intents {
             Some(sink) => driver.with_intents(sink),
             None => driver,
         };
-        let driver = tokio::spawn(driver.run(DriverIo {
+        let io = DriverIo {
             events,
             notices,
             bridge,
-        }));
+        };
         Fixture {
             link,
             brain,
             peers,
-            driver,
+            driver: (driver, io),
             teardown,
-            shutdown,
-            fatal,
             path,
             _dir: dir,
             _jsonl: jsonl,
@@ -739,7 +735,35 @@ mod tests {
         }
     }
 
-    impl Fixture {
+    impl Fixture<Unrun> {
+        /// Spawn the driver, which is its first poll.
+        fn spawn(self) -> Fixture {
+            let Fixture {
+                link,
+                brain,
+                peers,
+                driver: (driver, io),
+                teardown,
+                path,
+                _dir,
+                _jsonl,
+                _writer,
+            } = self;
+            Fixture {
+                link,
+                brain,
+                peers,
+                driver: tokio::spawn(driver.run(io)),
+                teardown,
+                path,
+                _dir,
+                _jsonl,
+                _writer,
+            }
+        }
+    }
+
+    impl<D> Fixture<D> {
         fn peer(&mut self) -> Peer {
             self.peers.pop_front().expect("the script opens a socket")
         }
@@ -771,7 +795,9 @@ mod tests {
             };
             (peer, motion)
         }
+    }
 
+    impl Fixture {
         /// Stop the driver and wait for it to finish, so the assertions that
         /// follow see a settled JSONL file.
         async fn teardown(&mut self) {
@@ -1175,7 +1201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_terminal_bridge_exit_latches_the_fault_and_stops_the_server() {
+    async fn a_terminal_bridge_exit_is_reported_unexpected_and_ends_the_driver() {
         let mut fx = fixture(&[Attempt::Open], brenn_config("")).await;
         let peer = fx.attached().await;
 
@@ -1188,21 +1214,166 @@ mod tests {
             .expect("the driver follows the bridge out")
             .expect("the driver task does not panic");
         let line = expect_line(&fx.path, "brenn_bridge_exit").await;
-        assert_eq!(line["fatal"], true);
+        assert_eq!(
+            line["unexpected"], true,
+            "nobody asked for this ending: {line}"
+        );
         let outcome = line["outcome"].as_str().unwrap();
         assert!(
             outcome.contains("attachment protocol error"),
             "the line carries the bridge's own account: {outcome}"
         );
-        assert!(
-            fx.shutdown.is_cancelled(),
-            "a voice node with no brain transport does not keep serving"
-        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_exit_landing_with_the_teardown_is_still_unexpected() {
+        // The race made certain: the bridge has already ended on its own and the
+        // teardown has already fired when the driver is first polled, so the
+        // biased select takes the teardown arm with the event channel closed.
+        // The ending was decided before the stop arrived, and the line says so.
+        let mut fx = compose(&[Attempt::Open], brenn_config(""), None).await;
+        let mut peer = fx.peer();
+        let hello = peer.expect_frame("Hello").await;
+        let max = hello["versions"]["max"]
+            .as_u64()
+            .expect("the bridge states a version range");
+        peer.say(json!({
+            "type": "Hello",
+            "versions": { "min": max + 7, "max": max + 9 },
+            "ident": "a-much-newer-peer",
+        }));
+        tokio::time::timeout(WAIT, async {
+            while !fx.driver.1.bridge.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a version refusal ends the bridge with nobody draining it");
+        fx.teardown.cancel();
+
+        // Run inline in the test task; the rest of the fixture stays alive so
+        // the line has a sink and a directory to land in.
+        let (driver, io) = fx.driver;
+        tokio::time::timeout(WAIT, driver.run(io))
+            .await
+            .expect("the driver joins a bridge that has already ended");
+        let line = expect_line(&fx.path, "brenn_bridge_exit").await;
         assert_eq!(
-            fx.fatal.get().map(String::as_str),
-            Some(format!("brenn bridge exited: {outcome}").as_str()),
-            "the fatal detail names the bridge, not the symptom downstream"
+            line["unexpected"], true,
+            "a stop issued after the bridge ended did not command the ending: {line}"
         );
+        let outcome = line["outcome"].as_str().unwrap();
+        assert!(
+            outcome.contains("no wire version in common")
+                && outcome.contains(&format!("{}", max + 9)),
+            "the line carries the bridge's own account: {outcome}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bridge_task_that_did_not_finish_is_unexpected_even_after_the_teardown() {
+        // A bridge task that never returned an outcome was commanded by nobody,
+        // whatever the token says. Both the abort and the teardown land before
+        // the driver's first poll so it sees them together.
+        let fx = compose(&[Attempt::Open], brenn_config(""), None).await;
+        fx.driver.1.bridge.abort();
+        tokio::time::timeout(WAIT, async {
+            while !fx.driver.1.bridge.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an aborted bridge task finishes");
+        fx.teardown.cancel();
+
+        let (driver, io) = fx.driver;
+        tokio::time::timeout(WAIT, driver.run(io))
+            .await
+            .expect("the driver joins a bridge task that was aborted");
+        let line = expect_line(&fx.path, "brenn_bridge_exit").await;
+        assert_eq!(
+            line["unexpected"], true,
+            "a bridge task that did not finish was commanded by nobody: {line}"
+        );
+        let outcome = line["outcome"].as_str().unwrap();
+        assert!(
+            outcome.starts_with("the bridge task did not finish"),
+            "the line says the task never reported an outcome: {outcome}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_after_a_terminal_bridge_exit_speaks_the_failure_message() {
+        // The degraded posture, at the seam where it is decided: with the bridge
+        // gone, the publish is refused at once and the turn ends on the
+        // configured apology instead of hanging or taking the pipeline with it.
+        let mut fx = fixture(&[Attempt::Open], brenn_config("")).await;
+        let peer = fx.attached().await;
+        peer.say(json!({ "type": "DeferredView", "channel": RESPONSE, "entries": [] }));
+        tokio::time::timeout(WAIT, &mut fx.driver)
+            .await
+            .expect("the driver follows the bridge out")
+            .expect("the driver task does not panic");
+
+        let (speak_tx, mut speak_rx) = futures_mpsc::channel::<SpeakCmd>(4);
+        let brain = fx.brain.clone();
+        let end = tokio::time::timeout(
+            WAIT,
+            tokio::spawn(async move {
+                brain
+                    .handle(utterance(7), ResponseSink::new(speak_tx))
+                    .await
+            }),
+        )
+        .await
+        .expect("a turn against a dead bridge answers without waiting for the bus")
+        .expect("the turn task does not panic");
+        assert_eq!(end, TurnEnd::Closed);
+
+        let cmd = futures::StreamExt::next(&mut speak_rx)
+            .await
+            .expect("the apology was queued");
+        match cmd.body {
+            SpeakBody::Text(text) => assert_eq!(text, "Sorry, something's not working right now."),
+            other => panic!("expected the failure message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_after_the_driver_itself_died_still_answers() {
+        // The other way the driver ends: it died on its own, and the bridge task
+        // it never joined is still up with nobody draining its events. Aborting
+        // the task drops the same `DriverIo` a panic drops. The turn is not
+        // wedged by that — its publish is answered, no reply can be routed with
+        // the driver gone, and the response window closes the turn on the
+        // apology.
+        let mut fx = fixture(&[Attempt::Open], brenn_config("response_timeout_ms = 200")).await;
+        let mut peer = fx.attached().await;
+        fx.driver.abort();
+        let _ = (&mut fx.driver).await;
+
+        let (speak_tx, mut speak_rx) = futures_mpsc::channel::<SpeakCmd>(4);
+        let brain = fx.brain.clone();
+        let turn = tokio::spawn(async move {
+            brain
+                .handle(utterance(11), ResponseSink::new(speak_tx))
+                .await
+        });
+        peer.answer_publish("Ok").await;
+
+        let end = tokio::time::timeout(WAIT, turn)
+            .await
+            .expect("a turn with no driver behind it ends on its own response window")
+            .expect("the turn task does not panic");
+        assert_eq!(end, TurnEnd::Closed);
+
+        let cmd = futures::StreamExt::next(&mut speak_rx)
+            .await
+            .expect("the apology was queued");
+        match cmd.body {
+            SpeakBody::Text(text) => assert_eq!(text, "Sorry, something's not working right now."),
+            other => panic!("expected the failure message, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1230,16 +1401,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_graceful_teardown_closes_the_bridge_without_a_fault() {
+    async fn a_graceful_teardown_closes_the_bridge_and_says_nobody_was_surprised() {
         let mut fx = fixture(&[Attempt::Open], brenn_config("")).await;
         let _peer = fx.attached().await;
 
         fx.teardown().await;
         let line = expect_line(&fx.path, "brenn_bridge_exit").await;
-        assert_eq!(line["fatal"], false);
+        assert_eq!(line["unexpected"], false);
         assert_eq!(line["outcome"], "the bridge was asked to shut down");
-        assert!(!fx.shutdown.is_cancelled(), "the server was not stopped");
-        assert!(fx.fatal.get().is_none());
     }
 
     /// The whole seam in one pass: the statement goes out with the recorded
@@ -1495,43 +1664,13 @@ mod tests {
         config: BrennConfig,
         intents: Option<Arc<dyn IntentSink>>,
     ) -> (BridgeDriver, PathBuf, tempfile::TempDir, JoinHandle<()>) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("events.jsonl");
-        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::File(path.clone()))
-            .await
-            .unwrap();
-        let (_bridge, handle, _events, _peers) = scripted(&[Attempt::Open], 3);
-        let (link, _notices) = BridgeLink::new(
-            handle.clone(),
-            config.publish_channel.clone(),
-            config.attribution.clone(),
-            jsonl.clone(),
-        );
-        let brain = Arc::new(BrennBrain::new(
-            Arc::new(link),
-            Duration::from_millis(config.response_timeout_ms),
-            Duration::from_millis(config.continuation_timeout_ms),
-            config.failure_message.clone(),
-            Arc::new(|_| {}),
-            Arc::new(BrainStats::default()),
-        ));
-        let driver = BridgeDriver::new(
-            &config,
-            handle,
-            brain,
-            DriverTokens {
-                teardown: CancellationToken::new(),
-                shutdown: CancellationToken::new(),
-                fatal: Arc::new(OnceLock::new()),
-            },
-            jsonl,
-        );
-        let mut driver = match intents {
-            Some(sink) => driver.with_intents(sink),
-            None => driver,
-        };
+        let fx = compose(&[Attempt::Open], config, intents).await;
+        let (mut driver, io) = fx.driver;
+        // Nothing here talks to the bridge; end its task rather than leave it
+        // dialing a peer nobody answers.
+        io.bridge.abort();
         driver.state_holds();
-        (driver, path, dir, writer)
+        (driver, fx.path, fx._dir, fx._writer)
     }
 
     /// One delivery, envelope and all, as the bridge hands it over.
