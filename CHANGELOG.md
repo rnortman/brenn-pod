@@ -13,6 +13,21 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   Reachy Mini Wireless robot.
 - Reachy acknowledges the wake word by raising its head, then stows it when the
   interaction is over.
+- **An announcement seam on `speech-surface`**: `announce_seam`,
+  `Server::with_announcements` and `Config::carries_announcements()`. A
+  composing process puts a sentence on the queue and the robot says it out loud
+  on every pod that is connected — one non-interruptible `Text` command per pod,
+  answering no turn, so an announcement authors no head motion and opens no
+  barge floor. New lines: `announcement_spoken`, `announcement_unheard`,
+  `announce_seam_unused`, `announce_task_exited` — the first two carrying the
+  sentence itself, so the spoken half of an alert joins its `alert_handed_off`
+  half by what was said.
+- **An alert or a sentence still queued when its drain ends is named** —
+  `alert_seam_ended` for the run shutting down and for a bridge that is gone,
+  `announcement_unheard` for the run shutting down and for a router that is
+  gone — rather than dropped with the drain. A seam whose queue has been taken
+  also refuses anything handed over afterwards, so a late alert is reported to
+  the composing process instead of vanishing into a receiver about to close.
 - **Boot-path labels on reported heap samples**, so a heap figure can be
   attributed to the boot that produced it. `TestData::DeviceHealth` gains a
   `reset_reason` field — a wire-schema change — surfacing as `rr=` in report

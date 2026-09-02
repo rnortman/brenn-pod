@@ -994,6 +994,71 @@ mod tests {
         );
     }
 
+    /// An announcement's shape, routed through the production path: it plays,
+    /// and neither the barge ledger nor the motion scripter hears about it.
+    ///
+    /// The property the surface's announcement seam rests on. `in_reply_to:
+    /// None` is what buys it — there is no turn to settle and none to schedule
+    /// a head movement for — so a robot saying its head is dead does not try to
+    /// nod while saying so.
+    #[tokio::test]
+    async fn an_announcement_shaped_command_tells_the_ledger_and_the_scripter_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
+            .await
+            .unwrap();
+        let (scripter, mut inbox) = crate::scripter::channel(jsonl.clone());
+        let ledger = Arc::new(TurnLedger::new());
+
+        let (_peer, device) = tokio::io::duplex(64 * 1024);
+        let noop: PlaybackEventFn = Arc::new(|_| Box::pin(std::future::ready(())));
+        let handle = PlaybackWriter::spawn(
+            device,
+            PodId("pod-x".into()),
+            PacerConfig::default(),
+            Arc::new(PlaybackStats::default()),
+            noop,
+            CancellationToken::new(),
+        );
+        let registry = empty_registry();
+        playback_register(&registry, "pod-x".into(), 1, handle);
+
+        let announcement = SpeakCmd {
+            target: PodId("pod-x".into()),
+            in_reply_to: None,
+            body: SpeakBody::Text("my head is not moving".into()),
+            interruptible: false,
+            timings: StageTimings::default(),
+        };
+        let synth: Arc<dyn Synthesizer> = Arc::new(FakeSynth::Chunks(vec![vec![1, 2, 3]]));
+        let (_lines, stats) = run_router_scripted(
+            registry,
+            vec![announcement],
+            Some(synth),
+            Arc::clone(&ledger),
+            Some(scripter.clone()),
+        )
+        .await;
+
+        assert_eq!(stats.delivered, 1, "the sentence reached the writer");
+        assert!(
+            ledger.chain(&PodId("pod-x".into())).is_none(),
+            "no turn was named, so the ledger has nothing to chain"
+        );
+
+        drop(scripter);
+        drop(jsonl);
+        join.await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(input) = inbox.recv().await {
+            seen.push(input);
+        }
+        assert!(
+            seen.is_empty(),
+            "an announcement schedules no head movement: {seen:?}"
+        );
+    }
+
     #[tokio::test]
     async fn absent_pod_emits_no_pod_line_and_counter() {
         let (lines, stats) = run_router(empty_registry(), vec![pcm_cmd("ghost", 4, &[9])]).await;

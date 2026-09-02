@@ -43,12 +43,14 @@ use speech_pipeline::{
     ListenerHandle, ListenerStats, ListenerStatsSnapshot, OwwModels, PacerConfig, PlayRejected,
     PlaybackEventFn, PlaybackHandle, PlaybackJob, PlaybackStats, PlaybackStatsSnapshot,
     PlaybackWriter, PodId, QueueStats, RoomId, SPINE_FORMAT, Segment, SegmentAssembler,
-    SegmentEndCause, Sender, SileroModel, SpeakCmd, StageTimings, StatsHandle, SttParams, SttStats,
-    SttStatsSnapshot, Synthesizer, Transcriber, TtsParams, TtsStats, TtsStatsSnapshot, UtteranceId,
-    WakeCommandReason, WakeError, WavBrain, audio_ms, stage_delta_us,
+    SegmentEndCause, Sender, SileroModel, SpeakBody, SpeakCmd, StageTimings, StatsHandle,
+    SttParams, SttStats, SttStatsSnapshot, Synthesizer, Transcriber, TtsParams, TtsStats,
+    TtsStatsSnapshot, UtteranceId, WakeCommandReason, WakeError, WavBrain, audio_ms,
+    stage_delta_us,
 };
 
 use crate::alerts::{Alert, AlertInbox};
+use crate::announce::{AnnounceInbox, Announcement};
 use crate::barge::TurnLedger;
 use crate::brenn::BridgeLink;
 use crate::brenn::driver::{BridgeDriver, DriverIo, IntentSink};
@@ -239,6 +241,22 @@ fn playback_deregister(reg: &PlaybackRegistry, pod: &str, conn_seq: u64) {
     guarded_remove(reg, pod, conn_seq, |e| e.conn_seq);
 }
 
+/// The pods with a live playback writer right now, in sorted order.
+///
+/// A snapshot: a pod that connects a moment later hears nothing of what was
+/// said before it arrived, which is what a sentence spoken into a room is.
+/// Sorted so a line naming them reads the same twice.
+fn playback_registry_pods(reg: &PlaybackRegistry) -> Vec<String> {
+    let mut pods: Vec<String> = reg
+        .lock()
+        .expect("connection registry poisoned")
+        .keys()
+        .cloned()
+        .collect();
+    pods.sort();
+    pods
+}
+
 /// Project the registry to `pod -> conn_seq`, the only observable surface a
 /// lifecycle test needs. Locks the map briefly and clones out plain data; the
 /// private `PlaybackEntry`/`PlaybackHandle` internals stay private.
@@ -366,6 +384,7 @@ pub struct Server {
     tls: TlsAccept,
     sinks: Sinks,
     alerts: Option<AlertInbox>,
+    announcements: Option<AnnounceInbox>,
     // A test-supplied router join handle that stands in for the real router task,
     // so a mid-run router exit can be driven without a live brain and channel.
     #[cfg(test)]
@@ -427,6 +446,7 @@ impl Server {
             },
             sinks: Sinks::default(),
             alerts: None,
+            announcements: None,
             #[cfg(test)]
             router_override: None,
             #[cfg(test)]
@@ -456,6 +476,25 @@ impl Server {
     #[must_use]
     pub fn with_alerts(mut self, inbox: AlertInbox) -> Self {
         self.alerts = Some(inbox);
+        self
+    }
+
+    /// Say this run's announcements out loud, on every pod that is listening.
+    ///
+    /// The other end of the room from [`Server::with_alerts`]: an alert leaves
+    /// the machine on the bus attachment, an announcement is spoken to whoever
+    /// is standing in front of it. A sentence authors no motion and opens no
+    /// barge floor, so a robot announcing that its head is dead does not try to
+    /// nod while saying so.
+    ///
+    /// Unwired, nothing changes. Wired on a run that carries no announcements
+    /// ([`Config::carries_announcements`]) the inbox is drained by nobody,
+    /// which is said once (`announce_seam_unused`) rather than left as silence.
+    ///
+    /// [`Config::carries_announcements`]: crate::config::Config::carries_announcements
+    #[must_use]
+    pub fn with_announcements(mut self, inbox: AnnounceInbox) -> Self {
+        self.announcements = Some(inbox);
         self
     }
 
@@ -536,6 +575,7 @@ impl Server {
             tls,
             sinks,
             alerts,
+            announcements,
             ..
         } = self;
 
@@ -733,10 +773,35 @@ impl Server {
         // the router task that resolves each reply to its target pod's writer.
         // No brain: no channel, no router task — the increment-3
         // mint-and-emit-utterance behavior, unchanged.
+        // Taken by the arm that has a speak channel to say it on; still `Some`
+        // after the match means the composer supplied a seam this run cannot
+        // speak through.
+        let mut announcements = announcements;
+        let mut announce_join: Option<tokio::task::JoinHandle<()>> = None;
         let (brain_wiring, router_join) = match brain {
             Some(brain) => {
+                // A futures channel holds `buffer` plus one slot per sender, so
+                // `speak_queue_depth` is the floor of what fits and every clone
+                // of this sender raises it by one. The announcement drain below
+                // takes a clone, and wants to: its slot is the one a sentence
+                // about a dead head reaches the room through while the reply
+                // path is saturated.
                 let (speak_tx, speak_rx) =
                     mpsc::channel::<SpeakCmd>(config.playback.speak_queue_depth);
+                // Beside the router because the router is what a sentence needs:
+                // the speak channel it drains and the registry it resolves a pod
+                // through. Its own task, because announcing waits on nothing.
+                if config.carries_announcements()
+                    && let Some(inbox) = announcements.take()
+                {
+                    announce_join = Some(tokio::spawn(drain_announcements(
+                        inbox,
+                        speak_tx.clone(),
+                        playback_registry.clone(),
+                        shutdown_token.clone(),
+                        jsonl.clone(),
+                    )));
+                }
                 let join = tokio::spawn(
                     playback_router::Router::new(
                         playback_registry.clone(),
@@ -866,6 +931,13 @@ impl Server {
             // answer a single turn. Either way the pod is silently inert.
             (parts, _) => {
                 let missing = if parts.is_some() { "brain" } else { "bridge" };
+                // The router and the announcement drain were spawned above and
+                // outlive this return unless they are told to stop: dropping the
+                // token does not cancel it. Left running, the drain would keep
+                // answering the composer `Ok` and writing `no_pod_connected` for
+                // a run that has already failed, and its JSONL clone would keep
+                // the writer task alive past every legitimate handle.
+                shutdown_token.cancel();
                 return Err(std::io::Error::other(format!(
                     "brain.mode = \"brenn\" built a bridge and a brain inconsistently: no {missing}"
                 )));
@@ -876,6 +948,17 @@ impl Server {
         // in another is diagnosed by nothing.
         if alerts.is_some() {
             jsonl.emit("alert_seam_unused", &json!({ "reason": "no bus brain" }));
+        }
+        // The same, for the same reason, with its own missing piece named: a
+        // brain builds the speak channel and `[tts]` renders the sentence, and
+        // a seam wired without either is a queue nothing reads.
+        if announcements.is_some() {
+            let reason = if config.brain.is_some() {
+                "no tts"
+            } else {
+                "no brain"
+            };
+            jsonl.emit("announce_seam_unused", &json!({ "reason": reason }));
         }
         // Drops the real handle if any; the task stops on the teardown token.
         #[cfg(test)]
@@ -1015,16 +1098,18 @@ impl Server {
                 }
                 result = async { router_join.as_mut().expect("guarded by is_some").await },
                         if router_join.is_some() && !router_joined => {
-                    // The router only exits mid-run when it dies: its senders
-                    // dropped or it panicked. Either way playback is permanently
-                    // dead for this process, so report it now and fall into the
-                    // shutdown path — the shutdown token has not fired yet, so this
-                    // can never be a clean shutdown-induced exit.
+                    // The router only exits mid-run when it dies: every sender on
+                    // its channel dropped, or it panicked. Either way playback is
+                    // permanently dead for this process, so report it now and fall
+                    // into the shutdown path — the shutdown token has not fired
+                    // yet, so this can never be a clean shutdown-induced exit.
                     router_joined = true;
                     // A router exit is often a downstream symptom of the pipeline
                     // dying first: the pipeline task holds `BrainWiring`'s
-                    // `SpeakCmd` sender, so its death drops that sender and the
-                    // router then exits cleanly. When both handles are ready in
+                    // `SpeakCmd` sender, and the announcement drain holds a clone,
+                    // so the channel closes only once both are gone; a pipeline
+                    // death is caught by its own arm either way. When both
+                    // handles are ready in
                     // the same poll, `select!` picks one arbitrarily. If the
                     // pipeline has also finished it is the root fault, so report
                     // it first — `get_or_insert` is first-writer-wins, so joining
@@ -1145,9 +1230,16 @@ impl Server {
             handle_pipeline_result(result, &jsonl, &mut pipeline_fatal);
         }
 
-        // The router task exits once its `SpeakCmd` channel closes (the pipeline
-        // has ended, dropping `BrainWiring`'s sender) or `shutdown_token` fired,
-        // whichever comes first. A non-`Ok` join means it panicked mid-run.
+        // Before the router's join, because this task holds a sender on the
+        // channel the router drains: kept past that point it would be the one
+        // thing stopping the router from seeing its channel close.
+        if let Some(join) = announce_join {
+            handle_task_exit(ANNOUNCE_TASK_EXITED, join.await, &jsonl);
+        }
+        // The router task exits once `shutdown_token` fired or its `SpeakCmd`
+        // channel closes — which needs both holders gone, `BrainWiring`'s sender
+        // with the pipeline and the announcement drain's clone joined just
+        // above. A non-`Ok` join means it panicked mid-run.
         if !router_joined && let Some(join) = router_join {
             handle_router_exit(join.await, &jsonl);
         }
@@ -1784,6 +1876,11 @@ const SCRIPT_TASK_EXITED: &str = "script_task_exited";
 /// stopped reaching the bus looks exactly like one with nothing to report.
 const ALERT_TASK_EXITED: &str = "alert_task_exited";
 
+/// The event name a dead announcement task is reported under: a robot that
+/// stopped speaking its own alerts is indistinguishable from one with nothing
+/// to say.
+const ANNOUNCE_TASK_EXITED: &str = "announce_task_exited";
+
 /// The line shape every dead-task report has, in one place.
 fn emit_task_exit(jsonl: &JsonlHandle, event: &str, reason: &str, detail: &str) {
     jsonl.emit(event, &json!({ "reason": reason, "detail": detail }));
@@ -1814,7 +1911,10 @@ fn handle_task_exit(event: &str, result: Result<(), tokio::task::JoinError>, jso
 ///
 /// The one run where more is known is a bridge that is already gone: the
 /// hand-off itself failed, so no hand-off is claimed and the alert rides the
-/// line that ends the seam instead.
+/// line that ends the seam instead. Either ending — the bridge gone or the run
+/// shutting down — names every alert still queued behind it on that same line,
+/// for the same reason: an alert nothing names is indistinguishable from one
+/// that reached the bus.
 async fn drain_alerts(
     mut inbox: AlertInbox,
     handle: brenn_bridge::BridgeHandle,
@@ -1827,7 +1927,27 @@ async fn drain_alerts(
             title,
             body,
         } = tokio::select! {
-            () = teardown.cancelled() => break,
+            // Biased on teardown: once it has fired, the driver is being told to
+            // stop, so an alert taken from the queue here would ride a hand-off
+            // line claiming a delivery nothing can make. The loss said plainly
+            // is the true record.
+            biased;
+            () = teardown.cancelled() => {
+                // The alerts most likely to arrive during teardown are the
+                // ones that ended the session.
+                for lost in inbox.take_queued() {
+                    jsonl.emit(
+                        "alert_seam_ended",
+                        &json!({
+                            "reason": "the run is shutting down",
+                            "severity": lost.severity,
+                            "title": &lost.title,
+                            "body": &lost.body,
+                        }),
+                    );
+                }
+                break;
+            }
             next = inbox.next() => match next {
                 Some(alert) => alert,
                 // Every raiser dropped: the composer is done, and no alert can
@@ -1841,7 +1961,9 @@ async fn drain_alerts(
             .is_err()
         {
             // Carried here rather than on a hand-off line that would claim a
-            // hand-off that provably did not happen.
+            // hand-off that provably did not happen. Every alert still queued
+            // behind it dies with this drain and is named under the same
+            // reason: the bridge is gone for all of them, not just this one.
             jsonl.emit(
                 "alert_seam_ended",
                 &json!({
@@ -1851,6 +1973,17 @@ async fn drain_alerts(
                     "body": &body,
                 }),
             );
+            for lost in inbox.take_queued() {
+                jsonl.emit(
+                    "alert_seam_ended",
+                    &json!({
+                        "reason": "the bridge is gone",
+                        "severity": lost.severity,
+                        "title": &lost.title,
+                        "body": &lost.body,
+                    }),
+                );
+            }
             break;
         }
         // The line must carry the whole alert: `alert` answers `Ok` once the
@@ -1866,6 +1999,138 @@ async fn drain_alerts(
             }),
         );
     }
+}
+
+/// Say the composing process's announcements on every pod that is listening,
+/// until the seam closes or the run shuts down.
+///
+/// One `SpeakCmd` per pod with a live playback writer at that instant, and one
+/// line saying which pods heard it. Three properties of the command are the
+/// whole of what an announcement is, as distinct from a reply:
+///
+/// - `in_reply_to: None`, so the turn ledger records nothing and the scripter is
+///   told nothing — an announcement authors no motion, which matters when motion
+///   is the thing being announced.
+/// - `interruptible: false`, so the listener's barge floor stays shut: a person
+///   talking over the sentence does not flush it.
+/// - `Text`, so the run's own `[tts]` voice says it. A synthesis failure is the
+///   router's `synth_failed` line; this seam cannot know it.
+///
+/// The router is serial, so a sentence plays after whatever is already
+/// speaking, and the writer's own queue bounds what can be waiting.
+///
+/// Two lines, and what a reader is entitled to conclude from each:
+///
+/// - `announcement_spoken` (`pods`, `text`, `chars`) — every pod named was
+///   handed the command. It says the sentence was queued for playback and no
+///   more: what the room heard depends on synthesis and on the writer, each of
+///   which says so on its own lines.
+/// - `announcement_unheard` (`reason`, `stage`, `pod`, `text`, `chars`) — this
+///   sentence did not reach that pod at all, and nothing will retry it.
+///   `no_pod_connected` is a room with nobody in it, `queue_full` on the
+///   `speak` stage is a pipeline too far behind to take another command,
+///   `router_gone` is the router gone — after which this drain stops and no
+///   further announcement is spoken for the rest of the run, so everything
+///   still queued is named under it too — and `shutting_down` is the run ending
+///   under whatever was still queued.
+///
+/// Both lines carry the sentence itself, so the spoken half of an alert joins
+/// its `alert_handed_off` half by what was said rather than by timestamp. On a
+/// deployment whose attachment grants no alerts, this line is the only record
+/// that the alert reached anybody at all.
+async fn drain_announcements(
+    mut inbox: AnnounceInbox,
+    mut speak: mpsc::Sender<SpeakCmd>,
+    registry: PlaybackRegistry,
+    shutdown: CancellationToken,
+    jsonl: JsonlHandle,
+) {
+    loop {
+        let Announcement { text } = tokio::select! {
+            // Biased on shutdown: once it has fired, the router is exiting on
+            // the same token, so a sentence taken from the queue here would be
+            // written as spoken into a channel nobody drains again.
+            biased;
+            () = shutdown.cancelled() => {
+                // A sentence nobody names is indistinguishable from one the
+                // room heard.
+                for lost in inbox.take_queued() {
+                    announcement_unheard(&jsonl, "shutting_down", None, None, &lost.text);
+                }
+                break;
+            }
+            next = inbox.next() => match next {
+                Some(sentence) => sentence,
+                // Every announcer dropped: the composer is done, and no sentence
+                // can arrive again on this seam.
+                None => break,
+            },
+        };
+        let pods = playback_registry_pods(&registry);
+        if pods.is_empty() {
+            announcement_unheard(&jsonl, "no_pod_connected", None, None, &text);
+            continue;
+        }
+        let mut spoken: Vec<String> = Vec::with_capacity(pods.len());
+        for pod in pods {
+            let cmd = SpeakCmd {
+                target: PodId(pod.clone()),
+                in_reply_to: None,
+                body: SpeakBody::Text(text.clone()),
+                interruptible: false,
+                timings: StageTimings::default(),
+            };
+            match speak.try_send(cmd) {
+                Ok(()) => spoken.push(pod),
+                Err(refused) if refused.is_full() => {
+                    announcement_unheard(&jsonl, "queue_full", Some("speak"), Some(&pod), &text);
+                }
+                // The router is gone, so nothing this task queues can play
+                // again: this sentence, and every one still queued behind it,
+                // is lost.
+                Err(_) => {
+                    announcement_unheard(&jsonl, "router_gone", Some("speak"), Some(&pod), &text);
+                    for lost in inbox.take_queued() {
+                        announcement_unheard(&jsonl, "router_gone", None, None, &lost.text);
+                    }
+                    return;
+                }
+            }
+        }
+        if !spoken.is_empty() {
+            jsonl.emit(
+                "announcement_spoken",
+                &json!({
+                    "pods": spoken,
+                    "text": &text,
+                    "chars": text.chars().count(),
+                }),
+            );
+        }
+    }
+}
+
+/// One sentence that was not said, under the word for why and the sentence
+/// itself. `stage` names the queue that refused it where one did; `pod` the pod
+/// it was bound for where the loss is per-pod. Both are null otherwise rather
+/// than absent, so a consumer reads one shape whatever the reason.
+fn announcement_unheard(
+    jsonl: &JsonlHandle,
+    reason: &str,
+    stage: Option<&str>,
+    pod: Option<&str>,
+    text: &str,
+) {
+    jsonl.emit(
+        "announcement_unheard",
+        &json!({
+            "reason": reason,
+            "stage": stage,
+            "pod": pod,
+            "text": text,
+            "chars": text.chars().count(),
+        }),
+    );
 }
 
 /// A `JoinError` is a panic unless the task was aborted. Nothing aborts the
@@ -4264,16 +4529,600 @@ mod tests {
         );
     }
 
+    /// A live playback writer for `pod`, registered in `registry`, held open by
+    /// a peer whose read half the caller keeps. The router tests' own shape: a
+    /// real writer, so nothing about the registry under test is a stand-in.
+    fn register_writer(registry: &PlaybackRegistry, pod: &str) -> tokio::io::DuplexStream {
+        let (peer, device) = tokio::io::duplex(64 * 1024);
+        let noop: PlaybackEventFn = Arc::new(|_| Box::pin(std::future::ready(())));
+        let handle = PlaybackWriter::spawn(
+            device,
+            PodId(pod.into()),
+            PacerConfig::default(),
+            Arc::new(PlaybackStats::default()),
+            noop,
+            CancellationToken::new(),
+        );
+        playback_register(registry, pod.to_owned(), 1, handle);
+        peer
+    }
+
+    /// Drive `drain_announcements` over `registry`, announcing each of
+    /// `sentences`, and hand back the announcement commands the router would
+    /// have dequeued plus the lines the drain wrote.
+    ///
+    /// `room` is how many commands the speak channel will take: the channel is
+    /// filled with replies until it refuses one and then drained by exactly that
+    /// many, so no case here encodes what a futures channel's capacity works out
+    /// to. `None` leaves it empty and roomy.
+    ///
+    /// The announcer is dropped before the drain is awaited, so the loop ends on
+    /// its seam closing rather than on the shutdown token — the same way the
+    /// router tests close their command channel.
+    async fn run_announcements(
+        registry: PlaybackRegistry,
+        room: Option<usize>,
+        sentences: &[&str],
+    ) -> (Vec<SpeakCmd>, Vec<Value>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (jsonl, writer_join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(path.clone()))
+                .await
+                .unwrap();
+        let (announcer, inbox) = crate::announce::announce_seam(sentences.len().max(1));
+        for text in sentences {
+            announcer
+                .announce(Announcement {
+                    text: (*text).to_owned(),
+                })
+                .expect("the test seam has room");
+        }
+        drop(announcer);
+
+        let (mut speak_tx, mut speak_rx) = mpsc::channel::<SpeakCmd>(4);
+        if let Some(room) = room {
+            // Fill it until it refuses, then take back exactly the slots this
+            // case wants free. A reply is the filler, so the announcements come
+            // back apart from it below.
+            while speak_tx.try_send(reply_command()).is_ok() {}
+            for _ in 0..room {
+                speak_rx.try_recv().expect("a filled channel holds replies");
+            }
+        }
+        drain_announcements(
+            inbox,
+            speak_tx,
+            registry,
+            CancellationToken::new(),
+            jsonl.clone(),
+        )
+        .await;
+
+        drop(jsonl);
+        writer_join.await.unwrap();
+        let mut cmds = Vec::new();
+        while let Ok(cmd) = speak_rx.try_recv() {
+            // The fillers are replies; what this helper is about is what the
+            // drain queued.
+            if cmd.in_reply_to.is_none() {
+                cmds.push(cmd);
+            }
+        }
+        (cmds, read_lines(&path))
+    }
+
+    /// A command shaped like a reply, for filling the speak channel: it answers
+    /// a turn, which is exactly what an announcement does not.
+    fn reply_command() -> SpeakCmd {
+        SpeakCmd {
+            target: PodId("pod-filler".into()),
+            in_reply_to: Some(UtteranceId(1)),
+            body: SpeakBody::Text("a reply".into()),
+            interruptible: true,
+            timings: StageTimings::default(),
+        }
+    }
+
+    /// What an announcement is: one speak command per pod that is listening,
+    /// with the three properties that separate it from a reply — no originating
+    /// turn, no barge floor, and text the run's own voice says.
+    #[tokio::test]
+    async fn an_announcement_becomes_one_speak_command_per_connected_pod() {
+        let registry: PlaybackRegistry = Arc::new(Mutex::new(HashMap::new()));
+        // Registered out of order, so the sorted reading below is about the sort
+        // and not about what order this case happened to install them in.
+        let _kitchen = register_writer(&registry, "pod-kitchen");
+        let _hall = register_writer(&registry, "pod-hall");
+
+        let (cmds, lines) = run_announcements(registry, None, &["my head is not moving"]).await;
+
+        let targets: Vec<&str> = cmds.iter().map(|cmd| cmd.target.0.as_str()).collect();
+        assert_eq!(
+            targets,
+            ["pod-hall", "pod-kitchen"],
+            "one per listening pod: {targets:?}"
+        );
+        for cmd in &cmds {
+            assert!(
+                cmd.in_reply_to.is_none(),
+                "an announcement answers no turn, so it authors no motion"
+            );
+            assert!(
+                !cmd.interruptible,
+                "a person talking over the sentence does not flush it"
+            );
+            match &cmd.body {
+                SpeakBody::Text(text) => assert_eq!(text, "my head is not moving"),
+                SpeakBody::Pcm(_) => panic!("the run's own voice says it, not this seam"),
+            }
+        }
+
+        let spoken = events_named(&lines, "announcement_spoken");
+        assert_eq!(spoken.len(), 1, "one line per sentence: {lines:?}");
+        assert_eq!(spoken[0]["pods"], json!(["pod-hall", "pod-kitchen"]));
+        // The sentence itself is what joins this line to the alert it came from.
+        assert_eq!(spoken[0]["text"], "my head is not moving");
+        assert_eq!(spoken[0]["chars"], 21);
+        assert!(
+            events_named(&lines, "announcement_unheard").is_empty(),
+            "both pods heard it: {lines:?}"
+        );
+    }
+
+    /// Nobody is connected: the sentence is dropped and said to be dropped. The
+    /// alert it came from is still narrated and still raised on the bus by the
+    /// composing process — this seam is the room, not the record.
+    #[tokio::test]
+    async fn an_announcement_with_no_pod_connected_is_unheard() {
+        let registry: PlaybackRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let (cmds, lines) = run_announcements(registry, None, &["my head is not moving"]).await;
+
+        assert!(cmds.is_empty(), "nothing to speak through: {cmds:?}");
+        let unheard = events_named(&lines, "announcement_unheard");
+        assert_eq!(unheard.len(), 1, "said once: {lines:?}");
+        assert_eq!(unheard[0]["reason"], "no_pod_connected");
+        assert!(
+            events_named(&lines, "announcement_spoken").is_empty(),
+            "nobody heard it: {lines:?}"
+        );
+    }
+
+    /// The speak channel is what bounds this path, and the pods whose commands
+    /// did not fit are named. Three listening pods against a channel with room
+    /// for one: the one that fits is the `announcement_spoken` line, the other
+    /// two are their own refusals, each naming its pod and the sentence it was
+    /// carrying.
+    #[tokio::test]
+    async fn a_full_speak_channel_leaves_the_rest_unheard() {
+        let registry: PlaybackRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let _a = register_writer(&registry, "pod-a");
+        let _b = register_writer(&registry, "pod-b");
+        let _c = register_writer(&registry, "pod-c");
+
+        let (cmds, lines) = run_announcements(registry, Some(1), &["my head is not moving"]).await;
+
+        let targets: Vec<&str> = cmds.iter().map(|cmd| cmd.target.0.as_str()).collect();
+        assert_eq!(targets, ["pod-a"], "what fit: {targets:?}");
+        let unheard = events_named(&lines, "announcement_unheard");
+        assert_eq!(unheard.len(), 2, "one refusal per pod: {lines:?}");
+        for (line, pod) in unheard.iter().zip(["pod-b", "pod-c"]) {
+            assert_eq!(line["reason"], "queue_full");
+            assert_eq!(line["stage"], "speak");
+            assert_eq!(line["pod"], pod);
+            assert_eq!(line["text"], "my head is not moving");
+        }
+        let spoken = events_named(&lines, "announcement_spoken");
+        assert_eq!(spoken[0]["pods"], json!(["pod-a"]));
+    }
+
+    /// The router gone is the end of announcing, not one skipped sentence: the
+    /// drain names the sentence that met it *and* everything still queued behind
+    /// it, then returns. The failure it is guarding against is silence, which on
+    /// a run with nothing to say looks exactly like working.
+    #[tokio::test]
+    async fn a_closed_speak_channel_ends_announcing_for_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, writer_join, path) = jsonl_file(dir.path()).await;
+        let registry: PlaybackRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let _pod = register_writer(&registry, "pod-a");
+
+        let (announcer, inbox) = crate::announce::announce_seam(2);
+        for text in ["my head is not moving", "and still is not"] {
+            announcer
+                .announce(Announcement {
+                    text: text.to_owned(),
+                })
+                .expect("the test seam has room");
+        }
+        drop(announcer);
+        let (speak_tx, speak_rx) = mpsc::channel::<SpeakCmd>(4);
+        drop(speak_rx);
+
+        drain_announcements(
+            inbox,
+            speak_tx,
+            registry,
+            CancellationToken::new(),
+            jsonl.clone(),
+        )
+        .await;
+
+        drop(jsonl);
+        writer_join.await.unwrap();
+        let lines = read_lines(&path);
+        let unheard = events_named(&lines, "announcement_unheard");
+        assert_eq!(
+            unheard.len(),
+            2,
+            "the sentence that met the dead router and the one queued behind it: {lines:?}"
+        );
+        assert_eq!(unheard[0]["reason"], "router_gone");
+        assert_eq!(unheard[0]["stage"], "speak");
+        assert_eq!(unheard[0]["pod"], "pod-a");
+        assert_eq!(unheard[0]["text"], "my head is not moving");
+        // Never offered to a pod, so no stage and no pod — lost with the drain.
+        assert_eq!(unheard[1]["reason"], "router_gone");
+        assert_eq!(unheard[1]["stage"], Value::Null);
+        assert_eq!(unheard[1]["pod"], Value::Null);
+        assert_eq!(unheard[1]["text"], "and still is not");
+        assert!(
+            events_named(&lines, "announcement_spoken").is_empty(),
+            "nothing reached the router: {lines:?}"
+        );
+    }
+
+    /// The run ending under a queued sentence: the loop returns, and every
+    /// sentence the composer handed over is on a line saying what became of it.
+    /// The alerts most likely to be raised at teardown are the ones that ended
+    /// the session, so a silent drop here is a hole where the seam is worth most.
+    #[tokio::test]
+    async fn a_shutdown_names_what_was_still_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, writer_join, path) = jsonl_file(dir.path()).await;
+        let registry: PlaybackRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+        let (announcer, inbox) = crate::announce::announce_seam(2);
+        for text in ["my head is not moving", "and still is not"] {
+            announcer
+                .announce(Announcement {
+                    text: text.to_owned(),
+                })
+                .expect("the test seam has room");
+        }
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let (speak_tx, _speak_rx) = mpsc::channel::<SpeakCmd>(4);
+
+        // The announcer is still held: nothing but the token can end this loop,
+        // so returning at all is the assertion.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_announcements(inbox, speak_tx, registry, shutdown, jsonl.clone()),
+        )
+        .await
+        .expect("a cancelled drain returns");
+        drop(announcer);
+
+        drop(jsonl);
+        writer_join.await.unwrap();
+        let lines = read_lines(&path);
+        let unheard = events_named(&lines, "announcement_unheard");
+        assert_eq!(
+            unheard.len(),
+            2,
+            "both sentences are accounted for: {lines:?}"
+        );
+        for (line, text) in unheard
+            .iter()
+            .zip(["my head is not moving", "and still is not"])
+        {
+            // The select is biased on the token, so a cancelled run never takes
+            // a queued sentence and reports it as anything but the loss it is.
+            assert_eq!(
+                line["reason"], "shutting_down",
+                "a sentence lost to the ending run says so: {line}"
+            );
+            assert_eq!(line["text"], text, "the sentence itself is the record");
+        }
+        assert!(
+            events_named(&lines, "announcement_spoken").is_empty(),
+            "the run was over before either was said: {lines:?}"
+        );
+    }
+
+    /// The same hole one function up, on the path that carries the fault-class
+    /// Criticals: a teardown with alerts still queued names each of them rather
+    /// than dropping them with the receiver. An alert nothing names is
+    /// indistinguishable from one that reached the bus.
+    #[tokio::test]
+    async fn a_teardown_names_the_alerts_still_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, writer_join, path) = jsonl_file(dir.path()).await;
+        let (raiser, inbox) = crate::alerts::alert_seam(4);
+        let (bridge, bridge_handle, _events, _peers) =
+            crate::brenn::scripted::scripted(&[crate::brenn::scripted::Attempt::Open], 1);
+        let _bridge = tokio::spawn(bridge.run());
+
+        for title in ["the head is parked", "and again"] {
+            raiser
+                .raise(crate::alerts::Alert {
+                    severity: brenn_bridge::AlertSeverity::Critical,
+                    title: title.to_owned(),
+                    body: "a fault row ended the session".to_owned(),
+                })
+                .expect("the seam is live");
+        }
+        let teardown = CancellationToken::new();
+        teardown.cancel();
+
+        // The raiser is still held, so nothing but the token can end this loop.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_alerts(inbox, bridge_handle, teardown, jsonl.clone()),
+        )
+        .await
+        .expect("a cancelled drain returns");
+        drop(raiser);
+
+        drop(jsonl);
+        writer_join.await.unwrap();
+        let lines = read_lines(&path);
+        let ended = events_named(&lines, "alert_seam_ended");
+        assert_eq!(ended.len(), 2, "both alerts are accounted for: {lines:?}");
+        for (line, title) in ended.iter().zip(["the head is parked", "and again"]) {
+            assert_eq!(line["reason"], "the run is shutting down");
+            assert_eq!(line["severity"], "critical");
+            assert_eq!(line["title"], title);
+            assert_eq!(line["body"], "a fault row ended the session");
+        }
+        assert!(
+            events_named(&lines, "alert_handed_off").is_empty(),
+            "the run was over before either was handed over: {lines:?}"
+        );
+    }
+
+    /// The drain is wired to the seam the composer handed over, through a real
+    /// `Server::run` on a config that carries announcements. The negative case
+    /// below covers a seam nothing drains; this is the positive one, so a
+    /// mistake in the arm that spawns the drain — the wrong condition, an inbox
+    /// never taken — fails here rather than in front of a silent robot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_carries_announcements_drains_the_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = brenn_config(dir.path());
+        assert!(cfg.carries_announcements(), "a brain and a voice");
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let (bridge, bridge_handle, events, mut peers) =
+            crate::brenn::scripted::scripted(&[crate::brenn::scripted::Attempt::Open], 3);
+        let (announcer, inbox) =
+            crate::announce::announce_seam(crate::announce::ANNOUNCE_QUEUE_DEPTH);
+        let (server, _addr, stop, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
+        let server = server
+            .with_brenn_override(tokio::spawn(bridge.run()), bridge_handle, events)
+            .with_announcements(inbox);
+        let run = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+
+        let mut peer = peers.pop_front().expect("the script opens a socket");
+        peer.handshake().await;
+        peer.answer_subscribe("brenn:pod.speak", "Ok").await;
+
+        // No pod is connected, so the drain's answer is the one that proves it
+        // took this inbox and is reading it.
+        announcer
+            .announce(Announcement {
+                text: "my head is not moving".to_owned(),
+            })
+            .expect("the seam is live for the life of the run");
+        let said = wait_for_event(&path, "the announcement the drain read", |v| {
+            v["event"] == "announcement_unheard"
+        })
+        .await;
+        assert_eq!(said["reason"], "no_pod_connected");
+        assert_eq!(said["text"], "my head is not moving");
+
+        stop.send(()).unwrap();
+        run.await.unwrap().expect("an orderly stop");
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        assert!(
+            events_named(&lines, "announce_seam_unused").is_empty(),
+            "the seam was drained, not left unread: {lines:?}"
+        );
+    }
+
+    /// A drain that died takes every later sentence with it, and a robot that
+    /// stopped speaking its alerts looks exactly like one with nothing to say.
+    /// The event that separates them, under its own name.
+    #[tokio::test]
+    async fn a_dead_announcement_task_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, writer_join, path) = jsonl_file(dir.path()).await;
+
+        let died = tokio::spawn(async { panic!("the drain fell over") });
+        handle_task_exit(ANNOUNCE_TASK_EXITED, died.await, &jsonl);
+
+        drop(jsonl);
+        writer_join.await.unwrap();
+        let lines = read_lines(&path);
+        let exited = events_named(&lines, "announce_task_exited");
+        assert_eq!(exited.len(), 1, "the death is named once: {lines:?}");
+        assert_eq!(exited[0]["reason"], "panic");
+    }
+
+    /// The question a composing process asks before it hands the announcement
+    /// seam over, and the condition this file spawns its drain under, are one
+    /// expression — the alert seam's property, for the seam that speaks.
+    ///
+    /// Both halves matter and neither is about the bus: a brain builds the speak
+    /// channel and the router, and `[tts]` is what turns text into sound.
+    #[test]
+    fn what_carries_announcements_is_what_the_run_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = brenn_config(dir.path());
+        assert!(
+            full.carries_announcements(),
+            "a brain and a voice: the drain is spawned"
+        );
+
+        let voiceless = test_config(&brenn_text(dir.path(), &dir.path().join("bus.token"), "")
+            .replace(
+                "[tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\nvoice = \"v\"\n",
+                "",
+            ))
+        .expect("config parses");
+        assert!(
+            !voiceless.carries_announcements(),
+            "no [tts] is a Text body nothing renders"
+        );
+
+        let brainless = config(&dir.path().join("store"), false);
+        assert!(
+            !brainless.carries_announcements(),
+            "no brain is no speak channel and no router"
+        );
+    }
+
+    /// A seam supplied to a run that cannot speak: the composer is told which
+    /// half is missing rather than left announcing into a queue nothing reads.
+    /// The alert seam's `alert_seam_unused`, for the sentence path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_announcement_seam_without_a_brain_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let (announcer, inbox) = crate::announce::announce_seam(1);
+
+        let cfg = config(&dir.path().join("store"), false);
+        assert!(
+            !cfg.carries_announcements(),
+            "no brain, so no speak channel to say it on"
+        );
+        let (server, _addr, stop_tx, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
+        let server = server.with_announcements(inbox);
+        let run = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+
+        let said = wait_for_event(&path, "the unused announcement seam", |v| {
+            v["event"] == "announce_seam_unused"
+        })
+        .await;
+        assert_eq!(said["reason"], "no brain");
+
+        stop_tx.send(()).unwrap();
+        run.await.unwrap().expect("a requested stop");
+        drop(handle);
+        join.await.unwrap();
+
+        // The inbox went with the run, so the composer's next announcement says
+        // the seam is gone instead of appearing to have been heard.
+        assert_eq!(
+            announcer
+                .announce(Announcement {
+                    text: "anybody there".to_owned(),
+                })
+                .expect_err("nothing is draining"),
+            crate::announce::AnnounceRefused::Gone
+        );
+
+        let lines = read_lines(&path);
+        assert_eq!(
+            events_named(&lines, "announce_seam_unused").len(),
+            1,
+            "said once: {lines:?}"
+        );
+    }
+
+    /// The other half of the same answer, and the likelier misconfiguration: a
+    /// run that builds a brain, a router and a speak channel, and still has no
+    /// voice to render the sentence with. The composer is sent after the half
+    /// that is actually missing rather than told it has no brain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_announcement_seam_on_a_voiceless_run_names_the_missing_voice() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("bus.token");
+        crate::psk::write_secret_file(&token, "a-bearer-token\n").expect("write token");
+        let cfg = Arc::new(
+            test_config(&brenn_text(dir.path(), &token, "").replace(
+                "[tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\nvoice = \"v\"\n",
+                "",
+            ))
+            .expect("config parses"),
+        );
+        assert!(cfg.brain.is_some(), "a brain: the speak channel is built");
+        assert!(
+            !cfg.carries_announcements(),
+            "and no [tts]: nothing renders the sentence"
+        );
+
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+        let (bridge, bridge_handle, events, mut peers) =
+            crate::brenn::scripted::scripted(&[crate::brenn::scripted::Attempt::Open], 3);
+        let (announcer, inbox) = crate::announce::announce_seam(1);
+        let (server, _addr, stop, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
+        let server = server
+            .with_brenn_override(tokio::spawn(bridge.run()), bridge_handle, events)
+            .with_announcements(inbox);
+        let run = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+
+        let mut peer = peers.pop_front().expect("the script opens a socket");
+        peer.handshake().await;
+        peer.answer_subscribe("brenn:pod.speak", "Ok").await;
+
+        let said = wait_for_event(&path, "the unused announcement seam", |v| {
+            v["event"] == "announce_seam_unused"
+        })
+        .await;
+        assert_eq!(said["reason"], "no tts");
+
+        stop.send(()).unwrap();
+        run.await.unwrap().expect("an orderly stop");
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        assert!(
+            events_named(&lines, "announcement_unheard").is_empty(),
+            "no drain ran, so no sentence was even considered: {lines:?}"
+        );
+        assert_eq!(
+            announcer
+                .announce(Announcement {
+                    text: "anybody there".to_owned(),
+                })
+                .expect_err("nothing is draining"),
+            crate::announce::AnnounceRefused::Gone
+        );
+    }
+
     /// The drain's third exit, and the one that runs when the operator surface
     /// has actually failed: the bridge refuses the publish.
     ///
     /// Driven against a handle whose bridge was never run and then dropped, so
     /// the command channel is closed and every publish answers `BridgeGone`.
-    /// The end is said once with its reason and with the alert that met it, and
-    /// the loop *stops* rather than turning every further alert into a log line
-    /// and a failed publish. A drain that kept going would be a busy loop in
-    /// exactly the condition it exists to report. Nothing claims a hand-off in
-    /// this run: there was none.
+    /// The end is said with its reason, over the alert that met it and every one
+    /// still queued behind it, and the loop *stops* rather than turning every
+    /// further alert into a log line and a failed publish. A drain that kept
+    /// going would be a busy loop in exactly the condition it exists to report.
+    /// Nothing claims a hand-off in this run: there was none.
     #[tokio::test]
     async fn an_alert_drain_whose_bridge_is_gone_says_so_once_and_stops() {
         let dir = tempfile::tempdir().unwrap();
@@ -4293,10 +5142,10 @@ mod tests {
                 .expect("the seam is live");
         }
 
-        // Two alerts queued and the raiser then dropped, so a drain that did
-        // not break would carry the second one and end on the empty seam
-        // instead — which is what the two counts below tell apart, without this
-        // case ever being able to park on a queue nothing fills.
+        // Two alerts queued and the raiser then dropped, so the drain cannot
+        // park on a queue nothing fills. A drain that did not break would hand
+        // the second one over as well, which is what the absent
+        // `alert_handed_off` below tells apart from the loss it actually is.
         drop(raiser);
         let teardown = CancellationToken::new();
         drain_alerts(inbox, bridge_handle, teardown, handle.clone()).await;
@@ -4306,13 +5155,17 @@ mod tests {
 
         let lines = read_lines(&path);
         let ended = events_named(&lines, "alert_seam_ended");
-        assert_eq!(ended.len(), 1, "said once: {lines:?}");
-        assert_eq!(ended[0]["reason"], "the bridge is gone");
-        // The first alert, not the second: the loop broke on the failed
-        // hand-off rather than draining the queue.
-        assert_eq!(ended[0]["severity"], "critical");
-        assert_eq!(ended[0]["title"], "the head is parked");
-        assert_eq!(ended[0]["body"], "a fault row ended the session");
+        assert_eq!(
+            ended.len(),
+            2,
+            "the alert that met the dead bridge and the one queued behind it: {lines:?}"
+        );
+        for (line, title) in ended.iter().zip(["the head is parked", "and again"]) {
+            assert_eq!(line["reason"], "the bridge is gone");
+            assert_eq!(line["severity"], "critical");
+            assert_eq!(line["title"], title);
+            assert_eq!(line["body"], "a fault row ended the session");
+        }
         assert!(
             events_named(&lines, "alert_handed_off").is_empty(),
             "nothing was handed off: {lines:?}"

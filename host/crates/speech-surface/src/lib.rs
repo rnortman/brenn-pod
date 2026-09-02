@@ -4,6 +4,7 @@
 //! the binaries assemble.
 
 pub mod alerts;
+pub mod announce;
 mod barge;
 pub mod brenn;
 pub mod clip;
@@ -17,12 +18,18 @@ pub mod prune;
 pub mod recorder;
 pub mod replay;
 pub mod scripter;
+/// The bounded, dropping handoff both composer-to-server seams are built on.
+mod seam;
 pub mod server;
 mod time;
 
 /// The operator-alert seam a composing process raises through.
 pub use alerts::{
     ALERT_QUEUE_DEPTH, Alert, AlertInbox, AlertRaiser, AlertRefused, AlertSeverity, alert_seam,
+};
+/// The announcement seam a composing process speaks a sentence through.
+pub use announce::{
+    ANNOUNCE_QUEUE_DEPTH, AnnounceInbox, AnnounceRefused, Announcement, Announcer, announce_seam,
 };
 /// The ledger reading the scripter schedules from; part of [`scripter::ScriptInput`].
 pub use barge::TurnAudio;

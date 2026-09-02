@@ -223,6 +223,25 @@ impl Config {
         self.brain.as_ref().map(|brain| brain.mode) == Some(BrainMode::Brenn)
     }
 
+    /// Whether a run composed from this configuration drains an announcement
+    /// seam.
+    ///
+    /// Two things have to be there, and this is asked of the crate for the
+    /// reason [`Config::carries_alerts`] is: a brain, because the speak channel
+    /// and the router that resolves a command to a pod's writer are built only
+    /// beside one; and `[tts]`, because a `Text` body with no synthesizer wired
+    /// is a counted `speak_unsupported` rejection rather than a sentence
+    /// anybody hears. Neither of them is about the bus — an announcement stays
+    /// in the room — so a deployment with a local brain announces.
+    ///
+    /// What an embedder does with `false` is keep no announcing end: the run
+    /// drops its own, so every announcement against it refuses and says so for
+    /// nothing.
+    #[must_use]
+    pub fn carries_announcements(&self) -> bool {
+        self.brain.is_some() && self.tts.is_some()
+    }
+
     /// Resolve a pod's room. A pod absent from the map is [`RoomLookup::Unmapped`]
     /// — the caller warns on it but never rejects the pod.
     pub fn room_for(&self, pod_id: &str) -> RoomLookup {

@@ -14,9 +14,10 @@
 //! is down — turns a reporting path into a memory leak in the one condition it
 //! exists to report through.
 //!
+//! The queue itself is [`crate::seam`]; what is here is this seam's cargo, its
+//! depth, and the verb an operator surface raises through.
+//!
 //! [`Server::run`]: crate::server::Server::run
-
-use tokio::sync::mpsc;
 
 /// The loudness an [`Alert`] carries, as the bus plane spells it.
 ///
@@ -41,39 +42,15 @@ pub struct Alert {
     pub body: String,
 }
 
-/// Why an alert did not reach the queue. Both are drops: nothing is retried and
-/// nothing is held, because the sender is the only thing that knows whether the
-/// condition still holds by the time an attachment exists again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum AlertRefused {
-    /// The queue is full — the drain is behind, or there is no live attachment
-    /// carrying alerts away.
-    #[error("the alert queue is full")]
-    Backlogged,
-    /// The server's half is gone: the run ended, or it was never composed with
-    /// this seam.
-    #[error("the server's end of the alert seam is gone")]
-    Gone,
-}
-
-impl AlertRefused {
-    /// The fixed word a caller reports the refusal under, so two embedders'
-    /// logs spell one condition the same way.
-    #[must_use]
-    pub fn reason(self) -> &'static str {
-        match self {
-            AlertRefused::Backlogged => "backlogged",
-            AlertRefused::Gone => "gone",
-        }
-    }
-}
+/// Why an alert did not reach the queue. The seam's own refusal: both variants
+/// are drops, and the two words they report under are the words every seam in
+/// this crate reports under.
+pub type AlertRefused = crate::seam::SeamRefused;
 
 /// The composing process's end of the seam. Cheap to clone, and callable from
 /// any thread — raising an alert neither blocks nor needs a runtime.
 #[derive(Clone, Debug)]
-pub struct AlertRaiser {
-    alerts: mpsc::Sender<Alert>,
-}
+pub struct AlertRaiser(crate::seam::Handoff<Alert>);
 
 impl AlertRaiser {
     /// Queue one alert for the attachment. Returns once it is queued, never once
@@ -85,10 +62,7 @@ impl AlertRaiser {
     /// [`AlertRefused::Gone`] if the server's end is closed. Either way this
     /// alert is dropped.
     pub fn raise(&self, alert: Alert) -> Result<(), AlertRefused> {
-        self.alerts.try_send(alert).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => AlertRefused::Backlogged,
-            mpsc::error::TrySendError::Closed(_) => AlertRefused::Gone,
-        })
+        self.0.hand(alert)
     }
 }
 
@@ -96,14 +70,18 @@ impl AlertRaiser {
 ///
 /// [`Server::with_alerts`]: crate::server::Server::with_alerts
 #[derive(Debug)]
-pub struct AlertInbox {
-    alerts: mpsc::Receiver<Alert>,
-}
+pub struct AlertInbox(crate::seam::Inbox<Alert>);
 
 impl AlertInbox {
     /// The next alert, or `None` once every raiser is dropped.
     pub(crate) async fn next(&mut self) -> Option<Alert> {
-        self.alerts.recv().await
+        self.0.next().await
+    }
+
+    /// The alerts still queued, taken without waiting, for a drain that is
+    /// ending while the composer is still raising.
+    pub(crate) fn take_queued(&mut self) -> Vec<Alert> {
+        self.0.take_queued()
     }
 }
 
@@ -115,9 +93,8 @@ impl AlertInbox {
 /// silently drops every alert rather than a configuration.
 #[must_use]
 pub fn alert_seam(depth: usize) -> (AlertRaiser, AlertInbox) {
-    assert!(depth > 0, "an alert seam holds at least one alert");
-    let (tx, rx) = mpsc::channel(depth);
-    (AlertRaiser { alerts: tx }, AlertInbox { alerts: rx })
+    let (handoff, inbox) = crate::seam::seam(depth);
+    (AlertRaiser(handoff), AlertInbox(inbox))
 }
 
 #[cfg(test)]
@@ -132,51 +109,6 @@ mod tests {
         }
     }
 
-    /// The ordinary path, driven the way the robot's host drives it.
-    #[tokio::test]
-    async fn an_alert_raised_off_a_runtime_reaches_the_inbox() {
-        let (raiser, mut inbox) = alert_seam(2);
-        // Off the runtime's own thread: `raise` is not `async` precisely so
-        // this works.
-        let raised = std::thread::spawn(move || raiser.raise(alert("parked")));
-        raised
-            .join()
-            .expect("the raising thread")
-            .expect("the queue has room");
-
-        let taken = inbox.next().await.expect("one alert was raised");
-        assert_eq!(taken, alert("parked"));
-    }
-
-    /// Full is a drop, and the caller is told which drop it was — the drain is
-    /// behind or the attachment is down, both of which an operator surface
-    /// reports differently from a seam that is gone.
-    #[test]
-    fn a_full_queue_refuses_without_blocking() {
-        let (raiser, _inbox) = alert_seam(1);
-        raiser.raise(alert("first")).expect("the queue has room");
-
-        let refused = raiser
-            .raise(alert("second"))
-            .expect_err("the queue is full");
-        assert_eq!(refused, AlertRefused::Backlogged);
-        assert_eq!(refused.reason(), "backlogged");
-    }
-
-    /// The server's end dropped — the run ended, or the composer never handed
-    /// the inbox over. Raising says so instead of appearing to succeed.
-    #[test]
-    fn a_dropped_inbox_refuses_as_gone() {
-        let (raiser, inbox) = alert_seam(1);
-        drop(inbox);
-
-        let refused = raiser
-            .raise(alert("parked"))
-            .expect_err("the inbox is gone");
-        assert_eq!(refused, AlertRefused::Gone);
-        assert_eq!(refused.reason(), "gone");
-    }
-
     /// A raiser clone drives the same queue: the alert table and the edge's own
     /// drops are two callers of one seam.
     #[tokio::test]
@@ -188,11 +120,5 @@ mod tests {
 
         assert_eq!(inbox.next().await.expect("first").title, "first");
         assert_eq!(inbox.next().await.expect("second").title, "second");
-    }
-
-    #[test]
-    #[should_panic(expected = "at least one alert")]
-    fn a_zero_depth_seam_is_refused() {
-        let _ = alert_seam(0);
     }
 }
