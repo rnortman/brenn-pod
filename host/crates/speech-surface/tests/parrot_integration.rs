@@ -225,6 +225,7 @@ fn echo_brain_reads_back_transcript_end_to_end() {
     // Shut down cleanly, then read the final `stage_health` line and assert the
     // stt/tts/brain/router/playback counters reflect the one parrot round-trip.
     let health = common::final_stage_health(&mut daemon);
+    common::assert_lossless(&health);
     assert_eq!(health["stt"]["requests"], 1, "one STT request: {health}");
     assert_eq!(
         health["stt"]["ok"], 1,

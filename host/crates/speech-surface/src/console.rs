@@ -153,6 +153,7 @@ const MAX_FIELD_CHARS: usize = 200;
 /// would let one stage's value mask the other's.
 const HEALTH_COUNTER_LEAVES: &[&str] = &[
     "dropped_oldest",
+    "bookkeeping_faults",
     "errors",
     "jobs_rejected_full",
     "jobs_rejected_dead",
@@ -359,7 +360,13 @@ impl Renderer {
 fn run_summary(fields: &Value) -> String {
     let queue = fields.get("segment_queue");
     let wake = fields.get("wake");
-    let pushed = fmt_u64(queue.and_then(|q| q.get("pushed")));
+    // `sheddable_pushed`, not `pushed`: the latter also counts the control
+    // events riding the queue's reliable lane, which are not segments and would
+    // over-report this tally by roughly an order of magnitude. Lines that carry
+    // only `pushed` come from a daemon with no reliable lane, where `pushed`
+    // was a segment count; falling back keeps the recap of an archived log a
+    // number rather than a `?`.
+    let pushed = fmt_u64(queue.and_then(|q| q.get("sheddable_pushed").or_else(|| q.get("pushed"))));
     let detected = fmt_u64(wake.and_then(|w| w.get("detected")));
     let rejected = fmt_u64(wake.and_then(|w| w.get("rejected")));
     let jobs = fmt_u64(fields.get("playback").and_then(|p| p.get("jobs_completed")));
@@ -2375,6 +2382,30 @@ mod tests {
     }
 
     #[test]
+    fn stage_health_reports_queue_bookkeeping_faults_as_a_mover() {
+        let mut r = Renderer::new(false);
+        r.render(
+            0,
+            "stage_health",
+            &json!({ "segment_queue": { "bookkeeping_faults": 0 } }),
+        );
+        // A nonzero value here means the lane accounting broke and every other
+        // field on the line may be fiction, so it must reach the console rather
+        // than only the JSONL.
+        let line = r
+            .render(
+                0,
+                "stage_health",
+                &json!({ "segment_queue": { "bookkeeping_faults": 1 } }),
+            )
+            .unwrap();
+        assert!(
+            line.ends_with("!!! stage_health: segment_queue.bookkeeping_faults +1"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn stage_health_reports_only_movers_by_delta() {
         let mut r = Renderer::new(false);
         // Establish a baseline snapshot. The first line diffs against zero, so
@@ -2511,7 +2542,9 @@ mod tests {
                 0,
                 "stage_health",
                 &json!({
-                    "segment_queue": { "pushed": 12, "dropped_oldest": 0 },
+                    // Both push counters, differing: the recap's "segments" is
+                    // the sheddable-lane one, never the both-lane total.
+                    "segment_queue": { "pushed": 57, "sheddable_pushed": 12, "dropped_oldest": 0 },
                     "wake": { "detected": 3, "rejected": 8 },
                     "playback": { "jobs_completed": 3 },
                     "jsonl_dropped": 0,
@@ -2537,6 +2570,26 @@ mod tests {
             ),
             "{bare}"
         );
+        // An archived log from a daemon that predates the reliable lane: only
+        // `pushed`, and it was a segment count. The recap still shows it.
+        let legacy = r
+            .render(
+                0,
+                "stage_health",
+                &json!({
+                    "segment_queue": { "pushed": 41, "dropped_oldest": 0 },
+                    "wake": { "detected": 1, "rejected": 0 },
+                    "playback": { "jobs_completed": 0 },
+                    "at_shutdown": true
+                }),
+            )
+            .unwrap();
+        assert!(
+            legacy.lines().next().is_some_and(|l| l.ends_with(
+                "run summary — 41 segments, wake 1 detected / 0 rejected, 0 playback jobs, 0 drops"
+            )),
+            "{legacy}"
+        );
     }
 
     #[test]
@@ -2549,7 +2602,7 @@ mod tests {
                 0,
                 "stage_health",
                 &json!({
-                    "segment_queue": { "pushed": 5, "dropped_oldest": 2 },
+                    "segment_queue": { "pushed": 5, "sheddable_pushed": 5, "dropped_oldest": 2 },
                     "wake": { "detected": 1, "rejected": 0 },
                     "playback": { "jobs_completed": 1 },
                     "jsonl_dropped": 4,

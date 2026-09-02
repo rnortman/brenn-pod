@@ -71,6 +71,21 @@ pub enum PipelineItem {
     Listener(ListenerEvent),
 }
 
+impl PipelineItem {
+    /// Whether this item is a control event — one whose loss is a lost wake or a
+    /// lost utterance, so it rides the queue's reliable lane rather than the
+    /// sheddable one. Segments are bulk data and are sheddable.
+    ///
+    /// The lane policy as data, for callers that route a `PipelineItem` whose
+    /// variant they do not know statically.
+    pub fn is_control(&self) -> bool {
+        match self {
+            PipelineItem::Listener(_) => true,
+            PipelineItem::Segment { .. } => false,
+        }
+    }
+}
+
 /// The brain and the response channel it writes into. `None` in `PipelineCtx.brain`
 /// is the no-brain pipeline: STT still runs and utterances still mint and emit, but
 /// nothing is dispatched.
@@ -1288,6 +1303,31 @@ mod tests {
         PipelineItem::Segment { seg, epoch }
     }
 
+    /// Write a `pod-x` sidecar into `store` holding one `Ungated` entry per
+    /// `(part, end_cause)` of `segment_id`, and return the framelog path the
+    /// entries belong to. `truncated` follows `HostCapped` and `resumed` follows
+    /// a non-zero part, as the recorder writes them.
+    fn seed_sidecar(store: &Path, segment_id: u32, parts: &[(u16, SegmentEndCause)]) -> PathBuf {
+        let framelog = store.join("pod-x_0.framelog");
+        let mut sc = crate::recorder::Sidecar::new("pod-x");
+        for &(part, end_cause) in parts {
+            sc.push(crate::recorder::SidecarSegment {
+                segment_id,
+                part,
+                wake: WakeClass::Ungated,
+                start_epoch_us: 1,
+                end_epoch_us: 2,
+                end_cause,
+                truncated: matches!(end_cause, SegmentEndCause::HostCapped),
+                resumed: part > 0,
+                gap_count: 0,
+                samples: 16,
+            });
+        }
+        sc.write_atomic(&sidecar_path(&framelog)).unwrap();
+        framelog
+    }
+
     fn wake_detected(epoch: u64, wake_end_sample: u64) -> PipelineItem {
         PipelineItem::Listener(ListenerEvent::WakeDetected {
             pod: pod(),
@@ -1397,6 +1437,7 @@ mod tests {
         nudges: Arc<Mutex<NudgeLog>>,
         scripter: Option<ScriptHandle>,
         turn_end: TurnEnd,
+        queue_depth: usize,
     }
 
     impl Harness {
@@ -1412,7 +1453,14 @@ mod tests {
                 nudges: Arc::new(Mutex::new(NudgeLog::default())),
                 turn_end: TurnEnd::Closed,
                 scripter: None,
+                queue_depth: 32,
             }
+        }
+        /// Bound the queue's sheddable lane, so a test can pin a depth narrower
+        /// than the burst it pre-loads.
+        fn queue_depth(mut self, depth: usize) -> Harness {
+            self.queue_depth = depth;
+            self
         }
         /// Wire the head's taps to `handle`, so a test can read the
         /// interaction lifecycle as the scripter receives it.
@@ -1478,9 +1526,15 @@ mod tests {
                 None
             };
 
-            let (tx, rx) = DropOldestQueue::<PipelineItem>::new(32);
+            let (tx, rx) = DropOldestQueue::<PipelineItem>::new(self.queue_depth);
+            // The lane split comes off the item itself, so a new variant cannot
+            // ride a lane here that it does not ride in the daemon.
             for item in items {
-                tx.send(item);
+                if item.is_control() {
+                    tx.send_reliable(item);
+                } else {
+                    tx.send_sheddable(item);
+                }
             }
             drop(tx);
 
@@ -2240,26 +2294,90 @@ mod tests {
         // WakeDetected landing in its span upgrades it to positive.
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().to_path_buf();
-        let framelog = store.join("pod-x_0.framelog");
-        let mut sc = crate::recorder::Sidecar::new("pod-x");
-        sc.push(crate::recorder::SidecarSegment {
-            segment_id: 7,
-            part: 0,
-            wake: WakeClass::Ungated,
-            start_epoch_us: 1,
-            end_epoch_us: 2,
-            end_cause: SegmentEndCause::VadRelease,
-            truncated: false,
-            resumed: false,
-            gap_count: 0,
-            samples: 16,
-        });
-        sc.write_atomic(&sidecar_path(&framelog)).unwrap();
+        let framelog = seed_sidecar(&store, 7, &[(0, SegmentEndCause::VadRelease)]);
 
         let (_lines, _cmds) = Harness::new()
             .record(store.clone())
             .run(vec![segment(seg_at(7, 0, 16)), wake_detected(1, 8)])
             .await;
+        let read = crate::recorder::Sidecar::read(&sidecar_path(&framelog)).unwrap();
+        assert_eq!(read.segments[0].wake, WakeClass::Positive);
+    }
+
+    #[tokio::test]
+    async fn a_close_burst_wider_than_the_segment_queue_reaches_the_sink() {
+        // One ordinary segment close puts nine listener events on the queue in a
+        // few milliseconds of inference; a consumer that is off-CPU for that span
+        // sees them all arrive first. With the control events on a sheddable lane
+        // the oldest — the wake — was silently evicted, and the pod never woke.
+        // Depth 1 makes that window deterministic: the whole burst is wider than
+        // the segment budget, and every line still has to land.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().to_path_buf();
+        let framelog = seed_sidecar(&store, 1, &[(0, SegmentEndCause::VadRelease)]);
+
+        let stats = |model: StatsModel, cause: StatsFlushCause| {
+            PipelineItem::Listener(ListenerEvent::ModelStats {
+                pod: pod(),
+                epoch: 1,
+                model,
+                cause,
+                summary: ScoreSummary {
+                    first_chunk_end: 2_560,
+                    last_chunk_end: 19_456,
+                    chunks: 4,
+                    min: 0.007,
+                    max: 0.999,
+                    mean: 0.7,
+                    median: 0.9,
+                },
+            })
+        };
+        let transition = |from: EndpointState, to: EndpointState, cause: TransitionCause| {
+            PipelineItem::Listener(ListenerEvent::EndpointerTransition {
+                pod: pod(),
+                epoch: 1,
+                transition: EndpointTransition {
+                    from,
+                    to,
+                    cause,
+                    sample_offset: 19_456,
+                },
+            })
+        };
+
+        let (lines, _cmds) = Harness::new()
+            .record(store.clone())
+            .queue_depth(1)
+            .run(vec![
+                segment(seg_at(1, 0, 16)),
+                wake_detected(1, 8),
+                stats(StatsModel::Silero, StatsFlushCause::Transition),
+                stats(StatsModel::Oww, StatsFlushCause::Transition),
+                transition(
+                    EndpointState::Speech,
+                    EndpointState::SoftEndpointed,
+                    TransitionCause::SoftEndpoint,
+                ),
+                stats(StatsModel::Silero, StatsFlushCause::SegmentClose),
+                stats(StatsModel::Oww, StatsFlushCause::SegmentClose),
+                soft_endpoint(carved(1, 0, 16, None)),
+                transition(
+                    EndpointState::SoftEndpointed,
+                    EndpointState::Idle,
+                    TransitionCause::DeviceReleaseClosed,
+                ),
+                PipelineItem::Listener(ListenerEvent::UtteranceClosed {
+                    pod: pod(),
+                    utterance_id: uid(1),
+                }),
+            ])
+            .await;
+
+        let named = |event: &str| lines.iter().filter(|l| l["event"] == event).count();
+        assert_eq!(named("wake_detected"), 1, "{lines:?}");
+        assert_eq!(named("utterance"), 1, "{lines:?}");
+        assert_eq!(named("utterance_closed"), 1, "{lines:?}");
         let read = crate::recorder::Sidecar::read(&sidecar_path(&framelog)).unwrap();
         assert_eq!(read.segments[0].wake, WakeClass::Positive);
     }
@@ -2457,23 +2575,14 @@ mod tests {
         // the `(segment_id, part)` key disambiguates them.
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().to_path_buf();
-        let framelog = store.join("pod-x_0.framelog");
-        let entry = |part: u16, cause| crate::recorder::SidecarSegment {
-            segment_id: 7,
-            part,
-            wake: WakeClass::Ungated,
-            start_epoch_us: 1,
-            end_epoch_us: 2,
-            end_cause: cause,
-            truncated: matches!(cause, SegmentEndCause::HostCapped),
-            resumed: part > 0,
-            gap_count: 0,
-            samples: 16,
-        };
-        let mut sc = crate::recorder::Sidecar::new("pod-x");
-        sc.push(entry(0, SegmentEndCause::HostCapped));
-        sc.push(entry(1, SegmentEndCause::VadRelease));
-        sc.write_atomic(&sidecar_path(&framelog)).unwrap();
+        let framelog = seed_sidecar(
+            &store,
+            7,
+            &[
+                (0, SegmentEndCause::HostCapped),
+                (1, SegmentEndCause::VadRelease),
+            ],
+        );
 
         // Part 1 is based at sample 16 (part 0 spanned [0, 16)); the wake lands at
         // sample 20, inside part 1.

@@ -1191,6 +1191,9 @@ fn default_roll_max_bytes() -> u64 {
 fn default_roll_max_age_s() -> u64 {
     900
 }
+/// Bounds the pipeline queue's sheddable lane only, so this is a count of
+/// whole assembled segments the consumer may fall behind by before the oldest
+/// is shed. Control events ride the reliable lane and are not counted here.
 fn default_segment_queue_depth() -> usize {
     8
 }

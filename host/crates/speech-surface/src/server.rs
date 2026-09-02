@@ -650,9 +650,10 @@ impl Server {
                     let fwd_tx = item_tx.clone();
                     let forwarder = tokio::spawn(async move {
                         while let Some(ev) = ev_rx.recv().await {
-                            // A drop-oldest eviction here is the same failure class as a
-                            // segment eviction (flood territory); the drop is silent.
-                            let _ = fwd_tx.send(crate::pipeline::PipelineItem::Listener(ev));
+                            // Control, not bulk: losing a listener event is a lost
+                            // wake or utterance, and one segment close emits more of
+                            // them than the segment budget holds.
+                            fwd_tx.send_reliable(crate::pipeline::PipelineItem::Listener(ev));
                         }
                     });
                     (Some(Arc::new(handle)), Some(stats), Some(forwarder))
@@ -2838,16 +2839,31 @@ fn finalize_segment(
         },
     );
 
-    if let Some(displaced) = item_tx.send(crate::pipeline::PipelineItem::Segment { seg, epoch }) {
-        let depth = item_tx.stats().depth;
+    if let Some(displaced) =
+        item_tx.send_sheddable(crate::pipeline::PipelineItem::Segment { seg, epoch })
+    {
+        // The sheddable count, not the total queued: a reader of either line
+        // below takes `depth` to mean "how full the segment budget was", so it
+        // is never above `pipeline.segment_queue_depth` and never inflated by
+        // the control events sharing the queue.
+        let depth = item_tx.stats().sheddable_depth;
         match &displaced {
+            // A segment the pipeline will never see: no utterance can cite its
+            // audio, and its recorded frames are orphaned. The line names which
+            // one, so a reader can tell a shed segment from one that never
+            // arrived.
             crate::pipeline::PipelineItem::Segment { seg: s, .. } => jsonl.emit(
                 "segment_dropped_overflow",
                 &json!({ "pod": s.pod.0, "segment_id": s.segment_id, "depth": depth }),
             ),
+            // Unreachable while every listener event is pushed with
+            // `send_reliable`. This line's presence therefore means a caller
+            // pushed a control event onto the sheddable lane — a code defect to
+            // fix at that caller, never a capacity to tune, and never a reason
+            // to raise `pipeline.segment_queue_depth`. Named rather than
+            // asserted: this runs on a live connection task, and a lane slip
+            // under flood must not take the connection down.
             crate::pipeline::PipelineItem::Listener(ev) => {
-                // A dropped listener event is a lost utterance or wake, not an
-                // anonymous segment drop; name the pod and the event kind.
                 use speech_pipeline::ListenerEvent::*;
                 let (pod, kind) = match ev {
                     WakeDetected { pod, .. } => (&pod.0, "wake_detected"),
@@ -3071,6 +3087,16 @@ fn emit_stage_health(sources: &HealthSources, at_shutdown: bool) {
 /// observability tallies.
 #[derive(Serialize)]
 struct StageHealthLine {
+    // Both lanes of the pipeline queue. `depth`, `high_water` and `pushed` span
+    // segments and control events alike; `sheddable_depth` and
+    // `sheddable_pushed` are the segment-only depth and total — the depth is
+    // what `pipeline.segment_queue_depth` bounds, and the total is the one a
+    // reader may call a segment count — and `dropped_oldest` is sheddable-only:
+    // a non-zero value means segments were shed, never that a wake or a carve
+    // was lost. `reliable_high_water` is how far behind the consumer ever fell
+    // on the control lane. `bookkeeping_faults` is non-zero only when the queue
+    // caught its own lane accounting drifting — a defect in the queue, and a
+    // reason to distrust every other field here.
     segment_queue: QueueStats,
     // Omitted when no continuous listener is wired — an absent listener has no
     // counters, distinct from a wired one that has seen no feeds.
@@ -3139,8 +3165,12 @@ mod tests {
             depth: 0,
             high_water: 0,
             pushed: 0,
+            sheddable_pushed: 0,
             dropped_oldest: 0,
             send_failures: 0,
+            reliable_high_water: 0,
+            sheddable_depth: 0,
+            bookkeeping_faults: 0,
         };
         let line = StageHealthLine {
             segment_queue: queue,
@@ -3160,6 +3190,28 @@ mod tests {
         let value = serde_json::to_value(&line).expect("serializes");
         assert_eq!(
             value["listener"]["marker_send_timeouts"],
+            Value::from(0_u64),
+            "line: {value}"
+        );
+        // Serialization presence: neither counter is reachable if the line
+        // omits it.
+        assert_eq!(
+            value["segment_queue"]["reliable_high_water"],
+            Value::from(0_u64),
+            "line: {value}"
+        );
+        assert_eq!(
+            value["segment_queue"]["sheddable_depth"],
+            Value::from(0_u64),
+            "line: {value}"
+        );
+        assert_eq!(
+            value["segment_queue"]["sheddable_pushed"],
+            Value::from(0_u64),
+            "line: {value}"
+        );
+        assert_eq!(
+            value["segment_queue"]["bookkeeping_faults"],
             Value::from(0_u64),
             "line: {value}"
         );
@@ -7604,14 +7656,26 @@ mod tests {
                 .await
                 .unwrap();
 
-        // A depth-1 queue, pre-filled so the next enqueue must displace it.
-        let (seg_tx, _seg_rx) = DropOldestQueue::<crate::pipeline::PipelineItem>::new(1);
+        // A depth-1 queue, pre-filled so the next enqueue must displace it, and
+        // then loaded with a listener close burst nine events wide. Only the
+        // segment is sheddable, so only the segment may give way.
+        let (seg_tx, mut seg_rx) = DropOldestQueue::<crate::pipeline::PipelineItem>::new(1);
         let end = SegmentEndInfo::new(SegmentEndCause::VadRelease, false, 0, None);
         let displaced_id = 1;
-        seg_tx.send(crate::pipeline::PipelineItem::Segment {
+        seg_tx.send_sheddable(crate::pipeline::PipelineItem::Segment {
             seg: crate::test_support::segment(displaced_id, 16, vec![], end.clone()),
             epoch: 1,
         });
+        for i in 0..9 {
+            seg_tx.send_reliable(crate::pipeline::PipelineItem::Listener(
+                speech_pipeline::ListenerEvent::WakeDetected {
+                    pod: PodId(TEST_POD_ID.to_string()),
+                    epoch: 1,
+                    score: 0.9,
+                    wake_end_sample: i,
+                },
+            ));
+        }
 
         // Finalize a second segment. `recording_on: false` makes `start` a no-op
         // (no filesystem side effects, `writer: None`), so `record_segment`
@@ -7646,7 +7710,90 @@ mod tests {
         let dropped = events_named(&lines, "segment_dropped_overflow");
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0]["segment_id"], displaced_id);
+        // The segment budget, not the ten items queued: `depth` on this line
+        // means "how full the sheddable lane was".
         assert_eq!(dropped[0]["depth"], 1);
+        assert!(
+            events_named(&lines, "listener_event_dropped_overflow").is_empty(),
+            "no control event may be shed: {lines:?}"
+        );
+        for i in 0..9 {
+            match seg_rx.recv().await {
+                Some(crate::pipeline::PipelineItem::Listener(
+                    speech_pipeline::ListenerEvent::WakeDetected {
+                        wake_end_sample, ..
+                    },
+                )) => assert_eq!(wake_end_sample, i),
+                other => panic!("expected reliable wake {i}, got {:?}", other.is_some()),
+            }
+        }
+        assert!(matches!(
+            seg_rx.recv().await,
+            Some(crate::pipeline::PipelineItem::Segment { .. })
+        ));
+    }
+
+    /// The `listener_event_dropped_overflow` arm is a misrouting guard, not a
+    /// load symptom: reached only when a caller pushes a control event onto the
+    /// sheddable lane. It must name the slip in the log and leave the connection
+    /// task standing — an assert here would take a live connection down under
+    /// flood and would make the line untestable.
+    #[tokio::test]
+    async fn a_misrouted_listener_item_is_named_not_panicked() {
+        use speech_pipeline::SegmentEndInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (jsonl, writer_join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+
+        let (seg_tx, _seg_rx) = DropOldestQueue::<crate::pipeline::PipelineItem>::new(1);
+        // The misroute under test: a control event on the sheddable lane.
+        seg_tx.send_sheddable(crate::pipeline::PipelineItem::Listener(
+            speech_pipeline::ListenerEvent::WakeDetected {
+                pod: PodId(TEST_POD_ID.to_string()),
+                epoch: 1,
+                score: 0.9,
+                wake_end_sample: 8,
+            },
+        ));
+
+        let mut recorder = Recorder::start(
+            dir.path().to_path_buf(),
+            1,
+            "unused",
+            false,
+            RecorderShared {
+                open_logs: OpenLogs::default(),
+                recording_failed: Arc::new(AtomicBool::new(false)),
+                jsonl: jsonl.clone(),
+            },
+        );
+        let end = SegmentEndInfo::new(SegmentEndCause::VadRelease, false, 0, None);
+        finalize_segment(
+            crate::test_support::segment(2, 16, vec![], end),
+            1,
+            &mut recorder,
+            &jsonl,
+            &seg_tx,
+            &AtomicU64::new(0),
+        );
+        drop(recorder);
+        drop(jsonl);
+        writer_join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        let dropped = events_named(&lines, "listener_event_dropped_overflow");
+        assert_eq!(dropped.len(), 1, "{lines:?}");
+        assert_eq!(dropped[0]["kind"], "wake_detected");
+        assert_eq!(dropped[0]["pod"], TEST_POD_ID);
+        // `depth` is the sheddable count the line's doc promises: the misrouted
+        // item left the lane and the segment that displaced it took its place,
+        // so it is the depth-1 budget, full — never the both-lane total.
+        assert_eq!(dropped[0]["depth"], 1);
+        assert!(events_named(&lines, "segment_dropped_overflow").is_empty());
     }
 
     /// Build a `HealthSources` with default zero counters. `stats` and `jsonl` are

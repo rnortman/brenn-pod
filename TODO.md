@@ -541,3 +541,38 @@ the qualifying paragraph on `handle_driver_exit_midrun` is retired.
 
 See `TODO(driver-death-ends-its-bridge)` at `handle_driver_exit_midrun` in
 `host/crates/speech-surface/src/server.rs`.
+
+## `control-lane-sanity-ceiling` — DEFERRED as of 2026-09-02 (needs a design decision on the ceiling and on a new emitted line)
+
+The pipeline queue's reliable lane (`host/crates/speech-pipeline/src/queue.rs`, `send_reliable`)
+has no ceiling. Every item on the assembler→pipeline route used to be bounded at
+`pipeline.segment_queue_depth` = 8; control events now ride a lane that is bounded only by its
+producer, and the only thing watching it is `reliable_high_water` in `stage_health`, a line
+emitted every 30 s and at shutdown.
+
+That producer bound holds per *segment*, not per unit of time. `ModelStats` force-flushes every
+`MODEL_STATS_FLUSH_CHUNKS` = 256 Silero chunks (~8.2 s of audio, two models), so a consumer wedged
+in `handle_segment`'s `spawn_blocking` sidecar write, a hung STT or brain call, or a stalled disk
+grows the deque for as long as the wedge lasts — slowly, but without limit, and holding whatever
+each `SoftEndpoint`'s `CarvedUtterance` owns. On a long-lived daemon on an embedded-class host that
+trades a bounded-memory lossy failure for an unbounded-memory silent one, and it bites in exactly
+the incident the two-lane queue exists to make diagnosable: RSS climbs instead of a counter moving,
+and if the OOM killer resolves it with SIGKILL the at-shutdown `stage_health` line is never
+written.
+
+Not fixed by shedding: shedding control events is the defect the lane was introduced to remove.
+The shape is a sanity ceiling far above any legitimate backlog (hundreds) plus a named JSONL line
+on crossing it — the same "name it in the log, never take the connection down" stance the
+misrouting guard in `finalize_segment` already takes. What that ceiling is, what the line is
+called, what its fields mean to a reader, and what (if anything) the daemon does on crossing are
+all interface decisions this repo makes once and lives with (CLAUDE.md: an emitted event is an
+interface). The design that introduced the lane
+weighed the unbounded backlog and accepted it with `reliable_high_water` as the watch; changing
+that answer is a design cycle, not a patch.
+
+Done = the reliable lane has a stated ceiling, crossing it emits a documented line whose
+emission-site doc says what a reader may conclude from it, and a unit test drives the lane past
+the ceiling and pins the line.
+
+See `TODO(control-lane-sanity-ceiling)` at `send_reliable` in
+`host/crates/speech-pipeline/src/queue.rs`.

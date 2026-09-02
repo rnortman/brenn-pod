@@ -225,6 +225,7 @@ fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
     );
 
     let health = common::final_stage_health(&mut daemon);
+    common::assert_lossless(&health);
     assert!(
         health["playback"]["jobs_flushed"].as_u64().unwrap_or(0) >= 1,
         "the writer recorded the flush: {health}"

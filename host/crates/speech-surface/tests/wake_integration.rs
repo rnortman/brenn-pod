@@ -46,6 +46,7 @@ fn wake_phrase_arms_detection_carves_utterance_and_labels_sidecar() {
 
     common::drain_and_await_utterance(&daemon, WAKE_SEGMENT_ID);
 
+    let health = common::final_stage_health(&mut daemon);
     let events = common::read_events(&jsonl_path);
 
     // wake_detected: the wake phrase arms openWakeWord above the 0.5 threshold.
@@ -74,10 +75,16 @@ fn wake_phrase_arms_detection_carves_utterance_and_labels_sidecar() {
         daemon.diagnostics()
     );
 
-    // Shut down cleanly, then assert the on-disk sidecar labels the segment
-    // Positive — the wake detection landed in its span (recording was on).
-    daemon.sigterm_and_wait();
+    // The wake detection landed in the recorded span, so the sidecar is Positive.
     common::assert_sidecar_wake(record_dir.path(), WAKE_SEGMENT_ID, WakeClass::Positive);
+
+    // A shed audio frame moves every score this test asserts on, so this clip
+    // must reach the models whole.
+    assert_eq!(
+        health["listener"]["dropped"], 0,
+        "the wake clip must reach the models with no shed frame: {health}"
+    );
+    common::assert_lossless(&health);
 }
 
 /// A daemon with no `[wake]`/`[endpointer]` tables runs no listener (the config
@@ -105,10 +112,10 @@ fn no_listener_config_mints_no_utterance_and_labels_negative() {
     let out = common::run_replay(&addr, "fast", &framelog);
     common::assert_replay_ok(&out, &daemon);
 
-    // Drain the segment path, then shut down (joins the listener thread, if any)
-    // so the absence of listener lines is deterministic, not a timing race.
+    // The test asserts on absent listener lines; drain and shut down first so
+    // that absence reflects the config, not incomplete output.
     common::wait_until_drained(&daemon, WAKE_SEGMENT_ID);
-    daemon.sigterm_and_wait();
+    let health = common::final_stage_health(&mut daemon);
 
     let events = common::read_events(&jsonl_path);
     assert!(
@@ -122,6 +129,12 @@ fn no_listener_config_mints_no_utterance_and_labels_negative() {
     // The segment path still labels the recorded segment — provisionally Negative,
     // as no wake detection landed in its span.
     common::assert_sidecar_wake(record_dir.path(), WAKE_SEGMENT_ID, WakeClass::Negative);
+
+    assert!(
+        health["listener"].is_null(),
+        "an unwired listener contributes no counters: {health}"
+    );
+    common::assert_lossless(&health);
 }
 
 /// With recording off (`record.enabled = false`) and the listener configured — the
@@ -150,6 +163,7 @@ fn recording_off_listener_scores_without_sidecar_noise() {
 
     common::drain_and_await_utterance(&daemon, WAKE_SEGMENT_ID);
 
+    let health = common::final_stage_health(&mut daemon);
     let events = common::read_events(&jsonl_path);
 
     // The listener still scores: a wake detection with a numeric score.
@@ -171,7 +185,11 @@ fn recording_off_listener_scores_without_sidecar_noise() {
         daemon.diagnostics()
     );
 
-    daemon.sigterm_and_wait();
+    assert_eq!(
+        health["listener"]["dropped"], 0,
+        "the wake clip must reach the models with no shed frame: {health}"
+    );
+    common::assert_lossless(&health);
 }
 
 /// Deterministic pseudo-random S16 noise from a fixed LCG, so the clip — and the
@@ -241,7 +259,7 @@ fn noise_does_not_arm_and_round_trips_through_export() {
         daemon.diagnostics()
     );
 
-    daemon.sigterm_and_wait();
+    let health = common::final_stage_health(&mut daemon);
 
     // No arm, so no wake detection and no carved utterance.
     let events = common::read_events(&jsonl_path);
@@ -275,4 +293,11 @@ fn noise_does_not_arm_and_round_trips_through_export() {
         exported, noise,
         "exported PCM must round-trip the noise byte-for-byte"
     );
+
+    // A shed frame would change the scores this test rests on ("nothing armed").
+    assert_eq!(
+        health["listener"]["dropped"], 0,
+        "the noise clip must reach the models with no shed frame: {health}"
+    );
+    common::assert_lossless(&health);
 }

@@ -1,7 +1,25 @@
 //! Shared integration-test helpers: the deterministic fixture generator and
 //! its expected per-segment facts. Included via `mod common;` by the
-//! integration-test binaries in `tests/` (currently `replay_roundtrip.rs` and
-//! `wake_integration.rs`); not every binary consumes every item.
+//! integration-test binaries in `tests/`; not every binary consumes every item.
+//! Anything added here is compiled — and any `#[test]` here is *run* — once per
+//! including binary, so per-binary cost is the thing to weigh before adding.
+//!
+//! # Writing a scenario
+//!
+//! Three rules:
+//!
+//! 1. **Wait on the strictly-latest event your assertions need.** Not the one
+//!    before it, not "the daemon has surely caught up by now". Every wait goes
+//!    through [`wait_for_event`] (or a wrapper like
+//!    [`drain_and_await_utterance`]); there are no bare sleeps.
+//! 2. **When the assertions are terminal, shut down first and assert on a
+//!    closed log.** Call [`final_stage_health`] before [`read_events`]; after
+//!    it returns, the log is complete and every later panic's
+//!    [`DaemonChild::diagnostics`] carries the at-shutdown counters.
+//! 3. **End with [`assert_lossless`].** A scenario that silently lost a queued
+//!    control event, a JSONL line, or an inference otherwise fails as a
+//!    baffling "expected one X, found none". `assert_lossless` makes the loss
+//!    name itself.
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
@@ -412,9 +430,12 @@ pub fn expect_one<'a>(events: &'a [Value], name: &str, daemon: &DaemonChild) -> 
     first
 }
 
-/// SIGTERM the daemon, then return the final at-shutdown `stage_health` line.
-/// Panics with the daemon's output if none was written — the post-shutdown
-/// snapshot read every playback scenario ends on, in one place.
+/// SIGTERM the daemon, join the listener thread and drain the pipeline, then
+/// return the final at-shutdown `stage_health` line. After this returns,
+/// [`read_events`] sees every line the run will ever write, and every later
+/// panic's [`DaemonChild::diagnostics`] carries the at-shutdown counters.
+///
+/// Panics with the daemon's output if no `stage_health` line was written.
 pub fn final_stage_health(daemon: &mut DaemonChild) -> Value {
     daemon.sigterm_and_wait();
     let events = read_events(&daemon.jsonl_path);
@@ -424,6 +445,151 @@ pub fn final_stage_health(daemon: &mut DaemonChild) -> Value {
         .find(|v| v["event"] == "stage_health" && v["at_shutdown"] == true)
         .cloned()
         .unwrap_or_else(|| panic!("no final stage_health line\n{}", daemon.diagnostics()))
+}
+
+/// Read the counter at `path` out of a `stage_health` value, panicking if it is
+/// absent or not a number — a renamed or dropped counter must fail the assertion
+/// loudly rather than silently read as zero and pass forever. `path` is walked
+/// segment by segment, so a top-level counter (`["jsonl_dropped"]`) and a nested
+/// one (`["segment_queue", "dropped_oldest"]`) read the same way; the panic
+/// names the dotted path.
+fn health_counter(health: &Value, path: &[&str]) -> u64 {
+    let mut node = health;
+    for segment in path {
+        node = &node[*segment];
+    }
+    node.as_u64().unwrap_or_else(|| {
+        panic!(
+            "stage_health.{} is not a counter in: {health}",
+            path.join(".")
+        )
+    })
+}
+
+/// Assert that a `stage_health` snapshot records no silent loss on any control
+/// path: nothing was evicted from or refused by the pipeline queue, the queue's
+/// lane accounting never drifted, no JSONL line was dropped, and — when a
+/// listener is wired — its marker channel never closed or timed out and no
+/// inference errored.
+///
+/// None of these counters is ever legitimately non-zero in a passing scenario.
+/// A dropped queue item is a lost wake or a lost utterance; a dropped JSONL
+/// line is an assertion reading a log the daemon did not finish writing; an
+/// inference error is as silent as either and as fatal to the scenario. Ending
+/// a scenario here turns all of them from "expected one X, found none" into a
+/// failure that names the counter.
+///
+/// The listener's *audio* `dropped` counter is deliberately not here: the audio
+/// feed is lossy by design, and a long clip may legitimately shed a frame. The
+/// scenarios where a shed frame would change a score assert it themselves.
+pub fn assert_lossless(health: &Value) {
+    for field in ["dropped_oldest", "send_failures", "bookkeeping_faults"] {
+        assert_eq!(
+            health_counter(health, &["segment_queue", field]),
+            0,
+            "segment_queue.{field} must be zero — a queued segment or control \
+             event was lost, or the queue's own lane accounting drifted: {health}"
+        );
+    }
+    assert_eq!(
+        health_counter(health, &["jsonl_dropped"]),
+        0,
+        "jsonl_dropped must be zero — the log this test reads is incomplete: {health}"
+    );
+    // Omitted entirely when no listener is wired; a scenario that runs none has
+    // no listener counters to assert, which is not the same as zeroed ones.
+    if !health["listener"].is_null() {
+        for field in ["channel_closed", "marker_send_timeouts", "errors"] {
+            assert_eq!(
+                health_counter(health, &["listener", field]),
+                0,
+                "listener.{field} must be zero — the listener lost work silently: {health}"
+            );
+        }
+    }
+}
+
+thread_local! {
+    /// Set only while this thread is inside [`panic_message`]. Read by the
+    /// delegating hook below to decide whether to print.
+    static MUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install, once per process, a hook that prints via the previous hook unless
+/// the panicking thread is inside [`panic_message`].
+///
+/// The panic hook is process-global and libtest runs a binary's tests in
+/// parallel threads: replacing it with a silent one, even briefly, would swallow
+/// a *sibling* scenario's panic message and its `diagnostics()` dump — a real
+/// failure reported as a bare `FAILED`. Delegating per-thread mutes only the
+/// deliberate panics, and the `Once` keeps the take/set pair from racing itself.
+fn install_delegating_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !MUTED.with(std::cell::Cell::get) {
+                prev(info);
+            }
+        }));
+    });
+}
+
+/// Run `f`, expected to panic, and return its panic message without printing a
+/// `thread '…' panicked at` block a reader of a *passing* run would then have to
+/// recognize as expected noise. This test runs once per including binary, so the
+/// noise would be per-binary too. Only this thread is muted; a sibling test
+/// panicking concurrently still prints in full.
+fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe, expected: &str) -> String {
+    install_delegating_panic_hook();
+    MUTED.with(|m| m.set(true));
+    let payload = std::panic::catch_unwind(f);
+    MUTED.with(|m| m.set(false));
+    let payload = payload.expect_err(expected);
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+#[test]
+fn assert_lossless_names_the_counter_that_tripped() {
+    let clean = serde_json::json!({
+        "event": "stage_health",
+        "segment_queue": {"dropped_oldest": 0, "send_failures": 0, "bookkeeping_faults": 0},
+        "jsonl_dropped": 0,
+    });
+    assert_lossless(&clean);
+
+    let lossy = serde_json::json!({
+        "event": "stage_health",
+        "segment_queue": {"dropped_oldest": 1, "send_failures": 0, "bookkeeping_faults": 0},
+        "jsonl_dropped": 0,
+    });
+    let msg = panic_message(
+        || assert_lossless(&lossy),
+        "a non-zero dropped_oldest must fail the assertion",
+    );
+    assert!(
+        msg.contains("segment_queue.dropped_oldest"),
+        "the panic must name the counter that tripped, got: {msg}"
+    );
+
+    let listener_lossy = serde_json::json!({
+        "event": "stage_health",
+        "segment_queue": {"dropped_oldest": 0, "send_failures": 0, "bookkeeping_faults": 0},
+        "jsonl_dropped": 0,
+        "listener": {"channel_closed": 0, "marker_send_timeouts": 2, "errors": 0},
+    });
+    let msg = panic_message(
+        || assert_lossless(&listener_lossy),
+        "a non-zero listener counter must fail the assertion",
+    );
+    assert!(
+        msg.contains("listener.marker_send_timeouts"),
+        "the panic must name the counter that tripped, got: {msg}"
+    );
 }
 
 /// Poll the daemon's JSONL file until a line satisfies `pred`, returning it.

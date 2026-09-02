@@ -224,6 +224,7 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
     // Shut down cleanly, then read the final `stage_health` line and assert it
     // carries the playback/brain/router counters reflecting the one reply.
     let health = common::final_stage_health(&mut daemon);
+    common::assert_lossless(&health);
     assert_eq!(
         health["playback"]["jobs_completed"], 1,
         "one job completed: {health}"
@@ -358,6 +359,7 @@ fn no_brain_config_mints_utterance_without_any_playback() {
     // blocks are emitted unconditionally, so an absent block is a regression,
     // never a no-brain artifact — present and all zero.
     let health = common::final_stage_health(&mut daemon);
+    common::assert_lossless(&health);
     assert!(
         health["playback"].is_object()
             && health["brain"].is_object()
