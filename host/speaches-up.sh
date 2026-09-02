@@ -35,5 +35,13 @@ echo "ensuring models are downloaded (first run downloads ~1 GB)..."
 curl -sf -X POST "http://127.0.0.1:$PORT/v1/models/$STT_MODEL" >/dev/null || true
 curl -sf -X POST "http://127.0.0.1:$PORT/v1/models/$TTS_MODEL" >/dev/null || true
 
-echo "speaches ready at http://127.0.0.1:$PORT"
+# The container publishes on 0.0.0.0 (podman's default publish address for a
+# `-p` with no host IP), so it is reachable from other hosts too — subject to
+# the firewall. Report both addresses rather than only the loopback one, which
+# reads as a localhost-only binding it isn't.
+echo "speaches ready at http://127.0.0.1:$PORT (published on 0.0.0.0:$PORT)"
+LAN_IP="$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+if [ -n "$LAN_IP" ]; then
+  echo "  from another host: http://$LAN_IP:$PORT (needs scripts/speaches-firewall.sh open)"
+fi
 echo "stop with: podman stop $NAME"
