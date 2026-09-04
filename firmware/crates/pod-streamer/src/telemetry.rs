@@ -370,14 +370,20 @@ impl TelemetryCore {
 ///
 /// A disconnected streamer channel is logged, not fatal: the pod keeps polling so
 /// a restarted streamer thread finds a live gate rather than a dead one.
+///
+/// `after_tick` runs once per tick, after the poll, at the same cadence. A pod
+/// that needs per-tick work on the bus (diagnostics, state reads) hangs it here
+/// rather than spinning a second thread that would contend for the transport.
 pub fn run_telemetry_loop<B: TelemetryBus>(
     mut core: TelemetryCore,
     bus: &mut B,
     ctx: &TelemetryCtx<'_>,
     sleep_ms: &dyn Fn(u32),
+    after_tick: &mut dyn FnMut(&TelemetryCore, &mut B),
 ) -> ! {
     loop {
         core.poll_tick(bus, ctx);
+        after_tick(&core, bus);
         sleep_ms(VAD_POLL_INTERVAL_MS);
     }
 }
@@ -1177,9 +1183,12 @@ mod tests {
             assert!(slept.len() < TICKS, "{STOP}");
         };
         let ctx = harness_ctx!(h);
+        let hooked = std::cell::RefCell::new(0usize);
 
         let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_telemetry_loop(core, &mut bus, &ctx, &sleep_ms);
+            run_telemetry_loop(core, &mut bus, &ctx, &sleep_ms, &mut |_, _| {
+                *hooked.borrow_mut() += 1;
+            });
         }));
 
         let payload = stopped.expect_err("the loop only ends by panicking out of the sleep");
@@ -1193,6 +1202,11 @@ mod tests {
             slept.into_inner(),
             vec![VAD_POLL_INTERVAL_MS; TICKS],
             "every inter-tick sleep is one poll interval"
+        );
+        assert_eq!(
+            hooked.into_inner(),
+            TICKS,
+            "the after-tick seam runs once per tick"
         );
         assert_eq!(
             bus.sp_reads(),

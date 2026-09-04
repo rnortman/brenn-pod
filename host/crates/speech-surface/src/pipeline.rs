@@ -1,6 +1,7 @@
-//! The pipeline task: the single consumer of the assembler→pipeline queue, now
-//! carrying both assembled `Segment`s and the continuous listener's
-//! `ListenerEvent`s as [`PipelineItem`]s.
+//! The pipeline task: the single consumer of the assembler→pipeline queue,
+//! carrying assembled `Segment`s, the continuous listener's `ListenerEvent`s, and
+//! each connection's own announcement of its room and frame log, all as
+//! [`PipelineItem`]s.
 //!
 //! Segments are demoted to recording/tracking artifacts: for each one the task
 //! stamps the tracking-emit time, emits the DoA-bearing `TrackingEvent`, and
@@ -60,15 +61,33 @@ pub struct PipelineFatal {
 }
 
 /// One item on the pipeline queue: an assembled transport segment (tracking +
-/// sidecar) or a listener event (wake detection + carved-utterance lifecycle).
+/// sidecar), a listener event (wake detection + carved-utterance lifecycle), or a
+/// connection announcing the context its first utterances are carved under.
 ///
-/// A segment carries its connection `epoch` alongside the assembled audio — the
-/// same per-pod connection sequence the listener stamps its events with, so both
-/// arms of the queue agree on which connection's index space an item belongs to.
+/// Every arm carries its connection `epoch` — the same per-pod connection sequence
+/// the listener stamps its events with, so all three agree on which connection's
+/// index space an item belongs to.
 #[derive(Debug)]
 pub enum PipelineItem {
-    Segment { seg: Segment, epoch: u64 },
+    Segment {
+        seg: Segment,
+        epoch: u64,
+    },
     Listener(ListenerEvent),
+    /// A pod's connection announced itself: the room the configuration resolved
+    /// for it and the frame log its capture is being written to, both known at
+    /// `Hello` and neither derivable from a segment until one closes.
+    ///
+    /// The first utterance of a connection is carved while the first segment is
+    /// still open, so without this the span it mints has no room and no log to
+    /// name. Control, not bulk, for the same reason a wake is: losing it costs
+    /// the attribution of exactly those utterances.
+    Connected {
+        pod: PodId,
+        epoch: u64,
+        room: RoomId,
+        log: String,
+    },
 }
 
 impl PipelineItem {
@@ -80,8 +99,52 @@ impl PipelineItem {
     /// variant they do not know statically.
     pub fn is_control(&self) -> bool {
         match self {
-            PipelineItem::Listener(_) => true,
+            PipelineItem::Listener(_) | PipelineItem::Connected { .. } => true,
             PipelineItem::Segment { .. } => false,
+        }
+    }
+
+    /// The pod this item belongs to. Every arm carries one, and a caller that
+    /// reports an item it did not construct needs it without matching.
+    pub fn pod(&self) -> &PodId {
+        use ListenerEvent::*;
+        match self {
+            PipelineItem::Segment { seg, .. } => &seg.pod,
+            PipelineItem::Connected { pod, .. } => pod,
+            PipelineItem::Listener(ev) => match ev {
+                WakeDetected { pod, .. }
+                | BargeIn { pod, .. }
+                | SoftEndpoint { pod, .. }
+                | Superseded { pod, .. }
+                | UtteranceClosed { pod, .. }
+                | ArmExpired { pod, .. }
+                | EndpointerTransition { pod, .. }
+                | ModelStats { pod, .. } => pod,
+            },
+        }
+    }
+
+    /// What a log line names this item: one word per variant, listener events
+    /// included.
+    ///
+    /// Beside the variants rather than at the reporting site, so the exhaustiveness
+    /// check bites where a variant is added and a new arm cannot be reported under
+    /// an older one's name.
+    pub fn kind(&self) -> &'static str {
+        use ListenerEvent::*;
+        match self {
+            PipelineItem::Segment { .. } => "segment",
+            PipelineItem::Connected { .. } => "connected",
+            PipelineItem::Listener(ev) => match ev {
+                WakeDetected { .. } => "wake_detected",
+                BargeIn { .. } => "barge_in",
+                SoftEndpoint { .. } => "soft_endpoint",
+                Superseded { .. } => "superseded",
+                UtteranceClosed { .. } => "utterance_closed",
+                ArmExpired { .. } => "arm_expired",
+                EndpointerTransition { .. } => "endpointer_transition",
+                ModelStats { .. } => "model_stats",
+            },
         }
     }
 }
@@ -209,6 +272,20 @@ struct PodState {
     /// (and its absolute sample-index space restarted with it), a fall means the
     /// event is a straggler from a superseded connection.
     epoch: u64,
+    /// The room the current connection resolved to, from its `Connected` item.
+    /// `None` until one lands — a pod whose audio arrived before its hello did,
+    /// or a rig that feeds listener events with no connection behind them.
+    ///
+    /// TODO(pipeline-room-from-config): a pod's room is a pure function of the
+    /// configuration and the pod id, so holding it per connection gives
+    /// `unmapped` a second meaning ("no hello has landed yet") beside the one it
+    /// had ("the `[pods]` table does not name this pod"), and no consumer can
+    /// tell the two apart.
+    room: Option<RoomId>,
+    /// The frame log the current connection is capturing into, from the same
+    /// item. Named whether or not recording is on, which is also what a closed
+    /// segment's `SegmentRef.log` carries at a site that records nothing.
+    log: Option<String>,
     /// Per-pod spawn nonce mint.
     spawn_seq: u64,
 }
@@ -234,6 +311,11 @@ impl PodState {
         if epoch > self.epoch {
             self.recent_segments.clear();
             self.recent_wakes.clear();
+            // The room and the log belonged to the connection that just went, and
+            // the new one announces its own; keeping them would attribute a fresh
+            // connection's first utterance to the old connection's log.
+            self.room = None;
+            self.log = None;
             if let Some(f) = self.in_flight.take() {
                 f.abort.abort();
             }
@@ -282,6 +364,9 @@ pub async fn run(
                     handle_segment(seg, epoch, &mut pods, record_dir.as_deref(), &clock_step_clamps, &jsonl)
                         .await;
                 }
+                Some(PipelineItem::Connected { pod, epoch, room, log }) => {
+                    handle_connected(pod, epoch, room, log, &mut pods, &jsonl);
+                }
                 Some(PipelineItem::Listener(ev)) => {
                     handle_listener(
                         ev,
@@ -314,6 +399,41 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Adopt a connection's room and frame log for the pod, so an utterance carved
+/// before that connection's first segment closes still names both.
+///
+/// Under the same epoch check as everything else: a hello from a connection the
+/// pipeline has already superseded describes an index space nothing live is in,
+/// and its log would send a replay at the wrong audio.
+///
+/// A stale one gets a line of its own. The server sends a hello only after the
+/// connection it supersedes has drained, so a hello arriving behind a later epoch
+/// is that ordering broken — and the console would otherwise show only its
+/// consequence, a first utterance reading `unmapped` for no stated reason.
+fn handle_connected(
+    pod: PodId,
+    epoch: u64,
+    room: RoomId,
+    log: String,
+    pods: &mut HashMap<PodId, PodState>,
+    jsonl: &JsonlHandle,
+) {
+    let state = pods.entry(pod.clone()).or_default();
+    if !state.adopt_epoch(epoch) {
+        jsonl.emit(
+            "connected_stale",
+            &json!({
+                "pod": pod.0,
+                "epoch": epoch,
+                "live_epoch": state.epoch,
+            }),
+        );
+        return;
+    }
+    state.room = Some(room);
+    state.log = Some(log);
 }
 
 /// Track and sidecar-label one assembled segment (recording/tracking only — no
@@ -661,8 +781,7 @@ async fn handle_listener(
                 return;
             };
             let state = pods.entry(pod.clone()).or_default();
-            let audio_ref =
-                build_audio_span(&state.recent_segments, start_sample, end_sample, &pod);
+            let audio_ref = build_audio_span(state, start_sample, end_sample, &pod);
             let id = UtteranceId(*next_utterance_id);
             *next_utterance_id += 1;
             (wiring.events)(BrainEvent::wake_command_absent(
@@ -828,12 +947,12 @@ async fn handle_stt_done(
     // Resolve the carved span against the pod's recent segments for the wire
     // reference, room, and DoA.
     let audio_ref = build_audio_span(
-        &state.recent_segments,
+        state,
         done.carve.start_sample,
         done.carve.end_sample,
         &done.pod,
     );
-    let (room, doa) = span_context(&state.recent_segments, &done.carve);
+    let (room, doa) = span_context(state, &done.carve);
 
     let id = *next_utterance_id;
     *next_utterance_id += 1;
@@ -1005,12 +1124,18 @@ async fn handle_stt_done(
 /// When no segment covers the span (carved before any close landed), the span
 /// still names the range with no covering parts and the pod's last known log, and
 /// resolves to spliced silence.
+///
+/// With no closed segment at all — every first utterance of a connection — the log
+/// is the one the connection announced, which is the file that carve's audio is
+/// actually in. The synthesized `<pod>.framelog` is the last resort, for a carve
+/// with no connection behind it.
 fn build_audio_span(
-    recent: &VecDeque<RecentSegment>,
+    state: &PodState,
     start_sample: u64,
     end_sample: u64,
     pod: &PodId,
 ) -> AudioSpan {
+    let recent = &state.recent_segments;
     let mut covering: Vec<&RecentSegment> = recent
         .iter()
         .filter(|s| s.base < end_sample && s.base.saturating_add(s.len) > start_sample)
@@ -1020,6 +1145,7 @@ fn build_audio_span(
         .first()
         .map(|s| s.seg_ref.log.clone())
         .or_else(|| recent.back().map(|s| s.seg_ref.log.clone()))
+        .or_else(|| state.log.clone())
         .unwrap_or_else(|| format!("{}.framelog", sanitize_filename(&pod.0)));
     AudioSpan {
         log,
@@ -1032,15 +1158,24 @@ fn build_audio_span(
 /// Room and DoA for a carved utterance, taken from the segment covering its onset
 /// (falling back to the most recent segment). DoA/room are pod-scoped context; a
 /// carve with no covering segment gets the pod's last room and an empty DoA track.
-fn span_context(recent: &VecDeque<RecentSegment>, carve: &Carve) -> (RoomId, DoaTrack) {
-    let seg = recent
+///
+/// With no closed segment at all, the room is the one the connection announced —
+/// resolved through the same `[pods]` lookup the connection line prints, so a pod
+/// the table does not name still reads `unmapped`. `UNMAPPED_ROOM` means
+/// "no connection has said", not "no segment has closed".
+fn span_context(state: &PodState, carve: &Carve) -> (RoomId, DoaTrack) {
+    let seg = state
+        .recent_segments
         .iter()
         .find(|s| s.contains(carve.start_sample))
-        .or_else(|| recent.back());
+        .or_else(|| state.recent_segments.back());
     match seg {
         Some(s) => (s.room.clone(), DoaTrack::from_telemetry(&s.telemetry)),
         None => (
-            RoomId(crate::config::UNMAPPED_ROOM.to_string()),
+            state
+                .room
+                .clone()
+                .unwrap_or_else(|| RoomId(crate::config::UNMAPPED_ROOM.to_string())),
             DoaTrack::default(),
         ),
     }
@@ -1264,6 +1399,12 @@ mod tests {
             barge_in: false,
             timing: CarveTiming::default(),
         }
+    }
+
+    /// Re-stamp a carve onto `epoch`, for a test that drives a reconnect.
+    fn at_epoch(mut u: CarvedUtterance, epoch: u64) -> CarvedUtterance {
+        u.utterance_id.epoch = epoch;
+        u
     }
 
     fn soft_endpoint(u: CarvedUtterance) -> PipelineItem {
@@ -2227,9 +2368,274 @@ mod tests {
     #[test]
     fn build_audio_span_fallback_sanitizes_a_dirty_pod_id() {
         let dirty = PodId("../evil/pod".into());
-        let span = build_audio_span(&VecDeque::new(), 0, 100, &dirty);
+        let span = build_audio_span(&PodState::default(), 0, 100, &dirty);
         assert_eq!(span.log, "___evil_pod.framelog");
         assert!(span.segments.is_empty());
+    }
+
+    // ── The connection's own context ──────────────────────────────────────────
+
+    /// A pod's connection announcing its room and frame log.
+    fn connected(epoch: u64, room: &str, log: &str) -> PipelineItem {
+        PipelineItem::Connected {
+            pod: pod(),
+            epoch,
+            room: RoomId(room.into()),
+            log: log.into(),
+        }
+    }
+
+    /// The lane a connection announcement rides is the same one a wake rides:
+    /// losing it costs the room and the log of that connection's first
+    /// utterances, which is exactly the loss the reliable lane exists for.
+    #[test]
+    fn connected_is_a_control_item() {
+        assert!(connected(1, "r-office", "a.framelog").is_control());
+        assert!(!segment(seg_at(1, 0, 16)).is_control());
+    }
+
+    /// The name a dropped item is reported under, and the pod it is charged to,
+    /// come off the variant itself — so a new variant cannot be reported under an
+    /// older one's name at a site that never matched on it.
+    #[test]
+    fn every_item_names_itself_and_its_pod() {
+        let listener = |ev| PipelineItem::Listener(ev);
+        let wake = WakeConfirmation {
+            score: 0.8,
+            wake_end_sample: 8_000,
+            stt_trim_samples: 0,
+        };
+        // One row per variant: the compiler catches a variant nobody named, not a
+        // variant named as another one, and the name is what a drop line sends its
+        // reader after.
+        let items = [
+            (segment(seg_at(1, 0, 16)), "segment"),
+            (connected(1, "r-office", "a.framelog"), "connected"),
+            (soft_endpoint(carved(1, 0, 100, None)), "soft_endpoint"),
+            (wake_detected(1, 8), "wake_detected"),
+            (
+                listener(ListenerEvent::BargeIn {
+                    pod: pod(),
+                    epoch: 1,
+                    trigger_sample: 16,
+                    host_rx: HostMicros(1),
+                }),
+                "barge_in",
+            ),
+            (
+                listener(ListenerEvent::Superseded {
+                    pod: pod(),
+                    utterance_id: uid(1),
+                }),
+                "superseded",
+            ),
+            (
+                listener(ListenerEvent::UtteranceClosed {
+                    pod: pod(),
+                    utterance_id: uid(1),
+                }),
+                "utterance_closed",
+            ),
+            (
+                listener(ListenerEvent::ArmExpired {
+                    pod: pod(),
+                    wake,
+                    start_sample: 0,
+                    end_sample: 16,
+                }),
+                "arm_expired",
+            ),
+            (
+                listener(ListenerEvent::EndpointerTransition {
+                    pod: pod(),
+                    epoch: 1,
+                    transition: EndpointTransition {
+                        from: EndpointState::Speech,
+                        to: EndpointState::SoftEndpointed,
+                        cause: TransitionCause::SoftEndpoint,
+                        sample_offset: 16,
+                    },
+                }),
+                "endpointer_transition",
+            ),
+            (
+                listener(ListenerEvent::ModelStats {
+                    pod: pod(),
+                    epoch: 1,
+                    model: StatsModel::Silero,
+                    cause: StatsFlushCause::Transition,
+                    summary: ScoreSummary {
+                        first_chunk_end: 0,
+                        last_chunk_end: 16,
+                        chunks: 1,
+                        min: 0.0,
+                        max: 1.0,
+                        mean: 0.5,
+                        median: 0.5,
+                    },
+                }),
+                "model_stats",
+            ),
+        ];
+        for (item, kind) in items {
+            assert_eq!(item.kind(), kind);
+            assert_eq!(item.pod(), &pod(), "{kind}");
+        }
+    }
+
+    /// With no closed segment, the connected log is the file the carve's audio is
+    /// in — the synthesized `<pod>.framelog` is only for a carve with no
+    /// connection behind it at all.
+    #[test]
+    fn build_audio_span_takes_the_connected_log_with_no_segments() {
+        let state = PodState {
+            log: Some("20260903T225630_657Z_1.framelog".into()),
+            ..PodState::default()
+        };
+        let span = build_audio_span(&state, 0, 100, &pod());
+        assert_eq!(span.log, "20260903T225630_657Z_1.framelog");
+        assert!(span.segments.is_empty());
+    }
+
+    /// Same for the room: `UNMAPPED_ROOM` means "no connection has said", not
+    /// "no segment has closed".
+    #[test]
+    fn span_context_takes_the_connected_room_with_no_segments() {
+        let carve = Carve {
+            id: uid(1),
+            start_sample: 0,
+            end_sample: 100,
+            wake: None,
+            cause: EndpointCause::SoftEndpoint,
+            barge_in: false,
+            timing: CarveTiming::default(),
+        };
+        let connected = PodState {
+            room: Some(RoomId("r-office".into())),
+            ..PodState::default()
+        };
+        let (room, doa) = span_context(&connected, &carve);
+        assert_eq!(room.0, "r-office");
+        assert!(doa.0.is_empty(), "no segment, so no bearings");
+        let (fallback, _) = span_context(&PodState::default(), &carve);
+        assert_eq!(fallback.0, crate::config::UNMAPPED_ROOM);
+    }
+
+    /// End to end: the first utterance of a connection is carved while segment 0
+    /// is still open, and it names the room and the log the hello resolved.
+    #[tokio::test]
+    async fn first_utterance_of_a_connection_names_its_room_and_log() {
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("test one".into(), None))))
+            .brain()
+            .run(vec![
+                connected(1, "r-office", "20260903T225630_657Z_1.framelog"),
+                soft_endpoint(carved(1, 16128, 59968, None)),
+            ])
+            .await;
+        let utt = lines.iter().find(|v| v["event"] == "utterance").unwrap();
+        assert_eq!(utt["room"], "r-office");
+        assert_eq!(utt["audio_ref"]["log"], "20260903T225630_657Z_1.framelog");
+    }
+
+    /// A pod the `[pods]` table does not name resolves to `unmapped` at the
+    /// connection, so the utterance reads `unmapped` for the reason it always
+    /// meant rather than for want of a closed segment.
+    #[tokio::test]
+    async fn an_unnamed_pods_first_utterance_is_still_unmapped() {
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("test one".into(), None))))
+            .brain()
+            .run(vec![
+                connected(1, crate::config::UNMAPPED_ROOM, "conn.framelog"),
+                soft_endpoint(carved(1, 0, 100, None)),
+            ])
+            .await;
+        let utt = lines.iter().find(|v| v["event"] == "utterance").unwrap();
+        assert_eq!(utt["room"], "unmapped");
+        assert_eq!(utt["audio_ref"]["log"], "conn.framelog");
+    }
+
+    /// No connection announced: the pre-existing fallbacks stand.
+    #[tokio::test]
+    async fn an_utterance_with_no_connection_falls_back_as_before() {
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("test one".into(), None))))
+            .brain()
+            .run(vec![soft_endpoint(carved(1, 0, 100, None))])
+            .await;
+        let utt = lines.iter().find(|v| v["event"] == "utterance").unwrap();
+        assert_eq!(utt["room"], "unmapped");
+        assert_eq!(utt["audio_ref"]["log"], "pod-x.framelog");
+    }
+
+    /// A closed segment still outranks the connection: it is the covering audio,
+    /// and it carries the bearings the connection has none of.
+    #[tokio::test]
+    async fn a_covering_segment_outranks_the_connection() {
+        let mut seg = seg_at(1, 0, 200);
+        seg.room = RoomId("r-lab".into());
+        seg.audio_ref.log = "segment.framelog".into();
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("test one".into(), None))))
+            .brain()
+            .run(vec![
+                connected(1, "r-office", "conn.framelog"),
+                segment(seg),
+                soft_endpoint(carved(1, 0, 100, None)),
+            ])
+            .await;
+        let utt = lines.iter().find(|v| v["event"] == "utterance").unwrap();
+        assert_eq!(utt["room"], "r-lab");
+        assert_eq!(utt["audio_ref"]["log"], "segment.framelog");
+    }
+
+    /// A hello from a connection the pipeline has already superseded describes an
+    /// index space nothing live is in; its log would send a replay at the wrong
+    /// audio.
+    #[tokio::test]
+    async fn a_stale_connection_does_not_replace_the_live_one() {
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("test one".into(), None))))
+            .brain()
+            .run(vec![
+                connected(1, "r-office", "live.framelog"),
+                connected(0, "r-lab", "stale.framelog"),
+                soft_endpoint(carved(1, 0, 100, None)),
+            ])
+            .await;
+        let utt = lines.iter().find(|v| v["event"] == "utterance").unwrap();
+        assert_eq!(utt["room"], "r-office");
+        assert_eq!(utt["audio_ref"]["log"], "live.framelog");
+        // The drop is a line: a hello can only arrive behind a later epoch if the
+        // server sent it out of order, and the only other trace is an utterance
+        // reading `unmapped` for no stated reason.
+        let stale = lines
+            .iter()
+            .find(|v| v["event"] == "connected_stale")
+            .expect("the stale hello is named: {lines:?}");
+        assert_eq!(stale["pod"], "pod-x");
+        assert_eq!(stale["epoch"], 0);
+        assert_eq!(stale["live_epoch"], 1);
+    }
+
+    /// A reconnect takes the previous connection's room and log with the tracking
+    /// it clears, so an utterance carved after it and before the new hello lands
+    /// falls back rather than naming the connection that went.
+    #[tokio::test]
+    async fn a_reconnect_drops_the_previous_connections_context() {
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("test one".into(), None))))
+            .brain()
+            .run(vec![
+                connected(1, "r-office", "old.framelog"),
+                wake_detected(2, 50),
+                soft_endpoint(at_epoch(carved(1, 0, 100, None), 2)),
+            ])
+            .await;
+        let utt = lines.iter().find(|v| v["event"] == "utterance").unwrap();
+        assert_eq!(utt["room"], "unmapped");
+        assert_eq!(utt["audio_ref"]["log"], "pod-x.framelog");
     }
 
     #[tokio::test]
@@ -2418,6 +2824,63 @@ mod tests {
             "arm-expiry reason: {:?}",
             evs[0]
         );
+    }
+
+    /// The other call site of the connected-log fallback: a wake with no command
+    /// following it. The first wake of a connection has to name the log the frames
+    /// are in, not a synthesized one — it is the event an operator replays.
+    #[tokio::test]
+    async fn arm_expired_takes_the_connected_log_before_any_segment_closes() {
+        let h = Harness::new().brain();
+        let events_seen = h.events.clone();
+        h.run(vec![
+            connected(1, "r-office", "conn.framelog"),
+            PipelineItem::Listener(ListenerEvent::ArmExpired {
+                pod: pod(),
+                wake: WakeConfirmation {
+                    score: 0.8,
+                    wake_end_sample: 8_000,
+                    stt_trim_samples: 4_800,
+                },
+                start_sample: 0,
+                end_sample: 16_000,
+            }),
+        ])
+        .await;
+        let evs = events_seen.lock().unwrap();
+        let BrainEvent::WakeCommandAbsent { audio_ref, .. } = &evs[0] else {
+            panic!("expected a wake-command-absent, got {:?}", evs[0]);
+        };
+        assert_eq!(audio_ref.log, "conn.framelog");
+        assert!(
+            audio_ref.segments.is_empty(),
+            "no segment closed: {audio_ref:?}"
+        );
+    }
+
+    /// The paired case: with no connection announced at all the same arm falls
+    /// back to the synthesized name, which is what says the fallback above came
+    /// from the hello and not from the pod id.
+    #[tokio::test]
+    async fn arm_expired_with_no_connection_still_synthesizes_a_log() {
+        let h = Harness::new().brain();
+        let events_seen = h.events.clone();
+        h.run(vec![PipelineItem::Listener(ListenerEvent::ArmExpired {
+            pod: pod(),
+            wake: WakeConfirmation {
+                score: 0.8,
+                wake_end_sample: 8_000,
+                stt_trim_samples: 4_800,
+            },
+            start_sample: 0,
+            end_sample: 16_000,
+        })])
+        .await;
+        let evs = events_seen.lock().unwrap();
+        let BrainEvent::WakeCommandAbsent { audio_ref, .. } = &evs[0] else {
+            panic!("expected a wake-command-absent, got {:?}", evs[0]);
+        };
+        assert_eq!(audio_ref.log, "pod-x.framelog");
     }
 
     #[tokio::test]

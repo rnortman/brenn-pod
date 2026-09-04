@@ -576,3 +576,35 @@ the ceiling and pins the line.
 
 See `TODO(control-lane-sanity-ceiling)` at `send_reliable` in
 `host/crates/speech-pipeline/src/queue.rs`.
+
+## `pipeline-room-from-config` — DEFERRED as of 2026-09-03 (needs a design decision: the pipeline holds no configuration today)
+
+A carved utterance's room is resolved per connection: `conn_hello` sends
+`PipelineItem::Connected { pod, epoch, room, log }`, `PodState` keeps the room for the current
+epoch, and `span_context` reads it when no closed segment covers the carve. The `log` half of that
+item has to travel — it is per-connection state with no other source — but the room does not: it is
+`Config::room_for(pod_id)`, a pure function of static configuration and a pod id the pipeline
+already has on every carve.
+
+The cost of carrying it is a window. `PodState::room` is `None` until the hello lands and again
+after every epoch rise, and a carve inside that window reads `UNMAPPED_ROOM` for a pod the `[pods]`
+table names. So `unmapped` in the corpus means two things — "not in the table" and "no hello yet" —
+and nothing downstream can tell them apart. Removing the ambiguity was the point of sending the
+room at all; per-connection state moves it rather than deletes it. In production the reliable lane
+delivers the hello ahead of anything that connection produces, so the window is not reachable
+today; it is reachable in the rigs, and it is one lane change away from being reachable here.
+
+The fix is a room lookup in `PipelineCtx` — an `Arc<Config>`, a `HashMap<PodId, RoomId>` snapshot,
+or a boxed `Fn(&PodId) -> RoomId` for the rigs that have no configuration — after which
+`span_context` resolves any pod at any time, `PipelineItem::Connected` carries only
+`{ pod, epoch, log }`, and `PodState::room` goes away. Which of the three, and whether the pipeline
+task is allowed to hold configuration at all (it holds none today, by construction: everything it
+needs is passed in at `run`), is the decision this waits on — as is what a live `[pods]` edit should
+mean to a running process, which a snapshot answers differently from an `Arc<Config>`.
+
+Done = the room a carved utterance names is resolved from configuration at carve time, `unmapped`
+has one meaning again, and a test carves an utterance for a mapped pod with no connection state at
+all and reads its configured room.
+
+See `TODO(pipeline-room-from-config)` at `PodState::room` in
+`host/crates/speech-surface/src/pipeline.rs`.

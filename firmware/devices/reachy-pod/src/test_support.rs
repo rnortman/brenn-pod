@@ -9,7 +9,7 @@
 #![cfg(test)]
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use xvf3800_ctrl::{ControlTransport, STATUS_DONE};
@@ -29,6 +29,9 @@ pub struct Scripted {
     /// The `(resid, cmd)` every read asked for, in order — what says a case read
     /// the register its name promises.
     pub registers: Vec<(u8, u8)>,
+    /// Every write, as `(resid, cmd, payload)` — what says a sequence wrote the
+    /// bytes it claims to, once each and in order.
+    pub writes: Vec<(u8, u8, Vec<u8>)>,
     pub reads: u32,
     pub delays: u32,
 }
@@ -44,6 +47,7 @@ impl Scripted {
             answers: answers.into(),
             error: None,
             registers: Vec::new(),
+            writes: Vec::new(),
             reads: 0,
             delays: 0,
         }
@@ -97,17 +101,110 @@ impl ControlTransport for Scripted {
 
     fn control_write_once(
         &mut self,
-        _resid: u8,
-        _cmd: u8,
-        _payload: &[u8],
+        resid: u8,
+        cmd: u8,
+        payload: &[u8],
         _attempt: u32,
     ) -> Result<u8, Self::Error> {
-        unreachable!("no case writes")
+        self.writes.push((resid, cmd, payload.to_vec()));
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        // The chip returns no status for a write: it fails by not arriving, and
+        // that is the `error` above.
+        Ok(STATUS_DONE)
     }
 
     fn delay_ms(&mut self, _ms: u32) {
         self.delays += 1;
     }
+}
+
+/// A transport that answers per register rather than in call order.
+///
+/// The scripted-sequence fake above says what a fixed sequence of reads asked for;
+/// this one is for a loop, where the reads a test cares about are interleaved with
+/// reads it does not control. A register nobody scripted answers with zeros of the
+/// length asked for, which is a chip with nothing to say rather than a failure.
+#[derive(Debug)]
+pub struct RegisterBank {
+    answers: HashMap<(u8, u8), Vec<u8>>,
+    /// Every `(resid, cmd)` read, in order.
+    pub registers: Vec<(u8, u8)>,
+    /// Every write, as `(resid, cmd, payload)`, in order.
+    pub writes: Vec<(u8, u8, Vec<u8>)>,
+    /// When set, every write returns this error; reads still answer from the bank.
+    write_error: Option<&'static str>,
+}
+
+impl RegisterBank {
+    pub fn new() -> Self {
+        Self {
+            answers: HashMap::new(),
+            registers: Vec::new(),
+            writes: Vec::new(),
+            write_error: None,
+        }
+    }
+
+    /// The same bank, with every write failing at the transport.
+    pub fn failing_writes(mut self, error: &'static str) -> Self {
+        self.write_error = Some(error);
+        self
+    }
+
+    /// What this register answers from now on.
+    pub fn set(&mut self, resid: u8, cmd: u8, payload: Vec<u8>) {
+        self.answers.insert((resid, cmd), payload);
+    }
+
+    /// How many times a register has been read.
+    pub fn reads_of(&self, resid: u8, cmd: u8) -> usize {
+        self.registers
+            .iter()
+            .filter(|asked| **asked == (resid, cmd))
+            .count()
+    }
+}
+
+impl ControlTransport for RegisterBank {
+    type Error = &'static str;
+
+    fn control_read_once(
+        &mut self,
+        resid: u8,
+        cmd: u8,
+        payload: &mut [u8],
+        _attempt: u32,
+    ) -> Result<u8, Self::Error> {
+        self.registers.push((resid, cmd));
+        payload.fill(0);
+        if let Some(answer) = self.answers.get(&(resid, cmd)) {
+            assert_eq!(
+                payload.len(),
+                answer.len(),
+                "script length for {resid}/{cmd}"
+            );
+            payload.copy_from_slice(answer);
+        }
+        Ok(STATUS_DONE)
+    }
+
+    fn control_write_once(
+        &mut self,
+        resid: u8,
+        cmd: u8,
+        payload: &[u8],
+        _attempt: u32,
+    ) -> Result<u8, Self::Error> {
+        self.writes.push((resid, cmd, payload.to_vec()));
+        if let Some(e) = self.write_error {
+            return Err(e);
+        }
+        Ok(STATUS_DONE)
+    }
+
+    fn delay_ms(&mut self, _ms: u32) {}
 }
 
 /// A period source the test writes the card's behavior into.

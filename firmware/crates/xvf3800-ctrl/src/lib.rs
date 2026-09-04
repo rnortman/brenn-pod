@@ -40,8 +40,68 @@ pub const VERSION_CMD: u8 = 0;
 /// which both return a three-byte triple.
 pub const VERSION_READ_LEN: usize = 3;
 
+/// `BLD_MSG` command ID on [`APPLICATION_SERVICER_RESID`] — the build string the
+/// firmware was compiled with, `char × 50`.
+pub const BLD_MSG_CMD: u8 = 1;
+
+/// `BLD_MSG` payload length in bytes: 50 characters, NUL-padded by the firmware.
+pub const BLD_MSG_READ_LEN: usize = 50;
+
+/// `REBOOT` command ID on [`APPLICATION_SERVICER_RESID`] — write-only, `uint8 × 1`.
+/// Any value reboots the chip and returns every parameter to its build default.
+/// There is no read side and no acknowledgement: the board drops off the bus.
+pub const REBOOT_CMD: u8 = 7;
+
+/// `REBOOT` payload length in bytes. The value itself is ignored by the firmware.
+pub const REBOOT_WRITE_LEN: usize = 1;
+
 /// AEC servicer resource ID.
 pub const AEC_RESID: u8 = 33;
+
+/// `AEC_ASROUTONOFF` command ID (`int32 × 1`). 0 outputs the AEC residuals, one
+/// channel per microphone; 1 outputs the ASR-processed signal, one channel per
+/// beamformer beam. Off by default.
+pub const AEC_ASROUTONOFF_CMD: u8 = 35;
+
+/// `AEC_ASROUTGAIN` command ID (`float × 1`) — fixed gain on the ASR output, applied
+/// only while [`AEC_ASROUTONOFF_CMD`] is 1. Valid range 0.0 to 1000.0.
+pub const AEC_ASROUTGAIN_CMD: u8 = 36;
+
+/// `AEC_AECCONVERGED` command ID (`int32 × 1`, read-only) — whether the linear echo
+/// canceller has converged. Latching: once the firmware sets it, it never clears.
+pub const AEC_AECCONVERGED_CMD: u8 = 3;
+
+/// Post-processing servicer resource ID. Owns the adaptive stages — AGC, noise
+/// suppression, echo suppression — that sit between the beamformer and the board's
+/// post-processed output channel.
+pub const PP_RESID: u8 = 17;
+
+/// `PP_AGCONOFF` command ID (`int32 × 1`) — whether the automatic gain control is
+/// permitted to adapt.
+pub const PP_AGCONOFF_CMD: u8 = 10;
+
+/// `PP_AGCGAIN` command ID (`float × 1`) — the AGC's current linear gain factor.
+pub const PP_AGCGAIN_CMD: u8 = 13;
+
+/// `PP_MIN_NS` command ID (`float × 1`) — gain floor for stationary noise
+/// suppression.
+pub const PP_MIN_NS_CMD: u8 = 21;
+
+/// `PP_MIN_NN` command ID (`float × 1`) — gain floor for non-stationary noise
+/// suppression.
+pub const PP_MIN_NN_CMD: u8 = 22;
+
+/// `PP_ECHOONOFF` command ID (`int32 × 1`) — whether echo suppression runs.
+pub const PP_ECHOONOFF_CMD: u8 = 23;
+
+/// `PP_DTSENSITIVE` command ID (`int32 × 1`) — the echo-suppression/double-talk
+/// trade-off.
+pub const PP_DTSENSITIVE_CMD: u8 = 31;
+
+/// Payload length of every single-value AEC and PP register named here: one
+/// `int32` or one `float`, four bytes either way (five on the wire with the status
+/// byte).
+pub const SCALAR_READ_LEN: usize = 4;
 
 /// `AEC_AZIMUTH_VALUES` command ID. Read byte = 75 | 0x80 = 0xCB.
 pub const AEC_AZIMUTH_VALUES_CMD: u8 = 75;
@@ -95,10 +155,42 @@ pub const GPO_VECTOR_LEN: usize = 6;
 pub const GPO_SETTLE_MS: u32 = 5;
 
 /// Maximum payload bytes across all known XVF3800 control registers, used to size
-/// transport-side staging buffers. The DoA azimuth and SPENERGY registers each need
-/// 16 payload bytes (17 total with status); 32 leaves room for future registers and
-/// for the 3-byte I2C header ahead of a written payload.
-pub const CTRL_BUF_CAPACITY: usize = 32;
+/// transport-side staging buffers. The longest is [`BLD_MSG_READ_LEN`] at 50 bytes
+/// (51 total with status); 64 leaves room for future registers and for the 3-byte
+/// I2C header ahead of a written payload.
+pub const CTRL_BUF_CAPACITY: usize = 64;
+
+// ── Operator-facing register labels ──────────────────────────────────────────
+//
+// One label per register a caller names when it reports a read or a write: the
+// name in the vendor's register table, with the address the driver issues. They
+// live beside the constants they describe so a firmware revision that moves a
+// command id moves the prose with it, and `every_label_states_its_own_address`
+// holds them to it.
+
+/// [`VERSION_CMD`] on [`APPLICATION_SERVICER_RESID`], as a reader names it.
+pub const VERSION_LABEL: &str = "VERSION (resid 48 cmd 0)";
+
+/// [`BLD_MSG_CMD`] on [`APPLICATION_SERVICER_RESID`], as a reader names it.
+pub const BLD_MSG_LABEL: &str = "BLD_MSG (resid 48 cmd 1)";
+
+/// [`REBOOT_CMD`] on [`APPLICATION_SERVICER_RESID`], as a reader names it.
+pub const REBOOT_LABEL: &str = "REBOOT (resid 48 cmd 7)";
+
+/// [`AEC_ASROUTONOFF_CMD`] on [`AEC_RESID`], as a reader names it.
+pub const AEC_ASROUTONOFF_LABEL: &str = "AEC_ASROUTONOFF (resid 33 cmd 35)";
+
+/// [`AEC_AZIMUTH_VALUES_CMD`] on [`AEC_RESID`], as a reader names it.
+pub const AEC_AZIMUTH_VALUES_LABEL: &str = "AEC_AZIMUTH_VALUES (resid 33 cmd 75)";
+
+/// [`AEC_SPENERGY_VALUES_CMD`] on [`AEC_RESID`], as a reader names it.
+pub const AEC_SPENERGY_VALUES_LABEL: &str = "AEC_SPENERGY_VALUES (resid 33 cmd 80)";
+
+/// [`AUDIO_MGR_OP_L_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_L_LABEL: &str = "AUDIO_MGR_OP_L (resid 35 cmd 15)";
+
+/// [`AUDIO_MGR_OP_R_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_R_LABEL: &str = "AUDIO_MGR_OP_R (resid 35 cmd 19)";
 
 // ── Status semantics ─────────────────────────────────────────────────────────
 
@@ -288,9 +380,104 @@ pub fn decode_f32x4(p: &[u8; 16]) -> [f32; 4] {
     ]
 }
 
+/// Decode one IEEE-754 little-endian f32 from a 4-byte payload.
+pub fn decode_f32(p: &[u8; 4]) -> f32 {
+    f32::from_le_bytes(*p)
+}
+
+/// Decode one little-endian i32 from a 4-byte payload.
+pub fn decode_i32(p: &[u8; 4]) -> i32 {
+    i32::from_le_bytes(*p)
+}
+
+/// Encode one i32 as the 4-byte little-endian payload a write carries.
+pub fn encode_i32(v: i32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+
+/// The printable prefix of a NUL-padded character register, trimmed of trailing
+/// whitespace.
+///
+/// Bytes outside printable ASCII end the string rather than being rendered: a
+/// register that answered with the wrong length or with binary must not put control
+/// characters into the journal.
+pub fn decode_ascii(payload: &[u8]) -> &str {
+    let end = payload
+        .iter()
+        .position(|b| !(0x20..0x7f).contains(b))
+        .unwrap_or(payload.len());
+    // Every byte below `end` is printable ASCII, so the slice is valid UTF-8.
+    core::str::from_utf8(&payload[..end])
+        .unwrap_or("")
+        .trim_end()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every label ends in the address of the register it names. The label is what
+    /// an operator reads to find the register in the vendor's table, so a command
+    /// id that moves and leaves its prose behind is a label that lies; this is the
+    /// check that fails instead.
+    #[test]
+    fn every_label_states_its_own_address() {
+        for (name, label, resid, cmd) in [
+            (
+                "VERSION",
+                VERSION_LABEL,
+                APPLICATION_SERVICER_RESID,
+                VERSION_CMD,
+            ),
+            (
+                "BLD_MSG",
+                BLD_MSG_LABEL,
+                APPLICATION_SERVICER_RESID,
+                BLD_MSG_CMD,
+            ),
+            (
+                "REBOOT",
+                REBOOT_LABEL,
+                APPLICATION_SERVICER_RESID,
+                REBOOT_CMD,
+            ),
+            (
+                "AEC_ASROUTONOFF",
+                AEC_ASROUTONOFF_LABEL,
+                AEC_RESID,
+                AEC_ASROUTONOFF_CMD,
+            ),
+            (
+                "AEC_AZIMUTH_VALUES",
+                AEC_AZIMUTH_VALUES_LABEL,
+                AEC_RESID,
+                AEC_AZIMUTH_VALUES_CMD,
+            ),
+            (
+                "AEC_SPENERGY_VALUES",
+                AEC_SPENERGY_VALUES_LABEL,
+                AEC_RESID,
+                AEC_SPENERGY_VALUES_CMD,
+            ),
+            (
+                "AUDIO_MGR_OP_L",
+                AUDIO_MGR_OP_L_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_OP_L_CMD,
+            ),
+            (
+                "AUDIO_MGR_OP_R",
+                AUDIO_MGR_OP_R_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_OP_R_CMD,
+            ),
+        ] {
+            // The whole spelling, not only the address: the name is what a reader
+            // greps the vendor's table with, so a right address under a wrong name
+            // sends them to the wrong register.
+            assert_eq!(label, format!("{name} (resid {resid} cmd {cmd})"));
+        }
+    }
 
     // ── Scripted fake transport ──────────────────────────────────────────────
 
@@ -752,6 +939,95 @@ mod tests {
         assert!(got[1] == 0.0 && got[1].is_sign_negative());
         assert_eq!(got[2], f32::INFINITY);
         assert_eq!(got[3], core::f32::consts::PI);
+    }
+
+    #[test]
+    fn the_routing_registers_frame_as_their_documented_resid_and_length() {
+        // AEC_ASROUTONOFF: resid 33 cmd 35, one int32 → length byte 5 on a read.
+        assert_eq!(
+            i2c_read_header(AEC_RESID, AEC_ASROUTONOFF_CMD, SCALAR_READ_LEN),
+            [33, 35 | 0x80, 5]
+        );
+        assert_eq!(
+            i2c_write_header(AEC_RESID, AEC_ASROUTONOFF_CMD, SCALAR_READ_LEN),
+            [33, 35, 4]
+        );
+        assert_eq!(
+            i2c_read_header(AEC_RESID, AEC_ASROUTGAIN_CMD, SCALAR_READ_LEN),
+            [33, 36 | 0x80, 5]
+        );
+        assert_eq!(
+            i2c_read_header(AEC_RESID, AEC_AECCONVERGED_CMD, SCALAR_READ_LEN),
+            [33, 0x83, 5]
+        );
+    }
+
+    #[test]
+    fn the_post_processing_readbacks_all_sit_on_resid_seventeen() {
+        for cmd in [
+            PP_AGCONOFF_CMD,
+            PP_AGCGAIN_CMD,
+            PP_MIN_NS_CMD,
+            PP_MIN_NN_CMD,
+            PP_ECHOONOFF_CMD,
+            PP_DTSENSITIVE_CMD,
+        ] {
+            assert_eq!(
+                i2c_read_header(PP_RESID, cmd, SCALAR_READ_LEN),
+                [17, cmd | READ_BIT, 5],
+                "cmd {cmd}"
+            );
+        }
+        // The six are distinct commands; a duplicated id would read one register
+        // twice and print it under two names.
+        let mut ids = [
+            PP_AGCONOFF_CMD,
+            PP_AGCGAIN_CMD,
+            PP_MIN_NS_CMD,
+            PP_MIN_NN_CMD,
+            PP_ECHOONOFF_CMD,
+            PP_DTSENSITIVE_CMD,
+        ];
+        ids.sort_unstable();
+        assert_eq!(ids, [10, 13, 21, 22, 23, 31]);
+    }
+
+    #[test]
+    fn reboot_and_the_build_message_share_the_application_servicer() {
+        // REBOOT is a one-byte write; it has no read side.
+        assert_eq!(
+            i2c_write_header(APPLICATION_SERVICER_RESID, REBOOT_CMD, REBOOT_WRITE_LEN),
+            [48, 7, 1]
+        );
+        // BLD_MSG is the longest register here, and the staging buffers are sized
+        // for it.
+        assert_eq!(
+            i2c_read_header(APPLICATION_SERVICER_RESID, BLD_MSG_CMD, BLD_MSG_READ_LEN),
+            [48, 0x81, 51]
+        );
+        const { assert!(BLD_MSG_READ_LEN <= CTRL_BUF_CAPACITY) };
+    }
+
+    #[test]
+    fn scalars_decode_little_endian_and_round_trip() {
+        assert_eq!(decode_i32(&[1, 0, 0, 0]), 1);
+        assert_eq!(decode_i32(&[0xFF, 0xFF, 0xFF, 0xFF]), -1);
+        assert_eq!(decode_i32(&encode_i32(-2)), -2);
+        // 0x3F800000 = 1.0f32.
+        assert_eq!(decode_f32(&[0, 0, 0x80, 0x3F]), 1.0);
+        assert!(decode_f32(&f32::NAN.to_le_bytes()).is_nan());
+    }
+
+    #[test]
+    fn a_character_register_renders_its_printable_prefix_only() {
+        let mut payload = [0u8; BLD_MSG_READ_LEN];
+        let msg = b"XMOS XVF3800 v2.1.2 (ua-io16-lin)  ";
+        payload[..msg.len()].copy_from_slice(msg);
+        assert_eq!(decode_ascii(&payload), "XMOS XVF3800 v2.1.2 (ua-io16-lin)");
+        // A register that answered with binary renders as nothing rather than as
+        // control characters in the journal.
+        assert_eq!(decode_ascii(&[0x01, 0x02, 0xFF]), "");
+        assert_eq!(decode_ascii(&[]), "");
     }
 
     #[test]

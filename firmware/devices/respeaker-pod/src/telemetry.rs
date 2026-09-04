@@ -85,7 +85,13 @@ pub(crate) fn spawn_telemetry_vad_thread(tx: std::sync::mpsc::SyncSender<Streame
                 now_us: &esp_monotonic_us,
                 capture_quiesced: &capture_quiesced,
             };
-            run_telemetry_loop(core, &mut I2cTelemetryBus, &ctx, &FreeRtos::delay_ms);
+            run_telemetry_loop(
+                core,
+                &mut I2cTelemetryBus,
+                &ctx,
+                &FreeRtos::delay_ms,
+                &mut |_, _| {},
+            );
         })
         .expect("telemetry: thread spawn failed — heap exhausted?");
 }

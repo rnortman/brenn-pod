@@ -45,14 +45,26 @@ pub const CONF_FILE_NAME: &str = "audio.conf";
 /// so an operator sees one cadence across both pods.
 pub const RECHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The two capture channels the board presents. Both are processed renderings of
-/// the chip's one auto-selected look direction, so the wrong one costs at most the
-/// processing flavor — never a direction.
+/// The two capture channels the board presents. Both render the chip's one
+/// auto-selected look direction, so neither carries a direction the other does not
+/// — but they are taken from different points in the chip's chain, and the pod
+/// routes them so: left is the post-processed beam (adaptive noise suppression, AGC
+/// and echo suppression), right is that same beam's ASR extraction, which bypasses
+/// all of it. Which one is streamed decides what a recogniser hears.
 pub const CHANNELS: usize = 2;
 
-/// The capture channel used when the file does not name one. Which one to prefer
-/// is a bring-up decision taken from a reviewed bench run, not a fact derived here.
-pub const DEFAULT_CHANNEL: usize = 0;
+/// The channel the pod routes the beamformer's ASR output to, and what speech
+/// recognition is meant to consume. A bring-up decision taken from the chip's
+/// documented routing, not a fact derived here.
+pub const ASR_OUTPUT_CHANNEL: usize = 1;
+
+/// The channel carrying the post-processed beam. The pod never writes this
+/// channel's routing, so it is what the board offers whatever became of the ASR
+/// routing — which is what makes it the fallback when that routing is refused.
+pub const POST_PROCESSED_CHANNEL: usize = 0;
+
+/// The capture channel used when the file does not name one.
+pub const DEFAULT_CHANNEL: usize = ASR_OUTPUT_CHANNEL;
 
 /// Everything the pipeline needs that is not compiled in.
 #[derive(Debug, Clone, PartialEq)]
@@ -345,6 +357,9 @@ mod tests {
         assert_eq!(config.psk[0], 0x01);
         assert_eq!(config.psk[PSK_LEN - 1], 0x20);
         assert_eq!(config.channel, DEFAULT_CHANNEL);
+        assert_eq!(config.channel, ASR_OUTPUT_CHANNEL);
+        assert_eq!(ASR_OUTPUT_CHANNEL, 1);
+        assert_eq!(POST_PROCESSED_CHANNEL, 0);
         // The defaults are the shared constants, so a pod that says nothing about
         // the gate behaves the same across both pod types.
         assert_eq!(config.vad_threshold, VAD_THRESHOLD_DEFAULT);
@@ -359,6 +374,15 @@ mod tests {
         let config = Config::parse(&text).expect("parse");
         assert_eq!(config.channel, 1);
         assert_eq!(config.addr.port(), 5555);
+    }
+
+    /// The tuning fragment's `CHANNEL=0` is how a comparison run gets the
+    /// post-processed channel back without a rebuild.
+    #[test]
+    fn a_stated_channel_overrides_the_asr_output_default() {
+        let config = Config::parse(&format!("{}CHANNEL=0\n", minimal())).expect("parse");
+        assert_eq!(config.channel, POST_PROCESSED_CHANNEL);
+        assert_ne!(config.channel, DEFAULT_CHANNEL);
     }
 
     #[test]

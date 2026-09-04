@@ -402,7 +402,17 @@ pub struct Server {
     // through the supervision arm.
     #[cfg(test)]
     driver_override: Option<tokio::task::JoinHandle<()>>,
+    // Test-supplied witness of every connection announcement a connection puts on
+    // the pipeline queue, so what the producer sends is assertable without a
+    // pipeline to consume it.
+    #[cfg(test)]
+    connected_tap: Option<ConnectedTap>,
 }
+
+/// What a test is handed for each `PipelineItem::Connected` a connection sends:
+/// the pod, the epoch, the room and the frame log, in send order.
+#[cfg(test)]
+pub(crate) type ConnectedTap = Arc<dyn Fn(&PodId, u64, &RoomId, &str) + Send + Sync>;
 
 /// A running bridge: the spawned `Bridge::run`, the handle everything publishes
 /// and subscribes through, and the event stream the driver pumps.
@@ -455,6 +465,8 @@ impl Server {
             brenn_override: None,
             #[cfg(test)]
             driver_override: None,
+            #[cfg(test)]
+            connected_tap: None,
         })
     }
 
@@ -539,6 +551,15 @@ impl Server {
         self
     }
 
+    /// Watch every connection announcement this server's connections send, in
+    /// order, so the producer half — the epoch, the room, and the renamed frame
+    /// log — is assertable without standing a pipeline up to consume it.
+    #[cfg(test)]
+    fn with_connected_tap(mut self, tap: ConnectedTap) -> Self {
+        self.connected_tap = Some(tap);
+        self
+    }
+
     /// Inject a playback registry the caller retains a clone of, so a test can
     /// observe the map through a real connection lifecycle. `run` uses it in place
     /// of the fresh one it would otherwise mint.
@@ -568,6 +589,8 @@ impl Server {
         let brenn_override = self.brenn_override;
         #[cfg(test)]
         let driver_override = self.driver_override;
+        #[cfg(test)]
+        let connected_tap = self.connected_tap;
         let Server {
             listener,
             config,
@@ -1084,6 +1107,8 @@ impl Server {
             playback_events: playback_events.clone(),
             playback_registry: playback_registry.clone(),
             listener: listener_handle.clone(),
+            #[cfg(test)]
+            connected_tap: connected_tap.clone(),
         };
         loop {
             tokio::select! {
@@ -1656,9 +1681,18 @@ fn build_transcriber(
                 // is held for `stage_health` to snapshot.
                 let stats = Arc::new(SttStats::default());
                 let transcriber = HttpTranscriber::new(params, stats.clone())?;
+                // The gate's thresholds ride this line: a fetched console is
+                // read long after the run, and a declined transcript means
+                // nothing without the numbers it was declined against.
                 jsonl.emit(
                     "stt_configured",
-                    &json!({ "url": url, "model": model, "language": stt.language.clone() }),
+                    &json!({
+                        "url": url,
+                        "model": model,
+                        "language": stt.language.clone(),
+                        "no_speech_max": stt.no_speech_max,
+                        "avg_logprob_min": stt.avg_logprob_min,
+                    }),
                 );
                 Ok(Some((Arc::new(transcriber) as Arc<dyn Transcriber>, stats)))
             }
@@ -2332,6 +2366,8 @@ struct ConnDeps {
     playback_events: PlaybackEventFn,
     playback_registry: PlaybackRegistry,
     listener: Option<Arc<ListenerHandle>>,
+    #[cfg(test)]
+    connected_tap: Option<ConnectedTap>,
 }
 
 /// One pod connection: complete the TLS-PSK handshake, then read frames, tap
@@ -2361,6 +2397,8 @@ async fn connection(
         playback_events,
         playback_registry,
         listener,
+        #[cfg(test)]
+        connected_tap,
     } = deps;
 
     // Authenticate before anything else happens on this socket: no frame log
@@ -2639,6 +2677,33 @@ async fn connection(
                         }
                     }
 
+                    // The pipeline's copy of what the `conn_hello` line just
+                    // said. Two orderings hold it here. Sent after the recorder's
+                    // rename, so the log named is the file this connection's
+                    // frames are actually going into; and sent after the
+                    // superseded connection has finished, because this item
+                    // carries the epoch that retires that connection's index
+                    // space — enqueued ahead of its close, it would make the
+                    // pipeline drop the old connection's last segment and the
+                    // utterance carved out of it. On the reliable lane: an
+                    // utterance carved before the first segment closes has no
+                    // other source for either field.
+                    #[cfg(test)]
+                    if let Some(tap) = &connected_tap {
+                        tap(
+                            &PodId(pod_id.clone()),
+                            conn_seq,
+                            &RoomId(current_room.clone()),
+                            recorder.log_name(),
+                        );
+                    }
+                    item_tx.send_reliable(crate::pipeline::PipelineItem::Connected {
+                        pod: PodId(pod_id.clone()),
+                        epoch: conn_seq,
+                        room: RoomId(current_room.clone()),
+                        log: recorder.log_name().to_string(),
+                    });
+
                     // Spawn this connection's paced playback writer on the socket
                     // write half, now the pod identity is known. Its eager `Hello`
                     // validates the outbound path at registration; the handle is
@@ -2827,6 +2892,7 @@ fn finalize_segment(
             pod: &seg.pod.0,
             room: &seg.room.0,
             segment_id: seg.segment_id,
+            base_sample: seg.base_sample_index,
             end_cause: seg.end.cause,
             truncated: seg.end.truncated,
             resumed: seg.end.resumed,
@@ -2856,30 +2922,21 @@ fn finalize_segment(
                 "segment_dropped_overflow",
                 &json!({ "pod": s.pod.0, "segment_id": s.segment_id, "depth": depth }),
             ),
-            // Unreachable while every listener event is pushed with
+            // Unreachable while every control item is pushed with
             // `send_reliable`. This line's presence therefore means a caller
             // pushed a control event onto the sheddable lane — a code defect to
             // fix at that caller, never a capacity to tune, and never a reason
             // to raise `pipeline.segment_queue_depth`. Named rather than
             // asserted: this runs on a live connection task, and a lane slip
             // under flood must not take the connection down.
-            crate::pipeline::PipelineItem::Listener(ev) => {
-                use speech_pipeline::ListenerEvent::*;
-                let (pod, kind) = match ev {
-                    WakeDetected { pod, .. } => (&pod.0, "wake_detected"),
-                    BargeIn { pod, .. } => (&pod.0, "barge_in"),
-                    SoftEndpoint { pod, .. } => (&pod.0, "soft_endpoint"),
-                    Superseded { pod, .. } => (&pod.0, "superseded"),
-                    UtteranceClosed { pod, .. } => (&pod.0, "utterance_closed"),
-                    ArmExpired { pod, .. } => (&pod.0, "arm_expired"),
-                    EndpointerTransition { pod, .. } => (&pod.0, "endpointer_transition"),
-                    ModelStats { pod, .. } => (&pod.0, "model_stats"),
-                };
-                jsonl.emit(
-                    "listener_event_dropped_overflow",
-                    &json!({ "pod": pod, "kind": kind, "depth": depth }),
-                );
-            }
+            //
+            // A lost connection announcement costs the room and log of that
+            // connection's first utterances. The event name is an interface:
+            // the console and the run report classify by it.
+            control => jsonl.emit(
+                "listener_event_dropped_overflow",
+                &json!({ "pod": control.pod().0, "kind": control.kind(), "depth": depth }),
+            ),
         }
     }
 }
@@ -3127,6 +3184,10 @@ struct SegmentClosedLine<'a> {
     pod: &'a str,
     room: &'a str,
     segment_id: u32,
+    /// The pod-absolute index of this segment's first sample. The offsets in the
+    /// `tracking` line that follows are relative to it, and nothing else on the
+    /// console states the base they are relative to.
+    base_sample: u64,
     end_cause: SegmentEndCause,
     truncated: bool,
     resumed: bool,
@@ -5622,7 +5683,43 @@ mod tests {
         assert_eq!(configured.len(), 1);
         assert_eq!(configured[0]["url"], "http://127.0.0.1:8000");
         assert_eq!(configured[0]["model"], "whisper-small");
+        // The gate's own thresholds, defaulted: a fetched console says what
+        // declined its turns without anyone having to guess the build's defaults.
+        assert_eq!(configured[0]["no_speech_max"], f64::from(0.2_f32));
+        assert!(
+            configured[0]["avg_logprob_min"].is_null(),
+            "no floor configured: {:?}",
+            configured[0]
+        );
         assert!(events_named(&lines, "stt_absent").is_empty());
+    }
+
+    /// A configured floor reaches the line as a number, so the two gate arms are
+    /// distinguishable in a console fetched days later.
+    #[tokio::test]
+    async fn stt_configured_carries_a_configured_confidence_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "listen_addr = \"127.0.0.1:0\"\n\
+             [record]\nenabled = false\ndir = {:?}\n\
+             [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
+             model = \"whisper-small\"\nno_speech_max = 0.35\navg_logprob_min = -0.9\n",
+            dir.path().join("store").to_str().unwrap(),
+        );
+        let cfg = Arc::new(test_config(&text).expect("config parses"));
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let transcriber = build_transcriber(&cfg, &handle).unwrap();
+        assert!(transcriber.is_some());
+
+        drop(transcriber);
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let configured = events_named(&lines, "stt_configured");
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0]["no_speech_max"], f64::from(0.35_f32));
+        assert_eq!(configured[0]["avg_logprob_min"], f64::from(-0.9_f32));
     }
 
     #[tokio::test]
@@ -7376,6 +7473,212 @@ mod tests {
         assert_eq!(resumed_close["cross_check"], "skipped_resume");
     }
 
+    /// One connection announcement as a test reads it: pod, epoch, room, log.
+    type ConnectedSeen = (String, u64, String, String);
+
+    /// Spawn a server that reports every connection announcement its connections
+    /// send into `seen`, in send order.
+    async fn spawn_server_with_connected_tap(
+        config: Arc<Config>,
+        jsonl: JsonlHandle,
+        seen: Arc<Mutex<Vec<ConnectedSeen>>>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (server, addr, stop_tx, stop_rx) = bind_with_stop(config, jsonl, None).await;
+        let server = server.with_connected_tap(Arc::new(
+            move |pod: &PodId, epoch, room: &RoomId, log: &str| {
+                seen.lock().expect("tap").push((
+                    pod.0.clone(),
+                    epoch,
+                    room.0.clone(),
+                    log.to_string(),
+                ));
+            },
+        ));
+        let join = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+                .expect("run");
+        });
+        (addr, stop_tx, join)
+    }
+
+    /// The `.framelog` file names in `store`, sorted.
+    fn framelog_names(store: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(store)
+            .expect("store")
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "framelog"))
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The producer half of the connection announcement: a connection sends one,
+    /// carrying the connection sequence as its epoch, the room the `[pods]` table
+    /// resolved, and the frame log *after* the recorder's pod-named rename — the
+    /// file this connection's frames actually land in. A send hoisted above the
+    /// rename would name a file no fetch can resolve, and every pipeline-side test
+    /// would stay green because it builds the item itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_connection_announces_its_epoch_room_and_renamed_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (addr, stop, run_join) =
+            spawn_server_with_connected_tap(config(&store, true), handle.clone(), seen.clone())
+                .await;
+
+        let mut first = connect_pod(addr).await;
+        first
+            .write_all(&framed(&hello(ChannelSource::AsrBeam)))
+            .await
+            .unwrap();
+        wait_for_event(&jsonl_path, "the first hello", |v| {
+            v["event"] == "conn_hello" && v["conn_seq"] == 1
+        })
+        .await;
+
+        // A second connection for the same pod: the epoch is that connection's
+        // sequence and the log is its own, which is what makes a reconnect's first
+        // utterance name the audio it is actually in.
+        let mut second = connect_pod(addr).await;
+        second
+            .write_all(&framed(&hello(ChannelSource::AsrBeam)))
+            .await
+            .unwrap();
+        wait_for_event(&jsonl_path, "the second hello", |v| {
+            v["event"] == "conn_hello" && v["conn_seq"] == 2
+        })
+        .await;
+
+        let mut buf = [0u8; 1];
+        let _ = first.read(&mut buf).await;
+        drop(first);
+        second.shutdown().await.unwrap();
+        drop(second);
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one announcement per connection: {seen:?}");
+        assert_eq!(seen[0].0, TEST_POD_ID);
+        assert_eq!(seen[0].1, 1, "the epoch is the connection sequence");
+        assert_eq!(seen[0].2, "kitchen", "the room the [pods] table resolved");
+        assert_eq!(seen[1].1, 2);
+        assert_ne!(seen[0].3, seen[1].3, "each connection names its own log");
+        // The renamed, pod-named logs on disk — not the connection-scoped names
+        // the recorder opened at accept.
+        let on_disk = framelog_names(&store);
+        assert_eq!(on_disk.len(), 2, "{on_disk:?}");
+        let mut announced = vec![seen[0].3.clone(), seen[1].3.clone()];
+        announced.sort();
+        assert_eq!(announced, on_disk);
+        assert!(
+            on_disk.iter().all(|n| n.starts_with("pod-srv_")),
+            "{on_disk:?}"
+        );
+    }
+
+    /// The announcement carries the epoch that retires the superseded
+    /// connection's index space, so it must reach the pipeline behind everything
+    /// that connection produced. Sent ahead of the supersede wait it would raise
+    /// the pipeline's epoch first, and the old connection's truncated final
+    /// segment would be dropped as a straggler — no sidecar label for a segment
+    /// that was current when it was produced, and an utterance carved out of it
+    /// silently discarded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_superseded_connections_last_segment_is_still_labelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        let (addr, stop, run_join) = spawn_server(config(&store, true), handle.clone()).await;
+
+        // The first connection opens segment 7 and never ends it: the supersede
+        // below truncates it, which is the shape a power-cycled pod produces.
+        let mut first = connect_pod(addr).await;
+        for f in [
+            hello(ChannelSource::AsrBeam),
+            StreamFrame::SegmentStart(SegmentStart {
+                segment_id: 7,
+                base_sample_index: 0,
+                base_device_ts_us: 0,
+                preroll_samples: 0,
+            }),
+            audio(7, 0, 320),
+        ] {
+            first.write_all(&framed(&f)).await.unwrap();
+        }
+        wait_for_event(&jsonl_path, "segment 7 open", |v| {
+            v["event"] == "segment_opened" && v["segment_id"] == 7
+        })
+        .await;
+
+        let mut second = connect_pod(addr).await;
+        second
+            .write_all(&framed(&hello(ChannelSource::AsrBeam)))
+            .await
+            .unwrap();
+        wait_for_event(&jsonl_path, "the supersede", |v| {
+            v["event"] == "conn_superseded"
+        })
+        .await;
+
+        let mut buf = [0u8; 1];
+        let _ = first.read(&mut buf).await;
+        drop(first);
+        second.shutdown().await.unwrap();
+        drop(second);
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(handle);
+        join.await.unwrap();
+
+        // The recorder writes the sidecar entry; the pipeline judges it. A
+        // straggler's entry never reaches the judgement and keeps the recorder's
+        // `Ungated`, so the class is what says the segment was still current when
+        // the pipeline saw it.
+        let names = framelog_names(&store);
+        assert_eq!(names.len(), 2, "{names:?}");
+        let labelled: Vec<PathBuf> = names
+            .iter()
+            .map(|n| sidecar_path(&store.join(n)))
+            .filter(|p| p.exists())
+            .collect();
+        assert_eq!(
+            labelled.len(),
+            1,
+            "one connection carved a segment: {names:?}"
+        );
+        let sc = Sidecar::read(&labelled[0]).expect("the sidecar of the superseded connection");
+        assert_eq!(sc.segments.len(), 1, "{sc:?}");
+        assert_eq!(sc.segments[0].segment_id, 7);
+        assert!(sc.segments[0].truncated, "{sc:?}");
+        assert_eq!(
+            sc.segments[0].wake,
+            crate::recorder::WakeClass::Negative,
+            "{sc:?}"
+        );
+    }
+
     /// Seed a store with a framelog of `size` bytes plus an `ungated` sidecar
     /// labelling one segment starting at `start_epoch_us`, optionally pinned.
     fn seed_log(dir: &Path, name: &str, size: usize, start_epoch_us: u64, pinned: bool) -> PathBuf {
@@ -7794,6 +8097,104 @@ mod tests {
         // so it is the depth-1 budget, full — never the both-lane total.
         assert_eq!(dropped[0]["depth"], 1);
         assert!(events_named(&lines, "segment_dropped_overflow").is_empty());
+    }
+
+    /// The same guard for the other control item. A connection announcement lost
+    /// off the sheddable lane costs the room and the log of that connection's
+    /// first utterances, and the line names it rather than taking the task down.
+    #[tokio::test]
+    async fn a_misrouted_connection_item_is_named_not_panicked() {
+        use speech_pipeline::SegmentEndInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (jsonl, writer_join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+
+        let (seg_tx, _seg_rx) = DropOldestQueue::<crate::pipeline::PipelineItem>::new(1);
+        seg_tx.send_sheddable(crate::pipeline::PipelineItem::Connected {
+            pod: PodId(TEST_POD_ID.to_string()),
+            epoch: 1,
+            room: RoomId("r-office".to_string()),
+            log: "conn.framelog".to_string(),
+        });
+
+        let mut recorder = Recorder::start(
+            dir.path().to_path_buf(),
+            1,
+            "unused",
+            false,
+            RecorderShared {
+                open_logs: OpenLogs::default(),
+                recording_failed: Arc::new(AtomicBool::new(false)),
+                jsonl: jsonl.clone(),
+            },
+        );
+        let end = SegmentEndInfo::new(SegmentEndCause::VadRelease, false, 0, None);
+        finalize_segment(
+            crate::test_support::segment(2, 16, vec![], end),
+            1,
+            &mut recorder,
+            &jsonl,
+            &seg_tx,
+            &AtomicU64::new(0),
+        );
+        drop(recorder);
+        drop(jsonl);
+        writer_join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        let dropped = events_named(&lines, "listener_event_dropped_overflow");
+        assert_eq!(dropped.len(), 1, "{lines:?}");
+        assert_eq!(dropped[0]["kind"], "connected");
+        assert_eq!(dropped[0]["pod"], TEST_POD_ID);
+    }
+
+    /// `segment_closed` states the pod-absolute index its first sample sits at.
+    /// The `tracking` line that follows carries offsets relative to it, and
+    /// nothing else on the console says what they are relative to — so a reader
+    /// converting a pod-absolute utterance span into those offsets has this line
+    /// or nothing.
+    #[tokio::test]
+    async fn segment_closed_states_the_base_its_offsets_are_relative_to() {
+        use speech_pipeline::SegmentEndInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (jsonl, writer_join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+
+        let (seg_tx, _seg_rx) = DropOldestQueue::<crate::pipeline::PipelineItem>::new(8);
+        let mut recorder = Recorder::start(
+            dir.path().to_path_buf(),
+            1,
+            "unused",
+            false,
+            RecorderShared {
+                open_logs: OpenLogs::default(),
+                recording_failed: Arc::new(AtomicBool::new(false)),
+                jsonl: jsonl.clone(),
+            },
+        );
+        let end = SegmentEndInfo::new(SegmentEndCause::VadRelease, false, 0, None);
+        let mut seg = crate::test_support::segment(1, 64, vec![], end);
+        // Far from zero, the way a second segment of a live run is: a line that
+        // reported the offset space's origin as 0 would read as correct here.
+        seg.base_sample_index = 17_537;
+        finalize_segment(seg, 1, &mut recorder, &jsonl, &seg_tx, &AtomicU64::new(0));
+        drop(recorder);
+        drop(jsonl);
+        writer_join.await.unwrap();
+
+        let lines = read_lines(&jsonl_path);
+        let closed = events_named(&lines, "segment_closed");
+        assert_eq!(closed.len(), 1, "{lines:?}");
+        assert_eq!(closed[0]["base_sample"], 17_537);
+        assert_eq!(closed[0]["samples"], 64);
     }
 
     /// Build a `HealthSources` with default zero counters. `stats` and `jsonl` are

@@ -1,28 +1,37 @@
 //! The bench case: does the audio this pod streams carry the speech the chip gated
 //! on, and what are the two capture channels?
 //!
-//! The board hands the host two processed outputs on one stereo capture stream, and
-//! reports per-beam speech energy and direction over the control interface. The two
-//! are not two beams: both processed outputs render the same auto-selected look
-//! direction, and the four telemetry indices are the beamformer's internal beams —
-//! two fixed, one free-running, one auto-select that mirrors whichever fixed beam it
-//! has settled on. So there is no channel↔beam pairing to establish, and the chip's
-//! own output-routing registers say what each channel carries anyway.
+//! The board hands the host two outputs on one stereo capture stream, and reports
+//! per-beam speech energy and direction over the control interface. The two outputs
+//! are not two beams: both render the same auto-selected look direction, and the
+//! four telemetry indices are the beamformer's internal beams — two fixed, one
+//! free-running, one auto-select that mirrors whichever fixed beam it has settled
+//! on. So there is no channel↔beam pairing to establish.
+//!
+//! What the two channels *carry* is another matter, and it is the pod's own doing:
+//! `chip::apply_asr_routing` writes the output routing at every startup, leaving
+//! the left channel the post-processed beam — noise suppression, AGC, echo
+//! suppression — and the right one that same beam's ASR extraction, taken off the
+//! beamformer ahead of all of it. A reading of `AUDIO_MGR_OP_L`/`OP_R` on a running
+//! unit is therefore this pod's write, not the chip's default; a chip that has been
+//! rebooted since is back at the default until the pod starts again.
 //!
 //! What this case asserts of a working board: speech raises at least one beam's
 //! energy to the level the pipeline's gate opens at, that beam resolves a direction
 //! while it does, the capture stream hears the same speech the chip did, and every
 //! capture channel's level follows its best-correlated beam closely enough that the
 //! audio streamed under an open gate is the audio the gate opened on. No margin, no
-//! distinctness: both channels tracking one beam is the expected reading, not a
-//! failure.
+//! distinctness: both channels tracking one direction is the expected reading, not a
+//! failure — direction is what they share, whatever processing each carries.
 //!
 //! What it reads rather than concludes: the ch0↔ch1 relationship (their per-tick
 //! power correlation, and whether the two sample streams are identical) and the raw
 //! `AUDIO_MGR_OP_L`/`OP_R` bytes. Those go in the detail on every run. The one
 //! contradiction it will fail on is sample-identical channels while the registers
 //! say the two outputs differ — the registers and the stream cannot both be right,
-//! and which is wrong is not something the bench can adjudicate.
+//! and which is wrong is not something the bench can adjudicate. With the routing
+//! above written, that is the check that catches a chip which acknowledged the
+//! write and ignored it.
 //!
 //! That makes this the one case a human has to be present for, which is why it is
 //! not in the unattended registry. Everything below the collection loop is pure, so
@@ -37,15 +46,15 @@ use audio_pipeline::ring::{SAMPLE_RATE_HZ, WaveformStats, ZERO_ABS_THRESHOLD};
 use device_protocol::{doa_azimuth_ok, sp_energy_ok};
 use pod_streamer::telemetry::{VAD_POLL_HZ, VAD_THRESHOLD_DEFAULT};
 use xvf3800_ctrl::{
-    AEC_AZIMUTH_READ_LEN, AEC_AZIMUTH_VALUES_CMD, AEC_RESID, AEC_SPENERGY_READ_LEN,
-    AEC_SPENERGY_VALUES_CMD, AUDIO_MGR_OP_L_CMD, AUDIO_MGR_OP_R_CMD, AUDIO_MGR_OP_READ_LEN,
-    AUDIO_MGR_RESID, ControlTransport,
+    AEC_AZIMUTH_READ_LEN, AEC_AZIMUTH_VALUES_CMD, AEC_AZIMUTH_VALUES_LABEL, AEC_RESID,
+    AEC_SPENERGY_READ_LEN, AEC_SPENERGY_VALUES_CMD, AEC_SPENERGY_VALUES_LABEL, ControlTransport,
 };
 
 use crate::alsa_capture::{PERIOD_FRAMES, append_channels};
+use crate::chip::{OutputRouting, read_output_routing};
 use crate::config::CHANNELS;
 use crate::run::PeriodSource;
-use crate::selftest::{Outcome, collect_window, read_f32x4, read_register, render};
+use crate::selftest::{Outcome, collect_window, read_f32x4, render};
 
 /// Beams the chip reports per AEC reading.
 pub const BEAMS: usize = 4;
@@ -261,70 +270,6 @@ impl BeamWindow {
     pub fn cross_channel_correlation(&self) -> Option<f32> {
         pearson(&self.channel_series(0), &self.channel_series(1))
     }
-}
-
-// ── Output routing ────────────────────────────────────────────────────────────
-
-/// What the chip says each of its two output channels carries.
-///
-/// Each register answers a `(category, source)` byte pair. The pair is carried and
-/// printed raw: nothing in-tree has ever written or exercised these registers on
-/// this firmware fork, so a reading of them is evidence to be reviewed rather than a
-/// value to be interpreted here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutputRouting {
-    /// `AUDIO_MGR_OP_L`.
-    pub left: [u8; AUDIO_MGR_OP_READ_LEN],
-    /// `AUDIO_MGR_OP_R`.
-    pub right: [u8; AUDIO_MGR_OP_READ_LEN],
-}
-
-impl OutputRouting {
-    /// Whether the two outputs are routed from different sources, as the registers
-    /// have it.
-    pub fn channels_differ(&self) -> bool {
-        self.left != self.right
-    }
-}
-
-impl fmt::Display for OutputRouting {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "OP_L (category {}, source {}) | OP_R (category {}, source {})",
-            self.left[0], self.left[1], self.right[0], self.right[1]
-        )
-    }
-}
-
-/// Read both output-routing registers, or say why not.
-///
-/// The failure is a string rather than an [`Outcome`] because this reading never
-/// decides the case's verdict: it is reported either way, and a board that will not
-/// answer it is judged on the arms that do not need it.
-pub fn read_output_routing<T: ControlTransport>(transport: &mut T) -> Result<OutputRouting, String>
-where
-    T::Error: fmt::Display,
-{
-    let mut routing = OutputRouting {
-        left: [0; AUDIO_MGR_OP_READ_LEN],
-        right: [0; AUDIO_MGR_OP_READ_LEN],
-    };
-    for (cmd, payload, label) in [
-        (
-            AUDIO_MGR_OP_L_CMD,
-            &mut routing.left,
-            "AUDIO_MGR_OP_L (resid 35 cmd 15)",
-        ),
-        (
-            AUDIO_MGR_OP_R_CMD,
-            &mut routing.right,
-            "AUDIO_MGR_OP_R (resid 35 cmd 19)",
-        ),
-    ] {
-        read_register(transport, AUDIO_MGR_RESID, cmd, payload, label)?;
-    }
-    Ok(routing)
 }
 
 // ── Correlation ───────────────────────────────────────────────────────────────
@@ -737,14 +682,14 @@ where
             AEC_RESID,
             AEC_SPENERGY_VALUES_CMD,
             AEC_SPENERGY_READ_LEN,
-            "AEC_SPENERGY_VALUES (resid 33 cmd 80)",
+            AEC_SPENERGY_VALUES_LABEL,
         )?;
         let azimuth = read_f32x4(
             transport,
             AEC_RESID,
             AEC_AZIMUTH_VALUES_CMD,
             AEC_AZIMUTH_READ_LEN,
-            "AEC_AZIMUTH_VALUES (resid 33 cmd 75)",
+            AEC_AZIMUTH_VALUES_LABEL,
         )?;
         window.ticks.push(BeamTick {
             energy,
@@ -814,7 +759,7 @@ where
 mod tests {
     use super::*;
     use crate::test_support::{Clock, Scripted, ScriptedCard, detail, f32x4_bytes};
-    use xvf3800_ctrl::STATUS_DONE;
+    use xvf3800_ctrl::{AUDIO_MGR_OP_L_CMD, AUDIO_MGR_OP_R_CMD, AUDIO_MGR_RESID, STATUS_DONE};
 
     /// A window whose beams and channels are written by hand as repeating patterns:
     /// `beams[beam]` and `channels[channel]` are cycled to `ticks` readings, with

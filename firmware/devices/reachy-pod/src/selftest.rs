@@ -25,17 +25,20 @@ use audio_pipeline::playback::WIRE_BYTES_PER_SAMPLE;
 use audio_pipeline::ring::{SAMPLE_RATE_HZ, WaveformStats};
 use device_protocol::{doa_azimuth_ok, sp_energy_ok};
 use xvf3800_ctrl::{
-    AEC_AZIMUTH_READ_LEN, AEC_AZIMUTH_VALUES_CMD, AEC_RESID, AEC_SPENERGY_READ_LEN,
-    AEC_SPENERGY_VALUES_CMD, APPLICATION_SERVICER_RESID, ControlTransport, STATUS_DONE, USB_RETRY,
-    VERSION_CMD, VERSION_READ_LEN, control_read, decode_f32x4,
+    AEC_AZIMUTH_READ_LEN, AEC_AZIMUTH_VALUES_CMD, AEC_AZIMUTH_VALUES_LABEL, AEC_RESID,
+    AEC_SPENERGY_READ_LEN, AEC_SPENERGY_VALUES_CMD, AEC_SPENERGY_VALUES_LABEL,
+    APPLICATION_SERVICER_RESID, ControlTransport, STATUS_DONE, USB_RETRY, VERSION_CMD,
+    VERSION_LABEL, VERSION_READ_LEN, control_read, decode_f32x4,
 };
 
 use crate::alsa_capture::{
     CAPTURE_PARAMS, CaptureStream, CardInfo, PERIOD_FRAMES, PcmError, append_channels, open_capture,
 };
 use crate::beam::beam_energy_speech;
+use crate::chip::{self, Routing};
 use crate::config::CHANNELS;
 use crate::playback::{AlsaOut, PlaybackFault, StereoOut, expand_mono_to_stereo, open_playback_on};
+use crate::regs::read_register;
 use crate::run::PeriodSource;
 use crate::usb_ctrl::{Generation, UsbControl, find_boards, log_generation, select_board};
 
@@ -51,7 +54,9 @@ pub const REACHY_FIRMWARE_EXPECTED_VERSION: (u8, u8, u8) = (2, 1, 2);
 
 /// The control-plane cases, in the order they run. Named so a run that never opened
 /// the board can still account for each of them.
-pub const CONTROL_PLANE_CASES: [&str; 3] = ["ctrl_version", "ctrl_spenergy", "ctrl_doa"];
+/// These two arrays are the sole statement of run order.
+pub const CONTROL_PLANE_CASES: [&str; 4] =
+    ["ctrl_version", "ctrl_spenergy", "ctrl_doa", "ctrl_routing"];
 
 /// The audio-plane cases, in the order they run. Same rule as the control-plane
 /// list: a run that never opened the card still accounts for each of them.
@@ -159,7 +164,7 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Case 1 (presence) — exactly one board enumerates, and its node opens read/write
+/// Presence — exactly one board enumerates, and its node opens read/write
 /// as the invoking account.
 ///
 /// Returns the open transport so the control-plane cases run against the same handle
@@ -198,7 +203,7 @@ pub fn usb_presence() -> (Outcome, Option<UsbControl>) {
     }
 }
 
-/// Case 2 (identity) — the application servicer reports the firmware version this
+/// Identity — the application servicer reports the firmware version this
 /// board is known to carry.
 ///
 /// The version is what says the command table this pipeline assumes is the table
@@ -218,11 +223,11 @@ where
         &mut payload,
     ) {
         Ok(answer) => answer,
-        Err(e) => return Outcome::fail(format!("VERSION read (resid 48 cmd 0) failed: {e}")),
+        Err(e) => return Outcome::fail(format!("{VERSION_LABEL} read failed: {e}")),
     };
     if status != STATUS_DONE {
         return Outcome::fail(format!(
-            "VERSION read (resid 48 cmd 0) returned status 0x{status:02x} after {attempts} \
+            "{VERSION_LABEL} read returned status 0x{status:02x} after {attempts} \
              transaction(s)"
         ));
     }
@@ -248,7 +253,7 @@ where
     Outcome::Pass(format!("firmware {rendered} in {attempts} transaction(s)"))
 }
 
-/// Case 3 — per-beam speech energy reads back plausibly: four finite, non-negative
+/// Per-beam speech energy reads back plausibly: four finite, non-negative
 /// values.
 pub fn ctrl_spenergy<T: ControlTransport>(transport: &mut T) -> Outcome
 where
@@ -259,7 +264,7 @@ where
         AEC_RESID,
         AEC_SPENERGY_VALUES_CMD,
         AEC_SPENERGY_READ_LEN,
-        "AEC_SPENERGY_VALUES (resid 33 cmd 80)",
+        AEC_SPENERGY_VALUES_LABEL,
     ) {
         Ok(values) => values,
         Err(outcome) => return outcome,
@@ -274,7 +279,7 @@ where
     }
 }
 
-/// Case 4 — per-beam direction of arrival reads back plausibly. NaN is accepted on
+/// Per-beam direction of arrival reads back plausibly. NaN is accepted on
 /// any beam: it is what the chip reports for a beam with nothing focused on it, and
 /// a room in which nobody is speaking is the normal state for this case.
 pub fn ctrl_doa<T: ControlTransport>(transport: &mut T) -> Outcome
@@ -286,7 +291,7 @@ where
         AEC_RESID,
         AEC_AZIMUTH_VALUES_CMD,
         AEC_AZIMUTH_READ_LEN,
-        "AEC_AZIMUTH_VALUES (resid 33 cmd 75)",
+        AEC_AZIMUTH_VALUES_LABEL,
     ) {
         Ok(values) => values,
         Err(outcome) => return outcome,
@@ -301,9 +306,48 @@ where
     }
 }
 
+/// Identity — the chip is carrying the ASR-output routing the pod writes at
+/// startup.
+///
+/// `AUDIO_MGR_OP_R` selecting the AEC-residual category on the auto-select beam,
+/// and `AEC_ASROUTONOFF` on, are together what puts the beamformed signal with no
+/// post-processing on the channel this pipeline streams. They survive until the
+/// chip is rebooted, so a board a pod has run on reads them back here and a board
+/// that has only been powered on does not — which is itself the reading to have.
+///
+/// The reading and the judgement are the pod's own ([`chip::read_routing`]), so a
+/// refusal reads here in the same words `pod_0.log` used when the pod met it.
+/// `AUDIO_MGR_OP_L` is printed and not asserted: nothing writes it, so there is no
+/// expectation to hold it to, and what the post-processed side is carrying is worth
+/// seeing beside the right channel's.
+pub fn ctrl_routing<T: ControlTransport>(transport: &mut T) -> Outcome
+where
+    T::Error: fmt::Display,
+{
+    let read = chip::read_routing(transport, USB_RETRY);
+    let rendered = read.reading.to_string();
+    match read.routing {
+        Routing::Applied => {
+            let mut lines = vec![rendered];
+            lines.extend(read.notes);
+            Outcome::Pass(lines.join("; "))
+        }
+        Routing::Refused(mut lines) => {
+            lines.extend(read.notes);
+            lines.push(rendered);
+            lines.push(
+                "the routing is written once per pod start and survives until the chip reboots: a \
+                 board that has not run the pod since its last reboot reads its defaults here"
+                    .to_string(),
+            );
+            Outcome::Fail(lines)
+        }
+    }
+}
+
 // ── The audio plane ───────────────────────────────────────────────────────────
 
-/// Case 5 (identity) — the card resolves by name and accepts the pipeline's exact
+/// Identity — the card resolves by name and accepts the pipeline's exact
 /// hardware parameters.
 ///
 /// Returns the open stream so the waveform case reads from the same configuration
@@ -324,7 +368,7 @@ pub fn alsa_params() -> (Outcome, Option<(CardInfo, PCM)>) {
     }
 }
 
-/// Case 6 — the captured waveform is live audio on both channels.
+/// The captured waveform is live audio on both channels.
 ///
 /// Both are judged, not just the configured one: both are processed beams, so a dead
 /// channel is a finding whichever one the pipeline is pointed at, and which channel
@@ -431,7 +475,7 @@ pub fn collect_window<S: PeriodSource>(
     Ok(collected)
 }
 
-/// Case 7 — the board takes a second of audio, and capture survives being run
+/// The board takes a second of audio, and capture survives being run
 /// full duplex.
 ///
 /// Two assertions in one pass, because they can only be taken together. The
@@ -569,31 +613,6 @@ pub const DUPLEX_SAMPLES_PER_PASS: usize = DUPLEX_PERIODS_PER_PASS * PERIOD_FRAM
 /// itself is the finding.
 pub const DUPLEX_MIN_SAMPLES: usize = SAMPLE_RATE_HZ as usize / 2;
 
-/// One register's payload, or the one-line reading that says why there is none.
-///
-/// Every case reads through this: the retry budget, the status check and the two
-/// failure readings are the registry's, not each case's. The failure is a string
-/// rather than an [`Outcome`] because not every caller's verdict turns on it.
-pub(crate) fn read_register<T: ControlTransport>(
-    transport: &mut T,
-    resid: u8,
-    cmd: u8,
-    payload: &mut [u8],
-    label: &str,
-) -> Result<(), String>
-where
-    T::Error: fmt::Display,
-{
-    let (status, attempts) = control_read(transport, USB_RETRY, resid, cmd, payload)
-        .map_err(|e| format!("{label} read failed: {e}"))?;
-    if status != STATUS_DONE {
-        return Err(format!(
-            "{label} returned status 0x{status:02x} after {attempts} transaction(s)"
-        ));
-    }
-    Ok(())
-}
-
 /// One four-f32 AEC reading, or the outcome that says why there is none.
 pub(crate) fn read_f32x4<T: ControlTransport>(
     transport: &mut T,
@@ -607,7 +626,7 @@ where
 {
     let mut payload = [0u8; 16];
     debug_assert_eq!(read_len, payload.len());
-    read_register(transport, resid, cmd, &mut payload, label).map_err(Outcome::fail)?;
+    read_register(transport, USB_RETRY, resid, cmd, &mut payload, label).map_err(Outcome::fail)?;
     Ok(decode_f32x4(&payload))
 }
 
@@ -752,6 +771,8 @@ where
             report.record(out, CONTROL_PLANE_CASES[1], spenergy)?;
             let doa = ctrl_doa(transport);
             report.record(out, CONTROL_PLANE_CASES[2], doa)?;
+            let routing = ctrl_routing(transport);
+            report.record(out, CONTROL_PLANE_CASES[3], routing)?;
         }
         None => {
             for name in CONTROL_PLANE_CASES {
@@ -837,8 +858,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chip::ASR_ROUTE;
     use crate::test_support::{Clock, Scripted, ScriptedCard, detail, f32x4_bytes};
-    use xvf3800_ctrl::STATUS_RETRY;
+    use xvf3800_ctrl::{
+        AEC_ASROUTONOFF_CMD, AUDIO_MGR_OP_L_CMD, AUDIO_MGR_OP_R_CMD, AUDIO_MGR_RESID, STATUS_RETRY,
+    };
 
     // ── ctrl_version ──────────────────────────────────────────────────────────
 
@@ -1001,6 +1025,9 @@ mod tests {
             (STATUS_DONE, vec![major, minor, patch]),
             (STATUS_DONE, f32x4_bytes([0.1, 0.2, 0.3, 0.4])),
             (STATUS_DONE, f32x4_bytes([0.0, 1.0, -1.0, f32::NAN])),
+            (STATUS_DONE, ASR_ROUTE.to_vec()),
+            (STATUS_DONE, 1_i32.to_le_bytes().to_vec()),
+            (STATUS_DONE, vec![0, 0]),
         ]);
         let mut out = Vec::new();
         let mut report = Report::default();
@@ -1022,6 +1049,9 @@ mod tests {
                 (APPLICATION_SERVICER_RESID, VERSION_CMD),
                 (AEC_RESID, AEC_SPENERGY_VALUES_CMD),
                 (AEC_RESID, AEC_AZIMUTH_VALUES_CMD),
+                (AUDIO_MGR_RESID, AUDIO_MGR_OP_R_CMD),
+                (AEC_RESID, AEC_ASROUTONOFF_CMD),
+                (AUDIO_MGR_RESID, AUDIO_MGR_OP_L_CMD),
             ],
             "each case must read the register its name promises"
         );
@@ -1041,6 +1071,91 @@ mod tests {
             detail(&report.cases[2].outcome).contains("NaN"),
             "{}",
             detail(&report.cases[2].outcome)
+        );
+        assert!(
+            detail(&report.cases[3].outcome).contains("ASROUTONOFF 1"),
+            "{}",
+            detail(&report.cases[3].outcome)
+        );
+    }
+
+    // ── ctrl_routing ──────────────────────────
+
+    /// A board a pod has started on: the case passes and its detail carries all
+    /// three registers, the unasserted left one included.
+    #[test]
+    fn the_routing_the_pod_writes_reads_back_and_passes() {
+        let mut t = Scripted::sequenced(vec![
+            (STATUS_DONE, ASR_ROUTE.to_vec()),
+            (STATUS_DONE, 1_i32.to_le_bytes().to_vec()),
+            (STATUS_DONE, vec![4, 0]),
+        ]);
+        let outcome = ctrl_routing(&mut t);
+        assert!(outcome.passed(), "{}", detail(&outcome));
+        assert!(
+            detail(&outcome).contains("OP_L (category 4, source 0)")
+                && detail(&outcome).contains("OP_R (category 7, source 3)")
+                && detail(&outcome).contains("ASROUTONOFF 1"),
+            "{}",
+            detail(&outcome)
+        );
+    }
+
+    /// A board that has been rebooted since the pod last ran reads its defaults.
+    /// Both disagreements are named, the whole reading follows them, and the last
+    /// line says what makes a board read this way.
+    #[test]
+    fn a_board_carrying_the_defaults_fails_with_both_readings() {
+        let mut t = Scripted::sequenced(vec![
+            (STATUS_DONE, vec![0, 0]),
+            (STATUS_DONE, 0_i32.to_le_bytes().to_vec()),
+            (STATUS_DONE, vec![4, 0]),
+        ]);
+        let outcome = ctrl_routing(&mut t);
+        assert!(!outcome.passed());
+        let said = detail(&outcome);
+        assert!(
+            said.contains(
+                "AUDIO_MGR_OP_R (resid 35 cmd 19) was written (7, 3) and reads back (0, 0)"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("AEC_ASROUTONOFF (resid 33 cmd 35) was written 1 and reads back 0"),
+            "{said}"
+        );
+        assert!(said.contains("survives until the chip reboots"), "{said}");
+    }
+
+    /// The left channel is printed, never asserted: nothing writes it, so there is
+    /// no expectation to hold it to.
+    #[test]
+    fn the_left_channels_routing_is_a_reading_not_an_assertion() {
+        let mut t = Scripted::sequenced(vec![
+            (STATUS_DONE, ASR_ROUTE.to_vec()),
+            (STATUS_DONE, 1_i32.to_le_bytes().to_vec()),
+            (STATUS_DONE, vec![1, 2]),
+        ]);
+        let outcome = ctrl_routing(&mut t);
+        assert!(outcome.passed(), "{}", detail(&outcome));
+        assert!(
+            detail(&outcome).contains("OP_L (category 1, source 2)"),
+            "{}",
+            detail(&outcome)
+        );
+    }
+
+    /// A register that will not answer names itself, the way every other case's
+    /// dead read does.
+    #[test]
+    fn a_routing_read_that_never_completes_names_the_register() {
+        let mut t = Scripted::failing("pipe error");
+        let outcome = ctrl_routing(&mut t);
+        assert!(!outcome.passed());
+        assert!(
+            detail(&outcome).contains("resid 35 cmd 15") && detail(&outcome).contains("pipe error"),
+            "{}",
+            detail(&outcome)
         );
     }
 

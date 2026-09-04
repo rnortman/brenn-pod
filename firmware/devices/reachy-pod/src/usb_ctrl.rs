@@ -404,9 +404,12 @@ impl ControlTransport for UsbControl {
 mod tests {
     use super::*;
     use xvf3800_ctrl::{
-        AEC_AZIMUTH_READ_LEN, AEC_AZIMUTH_VALUES_CMD, AEC_RESID, AEC_SPENERGY_READ_LEN,
-        AEC_SPENERGY_VALUES_CMD, APPLICATION_SERVICER_RESID, GPO_CMD, GPO_RESID, GPO_VECTOR_LEN,
-        VERSION_CMD, VERSION_READ_LEN,
+        AEC_AECCONVERGED_CMD, AEC_ASROUTGAIN_CMD, AEC_ASROUTONOFF_CMD, AEC_AZIMUTH_READ_LEN,
+        AEC_AZIMUTH_VALUES_CMD, AEC_RESID, AEC_SPENERGY_READ_LEN, AEC_SPENERGY_VALUES_CMD,
+        APPLICATION_SERVICER_RESID, AUDIO_MGR_OP_R_CMD, AUDIO_MGR_OP_READ_LEN, AUDIO_MGR_RESID,
+        BLD_MSG_CMD, BLD_MSG_READ_LEN, GPO_CMD, GPO_RESID, GPO_VECTOR_LEN, PP_AGCGAIN_CMD,
+        PP_AGCONOFF_CMD, PP_DTSENSITIVE_CMD, PP_ECHOONOFF_CMD, PP_MIN_NN_CMD, PP_MIN_NS_CMD,
+        PP_RESID, REBOOT_CMD, REBOOT_WRITE_LEN, SCALAR_READ_LEN, VERSION_CMD, VERSION_READ_LEN,
     };
 
     fn board(vendor: u16, product: u16, generation: Generation) -> Board {
@@ -456,6 +459,60 @@ mod tests {
         assert_eq!(setup.value, 0);
         assert_eq!(setup.index, 20);
         assert_eq!(setup.length, GPO_VECTOR_LEN);
+    }
+
+    #[test]
+    fn the_routing_registers_frame_as_the_user_guide_numbers_them() {
+        // AUDIO_MGR_OP_R: two bytes, category and source, on the audio manager.
+        let route = write_setup(AUDIO_MGR_RESID, AUDIO_MGR_OP_R_CMD, AUDIO_MGR_OP_READ_LEN);
+        assert_eq!(
+            (route.request_type, route.value, route.index),
+            (0x40, 19, 35)
+        );
+        assert_eq!(route.length, 2);
+        let read_back = read_setup(AUDIO_MGR_RESID, AUDIO_MGR_OP_R_CMD, AUDIO_MGR_OP_READ_LEN);
+        assert_eq!((read_back.value, read_back.length), (19 | 0x80, 3));
+        // AEC_ASROUTONOFF: one int32 on the AEC servicer, written then read back.
+        let enable = write_setup(AEC_RESID, AEC_ASROUTONOFF_CMD, SCALAR_READ_LEN);
+        assert_eq!((enable.value, enable.index, enable.length), (35, 33, 4));
+        let confirm = read_setup(AEC_RESID, AEC_ASROUTONOFF_CMD, SCALAR_READ_LEN);
+        assert_eq!(
+            (confirm.value, confirm.index, confirm.length),
+            (0xA3, 33, 5)
+        );
+    }
+
+    #[test]
+    fn the_state_line_registers_frame_as_five_byte_reads() {
+        for (resid, cmd) in [
+            (AEC_RESID, AEC_ASROUTGAIN_CMD),
+            (AEC_RESID, AEC_AECCONVERGED_CMD),
+            (PP_RESID, PP_AGCONOFF_CMD),
+            (PP_RESID, PP_AGCGAIN_CMD),
+            (PP_RESID, PP_MIN_NS_CMD),
+            (PP_RESID, PP_MIN_NN_CMD),
+            (PP_RESID, PP_ECHOONOFF_CMD),
+            (PP_RESID, PP_DTSENSITIVE_CMD),
+        ] {
+            let setup = read_setup(resid, cmd, SCALAR_READ_LEN);
+            assert_eq!(setup.request_type, 0xC0, "resid {resid} cmd {cmd}");
+            assert_eq!(setup.index, u16::from(resid));
+            assert_eq!(setup.value, u16::from(cmd | READ_BIT));
+            assert_eq!(setup.length, 5);
+        }
+    }
+
+    #[test]
+    fn reboot_is_a_one_byte_write_and_the_build_message_the_longest_read() {
+        let reboot = write_setup(APPLICATION_SERVICER_RESID, REBOOT_CMD, REBOOT_WRITE_LEN);
+        assert_eq!(reboot.request_type, 0x40);
+        assert_eq!((reboot.value, reboot.index, reboot.length), (7, 48, 1));
+
+        let build = read_setup(APPLICATION_SERVICER_RESID, BLD_MSG_CMD, BLD_MSG_READ_LEN);
+        assert_eq!((build.value, build.index, build.length), (0x81, 48, 51));
+        // The transport stages a read in `CTRL_BUF_CAPACITY + 1` bytes and asserts
+        // on anything longer, so the longest register must fit.
+        assert!(build.length <= CTRL_BUF_CAPACITY + 1);
     }
 
     #[test]

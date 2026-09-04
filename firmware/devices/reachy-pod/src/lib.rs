@@ -12,10 +12,12 @@
 
 pub mod alsa_capture;
 pub mod beam;
+pub mod chip;
 pub mod cli;
 pub mod config;
 pub mod logging;
 pub mod playback;
+mod regs;
 pub mod run;
 pub mod selftest;
 mod test_support;

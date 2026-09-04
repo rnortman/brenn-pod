@@ -13,6 +13,27 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   Reachy Mini Wireless robot.
 - Reachy acknowledges the wake word by raising its head, then stows it when the
   interaction is over.
+- **The Reachy pod now brings up the XVF3800 mic-array chip at startup.** The pod
+  reads the chip's identity, reboots it to clear adaptive state, then routes the
+  right output channel to the ASR signal — the beamformed, echo-cancelled path
+  that bypasses the chip's noise suppressor and AGC. The noise suppressor was
+  learning the robot's servo noise and suppressing speech along with it, which
+  caused most second-and-later utterances in a conversation to be declined by the
+  STT confidence gate. The new `chip` module (`reachy-pod`) and expanded register
+  surface in `xvf3800-ctrl` are tested off the device.
+- **A chip state line while someone is speaking.** While the VAD gate is open the
+  pod reads eleven post-processing registers and prints them periodically, so a
+  fetched console says what the adaptive stages were doing during the utterance
+  they degraded.
+- **Connection announcements on the pipeline.** Each pod connection sends a
+  `Connected` item carrying its room and frame-log path before its first segment
+  closes, so the first utterance of a session is attributed to the right room and
+  the right recording — previously it read `unmapped` until a segment closed.
+- **`segment_closed` carries `base_sample`** — the absolute sample index the
+  tracking line's offsets are relative to, previously unstated on the console.
+- **`stt_configured` carries the confidence-gate thresholds** (`no_speech_max`,
+  `avg_logprob_min`), so a declined transcript in a fetched log is interpretable
+  without knowing the build's defaults.
 - **An announcement seam on `speech-surface`**: `announce_seam`,
   `Server::with_announcements` and `Config::carries_announcements()`. A
   composing process puts a sentence on the queue and the robot says it out loud

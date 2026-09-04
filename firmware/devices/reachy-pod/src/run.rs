@@ -38,12 +38,14 @@ use pod_streamer::telemetry::{
 use xvf3800_ctrl::{ControlTransport, USB_RETRY};
 
 use crate::alsa_capture::{
-    CaptureStream, PcmError, append_channel, monotonic_us, new_ring, open_capture,
+    CaptureStream, PcmError, append_channel, enumerate_cards, monotonic_us, new_ring, open_capture,
+    select_card,
 };
+use crate::chip::{self, Routing, StateLineCadence};
 use crate::cli::EXIT_FAILED;
 use crate::config::{Config, ConfigError, RECHECK_INTERVAL};
 use crate::playback::{AlsaOut, open_playback_on, playback_pair, run_drain_loop};
-use crate::usb_ctrl::{UsbControl, find_boards, log_generation, select_board};
+use crate::usb_ctrl::{Board, UsbControl, find_boards, select_board};
 use crate::{config, tls};
 
 /// The capture ring, shared by the thread that fills it and the two that read it.
@@ -113,7 +115,11 @@ pub struct Wiring {
 ///
 /// No hardware: everything here is a ring, a flag, a channel or a value off the
 /// configuration, so the hand-off is decidable in a test.
-pub fn wire(config: &Config, pod_id: String) -> Wiring {
+///
+/// `channel` rather than `config.channel`, because the chip's routing has the last
+/// word on it: a board that refused the ASR routing is streamed on the
+/// post-processed channel whatever the configuration asked for.
+pub fn wire(config: &Config, pod_id: String, channel: usize) -> Wiring {
     let ring: SharedRing = Arc::new(Mutex::new(Some(new_ring())));
     let vad_closed = Arc::new(AtomicBool::new(false));
     let segment_active = Arc::new(AtomicBool::new(false));
@@ -122,7 +128,7 @@ pub fn wire(config: &Config, pod_id: String) -> Wiring {
     Wiring {
         capture: CaptureWiring {
             ring: Arc::clone(&ring),
-            channel: config.channel,
+            channel,
         },
         telemetry: TelemetryWiring {
             ring: Arc::clone(&ring),
@@ -372,6 +378,14 @@ impl<T> UsbTelemetryBus<T> {
     pub fn new(transport: T) -> Self {
         Self { transport }
     }
+
+    /// The transport itself, for the control-plane reads that are not telemetry.
+    ///
+    /// This thread owns the pod's only control handle, so the chip's state line is
+    /// read here or nowhere.
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
 }
 
 impl<T: ControlTransport> TelemetryBus for UsbTelemetryBus<T>
@@ -380,6 +394,27 @@ where
 {
     fn read(&mut self, reading: Reading) -> Option<[f32; 4]> {
         read_f32x4_reading(&mut self.transport, USB_RETRY, reading)
+    }
+}
+
+/// The chip's state line, when the gate says it is due: this pod's after-tick work
+/// on the shared telemetry loop.
+///
+/// The state line rides that thread because that thread holds the control handle —
+/// and it follows the gate because the chip's post-processing state is worth a line
+/// while someone is speaking and worth nothing while the room is quiet.
+pub fn state_line_tick<T>(
+    core: &TelemetryCore,
+    bus: &mut UsbTelemetryBus<T>,
+    cadence: &mut StateLineCadence,
+    now: &dyn Fn() -> Instant,
+    say: &mut dyn FnMut(String),
+) where
+    T: ControlTransport,
+    T::Error: fmt::Debug + fmt::Display,
+{
+    if cadence.tick(core.segment_open(), now()) {
+        say(chip::state_line(bus.transport_mut(), now));
     }
 }
 
@@ -434,13 +469,41 @@ pub fn jitter_seed(pod_id: &str) -> u32 {
     hash
 }
 
+/// The one board on the bus, or why there is not one.
+fn the_board() -> Result<Board, String> {
+    find_boards()
+        .map_err(|e| format!("cannot enumerate USB: {e}"))
+        .and_then(|found| select_board(&found))
+}
+
+/// Whether the kernel is presenting the board's sound card yet.
+///
+/// The USB device and its ALSA card come back at different moments after a reboot,
+/// and a capture opened between the two fails on a card that is not there.
+fn card_present() -> Result<(), String> {
+    let cards = enumerate_cards().map_err(|e| format!("cannot list sound cards: {e}"))?;
+    select_card(&cards).map(|_| ())
+}
+
+/// The chip's bring-up, on this unit's real bus, card and clock.
+fn bring_up_chip() -> Result<(UsbControl, Routing), String> {
+    chip::bring_up(
+        &|board| UsbControl::open(board).map_err(|e| format!("{board} will not open: {e}")),
+        &the_board,
+        &card_present,
+        &Instant::now,
+        &std::thread::sleep,
+    )
+}
+
 /// Bring up the pipeline and run it until a thread ends.
 ///
 /// Hardware is opened here, on the main thread, before anything is spawned: a
 /// board that is absent or a card that refuses the pipeline's parameters is a
 /// startup failure with one clear line, not four threads racing to report it.
-/// Configuration is the exception — a missing `audio.conf` is waited for, because
-/// it arrives per unit and may simply not be placed yet.
+/// The chip comes first of all, because bringing it up reboots it and the sound
+/// card goes away with it. Configuration is the exception — a missing `audio.conf`
+/// is waited for, because it arrives per unit and may simply not be placed yet.
 pub fn run() -> u8 {
     let config = wait_for_config(&mut Config::load, &std::thread::sleep);
     let pod_id = config::hostname();
@@ -448,17 +511,33 @@ pub fn run() -> u8 {
         log::error!("startup: {why}");
         return EXIT_FAILED;
     }
+
+    let (control, routing) = match bring_up_chip() {
+        Ok(brought_up) => brought_up,
+        Err(e) => {
+            log::error!("startup: {e}");
+            return EXIT_FAILED;
+        }
+    };
+    let capture_channel = routing.channel(config.channel);
     log::info!(
-        "startup: pod_id={pod_id} host={} channel={} vad_threshold={} vad_hangover_ms={}",
+        "startup: pod_id={pod_id} host={} {} vad_threshold={} vad_hangover_ms={}",
         config.addr,
-        config.channel,
+        routing.channel_note(config.channel),
         config.vad_threshold,
         config.vad_hangover_ms
     );
 
     // Both directions of the same resolved card, so the echo canceller is
-    // cancelling audio this pod actually played.
-    let (card, capture_pcm) = match open_capture() {
+    // cancelling audio this pod actually played. The open is retried while the
+    // node access budget lasts: the card comes back with the reboot and its
+    // permissions land a moment after it.
+    let (card, capture_pcm) = match chip::keep_trying(
+        &|| open_capture().map_err(|e| e.to_string()),
+        chip::NODE_ACCESS_TIMEOUT,
+        &Instant::now,
+        &std::thread::sleep,
+    ) {
         Ok(open) => open,
         Err(e) => {
             log::error!("startup: no capture stream: {e}");
@@ -473,26 +552,7 @@ pub fn run() -> u8 {
         }
     };
 
-    let board = match find_boards()
-        .map_err(|e| format!("cannot enumerate USB: {e}"))
-        .and_then(|found| select_board(&found))
-    {
-        Ok(board) => board,
-        Err(e) => {
-            log::error!("startup: no XVF3800 control interface: {e}");
-            return EXIT_FAILED;
-        }
-    };
-    log_generation(board);
-    let control = match UsbControl::open(board) {
-        Ok(control) => control,
-        Err(e) => {
-            log::error!("startup: cannot open {board} for control transfers: {e}");
-            return EXIT_FAILED;
-        }
-    };
-
-    let wiring = wire(&config, pod_id);
+    let wiring = wire(&config, pod_id, capture_channel);
     let (exit_tx, exit_rx) = channel::<ThreadExit>();
 
     spawn_capture(&exit_tx, capture_pcm, wiring.capture);
@@ -530,7 +590,7 @@ fn spawn_capture(exit_tx: &Sender<ThreadExit>, pcm: alsa::pcm::PCM, wiring: Capt
 fn spawn_telemetry<T>(exit_tx: &Sender<ThreadExit>, control: T, wiring: TelemetryWiring)
 where
     T: ControlTransport + Send + 'static,
-    T::Error: fmt::Debug,
+    T::Error: fmt::Debug + fmt::Display,
 {
     let TelemetryWiring {
         ring,
@@ -552,9 +612,15 @@ where
             // the life of the process.
             capture_quiesced: &|| false,
         };
-        run_telemetry_loop(core, &mut bus, &ctx, &|ms| {
-            std::thread::sleep(Duration::from_millis(u64::from(ms)))
-        });
+        let mut cadence = StateLineCadence::new();
+        let mut say = |line: String| log::info!("{line}");
+        run_telemetry_loop(
+            core,
+            &mut bus,
+            &ctx,
+            &|ms| std::thread::sleep(Duration::from_millis(u64::from(ms))),
+            &mut |core, bus| state_line_tick(core, bus, &mut cadence, &Instant::now, &mut say),
+        );
     });
 }
 
@@ -637,6 +703,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ASR_OUTPUT_CHANNEL, POST_PROCESSED_CHANNEL};
+    use crate::test_support::{Clock, RegisterBank};
     use audio_pipeline::playback::PlaybackSink;
     use audio_pipeline::ring::SAMPLE_RATE_HZ;
     use std::collections::VecDeque;
@@ -942,6 +1010,80 @@ mod tests {
         );
     }
 
+    /// Drive `ticks` telemetry ticks at the poll cadence over a chip whose speech
+    /// energy is `energy`, returning the state lines said and the gate's state.
+    fn ticks_at(
+        energy: f32,
+        ticks: u32,
+    ) -> (
+        Vec<String>,
+        TelemetryCore,
+        UsbTelemetryBus<RegisterBank>,
+        StateLineCadence,
+        Clock,
+    ) {
+        let mut bank = RegisterBank::new();
+        bank.set(
+            xvf3800_ctrl::AEC_RESID,
+            xvf3800_ctrl::AEC_SPENERGY_VALUES_CMD,
+            f32x4_bytes([energy; 4]).to_vec(),
+        );
+        let mut bus = UsbTelemetryBus::new(bank);
+        let mut core = TelemetryCore::new(1.0, 0);
+        let mut cadence = StateLineCadence::new();
+        let clock = Clock::new();
+        let mut said = Vec::new();
+        let (tx, _rx) = sync_channel::<StreamerMsg>(STREAMER_CHAN_CAPACITY);
+        let closed = AtomicBool::new(false);
+        let ctx = TelemetryCtx {
+            tx: &tx,
+            vad_closed_flag: &closed,
+            write_head: &|| 0,
+            now_us: &|| 0,
+            capture_quiesced: &|| false,
+        };
+        for _ in 0..ticks {
+            core.poll_tick(&mut bus, &ctx);
+            state_line_tick(
+                &core,
+                &mut bus,
+                &mut cadence,
+                &|| clock.now(),
+                &mut |line| said.push(line),
+            );
+            clock.advance(Duration::from_millis(u64::from(
+                pod_streamer::telemetry::VAD_POLL_INTERVAL_MS,
+            )));
+        }
+        (said, core, bus, cadence, clock)
+    }
+
+    /// The gate open, the state line said once for the opening and once more per
+    /// interval — and the registers it reads are the chip's, not the gate's.
+    #[test]
+    fn the_state_line_follows_the_gate_and_not_the_poll() {
+        // Fifty seconds of speech: the line the gate's opening says, and one more
+        // when the first interval is up.
+        let ticks = VAD_POLL_HZ * 50;
+        let (said, core, mut bus, _cadence, _clock) = ticks_at(5.0, ticks);
+        assert!(core.segment_open(), "the gate is open on this energy");
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].starts_with("chip state: OP_L="), "{said:?}");
+        assert_eq!(
+            bus.transport_mut()
+                .reads_of(xvf3800_ctrl::PP_RESID, xvf3800_ctrl::PP_DTSENSITIVE_CMD),
+            2,
+            "one post-processing readback per state line, no more"
+        );
+    }
+
+    #[test]
+    fn a_gate_that_never_opens_says_nothing_about_the_chip() {
+        let (said, core, _bus, _cadence, _clock) = ticks_at(0.0, VAD_POLL_HZ * 60);
+        assert!(!core.segment_open());
+        assert!(said.is_empty(), "{said:?}");
+    }
+
     // ── The wiring ────────────────────────────────────────────────────────────
 
     fn wired() -> Wiring {
@@ -950,7 +1092,36 @@ mod tests {
              VAD_HANGOVER_MS=1200\n"
         ))
         .expect("parse");
-        wire(&config, "reachy00".to_string())
+        wire(&config, "reachy00".to_string(), config.channel)
+    }
+
+    /// The routing has the last word over the configuration, and this is where
+    /// that word reaches the hardware: the capture thread's channel. A unit
+    /// whose tuning fragment asks for the ASR channel still streams the
+    /// post-processed one when the chip would not take the routing.
+    #[test]
+    fn a_refused_routing_wires_capture_to_the_post_processed_channel() {
+        let config = Config::parse(&format!(
+            "ADDR=198.51.100.7:5555\nPSK={KEY_HEX}\nCHANNEL=1\n"
+        ))
+        .expect("parse");
+        assert_eq!(config.channel, ASR_OUTPUT_CHANNEL);
+
+        let applied = Routing::Applied;
+        let w = wire(
+            &config,
+            "reachy00".to_string(),
+            applied.channel(config.channel),
+        );
+        assert_eq!(w.capture.channel, ASR_OUTPUT_CHANNEL);
+
+        let refused = Routing::Refused(vec!["AUDIO_MGR_OP_R reads back (8, 0)".to_string()]);
+        let w = wire(
+            &config,
+            "reachy00".to_string(),
+            refused.channel(config.channel),
+        );
+        assert_eq!(w.capture.channel, POST_PROCESSED_CHANNEL);
     }
 
     #[test]
