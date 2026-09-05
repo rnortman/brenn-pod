@@ -157,7 +157,7 @@ fn replay_log(path: &Path, listener: &mut ReplayListener) -> Result<LogCounts, R
                         "start_sample": utterance.start_sample,
                         "end_sample": utterance.end_sample,
                         "samples": utterance.pcm.len(),
-                        "stt_trim_samples": utterance.stt_trim_samples,
+                        "stt_trim_samples": utterance.wake.as_ref().map(|w| w.stt_trim_samples),
                         "cause": cause_str(utterance.cause),
                         "wake_score": utterance.wake.as_ref().map(|w| w.score),
                     }),
@@ -182,6 +182,22 @@ fn replay_log(path: &Path, listener: &mut ReplayListener) -> Result<LogCounts, R
                 emit(
                     "utterance_closed",
                     json!({ "log": log_name, "seq": utterance_id.seq }),
+                );
+            }
+            ListenerEvent::WakeHeld {
+                start_sample,
+                end_sample,
+                deadline_sample,
+                ..
+            } => {
+                emit(
+                    "wake_held",
+                    json!({
+                        "log": log_name,
+                        "start_sample": start_sample,
+                        "end_sample": end_sample,
+                        "deadline_sample": deadline_sample,
+                    }),
                 );
             }
             ListenerEvent::ArmExpired {

@@ -818,6 +818,12 @@ pub const WAKE_PHRASE_WAV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../testdata/wake/wake-phrase.wav"
 );
+/// The committed TTS command clip — "this is a test one two three", not the wake
+/// phrase, so it arms nothing.
+pub const COMMAND_PHRASE_WAV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../testdata/wake/command-phrase.wav"
+);
 /// The committed Silero VAD model — the host endpointer's speech classifier.
 pub const SILERO_MODEL: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -827,13 +833,19 @@ pub const SILERO_MODEL: &str = concat!(
 /// The `[wake]` config block running the real openWakeWord gate over the
 /// committed models. Shared by every `oww_*` config builder so the model wiring
 /// lives in exactly one place.
+///
+/// The wake-command hold is off here. The harness clip is the wake phrase with
+/// nothing after it, which is precisely what the hold keeps back and reports as a
+/// bare wake; these tests are about what happens to a carved utterance, so they
+/// need the phrase itself to carve.
 fn oww_wake_block() -> String {
     format!(
         "[wake]\n\
          mode = \"oww\"\n\
          melspectrogram = \"{OWW_MELSPECTROGRAM}\"\n\
          embedding = \"{OWW_EMBEDDING}\"\n\
-         model = \"{OWW_MODEL}\"\n"
+         model = \"{OWW_MODEL}\"\n\
+         command_wait_ms = 0\n"
     )
 }
 

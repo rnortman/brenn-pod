@@ -30,23 +30,24 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use futures::channel::mpsc as fmpsc;
-use futures::{FutureExt, StreamExt};
 use pod_ingest::{HostMicros, SegmentRef};
 use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
     AudioSpan, Brain, BrainEvent, BrainEventFn, BrainStats, CarveTiming, CarvedUtterance,
     ConfidenceGate, DoaTrack, EndpointCause, FlushRejected, GateReject, InterruptProgress,
-    ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, SPINE_FORMAT, Segment,
-    SegmentAudio, SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings, TrackingEvent,
-    TranscribeError, Transcriber, Transcript, Utterance, UtteranceId, WakeCommandReason,
-    WakeConfirmation, stage_delta_us, tracking_event,
+    ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment, SegmentTelemetry,
+    SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError, Transcriber, Transcript,
+    Utterance, UtteranceId, WakeCommandReason, WakeConfirmation, stage_delta_us, tracking_event,
+    transcribe_pcm,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::barge::TurnLedger;
+use crate::config::WakeWordInStt;
 use crate::jsonl::JsonlHandle;
 use crate::recorder::{
     WakeClass, WakeClassUpdate, sanitize_filename, set_wake_class, sidecar_path,
@@ -69,8 +70,11 @@ pub struct PipelineFatal {
 /// index space an item belongs to.
 #[derive(Debug)]
 pub enum PipelineItem {
+    /// Boxed: a `Segment` carries its PCM and telemetry inline and is several
+    /// times the size of every other arm, so an unboxed one would set the size
+    /// of every item on the queue.
     Segment {
-        seg: Segment,
+        seg: Box<Segment>,
         epoch: u64,
     },
     Listener(ListenerEvent),
@@ -117,6 +121,7 @@ impl PipelineItem {
                 | SoftEndpoint { pod, .. }
                 | Superseded { pod, .. }
                 | UtteranceClosed { pod, .. }
+                | WakeHeld { pod, .. }
                 | ArmExpired { pod, .. }
                 | EndpointerTransition { pod, .. }
                 | ModelStats { pod, .. } => pod,
@@ -141,6 +146,7 @@ impl PipelineItem {
                 SoftEndpoint { .. } => "soft_endpoint",
                 Superseded { .. } => "superseded",
                 UtteranceClosed { .. } => "utterance_closed",
+                WakeHeld { .. } => "wake_held",
                 ArmExpired { .. } => "arm_expired",
                 EndpointerTransition { .. } => "endpointer_transition",
                 ModelStats { .. } => "model_stats",
@@ -187,6 +193,8 @@ pub struct PipelineCtx {
     pub brain: Option<BrainWiring>,
     /// STT-confidence gate applied before brain dispatch; fail-open (no summary).
     pub confidence_gate: ConfidenceGate,
+    /// Whether the wake word is cut out of the clip before transcription.
+    pub wake_word: WakeWordInStt,
     /// Barge-in wiring, or `None` in a pipeline with no playback path (the replay
     /// rigs), where a detected barge-in is a log line and nothing more.
     pub(crate) barge: Option<BargeWiring>,
@@ -216,6 +224,10 @@ struct Carve {
     /// The listener's host-receipt stamps for this utterance's audio, from t0 to
     /// the carve. Copied onto the minted `Utterance`'s `StageTimings`.
     timing: CarveTiming,
+    /// Where transcription actually started in the carved PCM, or `None` when no
+    /// transcriber was wired. Rides back so the `utterance` line reports the clip
+    /// STT heard alongside the boundary the listener computed.
+    sent_from: Option<usize>,
 }
 
 /// A completed (or no-op) speculative STT, sent back into the loop.
@@ -240,6 +252,17 @@ struct InFlight {
     /// here rather than sent through the STT task, which measures its own in-task
     /// elapsed time and has no use for the host stamp.
     stt_started: HostMicros,
+}
+
+/// Wall-clock fallback for a standing wake hold. The listener's own hold is in the
+/// sample domain and only advances when audio arrives, so a quiet room can leave it
+/// standing indefinitely; this is the head's deadline for treating the wake as
+/// unanswered regardless.
+struct HoldRelease {
+    /// When the standing hold is treated as unanswered for the head.
+    at: tokio::time::Instant,
+    /// The hold's own deadline, carried so the release line joins its `wake_held`.
+    deadline_sample: u64,
 }
 
 /// A recently-assembled segment, retained so a listener utterance carved across it
@@ -288,6 +311,9 @@ struct PodState {
     log: Option<String>,
     /// Per-pod spawn nonce mint.
     spawn_seq: u64,
+    /// The head's release for a wake hold standing on this pod, armed on
+    /// `WakeHeld` and cancelled when the listener resolves the hold either way.
+    hold_release: Option<HoldRelease>,
 }
 
 impl PodState {
@@ -316,6 +342,8 @@ impl PodState {
             // connection's first utterance to the old connection's log.
             self.room = None;
             self.log = None;
+            // A reconnected pod's presence starts over with its next wake.
+            self.hold_release = None;
             if let Some(f) = self.in_flight.take() {
                 f.abort.abort();
             }
@@ -338,6 +366,7 @@ pub async fn run(
         transcriber,
         brain,
         confidence_gate,
+        wake_word,
         barge,
         scripter,
     } = ctx;
@@ -357,11 +386,26 @@ pub async fn run(
         if queue_closed && !pods.values().any(|s| s.in_flight.is_some()) {
             break;
         }
+        // The earliest head release standing on any pod.
+        let next_release = pods
+            .values()
+            .filter_map(|s| s.hold_release.as_ref().map(|h| h.at))
+            .min();
         tokio::select! {
+            () = sleep_until_opt(next_release), if !queue_closed => {
+                release_due_holds(&mut pods, scripter.as_ref(), &jsonl);
+            }
             item = rx.recv(), if !queue_closed => match item {
-                None => queue_closed = true,
+                None => {
+                    queue_closed = true;
+                    // No more listener events can resolve a hold, and the loop is
+                    // now waiting on in-flight STT alone.
+                    for state in pods.values_mut() {
+                        state.hold_release = None;
+                    }
+                }
                 Some(PipelineItem::Segment { seg, epoch }) => {
-                    handle_segment(seg, epoch, &mut pods, record_dir.as_deref(), &clock_step_clamps, &jsonl)
+                    handle_segment(*seg, epoch, &mut pods, record_dir.as_deref(), &clock_step_clamps, &jsonl)
                         .await;
                 }
                 Some(PipelineItem::Connected { pod, epoch, room, log }) => {
@@ -373,6 +417,7 @@ pub async fn run(
                         &mut pods,
                         record_dir.as_deref(),
                         transcriber.as_ref(),
+                        wake_word,
                         &done_tx,
                         &mut next_utterance_id,
                         brain.as_ref(),
@@ -399,6 +444,39 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Sleep until `at`, or forever when there is none — a select arm with nothing to
+/// wait for.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Tell the head that every hold whose wall-clock wait has run out went unanswered.
+/// Presence only: a release against a head that is already down is a no-op.
+fn release_due_holds(
+    pods: &mut HashMap<PodId, PodState>,
+    scripter: Option<&ScriptHandle>,
+    jsonl: &JsonlHandle,
+) {
+    let now = tokio::time::Instant::now();
+    for (pod, state) in pods.iter_mut() {
+        let Some(release) = state.hold_release.take_if(|r| r.at <= now) else {
+            continue;
+        };
+        // Distinguishable in the records from a head that came down on
+        // `arm_expired`, and joined to its `wake_held` by the deadline.
+        jsonl.emit(
+            "wake_hold_released",
+            &json!({ "pod": pod.0, "deadline_sample": release.deadline_sample }),
+        );
+        if let Some(scripter) = scripter {
+            scripter.send(ScriptInput::Unanswered(pod.clone()));
+        }
+    }
 }
 
 /// Adopt a connection's room and frame log for the pod, so an utterance carved
@@ -530,6 +608,7 @@ async fn handle_listener(
     pods: &mut HashMap<PodId, PodState>,
     record_dir: Option<&Path>,
     transcriber: Option<&Arc<dyn Transcriber>>,
+    wake_word: WakeWordInStt,
     done_tx: &mpsc::UnboundedSender<SttDone>,
     next_utterance_id: &mut u64,
     brain: Option<&BrainWiring>,
@@ -599,6 +678,10 @@ async fn handle_listener(
             if !state.adopt_epoch(uid.epoch) {
                 return; // Stale: a reconnect superseded this epoch.
             }
+            // Nothing is minted under a hold, so a carve on this pod is either the
+            // hold consumed or a fresh wake's own: the wait the head is waiting out
+            // is over either way.
+            state.hold_release = None;
             // Abort any in-flight STT at id ≤ the arriving one (a continuation reuses
             // its id, so this covers the re-STT-the-whole-utterance case), then spawn.
             if let Some(f) = state.in_flight.take() {
@@ -616,18 +699,46 @@ async fn handle_listener(
             // would narrate inference that never ran on a daemon that announced
             // `stt_absent` at startup. The stamp below is taken regardless — it
             // measures the listener → pipeline hop, which is real either way.
-            if transcriber.is_some() {
+            // What the transcriber will actually be handed, so the line names the
+            // clip rather than the carve: `samples` stays the pre-trim carve length.
+            let stt_trim_samples = utterance.wake.map_or(0, |w| w.stt_trim_samples);
+            // A boundary past the carve is a listener bug and cannot happen from a
+            // wake arm; `stt_sent_from` clamps rather than panicking, and this is
+            // the line that keeps the clamp from being silent when it does.
+            if stt_trim_samples > utterance.pcm.len() {
+                jsonl.emit(
+                    "stt_trim_out_of_range",
+                    &json!({
+                        "pod": pod.0,
+                        "utterance_seq": uid.seq,
+                        "stt_trim_samples": stt_trim_samples,
+                        "samples": utterance.pcm.len(),
+                    }),
+                );
+            }
+            let sent_from = transcriber
+                .is_some()
+                .then(|| stt_sent_from(wake_word, stt_trim_samples, utterance.pcm.len()));
+            if let Some(sent_from) = sent_from {
                 jsonl.emit(
                     "stt_started",
                     &json!({
                         "pod": pod.0,
                         "utterance_seq": uid.seq,
                         "samples": utterance.pcm.len(),
+                        "sent_from_sample": sent_from,
                     }),
                 );
             }
             let stt_started = HostMicros::now();
-            let abort = spawn_stt(pod.clone(), nonce, utterance, transcriber.cloned(), done_tx);
+            let abort = spawn_stt(
+                pod.clone(),
+                nonce,
+                utterance,
+                transcriber.cloned(),
+                sent_from,
+                done_tx,
+            );
             state.in_flight = Some(InFlight {
                 id: uid,
                 nonce,
@@ -750,6 +861,51 @@ async fn handle_listener(
                 &json!({ "pod": pod.0, "utterance_id": utterance_id }),
             );
         }
+        ListenerEvent::WakeHeld {
+            pod,
+            epoch,
+            start_sample,
+            end_sample,
+            wake_end_sample,
+            deadline_sample,
+        } => {
+            // The wake word arrived without its command yet and the listener is
+            // waiting. Nothing is dispatched and no brain hears of it — the turn is
+            // still open, and resolves as a published utterance or as `arm_expired`.
+            jsonl.emit(
+                "wake_held",
+                &json!({
+                    "pod": pod.0,
+                    "start_sample": start_sample,
+                    "end_sample": end_sample,
+                    "wake_end_sample": wake_end_sample,
+                    "deadline_sample": deadline_sample,
+                }),
+            );
+            let state = pods.entry(pod.clone()).or_default();
+            if !state.adopt_epoch(epoch) {
+                return; // Stale: a reconnect superseded this epoch.
+            }
+            // Past the epoch check because the arm touches per-pod state and the
+            // `Unanswered` it eventually sends is not a no-op against a live turn.
+            // With no scripter wired (replay, brainless tuning) nothing is armed:
+            // there is no head to release, and a wall-clock timer over a replay that
+            // runs faster than real time would be a fiction.
+            if scripter.is_some() {
+                let wait = Duration::from_millis(
+                    deadline_sample.saturating_sub(end_sample) / crate::config::SAMPLES_PER_MS,
+                );
+                // Receipt lands a soft hangover plus transport latency after
+                // `end_sample`, so this instant is later than the listener's own
+                // deadline: where audio keeps arriving, `ArmExpired` fires first and
+                // cancels it. A refreshed hold overwrites the entry with its later
+                // deadline.
+                state.hold_release = Some(HoldRelease {
+                    at: tokio::time::Instant::now() + wait,
+                    deadline_sample,
+                });
+            }
+        }
         ListenerEvent::ArmExpired {
             pod,
             wake,
@@ -767,6 +923,11 @@ async fn handle_listener(
                     "end_sample": end_sample,
                 }),
             );
+            // The hold resolved on the listener's clock, so the head's wall-clock
+            // release is not needed: the `Unanswered` below is the one it gets.
+            if let Some(state) = pods.get_mut(&pod) {
+                state.hold_release = None;
+            }
             // The usual false-positive-wake path: the head goes back down a
             // linger after this, and it does so with or without a brain wired.
             if let Some(scripter) = scripter {
@@ -795,6 +956,19 @@ async fn handle_listener(
     }
 }
 
+/// Where transcription starts inside a carved utterance: the listener's
+/// wake-trim boundary under `Trim`, the head of the carve under `Keep`. The
+/// boundary is carve-relative and must not exceed the carved PCM; clamp
+/// defensively — an empty tail beats a panic that would take the whole pipeline
+/// loop down over one utterance. Callers must report a boundary past the carve on
+/// their own line; otherwise the clamp is silent.
+fn stt_sent_from(mode: WakeWordInStt, stt_trim_samples: usize, pcm_len: usize) -> usize {
+    match mode {
+        WakeWordInStt::Keep => 0,
+        WakeWordInStt::Trim => stt_trim_samples.min(pcm_len),
+    }
+}
+
 /// Spawn the speculative STT for a carved utterance, returning its abort handle.
 /// When no transcriber is wired the task reports a null-transcript completion, so
 /// the dispatch path (supersede, gate, brain) is one shape regardless of STT.
@@ -803,6 +977,7 @@ fn spawn_stt(
     nonce: u64,
     utterance: CarvedUtterance,
     transcriber: Option<Arc<dyn Transcriber>>,
+    sent_from: Option<usize>,
     done_tx: &mpsc::UnboundedSender<SttDone>,
 ) -> AbortHandle {
     let CarvedUtterance {
@@ -811,7 +986,6 @@ fn spawn_stt(
         start_sample,
         end_sample,
         wake,
-        stt_trim_samples,
         cause,
         barge_in,
         timing,
@@ -826,6 +1000,7 @@ fn spawn_stt(
         // rides through so the mint on the far side can chain the interrupted turns.
         barge_in,
         timing,
+        sent_from,
     };
     let done_tx = done_tx.clone();
     let handle = tokio::spawn(async move {
@@ -837,17 +1012,7 @@ fn spawn_stt(
         let outcome = std::panic::AssertUnwindSafe(async {
             match transcriber {
                 None => None,
-                Some(t) => {
-                    // `stt_trim_samples` is carve-relative and must not exceed the
-                    // carved PCM; clamp defensively (an empty tail beats a panic)
-                    // and assert the invariant loudly in debug.
-                    debug_assert!(
-                        stt_trim_samples <= pcm.len(),
-                        "stt_trim_samples exceeds carved PCM length",
-                    );
-                    let trim = stt_trim_samples.min(pcm.len());
-                    Some(transcribe_pcm(&t, &pcm[trim..]).await)
-                }
+                Some(t) => Some(transcribe_pcm(t.as_ref(), &pcm[sent_from.unwrap_or(0)..]).await),
             }
         })
         .catch_unwind()
@@ -1002,6 +1167,8 @@ async fn handle_stt_done(
         &UtteranceLine {
             utterance: &utterance,
             stt_elapsed_us,
+            stt_trim_samples: utterance.wake.map(|w| w.stt_trim_samples),
+            stt_sent_from_sample: done.carve.sent_from,
         },
     );
 
@@ -1282,36 +1449,6 @@ fn assembled_to_tracking_us(t: &StageTimings, clamps: &AtomicU64) -> Option<u64>
     stage_delta_us(t.assembled, t.tracking_emitted, clamps)
 }
 
-/// Drive a transcriber's stream to completion for one PCM buffer, returning the
-/// settled [`Transcript`] or the terminal error. A stream ending with neither a
-/// final event nor an error is an implementation bug, reported as `Decode`.
-async fn transcribe_pcm(
-    transcriber: &Arc<dyn Transcriber>,
-    pcm: &[i16],
-) -> Result<Transcript, TranscribeError> {
-    let audio = SegmentAudio {
-        pcm: Arc::from(pcm),
-        sample_rate_hz: SPINE_FORMAT.sample_rate_hz,
-    };
-    let mut stream = transcriber.transcribe(audio);
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(event) => {
-                if event.is_final {
-                    return Ok(Transcript {
-                        text: event.text,
-                        confidence: event.confidence,
-                    });
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(TranscribeError::Decode(
-        "stream ended without a final event".into(),
-    ))
-}
-
 /// The `stt_failed` JSONL line: identity plus the truncated error detail and the
 /// locally-measured elapsed time of the failed attempt.
 #[derive(Serialize)]
@@ -1327,11 +1464,19 @@ struct SttFailedLine<'a> {
 /// the utterance type, so it rides on the line rather than in `StageTimings`
 /// (which carries the completion *receipt* as `transcribed`; the two differ by
 /// the completion-queue delay). `null` unless STT succeeded.
+/// `stt_trim_samples` and `stt_sent_from_sample` are carve-relative sample
+/// offsets: the wake-trim boundary the listener computed (`null` with no wake),
+/// and where transcription actually began (`null` with no transcriber wired).
+/// They differ whenever the wake word is kept in the clip. `Utterance.wake` is
+/// skipped by the type's own `Serialize`, so a dispatched turn's line carries the
+/// boundary only because it is restated here.
 #[derive(Serialize)]
 struct UtteranceLine<'a> {
     #[serde(flatten)]
     utterance: &'a Utterance,
     stt_elapsed_us: Option<u64>,
+    stt_trim_samples: Option<usize>,
+    stt_sent_from_sample: Option<usize>,
 }
 
 /// The `tracking` JSONL line: the full `TrackingEvent` flattened in, plus the
@@ -1347,13 +1492,15 @@ struct TrackingLine<'a> {
 mod tests {
     use super::*;
     use futures::FutureExt;
+    use futures::StreamExt;
     use futures::future::BoxFuture;
     use futures::stream::BoxStream;
     use serde_json::Value;
     use speech_pipeline::{
         CarveTiming, DropOldestQueue, EndpointState, EndpointTransition, InterruptProgress,
-        ScoreSummary, SegmentEndCause, SegmentEndInfo, SpeakBody, StatsFlushCause, StatsModel,
-        TranscriptConfidence, TranscriptEvent, TransitionCause, TurnEnd, WakeConfirmation,
+        ScoreSummary, SegmentAudio, SegmentEndCause, SegmentEndInfo, SpeakBody, StatsFlushCause,
+        StatsModel, TranscriptConfidence, TranscriptEvent, TransitionCause, TurnEnd,
+        WakeConfirmation,
     };
     use std::sync::Mutex;
 
@@ -1394,11 +1541,16 @@ mod tests {
             start_sample: start,
             end_sample: end,
             wake,
-            stt_trim_samples: 0,
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
             timing: CarveTiming::default(),
         }
+    }
+
+    /// A wake-gated carve, the shape the listener produces for a scored accept:
+    /// the wake provenance carries the trim boundary.
+    fn carved_trimmed(seq: u64, start: u64, end: u64, wake: WakeConfirmation) -> CarvedUtterance {
+        carved(seq, start, end, Some(wake))
     }
 
     /// Re-stamp a carve onto `epoch`, for a test that drives a reconnect.
@@ -1441,7 +1593,10 @@ mod tests {
     }
 
     fn segment_at_epoch(seg: Segment, epoch: u64) -> PipelineItem {
-        PipelineItem::Segment { seg, epoch }
+        PipelineItem::Segment {
+            seg: Box::new(seg),
+            epoch,
+        }
     }
 
     /// Write a `pod-x` sidecar into `store` holding one `Ungated` entry per
@@ -1558,6 +1713,27 @@ mod tests {
         }
     }
 
+    /// A transcriber that takes wall-clock time to answer, so a case can hold an
+    /// STT in flight while the clock runs.
+    struct SlowTranscriber(Duration);
+    impl Transcriber for SlowTranscriber {
+        fn transcribe(
+            &self,
+            _audio: SegmentAudio,
+        ) -> BoxStream<'static, Result<TranscriptEvent, TranscribeError>> {
+            let delay = self.0;
+            futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                Ok(TranscriptEvent {
+                    text: "late".into(),
+                    is_final: true,
+                    confidence: None,
+                })
+            })
+            .boxed()
+        }
+    }
+
     fn conf(no_speech_prob: f32, avg_logprob: f32) -> TranscriptConfidence {
         TranscriptConfidence {
             avg_logprob,
@@ -1575,6 +1751,7 @@ mod tests {
         events: Arc<Mutex<Vec<BrainEvent>>>,
         stats: Arc<BrainStats>,
         barge: Option<(Arc<TurnLedger>, FlushFn)>,
+        wake_word: WakeWordInStt,
         nudges: Arc<Mutex<NudgeLog>>,
         scripter: Option<ScriptHandle>,
         turn_end: TurnEnd,
@@ -1588,6 +1765,7 @@ mod tests {
                 transcriber: None,
                 brain: false,
                 confidence_gate: ConfidenceGate::OFF,
+                wake_word: WakeWordInStt::Trim,
                 events: Arc::new(Mutex::new(Vec::new())),
                 stats: Arc::new(BrainStats::default()),
                 barge: None,
@@ -1625,6 +1803,10 @@ mod tests {
             self.transcriber = Some(Arc::new(t));
             self
         }
+        fn wake_word(mut self, mode: WakeWordInStt) -> Harness {
+            self.wake_word = mode;
+            self
+        }
         fn brain(mut self) -> Harness {
             self.brain = true;
             self
@@ -1643,14 +1825,24 @@ mod tests {
             self
         }
 
+        /// Run the pipeline over `items` to the end of its queue.
         async fn run(self, items: Vec<PipelineItem>) -> (Vec<Value>, Vec<SpeakCmd>) {
+            self.start(items).await.finish().await
+        }
+
+        /// Start the pipeline over `items` with the queue's sender still open, so a
+        /// case can feed more items or let the clock run before closing it. The
+        /// items are queued before the task is spawned, so a burst a case means to
+        /// overflow the sheddable lane sheds against the depth, not against the
+        /// reader's pace.
+        async fn start(self, items: Vec<PipelineItem>) -> RunningPipeline {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("events.jsonl");
             let (jsonl, writer_join) = crate::jsonl::spawn_quiet(&JsonlSink::File(path.clone()))
                 .await
                 .unwrap();
 
-            let (speak_tx, mut speak_rx) = fmpsc::channel::<SpeakCmd>(16);
+            let (speak_tx, speak_rx) = fmpsc::channel::<SpeakCmd>(16);
             let brain = if self.brain {
                 let sink = self.events.clone();
                 let events: BrainEventFn = Arc::new(move |e| sink.lock().unwrap().push(e));
@@ -1671,41 +1863,93 @@ mod tests {
             // The lane split comes off the item itself, so a new variant cannot
             // ride a lane here that it does not ride in the daemon.
             for item in items {
-                if item.is_control() {
-                    tx.send_reliable(item);
-                } else {
-                    tx.send_sheddable(item);
-                }
+                send_on_its_lane(&tx, item);
             }
-            drop(tx);
 
-            run(
-                rx,
-                PipelineCtx {
-                    record_dir: self.record_dir.clone(),
-                    clock_step_clamps: Arc::new(AtomicU64::new(0)),
-                    transcriber: self.transcriber.clone(),
-                    brain,
-                    confidence_gate: self.confidence_gate,
-                    barge: self
-                        .barge
-                        .map(|(ledger, flush)| BargeWiring { ledger, flush }),
-                    scripter: self.scripter.clone(),
-                },
-                jsonl.clone(),
-            )
-            .await
-            .unwrap();
-            drop(jsonl);
-            writer_join.await.unwrap();
+            let ctx = PipelineCtx {
+                record_dir: self.record_dir.clone(),
+                clock_step_clamps: Arc::new(AtomicU64::new(0)),
+                transcriber: self.transcriber.clone(),
+                brain,
+                confidence_gate: self.confidence_gate,
+                wake_word: self.wake_word,
+                barge: self
+                    .barge
+                    .map(|(ledger, flush)| BargeWiring { ledger, flush }),
+                scripter: self.scripter.clone(),
+            };
+            let loop_jsonl = jsonl.clone();
+            let join = tokio::task::spawn(async move {
+                run(rx, ctx, loop_jsonl).await.unwrap();
+            });
+            RunningPipeline {
+                tx: Some(tx),
+                join,
+                jsonl,
+                writer_join,
+                path,
+                speak_rx,
+                _dir: dir,
+            }
+        }
+    }
 
-            let lines = std::fs::read_to_string(&path)
+    fn send_on_its_lane(tx: &speech_pipeline::Sender<PipelineItem>, item: PipelineItem) {
+        if item.is_control() {
+            tx.send_reliable(item);
+        } else {
+            tx.send_sheddable(item);
+        }
+    }
+
+    /// A pipeline running with its queue still open, and the sinks its answers are
+    /// read out of when it ends.
+    struct RunningPipeline {
+        tx: Option<speech_pipeline::Sender<PipelineItem>>,
+        join: tokio::task::JoinHandle<()>,
+        jsonl: JsonlHandle,
+        writer_join: tokio::task::JoinHandle<()>,
+        path: PathBuf,
+        speak_rx: fmpsc::Receiver<SpeakCmd>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl RunningPipeline {
+        /// Feed one more item and let the loop take it, so what follows in the case
+        /// happens after it rather than beside it.
+        async fn feed(&mut self, item: PipelineItem) {
+            send_on_its_lane(self.tx.as_ref().expect("queue open"), item);
+            self.settle().await;
+        }
+
+        /// Move the paused clock forward and let anything that came due run.
+        async fn advance(&mut self, by: Duration) {
+            tokio::time::advance(by).await;
+            self.settle().await;
+        }
+
+        /// Hand the runtime enough turns for the pipeline task to reach its next
+        /// await on an empty queue.
+        async fn settle(&mut self) {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// Close the queue and collect what the run wrote and said.
+        async fn finish(mut self) -> (Vec<Value>, Vec<SpeakCmd>) {
+            drop(self.tx.take());
+            self.join.await.unwrap();
+            drop(self.jsonl);
+            self.writer_join.await.unwrap();
+
+            let lines = std::fs::read_to_string(&self.path)
                 .unwrap()
                 .lines()
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect();
             let mut cmds = Vec::new();
-            while let Ok(cmd) = speak_rx.try_recv() {
+            while let Ok(cmd) = self.speak_rx.try_recv() {
                 cmds.push(cmd);
             }
             (lines, cmds)
@@ -2228,6 +2472,7 @@ mod tests {
                 cause: EndpointCause::SoftEndpoint,
                 barge_in: false,
                 timing: CarveTiming::default(),
+                sent_from: Some(0),
             },
             result: Some(Ok(Transcript {
                 text: "stale".into(),
@@ -2509,6 +2754,7 @@ mod tests {
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
             timing: CarveTiming::default(),
+            sent_from: Some(0),
         };
         let connected = PodState {
             room: Some(RoomId("r-office".into())),
@@ -2788,6 +3034,123 @@ mod tests {
         assert_eq!(read.segments[0].wake, WakeClass::Positive);
     }
 
+    /// Transcribes to the length of the audio it was handed, so a test can read
+    /// off how much of a carve reached the transcriber.
+    struct LengthTranscriber;
+    impl Transcriber for LengthTranscriber {
+        fn transcribe(
+            &self,
+            audio: SegmentAudio,
+        ) -> BoxStream<'static, Result<TranscriptEvent, TranscribeError>> {
+            let text = audio.pcm.len().to_string();
+            futures::stream::once(async move {
+                Ok(TranscriptEvent {
+                    text,
+                    is_final: true,
+                    confidence: None,
+                })
+            })
+            .boxed()
+        }
+    }
+
+    /// A wake-gated carve under a `[stt]` config, run through both wake-word
+    /// modes: what the transcriber receives, and what the two lines say was sent.
+    async fn wake_word_mode_run(mode: WakeWordInStt) -> Vec<Value> {
+        let wake = WakeConfirmation {
+            score: 0.8,
+            wake_end_sample: 5_000,
+            stt_trim_samples: 4,
+        };
+        let mut h = Harness::new().wake_word(mode);
+        h.transcriber = Some(Arc::new(LengthTranscriber));
+        let (lines, _cmds) = h
+            .run(vec![soft_endpoint(carved_trimmed(1, 0, 16, wake))])
+            .await;
+        lines
+    }
+
+    /// `trim` (the default) cuts the wake word: the transcriber sees the carve
+    /// from the boundary, and both lines name the same offset.
+    #[tokio::test]
+    async fn trim_sends_the_carve_from_the_wake_boundary() {
+        let lines = wake_word_mode_run(WakeWordInStt::Trim).await;
+        let started = lines.iter().find(|l| l["event"] == "stt_started").unwrap();
+        assert_eq!(started["samples"], 16, "the carve, not the clip: {lines:?}");
+        assert_eq!(started["sent_from_sample"], 4, "{lines:?}");
+        let utt = lines.iter().find(|l| l["event"] == "utterance").unwrap();
+        assert_eq!(utt["stt_trim_samples"], 4, "{lines:?}");
+        assert_eq!(utt["stt_sent_from_sample"], 4, "{lines:?}");
+        assert_eq!(
+            utt["transcript"]["text"], "12",
+            "16 carved less 4: {lines:?}"
+        );
+    }
+
+    /// `keep` leaves it in: the whole carve is transcribed, and the boundary is
+    /// still computed and still logged — which is what an offline comparison of
+    /// the two variants reads.
+    #[tokio::test]
+    async fn keep_sends_the_whole_carve_and_still_logs_the_boundary() {
+        let lines = wake_word_mode_run(WakeWordInStt::Keep).await;
+        let started = lines.iter().find(|l| l["event"] == "stt_started").unwrap();
+        assert_eq!(started["sent_from_sample"], 0, "{lines:?}");
+        let utt = lines.iter().find(|l| l["event"] == "utterance").unwrap();
+        assert_eq!(utt["stt_trim_samples"], 4, "the boundary stands: {lines:?}");
+        assert_eq!(utt["stt_sent_from_sample"], 0, "{lines:?}");
+        assert_eq!(utt["transcript"]["text"], "16", "{lines:?}");
+    }
+
+    /// A trim boundary past the end of the carve cannot come from a wake arm, so
+    /// it is a listener bug. The pipeline neither panics nor eats it: the clip is
+    /// clamped empty, the turn still completes, and a line names both numbers.
+    #[tokio::test]
+    async fn a_boundary_past_the_carve_is_reported_and_clamped() {
+        let wake = WakeConfirmation {
+            score: 0.8,
+            wake_end_sample: 5_000,
+            stt_trim_samples: 40,
+        };
+        let mut h = Harness::new().wake_word(WakeWordInStt::Trim);
+        h.transcriber = Some(Arc::new(LengthTranscriber));
+        let (lines, _cmds) = h
+            .run(vec![soft_endpoint(carved_trimmed(1, 0, 16, wake))])
+            .await;
+        let out = lines
+            .iter()
+            .find(|l| l["event"] == "stt_trim_out_of_range")
+            .unwrap_or_else(|| panic!("the violation is reported: {lines:?}"));
+        assert_eq!(out["stt_trim_samples"], 40, "{lines:?}");
+        assert_eq!(out["samples"], 16, "{lines:?}");
+        let started = lines.iter().find(|l| l["event"] == "stt_started").unwrap();
+        assert_eq!(
+            started["sent_from_sample"], 16,
+            "clamped to the carve's end: {lines:?}"
+        );
+        let utt = lines.iter().find(|l| l["event"] == "utterance").unwrap();
+        assert_eq!(
+            utt["transcript"]["text"], "0",
+            "an empty clip, not a panic: {lines:?}"
+        );
+    }
+
+    /// With no transcriber there is no clip, so the line says so rather than
+    /// reporting an offset into audio nothing read.
+    #[tokio::test]
+    async fn no_transcriber_reports_a_null_sent_from() {
+        let wake = WakeConfirmation {
+            score: 0.8,
+            wake_end_sample: 5_000,
+            stt_trim_samples: 4,
+        };
+        let (lines, _cmds) = Harness::new()
+            .run(vec![soft_endpoint(carved_trimmed(1, 0, 16, wake))])
+            .await;
+        let utt = lines.iter().find(|l| l["event"] == "utterance").unwrap();
+        assert_eq!(utt["stt_trim_samples"], 4, "{lines:?}");
+        assert!(utt["stt_sent_from_sample"].is_null(), "{lines:?}");
+    }
+
     #[tokio::test]
     async fn arm_expired_emits_wake_command_absent() {
         // A "wake, no follow": the listener's arm expired with no command. The
@@ -2906,6 +3269,267 @@ mod tests {
         assert_eq!(lines[0]["score"], f64::from(0.8_f32));
         assert_eq!(lines[0]["start_sample"], 0);
         assert_eq!(lines[0]["end_sample"], 16);
+    }
+
+    /// A wake-only carve the listener is holding: `end_sample` is its speech end
+    /// and the wake end with it, the start a preroll-padded half second earlier,
+    /// and `deadline_sample` where the listener's wait runs out.
+    fn wake_held(epoch: u64, end_sample: u64, deadline_sample: u64) -> PipelineItem {
+        PipelineItem::Listener(ListenerEvent::WakeHeld {
+            pod: pod(),
+            epoch,
+            start_sample: end_sample.saturating_sub(8_000),
+            end_sample,
+            wake_end_sample: end_sample,
+            deadline_sample,
+        })
+    }
+
+    #[tokio::test]
+    async fn wake_held_traces_the_wait_and_dispatches_nothing() {
+        let h = Harness::new().brain();
+        let events_seen = h.events.clone();
+        let (lines, cmds) = h.run(vec![wake_held(2, 15_360, 79_360)]).await;
+        assert!(cmds.is_empty(), "a held wake dispatches nothing");
+        assert!(
+            events_seen.lock().unwrap().is_empty(),
+            "and tells the brain nothing yet"
+        );
+        assert_eq!(lines.len(), 1, "the wait is traced: {lines:?}");
+        assert_eq!(lines[0]["event"], "wake_held");
+        assert_eq!(lines[0]["pod"], "pod-x");
+        assert_eq!(lines[0]["start_sample"], 7_360);
+        assert_eq!(lines[0]["end_sample"], 15_360);
+        assert_eq!(lines[0]["wake_end_sample"], 15_360);
+        assert_eq!(lines[0]["deadline_sample"], 79_360);
+    }
+
+    /// A bare wake in a room that then goes quiet: the listener keeps its hold and
+    /// hears no more audio to resolve it with, so the head comes down on the wall
+    /// clock instead of waiting for the room's next sound.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_wake_with_nothing_after_it_settles_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        // 8_000 samples of wait: 500 ms at the spine rate.
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![wake_detected(1, 15_360), wake_held(1, 15_360, 23_360)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())]
+        );
+        let released: Vec<&Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "wake_hold_released")
+            .collect();
+        assert_eq!(released.len(), 1, "the release is traced once: {lines:?}");
+        assert_eq!(released[0]["pod"], "pod-x");
+        assert_eq!(
+            released[0]["deadline_sample"], 23_360,
+            "joined to its wake_held: {lines:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The listener resolving the hold itself is the ordinary case: the head
+    /// settles on `arm_expired`, and the timer that would have said the same thing
+    /// is cancelled rather than saying it twice.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_wake_the_listener_expires_settles_the_head_once() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![wake_detected(1, 15_360), wake_held(1, 15_360, 23_360)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(100)).await;
+        run.feed(PipelineItem::Listener(ListenerEvent::ArmExpired {
+            pod: pod(),
+            wake: WakeConfirmation {
+                score: 0.8,
+                wake_end_sample: 15_360,
+                stt_trim_samples: 0,
+            },
+            start_sample: 7_360,
+            end_sample: 15_360,
+        }))
+        .await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())]
+        );
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "the listener answered first: {lines:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The command arrived: the hold was consumed, the turn is live, and nothing
+    /// tells the head the wake went unanswered.
+    #[tokio::test(start_paused = true)]
+    async fn a_consumed_hold_does_not_release_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![wake_detected(1, 15_360), wake_held(1, 15_360, 23_360)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(100)).await;
+        run.feed(soft_endpoint(carved(1, 7_360, 23_360, None)))
+            .await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+
+        let inputs = script_inputs(handle, rx).await;
+        assert!(
+            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            "the wake was answered: {inputs:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "{lines:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A continuation extends the wake-only carve, so the listener refreshes the
+    /// hold with a later deadline; the head's release moves with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_refreshed_hold_moves_its_release() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, mut rx) = crate::scripter::channel(jsonl.clone());
+        // 500 ms of wait, then a refresh carrying 1500 ms.
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![
+                wake_detected(1, 15_360),
+                wake_held(1, 15_360, 23_360),
+                wake_held(1, 16_000, 40_000),
+            ])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(1_000)).await;
+        let mut seen = Vec::new();
+        while let Some(input) = rx.try_recv() {
+            seen.push(input);
+        }
+        assert!(
+            !seen.contains(&ScriptInput::Unanswered(pod())),
+            "past the first deadline, which no longer governs: {seen:?}"
+        );
+        run.advance(Duration::from_millis(1_000)).await;
+        let (lines, _) = run.finish().await;
+
+        seen.extend(script_inputs(handle, rx).await);
+        assert_eq!(
+            seen,
+            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l["event"] == "wake_hold_released")
+                .count(),
+            1,
+            "released once, on the refreshed deadline: {lines:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A replay or a brainless tuning run: no head to release, and a wall-clock
+    /// timer over audio replayed faster than real time would be a fiction.
+    #[tokio::test(start_paused = true)]
+    async fn no_scripter_arms_no_release() {
+        let mut run = Harness::new()
+            .start(vec![wake_detected(1, 15_360), wake_held(1, 15_360, 23_360)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "{lines:?}"
+        );
+    }
+
+    /// A straggler from a superseded connection: its release would send an
+    /// `Unanswered` against whatever the live connection is doing, so it arms
+    /// nothing. The line it writes is accounting, and stays.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_wake_held_arms_nothing() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![wake_detected(2, 15_360), wake_held(1, 15_360, 23_360)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod())]
+        );
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l["event"] == "wake_held"),
+            "the straggler is still traced: {lines:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The queue closing ends the wait: no further listener event can resolve the
+    /// hold, and the loop is down to its in-flight STT. That STT is what keeps the
+    /// loop alive here — a run that ends the moment the queue does would state
+    /// nothing about a standing release — and under a paused clock the wait it
+    /// spends is auto-advanced through, so a release that survived the close would
+    /// fire inside it.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_queue_drops_a_standing_hold_release() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        // Six seconds of wait behind a transcription that takes ten.
+        let mut h = Harness::new().scripter(handle.clone());
+        h.transcriber = Some(Arc::new(SlowTranscriber(Duration::from_secs(10))));
+        let (lines, _) = h
+            .run(vec![
+                wake_detected(1, 15_360),
+                soft_endpoint(carved(1, 0, 16, None)),
+                wake_held(1, 15_360, 111_360),
+            ])
+            .await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod())]
+        );
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "{lines:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
     }
 
     #[tokio::test]

@@ -131,7 +131,7 @@ const CHUNK_SAMPLES: u64 = 512;
 impl Default for EndpointerConfig {
     fn default() -> EndpointerConfig {
         // Tuned defaults (framelog replay rig): onset 0.5, release 0.35, onset
-        // ~96 ms, soft hangover 250 ms, continuation 1000 ms, preroll 500 ms,
+        // ~96 ms, soft hangover 256 ms, continuation 992 ms, preroll 500 ms,
         // max utterance 60 s (the shipped segment cap). ms→chunk at 32 ms/chunk.
         EndpointerConfig {
             onset_thresh: 0.5,
@@ -239,6 +239,15 @@ impl Endpointer {
     /// device release is a missed-release fallback vs. a missed-onset carve.
     pub fn utterance_in_progress(&self) -> bool {
         !matches!(self.state, State::Idle { .. })
+    }
+
+    /// Whether the FSM is idle *and* counting no onset run — nothing at all is in
+    /// flight. Stricter than [`utterance_in_progress`](Endpointer::utterance_in_progress):
+    /// speech that has begun but not yet held long enough to confirm an onset leaves
+    /// the FSM in `Idle`, and a caller timing something out against "no speech" has
+    /// to see that speech.
+    pub fn fully_idle(&self) -> bool {
+        matches!(self.state, State::Idle { onset_run: 0, .. })
     }
 
     /// Feed one Silero chunk. `p` is P(speech); `chunk_end_sample` is the absolute
@@ -486,6 +495,23 @@ mod tests {
             }
         }
         out
+    }
+
+    /// `fully_idle` is the stricter of the two idleness questions: a building onset
+    /// run is speech the FSM has seen but not yet confirmed, and a caller timing
+    /// something out against "no speech at all" has to see it.
+    #[test]
+    fn a_building_onset_run_is_idle_but_not_fully_idle() {
+        let mut ep = Endpointer::new(test_config());
+        assert!(ep.fully_idle(), "nothing has been fed");
+        ep.push(0.9, CHUNK_SAMPLES); // one of the two chunks an onset needs
+        assert!(
+            !ep.utterance_in_progress(),
+            "no utterance yet — the run is still building"
+        );
+        assert!(!ep.fully_idle(), "but the speech that began is visible");
+        ep.push(0.1, 2 * CHUNK_SAMPLES); // the run lapses
+        assert!(ep.fully_idle(), "and gone again once it lapses");
     }
 
     /// Onset requires `onset_chunks` consecutive high chunks; a low chunk resets

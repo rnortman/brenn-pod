@@ -10,7 +10,9 @@
 //! carved back as silence — never as a splice that shifts every later sample.
 //!
 //! Capacity bounds the retained *stored* samples (gaps cost nothing); the oldest
-//! audio is evicted first. Sized by the listener to `max_utterance + preroll_pad`.
+//! audio is evicted first. Sized by the listener to `max_utterance + preroll_pad`,
+//! plus the wake hold's `wake_tail + command_wait` (and the allowance a held start
+//! may reach back by), so a coalesced carve is never padded from the head.
 //!
 //! Pushes may *overlap* retained audio: a transport segment's preroll is stamped
 //! with the samples' original capture indexes, so a segment opening less than one

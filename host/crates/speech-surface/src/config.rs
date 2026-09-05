@@ -18,7 +18,8 @@ use audio_pipeline::playback::{
 use audio_pipeline::wire::MAX_AUDIO_PAYLOAD;
 use serde::Deserialize;
 use speech_pipeline::{
-    ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, FRAME_MS, PacerConfig, Url,
+    ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, FRAME_MS, ListenerConfig,
+    PacerConfig, Url,
 };
 
 use crate::psk::parse_psk_hex;
@@ -29,8 +30,9 @@ use crate::psk::parse_psk_hex;
 /// this factor (defaults convert chunk→ms; [`EndpointerConfig::to_listener`] the
 /// other way).
 const SILERO_CHUNK_MS: u32 = 32;
-/// Samples per millisecond at the 16 kHz spine rate — the preroll ms↔sample bridge.
-const SAMPLES_PER_MS: u64 = 16;
+/// Samples per millisecond at the 16 kHz spine rate — the ms↔sample bridge for the
+/// preroll and for the `[wake]` timing knobs (which `replay` converts).
+pub(crate) const SAMPLES_PER_MS: u64 = 16;
 
 /// Room name used for a pod absent from the `[pods]` map.
 pub const UNMAPPED_ROOM: &str = "unmapped";
@@ -499,7 +501,10 @@ impl PlaybackConfig {
 }
 
 /// Wake-gate configuration. A present `[wake]` table names an explicit `mode`
-/// and all three model paths.
+/// and all three model paths, and may tune what happens in the moments after a
+/// wake fires. The two timing knobs live here rather than on `[endpointer]`
+/// because they describe the wake's own aftermath; the endpointer stays wake-free
+/// and endpoints every utterance at the same speed.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WakeConfig {
@@ -517,13 +522,45 @@ pub struct WakeConfig {
     /// Sigmoid score above which a segment wakes. Must be in `(0.0, 1.0)`.
     #[serde(default = "default_wake_threshold")]
     pub threshold: f32,
+    /// An utterance whose speech ends within this many ms of the wake end held the
+    /// wake word alone: it is not sent to STT, and the wake waits for its command.
+    /// At least one Silero chunk (32 ms).
+    #[serde(default = "default_wake_tail_ms")]
+    pub wake_tail_ms: u32,
+    /// How long the wake waits, after a wake-only utterance, for the command to
+    /// start. The command is then transcribed together with the wake word and the
+    /// pause, as one utterance. `0` turns the wait off: a wake-only utterance goes
+    /// to STT on its own and a command after the pause is dropped as unwaked.
+    ///
+    /// The effective wait is never shorter than `[endpointer] continuation_window_ms`:
+    /// the wait ends only once the endpointer has gone fully idle, which that window
+    /// gates. A smaller non-zero value here buys nothing.
+    #[serde(default = "default_command_wait_ms")]
+    pub command_wait_ms: u32,
 }
 
 impl WakeConfig {
-    /// Semantic checks: all three model paths are present, and `threshold` is a
-    /// strict probability. Path presence/validity beyond "specified" is the
-    /// gate's own load-time concern.
+    /// The two hold knobs as the listener's sample counts — the one ms→samples
+    /// funnel for `[wake]`. Answers `(wake_tail_samples, command_wait_samples)`.
+    pub fn hold_to_listener(&self) -> (u64, u64) {
+        (
+            u64::from(self.wake_tail_ms) * SAMPLES_PER_MS,
+            u64::from(self.command_wait_ms) * SAMPLES_PER_MS,
+        )
+    }
+
+    /// Semantic checks: all three model paths are present, `threshold` is a strict
+    /// probability, and `wake_tail_ms` spans at least one Silero chunk (a shorter
+    /// window cannot be observed, since speech ends are only known per chunk).
+    /// `command_wait_ms` takes any value, `0` meaning off. Path presence/validity
+    /// beyond "specified" is the gate's own load-time concern.
     pub fn validate(&self) -> Result<(), String> {
+        if self.wake_tail_ms < SILERO_CHUNK_MS {
+            return Err(format!(
+                "wake.wake_tail_ms {} must be at least one Silero chunk ({SILERO_CHUNK_MS} ms)",
+                self.wake_tail_ms
+            ));
+        }
         if !(self.threshold > 0.0 && self.threshold < 1.0) {
             return Err(format!(
                 "wake.threshold {} must be in the open interval (0.0, 1.0)",
@@ -917,6 +954,10 @@ pub struct SttConfig {
     /// cleanly than `no_speech_prob`, so an operator opts in per install.
     #[serde(default)]
     pub avg_logprob_min: Option<f32>,
+    /// Whether the wake word stays in the clip handed to the transcriber.
+    /// `"trim"` cuts it (leaving a margin); `"keep"` sends the whole carve.
+    #[serde(default)]
+    pub wake_word: WakeWordInStt,
 }
 
 impl SttConfig {
@@ -959,6 +1000,20 @@ impl SttConfig {
         }
         Ok(())
     }
+}
+
+/// Whether the leading wake word is cut out of the audio the transcriber sees.
+/// The trim boundary is computed by the listener either way and logged either
+/// way; this only decides whether it is applied, so a run's records say what was
+/// sent and an offline comparison can re-transcribe the other variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeWordInStt {
+    /// Drop everything before the wake end, less a margin.
+    #[default]
+    Trim,
+    /// Send the whole carve, wake word included.
+    Keep,
 }
 
 /// Which transcriber implementation the daemon builds at startup.
@@ -1202,6 +1257,15 @@ fn default_max_segment_seconds() -> u64 {
 }
 fn default_wake_threshold() -> f32 {
     0.5
+}
+// The `[wake]` timing defaults single-source from the listener's canonical
+// `ListenerConfig::default()` (sample-denominated), converting through
+// `SAMPLES_PER_MS`, so the two surfaces of one knob cannot drift.
+fn default_wake_tail_ms() -> u32 {
+    (ListenerConfig::default().wake_tail_samples / SAMPLES_PER_MS) as u32
+}
+fn default_command_wait_ms() -> u32 {
+    (ListenerConfig::default().command_wait_samples / SAMPLES_PER_MS) as u32
 }
 // The `[endpointer]` ms/threshold defaults single-source from the listener's
 // canonical `EndpointerConfig::default()` (chunk/sample-denominated), converting
@@ -1466,6 +1530,67 @@ threshold = 0.7
                 .expect("parse");
         assert_eq!(config.wake.as_ref().unwrap().threshold, 0.5);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn wake_hold_defaults_come_from_the_listener() {
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"")
+                .expect("parse");
+        let wake = config.wake.as_ref().expect("wake table");
+        assert_eq!(wake.wake_tail_ms, 1_500);
+        assert_eq!(wake.command_wait_ms, 8_000);
+        // The listener's samples are the single source; these are that value in ms.
+        let listener = ListenerConfig::default();
+        assert_eq!(
+            u64::from(wake.wake_tail_ms) * SAMPLES_PER_MS,
+            listener.wake_tail_samples
+        );
+        assert_eq!(
+            u64::from(wake.command_wait_ms) * SAMPLES_PER_MS,
+            listener.command_wait_samples
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn wake_hold_knobs_parse_and_zero_is_allowed() {
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\nwake_tail_ms = 750\ncommand_wait_ms = 0")
+                .expect("parse");
+        let wake = config.wake.as_ref().expect("wake table");
+        assert_eq!(wake.wake_tail_ms, 750);
+        assert_eq!(
+            wake.command_wait_ms, 0,
+            "0 is the escape hatch, not an error"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    /// The ms→samples conversion `ReplayListener::from_config` applies to the two
+    /// hold knobs. Parsing the ms and
+    /// behaving on the samples are tested apart; this is the join between them.
+    #[test]
+    fn wake_hold_ms_convert_to_the_listener_sample_counts() {
+        let config =
+            Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\nwake_tail_ms = 750\ncommand_wait_ms = 2000")
+                .expect("parse");
+        let wake = config.wake.as_ref().expect("wake table");
+        let (wake_tail_samples, command_wait_samples) = wake.hold_to_listener();
+        assert_eq!(wake_tail_samples, 12_000, "750 ms at 16 kHz");
+        assert_eq!(command_wait_samples, 32_000, "2000 ms at 16 kHz");
+    }
+
+    #[test]
+    fn wake_tail_shorter_than_a_silero_chunk_rejected() {
+        for bad in ["0", "31"] {
+            let config = Config::parse(&format!(
+                "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\nwake_tail_ms = {bad}"
+            ))
+            .expect("parse");
+            let err = config.validate().unwrap_err();
+            assert!(err.contains("wake_tail_ms"), "wake_tail_ms {bad}: {err}");
+        }
     }
 
     #[test]
@@ -2117,6 +2242,32 @@ voice = "af_heart"
         assert_eq!(gate.no_speech_max, 0.35);
         assert_eq!(gate.avg_logprob_min, Some(-0.9));
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn stt_wake_word_defaults_to_trim_and_parses_both_modes() {
+        let base = "[stt]\nbackend = \"http\"\nurl = \"http://h:8000\"\nmodel = \"m\"";
+        let config = Config::parse(&with_addr(base)).expect("parse");
+        assert_eq!(
+            config.stt.as_ref().unwrap().wake_word,
+            WakeWordInStt::Trim,
+            "today's behaviour is the default"
+        );
+        for (text, want) in [("trim", WakeWordInStt::Trim), ("keep", WakeWordInStt::Keep)] {
+            let config = Config::parse(&with_addr(&format!("{base}\nwake_word = \"{text}\"")))
+                .expect("parse");
+            assert_eq!(config.stt.as_ref().unwrap().wake_word, want);
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn stt_rejects_unknown_wake_word_mode() {
+        let err = Config::parse(&with_addr(
+            "[stt]\nbackend = \"http\"\nurl = \"http://h:8000\"\nmodel = \"m\"\nwake_word = \"strip\"",
+        ))
+        .expect_err("unknown mode");
+        assert!(err.to_string().contains("strip"), "message: {err}");
     }
 
     #[test]

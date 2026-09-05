@@ -193,9 +193,12 @@ impl ReplayListener {
         })?;
         let max_utterance_samples =
             config.pipeline.max_segment_seconds * u64::from(SPINE_FORMAT.sample_rate_hz);
+        let (wake_tail_samples, command_wait_samples) = wake.hold_to_listener();
         let listener_config = ListenerConfig {
             oww_threshold: wake.threshold,
             endpointer: endpointer.to_listener(max_utterance_samples),
+            wake_tail_samples,
+            command_wait_samples,
             ..ListenerConfig::default()
         };
         Ok(Some(ReplayListener::new(oww, silero, listener_config)))

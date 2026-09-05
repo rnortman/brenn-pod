@@ -149,14 +149,11 @@ pub struct CarvedUtterance {
     pub end_sample: u64,
     /// Wake provenance for a wake-gated utterance; `None` under `Bypass`.
     pub wake: Option<WakeConfirmation>,
-    /// Leading samples the pipeline cuts before STT (wake end − margin, relative to
-    /// `pcm`; `0` when no wake).
-    pub stt_trim_samples: usize,
     /// Why this utterance's audio ends where it does.
     pub cause: EndpointCause,
     /// This utterance is the speech that barged in on active playback: it passed
     /// the wake gate on the barge-in trigger rather than on a wake arm, so `wake`
-    /// is `None` and `stt_trim_samples` is 0 (there is no wake word to trim).
+    /// is `None` and nothing is trimmed (there is no wake word to trim).
     pub barge_in: bool,
     /// Host-receipt stamps for this utterance's audio, from t0 to the carve.
     pub timing: CarveTiming,
@@ -206,6 +203,28 @@ pub enum ListenerEvent {
     UtteranceClosed {
         pod: PodId,
         utterance_id: ListenerUtteranceId,
+    },
+    /// A wake-gated utterance ended within a wake-tail of the wake end, so it held
+    /// the wake word and nothing else: it is not published, the arm is kept, and the
+    /// listener waits until `deadline_sample` for the command to onset. The
+    /// utterance that follows inside the wait is carved from `start_sample`, so one
+    /// utterance carries wake word, pause and command.
+    ///
+    /// Purely the accounting for that decision — the interaction is still open, so
+    /// nothing downstream acts on it. A hold resolves either into an ordinary
+    /// `SoftEndpoint` or into [`ListenerEvent::ArmExpired`].
+    WakeHeld {
+        pod: PodId,
+        epoch: u64,
+        /// Absolute start of the held (and of the eventual coalesced) carve.
+        start_sample: u64,
+        /// Absolute end of the held carve's speech.
+        end_sample: u64,
+        /// Absolute index one past the wake phrase, as the arm recorded it.
+        wake_end_sample: u64,
+        /// `end_sample` plus the command wait: past this, with the endpointer idle,
+        /// the wake was a bare wake.
+        deadline_sample: u64,
     },
     /// An armed wake was cleared without any utterance passing the policy — a
     /// "wake, no follow": the wake fired but no command followed (the transport

@@ -9,6 +9,30 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **The wake word now waits for its command.** Saying "Hey Jarvis", pausing, and
+  then speaking used to send the wake word alone to speech-to-text and drop the
+  command that followed — the utterance closed a second after the wake word, and
+  the command arrived with no wake to gate it. An utterance that holds nothing
+  but the wake word is now kept back, and the next thing said within eight seconds
+  is transcribed together with it as one utterance — including when the pause was
+  long enough that the microphone stopped sending in the middle of it. Endpointing
+  everywhere else is unchanged, so a conversational reply is no slower. Two new
+  `[wake]` knobs tune it: `wake_tail_ms` (how much speech after the wake word
+  makes it a command, default 1500) and `command_wait_ms` (how long to wait,
+  default 8000; `0` restores the old behaviour). A wake that is never followed is
+  still reported as a wake with no command, and a new `wake_held` log line records
+  every wait. The head does not wait out a quiet room with it: a wake nothing
+  follows settles the head once the wait is up on the host's own clock, whether or
+  not the room has made another sound, and a `wake_hold_released` line records it.
+- **Wake-word trim is now a config switch.** `[stt] wake_word = "trim"` (the
+  default, preserving today's behaviour) cuts the wake word out of the clip
+  before transcription; `"keep"` sends the whole carve. The `utterance` log
+  line now reports both the listener's trim boundary and the sample offset
+  actually sent, so an offline comparison can re-transcribe the other variant
+  from the same recording.
+- `transcribe_pcm` is now a public helper in `speech-pipeline`, so downstream
+  tools can drain a transcriber stream without reimplementing the final-event
+  settle logic.
 - Reachy robot voice pipeline support! You can now run the speech in/out on a
   Reachy Mini Wireless robot.
 - Reachy acknowledges the wake word by raising its head, then stows it when the

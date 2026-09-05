@@ -1005,6 +1005,13 @@ impl Server {
                     .as_ref()
                     .map(SttConfig::confidence_gate)
                     .unwrap_or(ConfidenceGate::OFF),
+                // Absent `[stt]` means no transcriber, so the mode is moot; take
+                // the default rather than inventing a second no-STT meaning.
+                wake_word: config
+                    .stt
+                    .as_ref()
+                    .map(|stt| stt.wake_word)
+                    .unwrap_or_default(),
                 // Barge-in needs a listener to detect it and a writer to cut, so it
                 // is wired exactly when detection is: the same condition the
                 // playback fan-out above uses.
@@ -2905,9 +2912,10 @@ fn finalize_segment(
         },
     );
 
-    if let Some(displaced) =
-        item_tx.send_sheddable(crate::pipeline::PipelineItem::Segment { seg, epoch })
-    {
+    if let Some(displaced) = item_tx.send_sheddable(crate::pipeline::PipelineItem::Segment {
+        seg: Box::new(seg),
+        epoch,
+    }) {
         // The sheddable count, not the total queued: a reader of either line
         // below takes `depth` to mean "how full the segment budget was", so it
         // is never above `pipeline.segment_queue_depth` and never inflated by
@@ -7966,7 +7974,12 @@ mod tests {
         let end = SegmentEndInfo::new(SegmentEndCause::VadRelease, false, 0, None);
         let displaced_id = 1;
         seg_tx.send_sheddable(crate::pipeline::PipelineItem::Segment {
-            seg: crate::test_support::segment(displaced_id, 16, vec![], end.clone()),
+            seg: Box::new(crate::test_support::segment(
+                displaced_id,
+                16,
+                vec![],
+                end.clone(),
+            )),
             epoch: 1,
         });
         for i in 0..9 {

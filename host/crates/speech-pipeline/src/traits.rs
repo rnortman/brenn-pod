@@ -23,10 +23,12 @@ use std::sync::Arc;
 use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use futures::stream::StreamExt;
 use serde::Serialize;
 
 use crate::types::{
-    InterruptProgress, PodId, SpeakCmd, TranscriptConfidence, Utterance, UtteranceId,
+    InterruptProgress, PodId, SPINE_FORMAT, SpeakCmd, Transcript, TranscriptConfidence, Utterance,
+    UtteranceId,
 };
 
 /// The PCM handed to a `Transcriber`: the segment's samples plus their rate.
@@ -161,6 +163,38 @@ pub trait Transcriber: Send + Sync {
     ) -> BoxStream<'static, Result<TranscriptEvent, TranscribeError>>;
 }
 
+/// Drive a transcriber's stream to completion for one PCM buffer, returning the
+/// settled [`Transcript`] or the terminal error. The stream contract ends the
+/// stream at the first `is_final` event, so that event is the answer; a stream
+/// ending with neither it nor an error is an implementation bug, reported as
+/// `Decode`.
+pub async fn transcribe_pcm(
+    transcriber: &dyn Transcriber,
+    pcm: &[i16],
+) -> Result<Transcript, TranscribeError> {
+    let audio = SegmentAudio {
+        pcm: Arc::from(pcm),
+        sample_rate_hz: SPINE_FORMAT.sample_rate_hz,
+    };
+    let mut stream = transcriber.transcribe(audio);
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(event) => {
+                if event.is_final {
+                    return Ok(Transcript {
+                        text: event.text,
+                        confidence: event.confidence,
+                    });
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(TranscribeError::Decode(
+        "stream ended without a final event".into(),
+    ))
+}
+
 /// Text in → chunked PCM out.
 pub trait Synthesizer: Send + Sync {
     fn synthesize(&self, text: &str) -> BoxStream<'static, Result<PcmChunk, SynthesisError>>;
@@ -222,6 +256,92 @@ mod tests {
     use super::*;
     use crate::types::{PodId, SpeakBody, StageTimings};
     use futures::{FutureExt, StreamExt};
+
+    /// Answers with a scripted stream, for the shared drain's own tests.
+    struct Scripted(Vec<Result<TranscriptEvent, TranscribeError>>);
+
+    impl Transcriber for Scripted {
+        fn transcribe(
+            &self,
+            _audio: SegmentAudio,
+        ) -> BoxStream<'static, Result<TranscriptEvent, TranscribeError>> {
+            let events: Vec<_> = self
+                .0
+                .iter()
+                .map(|item| match item {
+                    Ok(event) => Ok(event.clone()),
+                    Err(e) => Err(clone_error(e)),
+                })
+                .collect();
+            futures::stream::iter(events).boxed()
+        }
+    }
+
+    /// [`TranscribeError`] is not `Clone`, and a scripted stream has to hand out
+    /// the same error on every call. Faithful per variant, so a test can assert the
+    /// drain passed the transcriber's own error through rather than one it made up.
+    fn clone_error(e: &TranscribeError) -> TranscribeError {
+        match e {
+            TranscribeError::Connect(s) => TranscribeError::Connect(s.clone()),
+            TranscribeError::Timeout => TranscribeError::Timeout,
+            TranscribeError::Status { code, body } => TranscribeError::Status {
+                code: *code,
+                body: body.clone(),
+            },
+            TranscribeError::Decode(s) => TranscribeError::Decode(s.clone()),
+        }
+    }
+
+    fn event(text: &str, is_final: bool) -> Result<TranscriptEvent, TranscribeError> {
+        Ok(TranscriptEvent {
+            text: text.to_owned(),
+            is_final,
+            confidence: None,
+        })
+    }
+
+    #[test]
+    fn the_drain_settles_on_the_first_final_event() {
+        let scripted = Scripted(vec![
+            event("partial", false),
+            event("settled", true),
+            event("after the end", true),
+        ]);
+        let transcript = transcribe_pcm(&scripted, &[0i16; 4])
+            .now_or_never()
+            .expect("the scripted stream never pends")
+            .expect("a final event is a transcript");
+        assert_eq!(transcript.text, "settled");
+    }
+
+    #[test]
+    fn a_stream_with_no_final_event_is_an_implementation_bug() {
+        let scripted = Scripted(vec![event("partial", false)]);
+        let error = transcribe_pcm(&scripted, &[0i16; 4])
+            .now_or_never()
+            .expect("the scripted stream never pends")
+            .expect_err("no final event is no transcript");
+        assert!(
+            matches!(error, TranscribeError::Decode(_)),
+            "reported as a decode failure: {error}"
+        );
+    }
+
+    /// A stream that fails carries the transcriber's own error to the caller —
+    /// the timeout stays a timeout, and is not laundered into the `Decode` the
+    /// no-final-event case synthesizes.
+    #[test]
+    fn a_failing_stream_reports_the_error_it_produced() {
+        let scripted = Scripted(vec![Err(TranscribeError::Timeout), event("late", true)]);
+        let error = transcribe_pcm(&scripted, &[0i16; 4])
+            .now_or_never()
+            .expect("the scripted stream never pends")
+            .expect_err("a failed stream is no transcript");
+        assert!(
+            matches!(error, TranscribeError::Timeout),
+            "the stream's own error, not a synthesized one: {error}"
+        );
+    }
 
     // Trivial implementations proving the traits are object-safe and their
     // signatures compile as declared.

@@ -722,6 +722,14 @@ impl ScriptInbox {
     pub(crate) async fn recv(&mut self) -> Option<ScriptInput> {
         self.rx.recv().await
     }
+
+    /// What is queued right now, without waiting for more. For a test reading the
+    /// taps partway through a run, where waiting would mean waiting for the input
+    /// the case says has not been sent.
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Option<ScriptInput> {
+        self.rx.try_recv().ok()
+    }
 }
 
 /// Build the input queue.
