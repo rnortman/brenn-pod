@@ -19,7 +19,7 @@ use audio_pipeline::wire::MAX_AUDIO_PAYLOAD;
 use serde::Deserialize;
 use speech_pipeline::{
     ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, FRAME_MS, ListenerConfig,
-    PacerConfig, Url,
+    PacerConfig, Url, WakePolicy,
 };
 
 use crate::psk::parse_psk_hex;
@@ -202,6 +202,19 @@ impl Config {
             return Err(
                 "a [brenn] table requires brain.mode = \"brenn\" (nothing else \
                  dials the bus, so the table would be read by nothing)"
+                    .to_string(),
+            );
+        }
+        // A bypassing gate sends every utterance in the room to the brain, and the
+        // bus brain hands each one to a harness that acts on it: a daemon that
+        // looks healthy and answers everything anyone says near it.
+        if self.brain.as_ref().map(|brain| brain.mode) == Some(BrainMode::Brenn)
+            && self.wake.as_ref().map(|wake| wake.policy) == Some(WakePolicyConfig::Bypass)
+        {
+            return Err(
+                "wake.policy = \"bypass\" with brain.mode = \"brenn\" publishes every \
+                 utterance in the room on the bus (gate the wake, or name a brain \
+                 that answers locally)"
                     .to_string(),
             );
         }
@@ -510,6 +523,11 @@ impl PlaybackConfig {
 pub struct WakeConfig {
     /// Selects the gate implementation.
     pub mode: WakeMode,
+    /// Whether the gate this `mode` builds decides what reaches STT, or every
+    /// utterance is forwarded regardless of it. Distinct from `mode`: the gate
+    /// is built and scored either way, so wake detections are still reported.
+    #[serde(default)]
+    pub policy: WakePolicyConfig,
     /// openWakeWord mel-spectrogram model. Required.
     #[serde(default)]
     pub melspectrogram: Option<PathBuf>,
@@ -678,6 +696,40 @@ impl EndpointerConfig {
 pub enum WakeMode {
     /// openWakeWord over `ort`.
     Oww,
+}
+
+/// Which utterances the wake gate lets through to STT.
+///
+/// `bypass` forwards every utterance with no wake word — a recording or
+/// labelling run. The gate is still built and its detections still reported;
+/// only the forwarding decision changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WakePolicyConfig {
+    /// An utterance reaches STT only when an armed wake covers it.
+    #[default]
+    Gated,
+    /// Every utterance reaches STT, wake or no wake.
+    Bypass,
+}
+
+impl WakePolicyConfig {
+    /// The listener's runtime `WakePolicy`.
+    pub fn to_listener(self) -> WakePolicy {
+        match self {
+            WakePolicyConfig::Gated => WakePolicy::WakeGated,
+            WakePolicyConfig::Bypass => WakePolicy::Bypass,
+        }
+    }
+
+    /// The configured policy as a stable label — `"gated"` or `"bypass"` — for
+    /// the `daemon_start` event and its console header line.
+    pub fn label(self) -> &'static str {
+        match self {
+            WakePolicyConfig::Gated => "gated",
+            WakePolicyConfig::Bypass => "bypass",
+        }
+    }
 }
 
 /// Brain configuration. A present `[brain]` table names an explicit `mode`;
@@ -1355,6 +1407,19 @@ fn default_brenn_failure_message() -> String {
     "Sorry, something's not working right now.".to_string()
 }
 
+/// A config text whose `[wake]` table is in the streaming listener's required
+/// form (`mode = "oww"` plus the three model paths) and whose `[endpointer]`
+/// table is present, with `extra` appended to `[wake]`. The one copy of that
+/// literal for the tests of both this module and `replay`, so a new required
+/// `[wake]` key is added in one place. Returns the text rather than a parsed
+/// [`Config`] so a case whose `extra` is meant to be refused reads the error.
+#[cfg(test)]
+pub(crate) fn wake_table_toml(extra: &str) -> String {
+    format!(
+        "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\n{extra}\n[endpointer]\nmodel = \"/m/silero.onnx\"\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1613,6 +1678,94 @@ threshold = 0.7
         assert!(
             Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"magic\"").is_err()
         );
+    }
+
+    #[test]
+    fn wake_policy_parses_both_spellings() {
+        for (text, want) in [
+            ("policy = \"gated\"", WakePolicyConfig::Gated),
+            ("policy = \"bypass\"", WakePolicyConfig::Bypass),
+        ] {
+            let config = Config::parse(&wake_table_toml(text)).expect("parse");
+            assert_eq!(config.wake.as_ref().expect("wake table").policy, want);
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn wake_policy_defaults_gated() {
+        let config = Config::parse(&wake_table_toml("")).expect("parse");
+        assert_eq!(
+            config.wake.as_ref().expect("wake table").policy,
+            WakePolicyConfig::Gated
+        );
+    }
+
+    #[test]
+    fn wake_policy_rejects_a_third_value() {
+        let err = Config::parse(&wake_table_toml("policy = \"open\"")).unwrap_err();
+        let message = err.to_string();
+        // "policy" alone would also appear if the key did not exist at all
+        // (`deny_unknown_fields`) and in the echoed source span. These two
+        // substrings appear only in the unknown-variant error, and the second is
+        // what makes the refusal fixable.
+        assert!(
+            message.contains("unknown variant"),
+            "refused as a variant, not as an unknown key: {message}"
+        );
+        assert!(
+            message.contains("gated") && message.contains("bypass"),
+            "the message names the legal spellings: {message}"
+        );
+    }
+
+    /// The bus brain acts on what it is handed, so bypassing the gate in front of
+    /// it is a daemon that answers the whole room. Refused with both keys named.
+    #[test]
+    fn wake_bypass_with_the_bus_brain_is_rejected() {
+        let text = format!(
+            "{}{}{}",
+            wake_table_toml("policy = \"bypass\""),
+            brenn_mode_tables(),
+            brenn_table("")
+        );
+        let err = Config::parse(&text).expect("parse").validate().unwrap_err();
+        assert!(
+            err.contains("wake.policy") && err.contains("brain.mode"),
+            "both keys named: {err}"
+        );
+        // The same pair with the gate left on, and the same bypass under the
+        // parrot the recording session runs, both stand.
+        assert!(
+            Config::parse(&format!(
+                "{}{}{}",
+                wake_table_toml("policy = \"gated\""),
+                brenn_mode_tables(),
+                brenn_table("")
+            ))
+            .expect("parse")
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            Config::parse(&format!(
+                "{}[brain]\nmode = \"echo\"\n{STT_TTS_TABLES}",
+                wake_table_toml("policy = \"bypass\"")
+            ))
+            .expect("parse")
+            .validate()
+            .is_ok()
+        );
+    }
+
+    /// The wire spelling maps to the listener's runtime policy, and labels itself
+    /// for the startup record.
+    #[test]
+    fn wake_policy_converts_and_labels() {
+        assert_eq!(WakePolicyConfig::Gated.to_listener(), WakePolicy::WakeGated);
+        assert_eq!(WakePolicyConfig::Bypass.to_listener(), WakePolicy::Bypass);
+        assert_eq!(WakePolicyConfig::Gated.label(), "gated");
+        assert_eq!(WakePolicyConfig::Bypass.label(), "bypass");
     }
 
     #[test]

@@ -105,7 +105,7 @@ pub struct EndpointTransition {
 /// Endpointer timing/threshold knobs. Chunk-count fields are in Silero chunks
 /// (512 samples / 32 ms); sample fields are absolute-index deltas. Design-time
 /// defaults ([`Default`]) are tuned on framelog replay.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EndpointerConfig {
     /// P(speech) at/above which a chunk counts toward onset (and resume).
     pub onset_thresh: f32,

@@ -191,6 +191,25 @@ async fn shutdown_signal(jsonl: jsonl::JsonlHandle) {
     }
 }
 
+/// The `daemon_start` fields: what this run is configured to be, in the first
+/// line of its event log. Extracted so the key spellings the console narrates
+/// are pinned by a test that needs no bound port and no model files —
+/// `wake_policy` in particular, whose `"bypass"` is the one value that changes
+/// what the daemon answers.
+fn daemon_start_fields(config: &Config) -> serde_json::Value {
+    json!({
+        "listen_addr": config.listen_addr.to_string(),
+        "record_enabled": config.record.enabled,
+        "record_dir": config.record.dir.display().to_string(),
+        "max_connections": config.max_connections,
+        "jsonl_sink": config.jsonl.sink.label(),
+        "wake_policy": config
+            .wake
+            .as_ref()
+            .map_or("none", |wake| wake.policy.label()),
+    })
+}
+
 /// Open the JSONL sink, bind and run the server until `shutdown` resolves, then
 /// drain the sink. `shutdown` is a factory, not a bare future: it is handed a
 /// live [`jsonl::JsonlHandle`] clone once the sink is open, so the signal path
@@ -213,16 +232,7 @@ where
     .context("opening JSONL sink")?;
 
     let config = Arc::new(config);
-    jsonl.emit(
-        "daemon_start",
-        &json!({
-            "listen_addr": config.listen_addr.to_string(),
-            "record_enabled": config.record.enabled,
-            "record_dir": config.record.dir.display().to_string(),
-            "max_connections": config.max_connections,
-            "jsonl_sink": config.jsonl.sink.label(),
-        }),
-    );
+    jsonl.emit("daemon_start", &daemon_start_fields(&config));
 
     let server = Server::bind(config.clone(), jsonl.clone())
         .await
@@ -399,10 +409,43 @@ mod tests {
             has_event(&contents, "daemon_start"),
             "daemon_start emitted: {contents}"
         );
+        assert_eq!(
+            event_field(&contents, "daemon_start", "wake_policy"),
+            Some(serde_json::json!("none")),
+            "the emitted line carries the policy field, here with no [wake] table: {contents}"
+        );
         assert!(
             has_event(&contents, "stage_health"),
             "final stage_health emitted: {contents}"
         );
+    }
+
+    /// The three readings of the startup line's `wake_policy`, over the map the
+    /// daemon actually emits. The console narrates this key by name, so the
+    /// spelling is pinned here rather than by a literal in one place.
+    #[test]
+    fn daemon_start_reports_the_wake_policy() {
+        let wake_table = |policy: &str| {
+            format!(
+                "[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\n\
+                 embedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\n{policy}"
+            )
+        };
+        for (table, want) in [
+            (String::new(), "none"),
+            (wake_table(""), "gated"),
+            (wake_table("policy = \"gated\"\n"), "gated"),
+            (wake_table("policy = \"bypass\"\n"), "bypass"),
+        ] {
+            let text =
+                format!("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n{table}");
+            let config = Config::parse(&text).expect("parse");
+            assert_eq!(
+                daemon_start_fields(&config)["wake_policy"],
+                serde_json::json!(want),
+                "policy line: {table:?}"
+            );
+        }
     }
 
     /// The shutdown seam is a factory handed a live `JsonlHandle`: an event
@@ -489,6 +532,17 @@ mod tests {
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .any(|v| v["event"] == event)
+    }
+
+    /// One field of the first `event` line in a JSONL file, `None` when either the
+    /// line or the field is absent — so a renamed key fails the assertion rather
+    /// than passing as a missing line.
+    fn event_field(contents: &str, event: &str, field: &str) -> Option<serde_json::Value> {
+        contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["event"] == event)
+            .and_then(|v| v.get(field).cloned())
     }
 
     #[test]

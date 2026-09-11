@@ -536,6 +536,11 @@ fn narrate_brain_clip(fields: &Value) -> String {
 /// `(off)`, and the events destination is the configured JSONL sink label
 /// (`none` / `stdout` / path). Each field degrades to `?` when absent or the
 /// wrong type; the `max_connections` field is left to the file stream.
+///
+/// A bypassing wake policy adds a clause of its own: it is the one startup
+/// switch that makes a healthy-looking daemon answer everything said in the
+/// room, so the header says so where the incident starts. Gating is the
+/// default and stays silent.
 fn narrate_daemon_start(fields: &Value) -> String {
     let listen = fmt_str(fields.get("listen_addr"));
     let record = fmt_str(fields.get("record_dir"));
@@ -545,9 +550,13 @@ fn narrate_daemon_start(fields: &Value) -> String {
         None => "?",
     };
     let sink = fmt_str(fields.get("jsonl_sink"));
-    format!(
+    let mut line = format!(
         "speech-surface starting — listen {listen}, record {record} ({enabled}), events → {sink}"
-    )
+    );
+    if fields.get("wake_policy").and_then(Value::as_str) == Some("bypass") {
+        line.push_str(", wake bypass: every utterance reaches STT with no wake word");
+    }
+    line
 }
 
 /// The resolved listen address as prose: `listening on 10.0.0.5:7380`. The
@@ -1336,6 +1345,25 @@ mod tests {
         assert!(
             bare.ends_with("listen ?, record ? (?), events → ?"),
             "{bare}"
+        );
+        let gated = r
+            .render(
+                0,
+                "daemon_start",
+                &json!({ "listen_addr": "10.0.0.5:7380", "wake_policy": "gated" }),
+            )
+            .unwrap();
+        assert!(!gated.contains("wake"), "{gated}");
+        let bypass = r
+            .render(
+                0,
+                "daemon_start",
+                &json!({ "listen_addr": "10.0.0.5:7380", "wake_policy": "bypass" }),
+            )
+            .unwrap();
+        assert!(
+            bypass.ends_with("wake bypass: every utterance reaches STT with no wake word"),
+            "{bypass}"
         );
     }
 

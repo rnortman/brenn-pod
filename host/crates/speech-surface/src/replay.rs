@@ -25,7 +25,7 @@ use speech_pipeline::{
     SegmentEndCause, SileroConfig, SileroModel, WakeError,
 };
 
-use crate::config::{Config, WakeMode};
+use crate::config::{Config, EndpointerConfig, WakeConfig, WakeMode};
 
 /// The listener's outer-boundary cause for a session close. The listener treats
 /// every device close as the same authoritative outer boundary (it does not
@@ -152,6 +152,23 @@ pub struct ReplayListener {
     config: ListenerConfig,
 }
 
+/// The per-pod [`ListenerConfig`] a `[wake]` + `[endpointer]` pair describes.
+fn listener_config(
+    wake: &WakeConfig,
+    endpointer: &EndpointerConfig,
+    max_utterance_samples: u64,
+) -> ListenerConfig {
+    let (wake_tail_samples, command_wait_samples) = wake.hold_to_listener();
+    ListenerConfig {
+        oww_threshold: wake.threshold,
+        endpointer: endpointer.to_listener(max_utterance_samples),
+        wake_tail_samples,
+        command_wait_samples,
+        default_policy: wake.policy.to_listener(),
+        ..ListenerConfig::default()
+    }
+}
+
 impl ReplayListener {
     /// Build from already-loaded models and a per-pod config.
     pub fn new(oww: OwwModels, silero: SileroModel, config: ListenerConfig) -> ReplayListener {
@@ -193,14 +210,7 @@ impl ReplayListener {
         })?;
         let max_utterance_samples =
             config.pipeline.max_segment_seconds * u64::from(SPINE_FORMAT.sample_rate_hz);
-        let (wake_tail_samples, command_wait_samples) = wake.hold_to_listener();
-        let listener_config = ListenerConfig {
-            oww_threshold: wake.threshold,
-            endpointer: endpointer.to_listener(max_utterance_samples),
-            wake_tail_samples,
-            command_wait_samples,
-            ..ListenerConfig::default()
-        };
+        let listener_config = listener_config(wake, endpointer, max_utterance_samples);
         Ok(Some(ReplayListener::new(oww, silero, listener_config)))
     }
 
@@ -332,4 +342,55 @@ fn drive(
         }
     }
     Ok(fatal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::wake_table_toml;
+    use speech_pipeline::WakePolicy;
+
+    /// Every knob the assembly sets lands in its own field. The two ms values are
+    /// mutually distinguishable on purpose: the sample counts arrive as a tuple,
+    /// so equal values would hide a swapped destructuring — and the live daemon
+    /// is built through this same function.
+    #[test]
+    fn listener_config_carries_every_wake_and_endpointer_knob() {
+        let config = Config::parse(&wake_table_toml(
+            "threshold = 0.42\nwake_tail_ms = 750\ncommand_wait_ms = 2000",
+        ))
+        .expect("parse");
+        let wake = config.wake.as_ref().expect("wake table");
+        let endpointer = config.endpointer.as_ref().expect("endpointer table");
+        let built = listener_config(wake, endpointer, 16_000);
+        assert_eq!(built.oww_threshold, 0.42, "the configured wake threshold");
+        assert_eq!(built.wake_tail_samples, 12_000, "750 ms at 16 kHz");
+        assert_eq!(built.command_wait_samples, 32_000, "2000 ms at 16 kHz");
+        assert_eq!(
+            built.endpointer,
+            endpointer.to_listener(16_000),
+            "the endpointer sub-config is that table's own conversion"
+        );
+    }
+
+    /// The mapping half this module owns: a parsed `[wake] policy` reaches the
+    /// listener config the replay and the live daemon are both built from. The
+    /// spellings themselves are `config`'s to test.
+    #[test]
+    fn configured_policy_reaches_the_listener_config() {
+        for (extra, want) in [
+            ("policy = \"bypass\"", WakePolicy::Bypass),
+            ("policy = \"gated\"", WakePolicy::WakeGated),
+            ("", WakePolicy::WakeGated),
+        ] {
+            let config = Config::parse(&wake_table_toml(extra)).expect("parse");
+            let wake = config.wake.as_ref().expect("wake table");
+            let endpointer = config.endpointer.as_ref().expect("endpointer table");
+            assert_eq!(
+                listener_config(wake, endpointer, 16_000).default_policy,
+                want,
+                "policy line: {extra:?}"
+            );
+        }
+    }
 }

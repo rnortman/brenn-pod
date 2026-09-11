@@ -9,6 +9,15 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **A pod can forward every utterance, wake word or not.** `[wake] policy =
+  "bypass"` sends every utterance to speech-to-text and to the brain with no
+  wake word required — a recording or labelling run, where saying the wake word
+  before each label is the thing in the way. The default, `"gated"`, is today's
+  behaviour: an utterance reaches speech-to-text only when an armed wake covers
+  it. The wake gate is still built and scored under either policy, so wake
+  detections are still reported, and the startup header says when a daemon is
+  bypassing. Bypassing alongside the bus brain is refused at startup: that pair
+  would publish every word said in the room to the harness.
 - **The wake word now waits for its command.** Saying "Hey Jarvis", pausing, and
   then speaking used to send the wake word alone to speech-to-text and drop the
   command that followed — the utterance closed a second after the wake word, and

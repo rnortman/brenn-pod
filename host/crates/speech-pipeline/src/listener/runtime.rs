@@ -852,9 +852,13 @@ impl ListenerState {
         // The `Idle` fallback carve is for a wake whose onset the endpointer
         // missed. A held wake was seen, carved and judged wake-only, so it gets no
         // second carve — it is reported below as the bare wake it turned out to be.
-        let armed_wake_end = match self.hold {
-            Some(_) => None,
-            None => self.wake.map(|a| a.wake_end_sample),
+        // Under `Bypass` there is no gate for the fallback to rescue an utterance
+        // from: the endpointer alone decides what is speech, and carving audio it
+        // judged silent because the wake model fired would mint an utterance out
+        // of a false positive. The arm is reported as the bare detection instead.
+        let armed_wake_end = match (self.policy, self.hold) {
+            (WakePolicy::Bypass, _) | (_, Some(_)) => None,
+            (_, None) => self.wake.map(|a| a.wake_end_sample),
         };
         let ev = self
             .endpointer
@@ -1016,7 +1020,24 @@ impl ListenerState {
                 let mut barge = std::mem::take(&mut self.barge_pending);
                 let mut start = start;
                 let wake = match self.policy {
-                    WakePolicy::Bypass => None,
+                    // An arm the utterance covers is consumed here as it is under
+                    // gating, even though it attaches to nothing: an utterance
+                    // this policy forwarded is the command that wake was waiting
+                    // for, and an arm left standing would expire later as a wake
+                    // no command followed. The window is the gated one, so a wake
+                    // that fired minutes earlier is not absorbed by whatever is
+                    // said next — it is still reported as the bare detection it
+                    // was.
+                    WakePolicy::Bypass => {
+                        let lo = start.saturating_sub(self.config.arm_slack_samples);
+                        if self
+                            .wake
+                            .is_some_and(|a| a.wake_end_sample >= lo && a.wake_end_sample <= end)
+                        {
+                            self.wake = None;
+                        }
+                        None
+                    }
                     WakePolicy::WakeGated => {
                         let hold = self.hold;
                         // A hold attaches its arm with no window check: the window
@@ -2641,6 +2662,106 @@ mod tests {
         let carved = soft_endpoints(&events);
         assert_eq!(carved.len(), 1, "bypass carves the utterance: {events:?}");
         assert!(carved[0].wake.is_none(), "bypass attaches no wake");
+    }
+
+    /// A forwarded utterance consumes the arm it covers under `Bypass` too, and
+    /// the segment close — the production driver of arm expiry — reports nothing
+    /// for it: no wake-with-no-command line about speech that was transcribed.
+    #[test]
+    fn bypass_consumes_the_arm() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::Bypass));
+        state.push_ring_for_test(0, &vec![5_i16; 4096]);
+        state.arm_wake_for_test(0.9, 500);
+        let mut cursor = 0u64;
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "bypass carves the utterance: {events:?}");
+        assert!(carved[0].wake.is_none(), "bypass attaches no wake");
+        assert!(
+            state.wake.is_none(),
+            "the forwarded utterance consumed the arm it covered"
+        );
+        events.extend(close_segment(&mut state, 4_096, &mut oww, &mut silero));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::ArmExpired { .. })),
+            "nothing expires across the carve and the close that follows it: {events:?}"
+        );
+        assert_eq!(
+            soft_endpoints(&events).len(),
+            1,
+            "and the close carves nothing further: {events:?}"
+        );
+    }
+
+    /// A wake the forwarded utterance does not cover survives it: a false positive
+    /// minutes earlier is not absorbed by whatever is said next, and the segment
+    /// close reports it as the bare detection it was.
+    #[test]
+    fn bypass_leaves_an_uncovered_arm_standing() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(ListenerConfig {
+            // A slack narrow enough that a few chunks of silence put the arm
+            // outside the window, which minutes of it would do at the default.
+            arm_slack_samples: 1_024,
+            ..synth_config(WakePolicy::Bypass)
+        });
+        state.push_ring_for_test(0, &vec![5_i16; 8_192]);
+        state.arm_wake_for_test(0.9, 100);
+        let mut cursor = 0u64;
+        let mut events = drive(&mut state, 0.1, 8, &mut cursor); // the room stays quiet
+        events.extend(drive(&mut state, 0.9, 2, &mut cursor)); // then someone speaks
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "bypass carves the utterance: {events:?}");
+        assert!(
+            state.wake.is_some(),
+            "the utterance is nowhere near the wake, so it takes no arm"
+        );
+        events.extend(close_segment(&mut state, cursor, &mut oww, &mut silero));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ListenerEvent::ArmExpired { .. }))
+                .count(),
+            1,
+            "the close reports the wake no command followed: {events:?}"
+        );
+        assert_eq!(
+            soft_endpoints(&events).len(),
+            1,
+            "and mints nothing from the stale arm: {events:?}"
+        );
+    }
+
+    /// The missed-onset fallback is a gated-path rescue. Under `Bypass` the
+    /// endpointer alone says what speech is, so a wake over silence carves no
+    /// utterance and is reported as the detection it was.
+    #[test]
+    fn bypass_carves_no_missed_onset_fallback() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::Bypass));
+        state.push_ring_for_test(0, &vec![5_i16; 8_192]);
+        state.arm_wake_for_test(0.9, 2_000);
+        let events = close_segment(&mut state, 8_192, &mut oww, &mut silero);
+        assert!(
+            soft_endpoints(&events).is_empty(),
+            "a false positive over silence mints nothing: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ListenerEvent::ArmExpired { .. }))
+                .count(),
+            1,
+            "it is reported as a wake no command followed: {events:?}"
+        );
     }
 
     /// A continuation reuses the utterance id and its wake provenance: soft
