@@ -66,11 +66,17 @@ RUN set -eu; \
 # system library the crate links. Each -dev package here has a runtime
 # counterpart on the device image; a link failure in this container is the
 # early form of a missing library there.
+#
+# git is the exception: nothing links it. The build-id crate's build script
+# shells out to it to stamp the commit and dirty flag of the mounted checkout
+# into the binary, and it panics rather than stamping a sentinel when git is
+# absent — so without it in here the payload does not compile at all.
 RUN set -eu; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends \
 		ca-certificates \
 		gcc \
+		git \
 		libasound2-dev \
 		libc6-dev \
 		libssl-dev \

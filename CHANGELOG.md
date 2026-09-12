@@ -58,6 +58,11 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   pod reads eleven post-processing registers and prints them periodically, so a
   fetched console says what the adaptive stages were doing during the utterance
   they degraded.
+- **The pod's startup line carries `build=`**, the first twelve hex digits of the
+  commit it was compiled from (plus `+dirty` when the tree had tracked edits).
+  The build script writes a `.build` sidecar beside the payload binary with the
+  full revision and a SHA-256 digest, so a downstream consumer can verify that
+  the artifact it stages matches the source it compiled.
 - **Connection announcements on the pipeline.** Each pod connection sends a
   `Connected` item carrying its room and frame-log path before its first segment
   closes, so the first utterance of a session is attributed to the right room and
@@ -91,6 +96,22 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Changed
 
+- **Playback events now distinguish "written to the device" from "heard to the
+  end".** The old `playback_finished` fired when the last frame was handed to
+  the device, up to a second before the audio played out. A new
+  `playback_written` marks that handoff; `playback_finished` now fires at the
+  pacer's estimate of the audible end. A third event, `playback_audible`, names
+  the job the speaker is playing right now (or silence), and the listener's
+  barge-in floor follows it directly instead of a timer. Barge-in at the tail of
+  a reply now cuts the audio instead of being rejected as stale, and the ledger
+  settles each job at the right instant.
+- **Speech heard over the pod's own playback is gated on STT confidence.** A
+  reply's residual leaking back through the mic used to reach the brain under
+  `[wake] policy = "bypass"`, because the echo never tripped the barge guard
+  and had no wake to gate it. The listener now latches whether any chunk of an
+  utterance overlapped the pod's playback floor, and the confidence gate
+  declines such a carve the same way it declines a hallucinated wake or barge.
+  New event: `echo_declined`; new counter: `echo_declined` in `stage_health`.
 - **The brenn bridge speaks wire version 4**, following the bus server's move
   there. A pod built before this bump cannot attach to a v4 server at all.
 - **Losing the bus no longer stops a voice pod.** A bridge that ends terminally
@@ -106,6 +127,13 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   guards against recurrence.
 - **TLS-PSK connect timeout cut from 10s to 3s.** These devices are LAN-only; a longer
   wait only delays an inevitable failure.
+- `barge_command_absent` and `echo_declined` now appear on the console alongside
+  `wake_command_absent`, so all three confidence-gate declines are visible during
+  a bench session.
+- `FeedPermit` and `reserve_marker` on the listener are crate-private again;
+  they were only used internally by the reliable-marker path inside `FeedSender`.
+- The floor-close generation timer in the playback fan-out is removed, replaced
+  by the pacer's own `Audible` event.
 
 ### Fixed
 

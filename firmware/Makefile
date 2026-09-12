@@ -81,6 +81,12 @@ check-host: check-host-arch
 # touches a pod is text processing, and a wrong answer there mis-files or duplicates a key
 # that exists nowhere else. No toolchain, no device, no network.
 	tools/provision-reachy-pod.test.sh
+# The payload build's build record — the commit, the dirty flag and the digest it
+# writes beside the binary — with the arm64 container stubbed. brenn-reachy's
+# payload build reads that record and refuses a pod whose record disagrees with
+# the checkout it compiled, so a record that stopped matching this tree breaks a
+# build in another repository and nothing here would have said so.
+	tools/build-reachy-pod.test.sh
 # The payload's deploy path, with ssh and rsync stubbed. The sharp one is the refusal that
 # keeps a pod-only payload off a robot: the store slot is shared, so an activation there
 # would replace a five-app stack with a binary that cannot move the machine.

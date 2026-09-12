@@ -36,6 +36,10 @@ const CONSOLE_INFO: &[&str] = &[
     "wake_decision",
     "wake_detected",
     "wake_command_absent",
+    // The other two ways the confidence gate declines a raise. Rate-bounded the
+    // same way: at most one per utterance.
+    "barge_command_absent",
+    "echo_declined",
     // A response accepted for the pending turn without its correlation marker:
     // benign by the reply policy, worth watching while a peer's habits settle.
     "brain_link_reply_assumed",
@@ -70,6 +74,8 @@ const CONSOLE_INFO: &[&str] = &[
     "synth",
     "playback_started",
     "latency_summary",
+    "playback_written",
+    "playback_audible",
     "playback_finished",
     "stage_health",
 ];
@@ -439,6 +445,8 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
         "utterance_closed" => Some(narrate_utterance_closed(fields)),
         "arm_expired" => Some(narrate_arm_expired(fields)),
         "wake_command_absent" => Some(narrate_wake_command_absent(fields)),
+        "barge_command_absent" => Some(narrate_barge_command_absent(fields)),
+        "echo_declined" => Some(narrate_echo_declined(fields)),
         "utterance" => Some(narrate_utterance(fields)),
         "segment_opened" => Some(narrate_segment_opened(fields)),
         "segment_closed" => Some(narrate_segment_closed(fields)),
@@ -448,6 +456,8 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
         "synth" => Some(narrate_synth(fields)),
         "playback_started" => Some(narrate_playback_started(fields)),
         "latency_summary" => Some(narrate_latency_summary(fields)),
+        "playback_written" => Some(narrate_playback_written(fields)),
+        "playback_audible" => Some(narrate_playback_audible(fields)),
         "playback_finished" => Some(narrate_playback_finished(fields)),
         "motion_script" => Some(narrate_motion_script(fields)),
         "presence_absent" => Some("head: unscripted".to_string()),
@@ -604,7 +614,41 @@ fn narrate_conn_hello(fields: &Value) -> String {
     format!("connected (conn {seq}){warn}")
 }
 
-/// Playback completion as prose:
+/// The last write of a playback as prose:
+/// `▪ playback written (reply to #3, 96 frames, EOA sent, 820 ms banked)`. The
+/// reply clause and the EOA phrase read as [`narrate_playback_finished`]'s;
+/// `banked_ms` is how much of the clip the device still holds unplayed at this
+/// instant, which is the gap between this line and the `playback_finished` that
+/// dates the audible end.
+fn narrate_playback_written(fields: &Value) -> String {
+    let frames = fmt_u64(fields.get("frames"));
+    let eoa = match fields.get("eoa_written").and_then(Value::as_bool) {
+        Some(true) => "EOA sent",
+        Some(false) => "no EOA",
+        None => "EOA ?",
+    };
+    let banked = fmt_u64(fields.get("banked_ms"));
+    let reply = reply_clause(fields.get("utterance"));
+    format!("\u{25aa} playback written ({reply}, {frames} frames, {eoa}, {banked} ms banked)")
+}
+
+/// What the pod is audibly playing, as prose: `\u{25aa} audible (reply to #3)`, or
+/// `\u{25aa} silent` when its bank has emptied. The line the barge-in floor follows,
+/// so it moves at hand-overs and re-writes no lifecycle line reports.
+fn narrate_playback_audible(fields: &Value) -> String {
+    if fields.get("active").and_then(Value::as_bool) != Some(true) {
+        return "\u{25aa} silent".to_string();
+    }
+    let reply = reply_clause(fields.get("utterance"));
+    let alert = match fields.get("interruptible").and_then(Value::as_bool) {
+        Some(false) => ", uninterruptible",
+        _ => "",
+    };
+    format!("\u{25aa} audible ({reply}{alert})")
+}
+
+/// Playback heard to its end as prose — the pacer's estimate of the audible end,
+/// which trails the last write by the audio the device still had banked:
 /// `■ playback finished (reply to #3, 96 frames, EOA sent)`, or with
 /// `unsolicited` in place of the reply clause for a playback that answers no
 /// utterance (a `null` `utterance` field). The EOA phrase degrades to `EOA ?`
@@ -842,15 +886,45 @@ fn fmt_f64(value: Option<&Value>, decimals: usize) -> String {
 fn narrate_wake_command_absent(fields: &Value) -> String {
     let id = fmt_u64(fields.get("utterance"));
     let score = fmt_score(fields.get("score"));
-    let cause = match fields.get("reason").and_then(Value::as_str) {
+    let cause = decline_cause(fields);
+    format!("utterance #{id} — wake, no command{cause} (score {score})")
+}
+
+/// A barge that cut the reply and then failed the confidence gate:
+/// `utterance #4 — barge, no command, low confidence no_speech=0.44
+/// logprob=-1.20`.
+fn narrate_barge_command_absent(fields: &Value) -> String {
+    let id = fmt_u64(fields.get("utterance"));
+    format!(
+        "utterance #{id} — barge, no command{}",
+        decline_cause(fields)
+    )
+}
+
+/// The robot answering its own voice, declined: `utterance #7 — over the pod's
+/// own playback, declined, low confidence no_speech=0.37 logprob=-0.90`.
+///
+/// On the console because the diagnosis is acoustic — mic gain, placement,
+/// ducking — and is made at the bench with this window open.
+fn narrate_echo_declined(fields: &Value) -> String {
+    let id = fmt_u64(fields.get("utterance"));
+    format!(
+        "utterance #{id} — over the pod's own playback, declined{}",
+        decline_cause(fields)
+    )
+}
+
+/// The confidence clause the gate's declines share, or nothing when the line
+/// carries no reason this renders.
+fn decline_cause(fields: &Value) -> String {
+    match fields.get("reason").and_then(Value::as_str) {
         Some("low_confidence") => {
             let no_speech = fmt_f64(fields.get("no_speech"), 2);
             let logprob = fmt_f64(fields.get("logprob"), 2);
             format!(", low confidence no_speech={no_speech} logprob={logprob}")
         }
         _ => String::new(),
-    };
-    format!("utterance #{id} — wake, no command{cause} (score {score})")
+    }
 }
 
 /// The wake verdict as prose: `✓ wake positive — score 0.874 ≥ 0.500 (infer
@@ -1580,6 +1654,51 @@ mod tests {
     }
 
     #[test]
+    fn the_other_two_declines_reach_the_console_with_their_numbers() {
+        // The gate declines three ways and the console showed one of them. An echo
+        // decline is the line that says the robot answered its own voice, and its
+        // diagnosis — gain, placement, ducking — is made at the bench with this
+        // window open, not by grepping JSONL afterwards.
+        let mut r = Renderer::new(false);
+        let echo = r
+            .render(
+                0,
+                "echo_declined",
+                &json!({
+                    "utterance": 7,
+                    "reason": "low_confidence", "no_speech": 0.37, "logprob": -0.9
+                }),
+            )
+            .unwrap();
+        assert!(
+            echo.ends_with(
+                "utterance #7 — over the pod's own playback, declined, low confidence \
+                 no_speech=0.37 logprob=-0.90"
+            ),
+            "{echo}"
+        );
+        assert!(!echo.contains("!!!"), "a calm line, not loud: {echo}");
+
+        let barge = r
+            .render(
+                0,
+                "barge_command_absent",
+                &json!({
+                    "utterance": 4,
+                    "reason": "low_confidence", "no_speech": 0.44, "logprob": -1.2
+                }),
+            )
+            .unwrap();
+        assert!(
+            barge.ends_with(
+                "utterance #4 — barge, no command, low confidence no_speech=0.44 \
+                 logprob=-1.20"
+            ),
+            "{barge}"
+        );
+    }
+
+    #[test]
     fn wake_command_absent_missing_reason_degrades_to_bare_line() {
         // A line with no `reason` key (an older replay, or a future/unknown reason)
         // renders the bare wake-no-command line rather than inventing a cause.
@@ -1692,6 +1811,99 @@ mod tests {
             .unwrap();
         assert!(line.ends_with("head: unscripted"), "{line}");
         assert!(!line.contains("!!!"), "a configuration is calm: {line}");
+    }
+
+    #[test]
+    fn playback_audible_narrates_the_floors_own_record() {
+        // The one line that dates a hand-over between replies or a clip re-written
+        // after a cut, and the bench's only view of what the listener's floor is
+        // doing. Read backwards — an inverted `active`, or the job fields leaking
+        // into a silence — it says the opposite of what happened.
+        let mut r = Renderer::new(false);
+        let alert = r
+            .render(
+                0,
+                "playback_audible",
+                &json!({
+                    "pod": "pod-a1b2c3", "active": true,
+                    "utterance": 3, "interruptible": false
+                }),
+            )
+            .unwrap();
+        assert!(
+            alert.ends_with("[pod-a1b2c3] \u{25aa} audible (reply to #3, uninterruptible)"),
+            "{alert}"
+        );
+        assert!(!alert.contains("!!!"), "the floor moving is calm: {alert}");
+
+        let bargeable = r
+            .render(
+                0,
+                "playback_audible",
+                &json!({ "active": true, "utterance": 4, "interruptible": true }),
+            )
+            .unwrap();
+        assert!(
+            bargeable.ends_with("\u{25aa} audible (reply to #4)"),
+            "{bargeable}"
+        );
+
+        // Silence names no job: the two null fields say nothing at all.
+        let silent = r
+            .render(
+                0,
+                "playback_audible",
+                &json!({ "active": false, "utterance": null, "interruptible": null }),
+            )
+            .unwrap();
+        assert!(silent.ends_with("\u{25aa} silent"), "{silent}");
+
+        let bare = r.render(0, "playback_audible", &json!({})).unwrap();
+        assert!(bare.ends_with("\u{25aa} silent"), "{bare}");
+    }
+
+    #[test]
+    fn playback_written_narrates_what_the_device_still_holds() {
+        let mut r = Renderer::new(false);
+        let line = r
+            .render(
+                0,
+                "playback_written",
+                &json!({
+                    "pod": "pod-a1b2c3", "utterance": 3, "frames": 96,
+                    "eoa_written": true, "banked_ms": 820
+                }),
+            )
+            .unwrap();
+        assert!(
+            line.ends_with(
+                "[pod-a1b2c3] \u{25aa} playback written (reply to #3, 96 frames, EOA sent, \
+                 820 ms banked)"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("!!!"), "{line}");
+
+        let no_eoa = r
+            .render(
+                0,
+                "playback_written",
+                &json!({ "utterance": null, "frames": 8, "eoa_written": false, "banked_ms": 0 }),
+            )
+            .unwrap();
+        assert!(
+            no_eoa.ends_with(
+                "\u{25aa} playback written (unsolicited, 8 frames, no EOA, 0 ms banked)"
+            ),
+            "{no_eoa}"
+        );
+
+        // Missing fields degrade to `?` rather than panicking.
+        let bare = r.render(0, "playback_written", &json!({})).unwrap();
+        assert!(
+            bare.ends_with("\u{25aa} playback written (reply to #?, ? frames, EOA ?, ? ms banked)"),
+            "{bare}"
+        );
     }
 
     #[test]
@@ -2734,6 +2946,7 @@ mod tests {
     /// that starts, or a `FileOnly` one that leaks to the console fails the test.
     const EVENTS: &[(&str, Class)] = &[
         ("arm_expired", Class::Calm),
+        ("barge_command_absent", Class::Calm),
         ("brain_absent", Class::Calm),
         ("brain_brenn", Class::Calm),
         ("brain_clip_loaded", Class::Calm),
@@ -2771,6 +2984,7 @@ mod tests {
         ("conn_superseded", Class::Calm),
         ("console_sink_failed", Class::Loud),
         ("daemon_start", Class::Calm),
+        ("echo_declined", Class::Calm),
         ("endpointer_transition", Class::Calm),
         ("model_stats", Class::Calm),
         ("jsonl_encode_error", Class::Loud),
@@ -2788,6 +3002,8 @@ mod tests {
         ("playback_rejected", Class::Loud),
         ("playback_router_exited", Class::Loud),
         ("playback_started", Class::Calm),
+        ("playback_written", Class::Calm),
+        ("playback_audible", Class::Calm),
         ("playback_writer_dead", Class::Loud),
         ("motion_script", Class::Calm),
         ("presence_absent", Class::Calm),

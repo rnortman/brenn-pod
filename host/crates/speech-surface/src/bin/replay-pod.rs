@@ -71,6 +71,14 @@ struct Cli {
         requires = "linger_until_eoa"
     )]
     linger_timeout_ms: u64,
+    /// After `--linger-until-eoa` releases on the `EndOfAudio`, hold the
+    /// connection open a further this many milliseconds before FIN, as a device
+    /// playing out its bank does: end-of-audio marks the end of the *stream*, not
+    /// the end of what the speaker has left to say. Without it a replay FINs
+    /// inside the playout window, which the daemon reads as losing the stream
+    /// mid-clip. Requires `--linger-until-eoa`; 0 (the default) is the old FIN.
+    #[arg(long, default_value_t = 0, requires = "linger_until_eoa")]
+    linger_playout_ms: u64,
     /// Frame logs to replay, in order. Each replays on its own TCP connection.
     #[arg(required = true)]
     framelogs: Vec<PathBuf>,
@@ -281,6 +289,29 @@ impl LingerSignal {
     }
 }
 
+/// The `--linger-until-eoa` policy for one connection: how long to wait for the
+/// daemon's playback `EndOfAudio`, and how long to hold the connection open after
+/// it arrives.
+#[derive(Debug, Clone, Copy)]
+struct Linger {
+    /// Liveness bound on the wait for `EndOfAudio`.
+    timeout: Duration,
+    /// Post-`EndOfAudio` hold, standing in for the device's playout of its bank.
+    playout_hold: Duration,
+}
+
+impl Linger {
+    /// A policy that waits for the `EndOfAudio` and FINs on it, holding nothing —
+    /// the shape every check that is not about the hold itself wants.
+    #[cfg(test)]
+    fn eoa_only(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            playout_hold: Duration::ZERO,
+        }
+    }
+}
+
 /// Per-connection linger result, present only when `--linger-until-eoa` reached
 /// the clean (`Done`) replay path; emitted on the `replay_log_done` line and
 /// folded into the run-level report.
@@ -481,7 +512,7 @@ fn replay_log(
     ctx: &SslContext,
     pace: Pace,
     max_gap: Option<Duration>,
-    linger: Option<Duration>,
+    linger: Option<Linger>,
 ) -> LogReplay {
     let log_name = path.display().to_string();
 
@@ -619,12 +650,20 @@ fn replay_log(
     // teardown never beats the async pipeline to the utterance. Only the `Done` path
     // lingers; every other exit already knows its outcome and FINs immediately.
     let linger_report = match (linger, &result) {
-        (Some(timeout), LogOutcome::Done) if drain.is_some() => {
+        (Some(policy), LogOutcome::Done) if drain.is_some() => {
             let wait_start = Instant::now();
-            Some(LingerReport {
-                outcome: linger_signal.wait(timeout),
+            let outcome = linger_signal.wait(policy.timeout);
+            // `waited_ms` measures the wait for the end-of-audio alone, so the
+            // playout hold is taken after the stamp: the two are different
+            // questions, and only the first one can time out.
+            let report = LingerReport {
+                outcome,
                 waited_ms: wait_start.elapsed().as_millis() as u64,
-            })
+            };
+            if matches!(outcome, LingerOutcome::Eoa) && !policy.playout_hold.is_zero() {
+                std::thread::sleep(policy.playout_hold);
+            }
+            Some(report)
         }
         // The linger path was reached on a clean replay, but the drain clone
         // failed at connect time — nothing can observe an `EndOfAudio`. Report
@@ -753,7 +792,7 @@ fn run_all(
     ctx: &SslContext,
     pace: Pace,
     max_gap: Option<Duration>,
-    linger: Option<Duration>,
+    linger: Option<Linger>,
 ) -> RunSummary {
     let mut codes: Vec<u8> = Vec::new();
     let mut total_frames = 0u64;
@@ -808,9 +847,10 @@ fn main() {
         }
     };
     let max_gap = cli.max_gap_ms.map(Duration::from_millis);
-    let linger = cli
-        .linger_until_eoa
-        .then(|| Duration::from_millis(cli.linger_timeout_ms));
+    let linger = cli.linger_until_eoa.then(|| Linger {
+        timeout: Duration::from_millis(cli.linger_timeout_ms),
+        playout_hold: Duration::from_millis(cli.linger_playout_ms),
+    });
 
     // Key and context first: a bad key file or identity is a usage error, and
     // must not cost a connection attempt to discover.
@@ -1329,6 +1369,7 @@ mod tests {
         assert_eq!(cli.max_gap_ms, None);
         assert!(!cli.linger_until_eoa);
         assert_eq!(cli.linger_timeout_ms, 30000);
+        assert_eq!(cli.linger_playout_ms, 0);
         assert_eq!(cli.framelogs, vec![PathBuf::from("a.framelog")]);
     }
 
@@ -1350,6 +1391,7 @@ mod tests {
         .expect("parse linger");
         assert!(cli.linger_until_eoa);
         assert_eq!(cli.linger_timeout_ms, 500);
+        assert_eq!(cli.linger_playout_ms, 0, "no hold unless asked for");
     }
 
     #[test]
@@ -1622,7 +1664,7 @@ mod tests {
             &test_ctx(),
             Pace::Fast,
             None,
-            Some(Duration::from_secs(10)),
+            Some(Linger::eoa_only(Duration::from_secs(10))),
         );
         server.join().unwrap();
         assert!(matches!(replay.outcome, LogOutcome::Done));
@@ -1632,6 +1674,58 @@ mod tests {
         assert_eq!(
             replay.rx.end_of_audio, 1,
             "the drain decoded the EndOfAudio"
+        );
+    }
+
+    #[test]
+    fn playout_hold_delays_the_fin_and_stays_out_of_waited_ms() {
+        // A device holds its connection while its bank plays out; end-of-audio ends
+        // the stream, not the sound. The hold is what makes the daemon's audible-end
+        // accounting land on a replay instead of reading as a lost stream mid-clip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cap.framelog");
+        write_framelog(&path, false, &[(10, &[1, 2, 3, 4])]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Daemon stand-in: the whole playback stream at once, then read to the
+        // client's FIN and report when it came.
+        let server = thread::spawn(move || {
+            let mut sock = accept_tls(&listener);
+            sock.write_all(&frame_bytes(&hello_frame())).unwrap();
+            sock.write_all(&frame_bytes(&audio_frame())).unwrap();
+            sock.write_all(&frame_bytes(&StreamFrame::EndOfAudio(EndOfAudio {})))
+                .unwrap();
+            let eoa_at = Instant::now();
+            let mut got = Vec::new();
+            sock.read_to_end(&mut got).unwrap();
+            eoa_at.elapsed()
+        });
+
+        let hold = Duration::from_millis(300);
+        let replay = replay_log(
+            &path,
+            &addr.to_string(),
+            &test_ctx(),
+            Pace::Fast,
+            None,
+            Some(Linger {
+                timeout: Duration::from_secs(10),
+                playout_hold: hold,
+            }),
+        );
+        let fin_after_eoa = server.join().unwrap();
+        assert!(matches!(replay.outcome, LogOutcome::Done));
+        let linger = replay.linger.expect("flag set on a Done replay");
+        assert_eq!(linger.outcome, LingerOutcome::Eoa);
+        assert!(
+            fin_after_eoa >= hold,
+            "FIN came {fin_after_eoa:?} after the end-of-audio, inside the {hold:?} hold",
+        );
+        assert!(
+            linger.waited_ms < hold.as_millis() as u64,
+            "waited_ms {} counts the wait for the end-of-audio alone, not the hold",
+            linger.waited_ms,
         );
     }
 
@@ -1658,7 +1752,7 @@ mod tests {
             &test_ctx(),
             Pace::Fast,
             None,
-            Some(Duration::from_millis(150)),
+            Some(Linger::eoa_only(Duration::from_millis(150))),
         );
         server.join().unwrap();
         assert!(
@@ -1695,7 +1789,7 @@ mod tests {
             &test_ctx(),
             Pace::Fast,
             None,
-            Some(Duration::from_secs(10)),
+            Some(Linger::eoa_only(Duration::from_secs(10))),
         );
         let elapsed = start.elapsed();
         server.join().unwrap();
@@ -1758,7 +1852,7 @@ mod tests {
             &test_ctx(),
             Pace::Fast,
             None,
-            Some(Duration::from_secs(10)),
+            Some(Linger::eoa_only(Duration::from_secs(10))),
         );
         server.join().unwrap();
         let linger = summary
@@ -1795,7 +1889,7 @@ mod tests {
             &test_ctx(),
             Pace::Fast,
             None,
-            Some(Duration::from_millis(500)),
+            Some(Linger::eoa_only(Duration::from_millis(500))),
         );
         let linger = summary
             .linger

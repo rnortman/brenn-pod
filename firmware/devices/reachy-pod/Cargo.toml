@@ -23,6 +23,10 @@ license.workspace = true
 xvf3800-ctrl = { path = "../../crates/xvf3800-ctrl" }
 # Telemetry plausibility predicates, shared with the ESP pod's HIL self-tests.
 device-protocol = { path = "../../crates/device-protocol" }
+# The commit and dirty flag of the tree this binary was compiled from, stamped in
+# at build time. The startup line prints it, so the unit itself testifies to what
+# it is running. The ESP pod carries the same crate for the same reason.
+build-id = { path = "../../crates/build-id" }
 # The wire format, the capture ring and the VAD bounds — the same code the ESP pod
 # runs, which is what keeps the two pods' audio identical above the transport.
 audio-pipeline = { path = "../../crates/audio-pipeline", features = ["std"] }

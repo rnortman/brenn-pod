@@ -608,3 +608,35 @@ all and reads its configured room.
 
 See `TODO(pipeline-room-from-config)` at `PodState::room` in
 `host/crates/speech-surface/src/pipeline.rs`.
+
+## `flush-stale-target-interrupt` — BLOCKED as of 2026-09-11 (needs a decision about where a barge marks the turn)
+
+`PlaybackHandle::flush` validates the audible job under the `current` mutex, publishes the flush
+target and answers `Ok(progress)` synchronously. The writer takes that target later — after
+whatever frame write or event-sink await it is in, up to `write_timeout_ms`. If the audible job
+retires in that window and the new front is another turn (or the stream empties), `take_flush_for`
+reads the target as stale and drops it: no `Flushed`, no `FlushPlayback`, nothing cut, and nothing
+said anywhere that the request evaporated.
+
+The caller has already acted on the `Ok`. `drive_barge`'s chain — `barge.ledger.interrupt`, the
+`playback_interrupted` line, `brain.interrupt` — has pushed a context segment, marked the turn
+interrupted, pruned it so a late `SpeakCmd` for it is dropped, and told the brain a reply was cut.
+The reply was in fact heard whole, and its `Finished` then settles against a pruned turn, so
+nothing corrects the record. The window is short on a healthy link, but it is exactly the
+end-of-tail instant the audible-tail flush exists to serve: a barge in the last ~100 ms of a clip.
+
+Deferred because the two candidate fixes are a design choice, not an edit. Moving the ledger's
+`interrupt` to the `Flushed { was_playing: true }` arm of the fan-out makes the record follow what
+the writer actually did, but it re-opens the race the current ordering deliberately closes — the
+comment at the call site ("Throat: mark the turn before anything else, so a `SpeakCmd` for it can
+never land after the flush has already cut its audio") is the reason it is synchronous. The
+alternative — the writer emitting a stale-target event the router uses to un-mark the turn — adds a
+compensating path and an interval in which the ledger is knowingly wrong. Which of those the barge
+path should carry is the decision this waits on.
+
+Done = a flush the writer drops as stale leaves no turn marked interrupted and no brain told it was
+cut, or leaves a record that says the cut did not happen; and a test parks the writer past a
+retirement with a target published for the retired turn and reads the ledger afterwards.
+
+See `TODO(flush-stale-target-interrupt)` at `take_flush_for` in
+`host/crates/speech-pipeline/src/playback.rs`.

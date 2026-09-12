@@ -10,6 +10,15 @@
 //! `tokio::time` clock, so the audio-ahead-of-real-time bound holds regardless of
 //! wall-clock (NTP) steps — that bound is also what a future flush queues behind.
 //!
+//! The pacer owns the stream clock, so it is the one place that knows when a job
+//! has finished *playing* rather than finished being written: it keeps every job
+//! from its first write until its audible end in `pending`, reports the last write
+//! as `Written` and the audible end as `Finished`, and treats the front of
+//! `pending` — the job audible now — as the one a barge-in flush cuts. That front
+//! is also what the listener's playback floor follows, reported as `Audible`
+//! whenever it changes, because no per-job event can name a per-pod state once
+//! several jobs share one stream.
+//!
 //! Generic over `AsyncWrite`: production passes the connection's write half; tests
 //! pass a `tokio::io::duplex` fake device.
 
@@ -133,21 +142,57 @@ pub enum PlaybackEvent {
         /// tell the listener whether the barge-in floor is open for this playback.
         interruptible: bool,
     },
-    /// A job's audio was fully written. `eoa_written` is true when this job drained
-    /// the stream and an `EndOfAudio` followed it.
+    /// A job's audio has all been handed to the device. `eoa_written` is true when
+    /// this job drained the stream and an `EndOfAudio` followed it. Not terminal:
+    /// up to the pacer's lead of this job is still banked on the device, and the
+    /// `Finished` below is when the last of it is heard.
+    Written {
+        pod: PodId,
+        in_reply_to: Option<UtteranceId>,
+        frames: u64,
+        samples: u64,
+        eoa_written: bool,
+        /// Whether this pass re-wrote a job the stream already carried before a
+        /// flush discarded the device's bank. Such a job repeats no `Started`, so
+        /// without this a reader cannot tell one reply written twice from two
+        /// replies, and the counters cannot separate write passes from answers.
+        rewritten: bool,
+        /// The pacer's estimate of when the last of this job is heard: the stream
+        /// anchor, the device's playout hop, and every frame written on this stream
+        /// so far. A lower bound, for the reasons
+        /// `audio_pipeline::playback::PLAYBACK_PLAYOUT_HOP_MS` gives.
+        plays_until: Instant,
+    },
+    /// A job's audio has been heard to its end — its `plays_until` has passed.
+    /// Terminal and clean: the ledger settles on it, and a job that played out is a
+    /// clean completion whether or not it drained the stream (a clip finishing with
+    /// another queued behind it writes no `EndOfAudio` yet delivered all its audio).
+    /// A job whose stream-drain `EndOfAudio` write failed never reaches this: it
+    /// gets `Written` and then `Aborted`, because the host has lost the stream and
+    /// cannot know whether the tail was heard — the device plays out its bank on a
+    /// dropped connection and discards it on a reconnect — so it reports what it
+    /// saw, which is that it did not see the job through.
     Finished {
         pod: PodId,
         in_reply_to: Option<UtteranceId>,
         frames: u64,
         samples: u64,
         eoa_written: bool,
-        /// The stream-drain `EndOfAudio` write failed, so the writer is exiting
-        /// after this otherwise-completed job. A job that plays out fully is a
-        /// clean completion whether or not it drained the stream — a clip finishing
-        /// with another job queued behind it writes no `EndOfAudio` yet delivered
-        /// all its audio — so this death shape is the only unclean `Finished`.
-        writer_dying: bool,
     },
+    /// What the pod is audibly playing changed: the turn and interruptibility of
+    /// the job at the front of the writer's `pending`, or nothing when the device
+    /// holds no audio at all. Emitted when that value changes and only then — a
+    /// first write onto an empty stream, a front retiring to a job of another turn
+    /// banked behind it, the stream emptying (heard out, flushed, or aborted), and
+    /// a re-deferred job's re-write onto the fresh stream after a flush. A front
+    /// retiring to the next clip of the *same* turn is not a change.
+    ///
+    /// This is what the listener's playback floor follows, and the per-job
+    /// lifecycle events are not: the floor is one state per pod, the lifecycle
+    /// events interleave across the jobs sharing a stream, and a job re-written
+    /// after a flush repeats none of them. Emitted after whichever lifecycle event
+    /// caused the change.
+    Audible { pod: PodId, job: Option<AudibleJob> },
     /// A job was aborted (write failure or cancellation); its audio did not finish.
     Aborted {
         pod: PodId,
@@ -168,6 +213,17 @@ pub enum PlaybackEvent {
     },
 }
 
+/// The audible job [`PlaybackEvent::Audible`] names. Only the fields the floor
+/// carries: the identity is the payload, so two clips of one reply hand over with
+/// no event and the barge guard's sustain run survives the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudibleJob {
+    /// The utterance the audible job answers, if any.
+    pub in_reply_to: Option<UtteranceId>,
+    /// Whether speech over it may flush it.
+    pub interruptible: bool,
+}
+
 /// The sink each writer emits its events into. `Arc`'d so one closure serves every
 /// writer; the surface owns the adapter that turns events into JSONL lines.
 ///
@@ -183,6 +239,7 @@ pub type PlaybackEventFn = Arc<dyn Fn(PlaybackEvent) -> BoxFuture<'static, ()> +
 #[derive(Debug, Default)]
 pub struct PlaybackStats {
     jobs_completed: AtomicU64,
+    jobs_rewritten: AtomicU64,
     jobs_rejected_full: AtomicU64,
     jobs_rejected_dead: AtomicU64,
     jobs_aborted: AtomicU64,
@@ -196,8 +253,12 @@ pub struct PlaybackStats {
 /// A point-in-time copy of [`PlaybackStats`], for `stage_health` reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PlaybackStatsSnapshot {
-    /// Jobs whose audio was fully written.
+    /// Write passes whose audio was fully written. A job re-written after a flush
+    /// counts once per pass, so `jobs_completed - jobs_rewritten` is the number of
+    /// distinct answers that reached the device whole.
     pub jobs_completed: u64,
+    /// Write passes that re-wrote a job whose banked frames a flush discarded.
+    pub jobs_rewritten: u64,
     /// Jobs rejected because a writer's queue was full.
     pub jobs_rejected_full: u64,
     /// Jobs rejected because the writer task had already exited.
@@ -221,6 +282,9 @@ pub struct PlaybackStatsSnapshot {
 impl PlaybackStats {
     fn record_completed(&self) {
         self.jobs_completed.fetch_add(1, Ordering::Relaxed);
+    }
+    fn record_rewritten(&self) {
+        self.jobs_rewritten.fetch_add(1, Ordering::Relaxed);
     }
     fn record_rejected_full(&self) {
         self.jobs_rejected_full.fetch_add(1, Ordering::Relaxed);
@@ -251,6 +315,7 @@ impl PlaybackStats {
     pub fn snapshot(&self) -> PlaybackStatsSnapshot {
         PlaybackStatsSnapshot {
             jobs_completed: self.jobs_completed.load(Ordering::Relaxed),
+            jobs_rewritten: self.jobs_rewritten.load(Ordering::Relaxed),
             jobs_rejected_full: self.jobs_rejected_full.load(Ordering::Relaxed),
             jobs_rejected_dead: self.jobs_rejected_dead.load(Ordering::Relaxed),
             jobs_aborted: self.jobs_aborted.load(Ordering::Relaxed),
@@ -273,48 +338,88 @@ pub enum PlayRejected {
     WriterDead,
 }
 
-/// The writer's currently-playing job, as the flush path needs to see it.
+/// The job audible right now — the front of the writer's `pending` queue — as the
+/// flush path needs to see it.
 #[derive(Debug, Clone, Copy)]
 struct CurrentJob {
     turn: Option<UtteranceId>,
     interruptible: bool,
     total_samples: u64,
-    /// Monotonic instant the job's first frame went out — the origin the heard
-    /// estimate measures from. `None` before that frame lands: the job is current
-    /// (and so flushable) from the moment the writer takes it, but nothing of it
-    /// is audible yet.
-    first_write: Option<Instant>,
+    /// The pacer's estimate of when this job's first sample is heard: the stream
+    /// anchor plus the device's playout hop plus the audio banked ahead of it. The
+    /// origin the heard estimate measures from, and in the future while the device
+    /// is still working through the hop.
+    starts_at: Instant,
 }
 
-/// The writer's currently-playing job, readable by the flush path. Written by the
-/// writer at job start and end; read under the mutex by [`PlaybackHandle::flush`].
-/// The per-frame hot path costs one relaxed atomic add.
-#[derive(Debug, Default)]
-struct JobProgress {
-    /// `None` between jobs.
-    current: Mutex<Option<CurrentJob>>,
-    /// Frames of the current job written so far; reset at each job start.
-    frames_written: AtomicU64,
-}
-
-impl JobProgress {
-    /// The heard/total estimate for `job` right now.
-    ///
-    /// `heard_ms` is the lesser of elapsed wall time and the audio actually
-    /// written: the pacer front-loads up to `lead_ms`, so frames-written alone
-    /// overshoots by up to that lead, while elapsed time alone overshoots inside
-    /// the sub-lead startup window before the first frame lands.
-    fn snapshot(&self, job: &CurrentJob) -> InterruptProgress {
-        let elapsed_ms = job
-            .first_write
-            .map(|t| Instant::now().duration_since(t).as_millis() as u64)
-            .unwrap_or(0);
-        let written_ms = self.frames_written.load(Ordering::Relaxed) * FRAME_MS;
+impl CurrentJob {
+    /// The heard/total estimate for this job right now. `heard_ms` runs from the
+    /// job's audible start, so it is zero while the device is still banking the
+    /// playout hop and never counts audio the pacer has only written; it is capped
+    /// at the clip's own length, which the estimate can otherwise exceed by however
+    /// late the job's retirement was serviced.
+    fn progress(&self) -> InterruptProgress {
+        let total_ms = audio_ms(self.total_samples);
+        let heard_ms = Instant::now()
+            .saturating_duration_since(self.starts_at)
+            .as_millis() as u64;
         InterruptProgress {
-            heard_ms: elapsed_ms.min(written_ms),
-            total_ms: audio_ms(job.total_samples),
+            heard_ms: heard_ms.min(total_ms),
+            total_ms,
         }
     }
+}
+
+/// The audible job, readable by the flush path. `pending` is its only writer: set
+/// when a job becomes the front, handed over when the front retires, cleared when
+/// `pending` empties. Read under the mutex by [`PlaybackHandle::flush`].
+#[derive(Debug, Default)]
+struct JobProgress {
+    /// `None` when nothing is banked on the device.
+    current: Mutex<Option<CurrentJob>>,
+}
+
+/// One job on the stream, from its first write until its audible end.
+struct Pending {
+    /// The job itself, PCM included: a job whose frames the device has not yet
+    /// played can be written again after a flush discards the device's bank, so
+    /// the writer holds at most the pacer's lead of audio per pod here.
+    job: PlaybackJob,
+    /// Frames of this job written so far.
+    frames: u64,
+    /// The whole clip's sample count, however much of it has been written.
+    samples: u64,
+    /// Whether an `EndOfAudio` followed this job's last frame. Meaningful only
+    /// once `ends_at` is set.
+    eoa_written: bool,
+    /// When this job's first sample is heard.
+    starts_at: Instant,
+    /// When its last sample is heard; `None` until its last frame is written, so
+    /// only the back of `pending` can lack it.
+    ends_at: Option<Instant>,
+}
+
+impl Pending {
+    /// This job as the flush path sees it.
+    fn as_current(&self) -> CurrentJob {
+        CurrentJob {
+            turn: self.job.in_reply_to,
+            interruptible: self.job.interruptible,
+            total_samples: self.samples,
+            starts_at: self.starts_at,
+        }
+    }
+}
+
+/// A job waiting to be written again after a flush took the stream out from under
+/// it, or evicted from the queue by one.
+struct Deferred {
+    job: PlaybackJob,
+    /// Whether this job already reported a `Started`. True for a job the flush
+    /// pulled back off the stream: it had written frames, so its first write is
+    /// already dated and already counted, and the device discarding those frames
+    /// unheard does not make it a second reply.
+    started: bool,
 }
 
 /// The flush request handed from a [`PlaybackHandle`] to its writer.
@@ -332,9 +437,9 @@ struct FlushSignal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlushRejected {
-    /// No job is playing right now.
+    /// Nothing is audible right now — no job's audio is banked on the device.
     NotPlaying,
-    /// A different turn's job is playing (the named turn already finished).
+    /// A different turn's job is the audible one (the named turn has played out).
     WrongTurn,
     /// The playing job is marked non-interruptible (an alert).
     NotInterruptible,
@@ -367,8 +472,9 @@ impl PlaybackHandle {
         }
     }
 
-    /// The turn whose job is playing right now, or `None` between jobs (and for a
-    /// job with no originating utterance). The key a caller passes to [`flush`].
+    /// The turn whose job is audible right now, or `None` when nothing is banked
+    /// on the device (and for a job with no originating utterance). The key a
+    /// caller passes to [`flush`].
     ///
     /// [`flush`]: PlaybackHandle::flush
     pub fn current_turn(&self) -> Option<UtteranceId> {
@@ -381,13 +487,19 @@ impl PlaybackHandle {
 
     /// Request a flush of the playback for `turn`.
     ///
-    /// Returns the progress snapshot when `turn` names the currently-playing
-    /// interruptible job — the writer will cut it, evict any queued jobs for the
-    /// same turn, and send `FlushPlayback` on the wire, after which the device
-    /// discards its banked audio and mutes. Every other case is a
-    /// `FlushRejected` with no side effects: a stale interrupt (the turn already
-    /// finished, or a different turn is playing) is a no-op by construction,
-    /// never a flush of the wrong response.
+    /// Returns the progress snapshot when `turn` names the audible interruptible
+    /// job — the writer will cut it, evict any queued jobs for the same turn, and
+    /// send `FlushPlayback` on the wire, after which the device discards its banked
+    /// audio and mutes. Any later job of another turn already on the stream is
+    /// written again on the fresh stream, none of it having been heard. Every other
+    /// case is a `FlushRejected` with no side effects: a stale interrupt (the
+    /// turn has played out, or another turn is audible) is a no-op by
+    /// construction, never a flush of the wrong response.
+    ///
+    /// Audible, not being written: a barge arriving in the last of a reply — after
+    /// its final frame, while up to the pacer's lead of it is still coming out of
+    /// the speaker — cuts it, which is when a listener who has heard enough is
+    /// most likely to speak.
     ///
     /// **Flush promptness.** The frame queues on the TCP stream behind whatever
     /// audio is already written, but the pacer bounds that to `lead_ms` of audio
@@ -407,7 +519,7 @@ impl PlaybackHandle {
         if !job.interruptible {
             return Err(FlushRejected::NotInterruptible);
         }
-        let progress = self.progress.snapshot(&job);
+        let progress = job.progress();
         // Publish the target before dropping the job lock, so the writer cannot
         // observe a notify with no target behind it.
         *self.flush_signal.target.lock().expect("flush target mutex") = Some(turn);
@@ -450,7 +562,10 @@ impl PlaybackWriter {
             buf: [0u8; MAX_FRAME_BYTES + 2],
             anchor: None,
             frames_in_stream: 0,
+            pending: VecDeque::new(),
             deferred: VecDeque::new(),
+            queue_closed: false,
+            last_audible: None,
         };
         tokio::spawn(writer.run(rx));
         PlaybackHandle {
@@ -475,14 +590,27 @@ struct Writer<W> {
     flush_signal: Arc<FlushSignal>,
     buf: [u8; MAX_FRAME_BYTES + 2],
     /// Stream clock: anchored at the first frame of an idle→busy transition, reset
-    /// only after a drain or a flush, so back-to-back jobs ride one continuous
-    /// clock.
+    /// when `pending` empties or a flush discards the device's bank, so back-to-back
+    /// jobs — including one arriving while the previous one's tail is still audible
+    /// — ride one continuous clock instead of bursting a second lead on top of
+    /// audio the device has not played.
     anchor: Option<Instant>,
     /// Frames written since the current stream's anchor.
     frames_in_stream: u64,
-    /// Jobs pulled off the queue during a flush's selective eviction but belonging
-    /// to another turn. Served before the queue so their order is preserved.
-    deferred: VecDeque<PlaybackJob>,
+    /// Every job on the stream, oldest first: each from its first write until its
+    /// audible end. The front is the job audible now (and the one a flush cuts);
+    /// the back is the job being written. Empty means nothing is banked.
+    pending: VecDeque<Pending>,
+    /// Jobs pulled off the queue or the stream during a flush's selective eviction
+    /// but belonging to another turn. Served before the queue so their order is
+    /// preserved.
+    deferred: VecDeque<Deferred>,
+    /// The job queue has closed (every sender dropped) and been drained. The writer
+    /// stays alive past it until `pending` is heard out.
+    queue_closed: bool,
+    /// The audible job as last reported by [`PlaybackEvent::Audible`]. Compared
+    /// against the front of `pending` to emit on changes only.
+    last_audible: Option<AudibleJob>,
 }
 
 /// How one frame write ended.
@@ -524,18 +652,22 @@ fn build_audio_frame(chunk: &[i16]) -> StreamFrame {
     })
 }
 
-/// Outcome of playing one job's audio.
+/// Outcome of writing one job's audio. `frames` is how many of its frames went
+/// out, which is also whether it reached `pending`: a job is on the stream from its
+/// first successful write.
 enum JobResult {
     Completed {
         frames: u64,
-        samples: u64,
     },
-    Aborted(AbortReason),
-    /// A flush named this job: writing stopped early, and the writer stays alive.
-    /// The progress is snapshotted at the cut, while the job is still current.
-    Flushed {
+    Aborted {
+        reason: AbortReason,
         frames: u64,
-        progress: InterruptProgress,
+    },
+    /// A flush for `turn` — the audible job's turn, which may be an earlier job's —
+    /// arrived while this one was being written. The writer stays alive.
+    Flushed {
+        turn: Option<UtteranceId>,
+        frames: u64,
     },
 }
 
@@ -545,8 +677,25 @@ enum FrameSlot {
     Ready,
     /// `cancel` fired during the wait.
     Cancelled,
-    /// A flush naming the current job arrived; stop writing it.
-    Flush,
+    /// A flush naming the audible job's turn arrived; stop writing.
+    Flush(Option<UtteranceId>),
+}
+
+/// What the writer's between-jobs wait produced.
+enum WriterStep {
+    /// Play this job. Boxed: a `PlaybackJob` dwarfs every other variant, and this
+    /// enum is returned once per job rather than per frame.
+    Job(Box<Deferred>),
+    /// A flush for the audible job's turn arrived; cut it.
+    Flush(Option<UtteranceId>),
+    /// A pending job's audible end came due, or a wait woke for nothing. Either
+    /// way the loop re-enters, which retires whatever is due.
+    Retire,
+    /// `cancel` fired.
+    Cancelled,
+    /// The queue is closed and drained. The writer exits once `pending` is heard
+    /// out.
+    Closed,
 }
 
 impl<W> Writer<W>
@@ -575,140 +724,259 @@ where
         }
     }
 
-    /// Take a pending flush request if it names `turn`. A signal for any other turn
-    /// is dropped: the handle already told its caller the outcome, so a race
-    /// between the handle's check and this take resolves to a no-op.
-    fn take_flush_for(&self, turn: Option<UtteranceId>) -> bool {
+    /// Take a pending flush request if it names the turn of the stream's audible
+    /// job — the front of `pending` — and return that turn.
+    ///
+    /// The audible job, not the one being written: a target naming the front while
+    /// a later job of another turn is being written is exactly the legitimate
+    /// barge. A target naming any other turn is stale by construction — the handle
+    /// verified the audible job before setting it, so a mismatch means that job has
+    /// since retired and nobody can still hear it. It is cleared too, so a
+    /// non-matching signal is genuinely dropped rather than lingering.
+    ///
+    /// TODO(flush-stale-target-interrupt): the handle answered `Ok` before the
+    /// drop, so its caller has already marked the turn interrupted for a reply
+    /// that was heard whole.
+    fn take_flush_for(&self) -> Option<Option<UtteranceId>> {
+        let front = self.pending.front().and_then(|p| p.job.in_reply_to);
         let mut target = self.flush_signal.target.lock().expect("flush target mutex");
         match *target {
-            Some(t) if Some(t) == turn => {
+            Some(t) if Some(t) == front => {
                 *target = None;
-                true
+                Some(front)
             }
-            // A target that no longer names the current turn is stale by
-            // construction — the handle verified the playing job before setting it,
-            // so a mismatch means the writer has moved past that job. Clear it too,
-            // so a non-matching signal is genuinely dropped rather than lingering.
             Some(_) => {
                 *target = None;
-                false
+                None
             }
-            None => false,
+            None => None,
+        }
+    }
+
+    /// The stream clock's anchor, starting the stream at `now` if nothing is banked.
+    fn stream_anchor(&mut self) -> Instant {
+        *self.anchor.get_or_insert_with(Instant::now)
+    }
+
+    /// When the frame at the current stream index is heard: the anchor, the device's
+    /// playout hop, and every frame written on this stream so far. Evaluated before
+    /// a job's first frame this is that job's audible start; evaluated after its
+    /// last it is its audible end.
+    fn stream_position(&mut self) -> Instant {
+        let banked = Duration::from_millis(
+            audio_pipeline::playback::PLAYBACK_PLAYOUT_HOP_MS + self.frames_in_stream * FRAME_MS,
+        );
+        self.stream_anchor() + banked
+    }
+
+    /// The earliest audible end waiting to be serviced, or `None` when the front of
+    /// `pending` is still being written (only the back can lack an end, so a front
+    /// without one means `pending` holds just that job).
+    fn next_audible_end(&self) -> Option<Instant> {
+        self.pending.front().and_then(|p| p.ends_at)
+    }
+
+    /// Republish the audible job for the flush path: the front of `pending`, or
+    /// nothing when the device's bank is empty.
+    fn publish_current(&self) {
+        *self.progress.current.lock().expect("job progress mutex") =
+            self.pending.front().map(Pending::as_current);
+    }
+
+    /// Report the audible job if it has changed since the last report: the front
+    /// of `pending`, by turn and interruptibility. Called after each lifecycle
+    /// event that can move the front, so a change always trails the event that
+    /// caused it.
+    ///
+    /// Separate from [`Writer::publish_current`], which stays synchronous with
+    /// every mutation of `pending` so the flush handle never reads a `current`
+    /// that lags the queue across an await.
+    async fn emit_audible(&mut self) {
+        let job = self.pending.front().map(|p| AudibleJob {
+            in_reply_to: p.job.in_reply_to,
+            interruptible: p.job.interruptible,
+        });
+        if job == self.last_audible {
+            return;
+        }
+        self.last_audible = job.clone();
+        (self.events)(PlaybackEvent::Audible {
+            pod: self.pod.clone(),
+            job,
+        })
+        .await;
+    }
+
+    /// Retire every pending job whose audible end has passed, emitting its
+    /// `Finished` and handing the audible job over to the next one. With nothing
+    /// left banked the stream clock resets, so the next job anchors a fresh stream.
+    async fn retire_heard(&mut self) {
+        while self
+            .pending
+            .front()
+            .is_some_and(|p| p.ends_at.is_some_and(|end| end <= Instant::now()))
+        {
+            let done = self.pending.pop_front().expect("front was just inspected");
+            self.publish_current();
+            (self.events)(PlaybackEvent::Finished {
+                pod: self.pod.clone(),
+                in_reply_to: done.job.in_reply_to,
+                frames: done.frames,
+                samples: done.samples,
+                eoa_written: done.eoa_written,
+            })
+            .await;
+            self.emit_audible().await;
+        }
+        if self.pending.is_empty() {
+            self.anchor = None;
+            self.frames_in_stream = 0;
         }
     }
 
     /// Wait for the pacer's slot for the frame at the current stream index, so
     /// banked audio stays at most `lead_ms` ahead of real time. Cancellation and a
-    /// flush for `turn` both cut the wait short.
-    async fn wait_frame_slot(&mut self, anchor: Instant, turn: Option<UtteranceId>) -> FrameSlot {
-        if self.take_flush_for(turn) {
-            return FrameSlot::Flush;
-        }
-        let banked = Duration::from_millis(self.frames_in_stream * FRAME_MS);
-        let ahead = (anchor + banked).saturating_duration_since(Instant::now());
-        let lead = Duration::from_millis(self.cfg.lead_ms);
-        if ahead <= lead {
-            return FrameSlot::Ready;
-        }
-        tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => FrameSlot::Cancelled,
-            // The target mutex is the authority; this only wakes the nap early.
-            _ = self.flush_signal.notify.notified() => {
-                if self.take_flush_for(turn) { FrameSlot::Flush } else { FrameSlot::Ready }
+    /// flush for the audible turn both cut the wait short, and a pending job's
+    /// audible end is serviced during it.
+    async fn wait_frame_slot(&mut self) -> FrameSlot {
+        loop {
+            self.retire_heard().await;
+            if let Some(turn) = self.take_flush_for() {
+                return FrameSlot::Flush(turn);
             }
-            _ = tokio::time::sleep(ahead - lead) => FrameSlot::Ready,
+            let banked = Duration::from_millis(self.frames_in_stream * FRAME_MS);
+            let ahead = (self.stream_anchor() + banked).saturating_duration_since(Instant::now());
+            let lead = Duration::from_millis(self.cfg.lead_ms);
+            if ahead <= lead {
+                return FrameSlot::Ready;
+            }
+            let end = self.next_audible_end();
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return FrameSlot::Cancelled,
+                // The target mutex is the authority; this only wakes the nap early.
+                _ = self.flush_signal.notify.notified() => {
+                    if let Some(turn) = self.take_flush_for() {
+                        return FrameSlot::Flush(turn);
+                    }
+                }
+                // A retirement came due mid-nap: the loop above services it and
+                // re-computes the slot.
+                _ = tokio::time::sleep_until(end.unwrap_or_else(Instant::now)),
+                    if end.is_some() => {}
+                _ = tokio::time::sleep(ahead - lead) => return FrameSlot::Ready,
+            }
         }
     }
 
     /// Chunk and pace a job's PCM out as `Audio` frames, emitting `Started` at the
-    /// first frame and publishing progress the flush path reads.
-    async fn play_job(&mut self, job: &PlaybackJob, anchor: Instant) -> JobResult {
+    /// first frame and putting the job on the stream — into `pending`, where the
+    /// flush path can see it — from that frame on.
+    ///
+    /// `rewritten` marks a job the stream already carried before a flush discarded
+    /// the device's bank: it reports no second `Started`, which would count a second
+    /// cmd in the ledger and a second reply in the log for one answer. Its `Audible`
+    /// is emitted either way — nobody heard the frames the flush threw away, so the
+    /// floor really does open again here.
+    async fn play_job(&mut self, job: &PlaybackJob, rewritten: bool) -> JobResult {
         let samples = job.pcm.len() as u64;
-        // Current from the moment the writer takes the job, not from its first
-        // frame: a barge landing while the pacer holds this job back must still cut
-        // it (the stream's banked audio is what the user is hearing).
-        *self.progress.current.lock().expect("job progress mutex") = Some(CurrentJob {
-            turn: job.in_reply_to,
-            interruptible: job.interruptible,
-            total_samples: samples,
-            first_write: None,
-        });
-        self.progress.frames_written.store(0, Ordering::Relaxed);
-
         let mut job_frames = 0u64;
-        let mut started = false;
 
         for chunk in job.pcm.chunks(AUDIO_SAMPLES_PER_FRAME) {
-            match self.wait_frame_slot(anchor, job.in_reply_to).await {
+            match self.wait_frame_slot().await {
                 FrameSlot::Ready => {}
-                FrameSlot::Cancelled => return JobResult::Aborted(AbortReason::Cancelled),
-                FrameSlot::Flush => {
-                    // Snapshot while the job is still current — the loop below
-                    // clears it as soon as this returns.
-                    let current = self.progress.current.lock().expect("job progress mutex");
-                    let progress = current
-                        .as_ref()
-                        .map(|c| self.progress.snapshot(c))
-                        .expect("the playing job is current until play_job returns");
-                    return JobResult::Flushed {
+                FrameSlot::Cancelled => {
+                    return JobResult::Aborted {
+                        reason: AbortReason::Cancelled,
                         frames: job_frames,
-                        progress,
+                    };
+                }
+                FrameSlot::Flush(turn) => {
+                    return JobResult::Flushed {
+                        turn,
+                        frames: job_frames,
                     };
                 }
             }
-            let first_write = (!started).then(HostMicros::now);
+            // The audible start is the stream position *before* this frame: the
+            // device plays what is already banked ahead of it first.
+            let starts_at = (job_frames == 0).then(|| self.stream_position());
+            let first_write = (job_frames == 0).then(HostMicros::now);
             let frame = build_audio_frame(chunk);
             if let Err(f) = self.write_frame(&frame).await {
                 if matches!(f, WriteFail::Timeout) {
                     self.stats.record_write_timeout();
                 }
-                return JobResult::Aborted(f.into());
+                return JobResult::Aborted {
+                    reason: f.into(),
+                    frames: job_frames,
+                };
             }
             self.stats.record_frame();
-            self.progress.frames_written.fetch_add(1, Ordering::Relaxed);
             self.frames_in_stream += 1;
             job_frames += 1;
-            if !started {
-                started = true;
-                if let Some(cur) = self
-                    .progress
-                    .current
-                    .lock()
-                    .expect("job progress mutex")
-                    .as_mut()
-                {
-                    cur.first_write = Some(Instant::now());
+            match starts_at {
+                Some(starts_at) => {
+                    self.pending.push_back(Pending {
+                        job: job.clone(),
+                        frames: 1,
+                        samples,
+                        eoa_written: false,
+                        starts_at,
+                        ends_at: None,
+                    });
+                    self.publish_current();
+                    if !rewritten {
+                        (self.events)(PlaybackEvent::Started {
+                            pod: self.pod.clone(),
+                            in_reply_to: job.in_reply_to,
+                            timings: Box::new(job.timings.clone()),
+                            speak_rx: job.speak_rx,
+                            first_write: first_write.expect("stamped on the first frame"),
+                            samples,
+                            interruptible: job.interruptible,
+                        })
+                        .await;
+                    }
+                    self.emit_audible().await;
                 }
-                (self.events)(PlaybackEvent::Started {
-                    pod: self.pod.clone(),
-                    in_reply_to: job.in_reply_to,
-                    timings: Box::new(job.timings.clone()),
-                    speak_rx: job.speak_rx,
-                    first_write: first_write.expect("stamped on the first frame"),
-                    samples,
-                    interruptible: job.interruptible,
-                })
-                .await;
+                None => {
+                    self.pending
+                        .back_mut()
+                        .expect("the job being written is the back of pending")
+                        .frames += 1;
+                }
             }
         }
 
-        JobResult::Completed {
-            frames: job_frames,
-            samples,
-        }
+        JobResult::Completed { frames: job_frames }
     }
 
-    /// Emit `Aborted` for every job still queued, counting each. Used on a write
-    /// failure or cancellation to fail the whole backlog loudly rather than
-    /// silently.
+    /// Emit `Aborted` for every job still on the stream or still queued, counting
+    /// each. Used on a write failure or cancellation to fail the whole backlog
+    /// loudly rather than silently. A pending job aborts with the rest: the writer
+    /// is losing the stream, and what the device does with a bank it still holds
+    /// depends on something the host cannot see — a connection that stays down
+    /// plays the tail out, a reconnect discards it — so the honest report is that
+    /// the writer did not see the job through, and the ledger settles it unclean.
+    /// Reporting it heard would claim a tail a reconnect threw away.
     async fn drain_aborted(&mut self, rx: &mut mpsc::Receiver<PlaybackJob>, reason: AbortReason) {
         // Close first so the drain-then-exit is atomic from a sender's view: a job
         // that races the drain is rejected as `WriterDead` rather than accepted and
         // then destroyed by the receiver drop with no terminal event.
         rx.close();
-        let queued = std::mem::take(&mut self.deferred)
+        let banked = std::mem::take(&mut self.pending)
             .into_iter()
+            .map(|p| p.job)
+            .collect::<Vec<_>>();
+        self.publish_current();
+        let queued = banked
+            .into_iter()
+            .chain(
+                std::mem::take(&mut self.deferred)
+                    .into_iter()
+                    .map(|d| d.job),
+            )
             .chain(std::iter::from_fn(|| rx.try_recv().ok()));
         for job in queued {
             self.stats.record_aborted();
@@ -719,74 +987,178 @@ where
             })
             .await;
         }
+        self.emit_audible().await;
     }
 
-    /// Cut the flushed turn: report the playing job, evict the turn's queued jobs,
-    /// and end the stream on the wire with `FlushPlayback`.
+    /// Report one job the flush evicted: audio that was banked or queued and that
+    /// nobody heard, whatever it cost to get there. Every eviction shape goes
+    /// through here, so they cannot drift in what they count or what they say the
+    /// clip's length was.
+    async fn report_evicted(
+        &mut self,
+        in_reply_to: Option<UtteranceId>,
+        frames_written: u64,
+        samples: u64,
+    ) {
+        self.stats.record_flushed();
+        (self.events)(PlaybackEvent::Flushed {
+            pod: self.pod.clone(),
+            in_reply_to,
+            was_playing: false,
+            frames_written,
+            progress: InterruptProgress {
+                heard_ms: 0,
+                total_ms: audio_ms(samples),
+            },
+        })
+        .await;
+    }
+
+    /// Cut `turn`: report the audible job, evict the turn's banked, parked and
+    /// queued jobs,
+    /// re-defer every other turn's banked job, and end the stream on the wire with
+    /// `FlushPlayback`.
+    ///
+    /// Only the front of `pending` was audible, and `FlushPlayback` discards the
+    /// device's whole bank, so a later job of another turn has been heard by nobody:
+    /// it goes back to the front of `deferred` and is written again from its first
+    /// frame on the fresh stream. Its `Started` is not repeated — that event dated
+    /// the first write, and its readers tolerate the pacer's lead as noise already
+    /// — and it gets no `Flushed`, because nobody barged its turn.
     ///
     /// No `EndOfAudio` follows: the device's flush already discards its banked
     /// audio and mutes, so an end-of-audio mark after it would be a redundant
     /// second one. The writer stays alive — unlike a cancel, a flush is a mid-life
     /// event, and the barge-in's own response plays next on this connection.
+    ///
+    /// `unwritten` is the job the writer had taken but had not put a frame on the
+    /// stream for when the flush landed. It is newer than everything banked, so it
+    /// is re-deferred behind them rather than ahead: one pass over the stream
+    /// decides the order the replies come back in.
     async fn handle_flush(
         &mut self,
-        job: &PlaybackJob,
-        frames: u64,
-        progress: InterruptProgress,
+        turn: Option<UtteranceId>,
+        unwritten: Option<PlaybackJob>,
         rx: &mut mpsc::Receiver<PlaybackJob>,
     ) -> Result<(), WriteFail> {
-        self.stats.record_flushed();
-        (self.events)(PlaybackEvent::Flushed {
-            pod: self.pod.clone(),
-            in_reply_to: job.in_reply_to,
-            was_playing: true,
-            frames_written: frames,
-            progress,
-        })
-        .await;
+        if let Some(audible) = self.pending.pop_front() {
+            self.stats.record_flushed();
+            (self.events)(PlaybackEvent::Flushed {
+                pod: self.pod.clone(),
+                in_reply_to: audible.job.in_reply_to,
+                was_playing: true,
+                frames_written: audible.frames,
+                progress: audible.as_current().progress(),
+            })
+            .await;
+        }
+
+        // The rest of the stream, oldest first: the flushed turn's own jobs report
+        // audio nobody heard, other turns' jobs go back ahead of everything already
+        // deferred, in order.
+        let mut requeue = Vec::new();
+        for banked in std::mem::take(&mut self.pending) {
+            if banked.job.in_reply_to == turn {
+                self.report_evicted(banked.job.in_reply_to, banked.frames, banked.samples)
+                    .await;
+            } else {
+                requeue.push(Deferred {
+                    job: banked.job,
+                    started: true,
+                });
+            }
+        }
+        if let Some(job) = unwritten {
+            if job.in_reply_to == turn {
+                self.report_evicted(job.in_reply_to, 0, job.pcm.len() as u64)
+                    .await;
+            } else {
+                requeue.push(Deferred {
+                    job,
+                    started: false,
+                });
+            }
+        }
+        // Jobs an earlier flush parked, which `next_step` plays ahead of everything
+        // else: the flushed turn's own are evicted here too. A multi-clip reply
+        // banked behind another turn's tail lands there whole, so leaving them
+        // would let the second clip of a barged reply speak right after the cut.
+        for parked in std::mem::take(&mut self.deferred) {
+            if parked.job.in_reply_to == turn {
+                self.report_evicted(parked.job.in_reply_to, 0, parked.job.pcm.len() as u64)
+                    .await;
+            } else {
+                self.deferred.push_back(parked);
+            }
+        }
+        for deferred in requeue.into_iter().rev() {
+            self.deferred.push_front(deferred);
+        }
+        self.publish_current();
 
         // Evict the flushed turn's queued jobs; anything for another turn is
         // deferred, keeping its order, and plays after the flush on a fresh stream.
         while let Ok(queued) = rx.try_recv() {
-            if queued.in_reply_to == job.in_reply_to {
-                self.stats.record_flushed();
-                (self.events)(PlaybackEvent::Flushed {
-                    pod: self.pod.clone(),
-                    in_reply_to: queued.in_reply_to,
-                    was_playing: false,
-                    frames_written: 0,
-                    progress: InterruptProgress {
-                        heard_ms: 0,
-                        total_ms: 0,
-                    },
-                })
-                .await;
+            if queued.in_reply_to == turn {
+                self.report_evicted(queued.in_reply_to, 0, queued.pcm.len() as u64)
+                    .await;
             } else {
-                self.deferred.push_back(queued);
+                self.deferred.push_back(Deferred {
+                    job: queued,
+                    started: false,
+                });
             }
         }
 
         self.write_frame(&StreamFrame::FlushPlayback(FlushPlayback {}))
             .await?;
-        // The flush ended the stream the way a drain's EndOfAudio does.
+        // The device's bank is gone, so the stream clock starts over.
         self.anchor = None;
         self.frames_in_stream = 0;
+        // Nothing is audible now. A job re-deferred above reports itself audible
+        // again at its first write on the fresh stream, which is the one thing
+        // that tells the floor a reply nobody barged is being heard from the top.
+        self.emit_audible().await;
         Ok(())
     }
 
-    /// The next job to play: deferred jobs first (they were queued before anything
-    /// still in the channel), then the queue.
-    async fn next_job(&mut self, rx: &mut mpsc::Receiver<PlaybackJob>) -> Option<PlaybackJob> {
-        if let Some(job) = self.deferred.pop_front() {
-            return Some(job);
+    /// What to do next when no job is being written: deferred jobs first (they were
+    /// queued or banked before anything still in the channel), then a flush for the
+    /// audible turn, a pending job's audible end, a queued job, or the queue's end.
+    ///
+    /// The flush branch is what makes a barge in a reply's last lead cut it: the
+    /// writer is idle here with the tail audible, and without it the cut would wait
+    /// out the audio it was meant to stop.
+    async fn next_step(&mut self, rx: &mut mpsc::Receiver<PlaybackJob>) -> WriterStep {
+        if let Some(d) = self.deferred.pop_front() {
+            return WriterStep::Job(Box::new(d));
         }
+        if let Some(turn) = self.take_flush_for() {
+            return WriterStep::Flush(turn);
+        }
+        if self.queue_closed && self.pending.is_empty() {
+            return WriterStep::Closed;
+        }
+        let end = self.next_audible_end();
         tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => {
-                self.drain_aborted(rx, AbortReason::Cancelled).await;
-                None
-            }
-            j = rx.recv() => j, // `None`: all senders dropped, queue drained.
+            _ = self.cancel.cancelled() => WriterStep::Cancelled,
+            // The target mutex is the authority; this only wakes the wait early.
+            _ = self.flush_signal.notify.notified() => match self.take_flush_for() {
+                Some(turn) => WriterStep::Flush(turn),
+                None => WriterStep::Retire,
+            },
+            _ = tokio::time::sleep_until(end.unwrap_or_else(Instant::now)),
+                if end.is_some() => WriterStep::Retire,
+            // `None`: all senders dropped, queue drained. The writer stays for
+            // whatever is still coming out of the speaker.
+            j = rx.recv(), if !self.queue_closed => match j {
+                Some(job) => WriterStep::Job(Box::new(Deferred {
+                    job,
+                    started: false,
+                })),
+                None => WriterStep::Closed,
+            },
         }
     }
 
@@ -821,21 +1193,47 @@ where
         })
         .await;
 
-        while let Some(job) = self.next_job(&mut rx).await {
-            let anchor = *self.anchor.get_or_insert_with(Instant::now);
-            let result = self.play_job(&job, anchor).await;
-            // The job is no longer current whatever its outcome, so a flush racing
-            // the boundary finds nothing to cut and resolves to a no-op.
-            *self.progress.current.lock().expect("job progress mutex") = None;
+        loop {
+            self.retire_heard().await;
+            let (job, rewritten) = match self.next_step(&mut rx).await {
+                WriterStep::Job(d) => (d.job, d.started),
+                WriterStep::Retire => continue,
+                WriterStep::Flush(turn) => {
+                    // Idle between jobs: the writer holds nothing it has not
+                    // written, so there is no unwritten job to place.
+                    if let Err(f) = self.handle_flush(turn, None, &mut rx).await {
+                        self.die_on_flush_write(&mut rx, f).await;
+                        return;
+                    }
+                    continue;
+                }
+                WriterStep::Cancelled => {
+                    self.drain_aborted(&mut rx, AbortReason::Cancelled).await;
+                    return;
+                }
+                WriterStep::Closed => {
+                    // Every sender is gone, but the writer stays until the last
+                    // banked frame has been heard and reported.
+                    self.queue_closed = true;
+                    if self.pending.is_empty() {
+                        return;
+                    }
+                    continue;
+                }
+            };
 
-            match result {
-                JobResult::Completed { frames, samples } => {
+            match self.play_job(&job, rewritten).await {
+                JobResult::Completed { frames } => {
                     self.stats.record_completed();
-                    // A drained queue ends the stream: mark it with EndOfAudio, then
-                    // re-anchor the next stream. A new job already waiting continues
-                    // the same stream with no intervening EndOfAudio.
+                    if rewritten {
+                        self.stats.record_rewritten();
+                    }
+                    // A drained queue ends the stream: mark it with EndOfAudio. A new
+                    // job already waiting continues the same stream with no
+                    // intervening EndOfAudio.
                     let drained = self.deferred.is_empty() && rx.is_empty();
                     let mut eoa_written = false;
+                    let mut eoa_failure = None;
                     if drained {
                         let eoa = StreamFrame::EndOfAudio(EndOfAudio {});
                         match self.write_frame(&eoa).await {
@@ -848,53 +1246,88 @@ where
                                 if matches!(f, WriteFail::Timeout) {
                                     self.stats.record_write_timeout();
                                 }
-                                let reason = AbortReason::from(f);
-                                // The job itself completed; report it. The failed
-                                // EndOfAudio leaves the writer dead (the device mutes
-                                // on the disconnect it is about to observe), so fail
-                                // any job that raced into the queue during the write
-                                // loudly rather than dropping it on the receiver
-                                // teardown.
-                                (self.events)(PlaybackEvent::Finished {
-                                    pod: self.pod.clone(),
-                                    in_reply_to: job.in_reply_to,
-                                    frames,
-                                    samples,
-                                    eoa_written: false,
-                                    writer_dying: true,
-                                })
-                                .await;
-                                self.drain_aborted(&mut rx, reason).await;
-                                return;
+                                eoa_failure = Some(AbortReason::from(f));
                             }
                         }
-                        self.anchor = None;
-                        self.frames_in_stream = 0;
                     }
-                    (self.events)(PlaybackEvent::Finished {
+                    // The job's audio is all out: date its audible end on the stream
+                    // clock and report the write. An empty clip never reached the
+                    // stream, so it is written and heard in the same instant.
+                    let plays_until = self.stream_position();
+                    match self.pending.back_mut() {
+                        Some(last) if frames > 0 => {
+                            last.eoa_written = eoa_written;
+                            last.ends_at = Some(plays_until);
+                        }
+                        _ => {}
+                    }
+                    (self.events)(PlaybackEvent::Written {
                         pod: self.pod.clone(),
                         in_reply_to: job.in_reply_to,
                         frames,
-                        samples,
+                        samples: job.pcm.len() as u64,
                         eoa_written,
-                        writer_dying: false,
+                        rewritten,
+                        plays_until,
                     })
                     .await;
-                }
-                JobResult::Flushed { frames, progress } => {
-                    if let Err(f) = self.handle_flush(&job, frames, progress, &mut rx).await {
-                        // The flush frame could not be written: the peer is gone
-                        // mid-flush, which mutes the device anyway, so the cut still
-                        // happens. Fail the backlog loudly and die, as any write
-                        // failure does.
-                        if matches!(f, WriteFail::Timeout) {
-                            self.stats.record_write_timeout();
+                    // An empty clip is heard in the instant it is written, so it
+                    // reports its own end here — unless the drain's mark failed
+                    // under it, in which case the abort below is its one terminal
+                    // event, as it is for every other job on this stream.
+                    if frames == 0 && eoa_failure.is_none() {
+                        (self.events)(PlaybackEvent::Finished {
+                            pod: self.pod.clone(),
+                            in_reply_to: job.in_reply_to,
+                            frames,
+                            samples: job.pcm.len() as u64,
+                            eoa_written,
+                        })
+                        .await;
+                    }
+                    if let Some(reason) = eoa_failure {
+                        // The failed EndOfAudio leaves the writer dead, and with
+                        // the stream gone the host cannot know whether the device
+                        // played its bank out or discarded it on a reconnect. So
+                        // this job aborts rather than finishing, and everything
+                        // else banked or queued goes with it.
+                        self.stats.record_aborted();
+                        // Only a job with frames out is on the stream; popping for
+                        // an empty one would take the previous job's entry and
+                        // leave that job with no terminal event at all.
+                        if frames > 0 {
+                            self.pending.pop_back();
                         }
-                        self.drain_aborted(&mut rx, AbortReason::from(f)).await;
+                        self.publish_current();
+                        (self.events)(PlaybackEvent::Aborted {
+                            pod: self.pod.clone(),
+                            in_reply_to: job.in_reply_to,
+                            reason,
+                        })
+                        .await;
+                        self.drain_aborted(&mut rx, reason).await;
                         return;
                     }
                 }
-                JobResult::Aborted(reason) => {
+                JobResult::Flushed { turn, frames } => {
+                    // A job taken but not yet written is not on the stream, so the
+                    // flush's re-deferral cannot find it there; it is handed over
+                    // instead, and re-deferred behind the banked jobs it is newer
+                    // than or reported evicted if its own turn was the flushed one.
+                    let unwritten = (frames == 0).then(|| job.clone());
+                    if let Err(f) = self.handle_flush(turn, unwritten, &mut rx).await {
+                        self.die_on_flush_write(&mut rx, f).await;
+                        return;
+                    }
+                }
+                JobResult::Aborted { reason, frames } => {
+                    // A job with frames out is the back of `pending`; it reports its
+                    // own abort here rather than through the drain below, which takes
+                    // the rest of the stream and the backlog.
+                    if frames > 0 {
+                        self.pending.pop_back();
+                        self.publish_current();
+                    }
                     self.stats.record_aborted();
                     (self.events)(PlaybackEvent::Aborted {
                         pod: self.pod.clone(),
@@ -902,13 +1335,27 @@ where
                         reason,
                     })
                     .await;
-                    // No EndOfAudio on abort: the device mutes on the disconnect the
-                    // failure or cancel implies. Fail the rest of the backlog loudly.
+                    // No EndOfAudio on abort: the write that would carry it is the
+                    // one that just failed, or a cancel is tearing the stream down.
+                    // Fail the rest of the backlog loudly.
                     self.drain_aborted(&mut rx, reason).await;
                     return;
                 }
             }
         }
+    }
+
+    /// The `FlushPlayback` frame could not be written: the cut was not delivered,
+    /// so the device still holds up to the pacer's lead of the barged reply and
+    /// will play it out unless it reconnects. The writer no longer knows what the
+    /// device plays, so it fails the backlog loudly and dies, as any write failure
+    /// does; the floor closes with it, because the host has nothing to tell the
+    /// listener about audio it cannot see.
+    async fn die_on_flush_write(&mut self, rx: &mut mpsc::Receiver<PlaybackJob>, f: WriteFail) {
+        if matches!(f, WriteFail::Timeout) {
+            self.stats.record_write_timeout();
+        }
+        self.drain_aborted(rx, AbortReason::from(f)).await;
     }
 }
 
@@ -1312,18 +1759,72 @@ mod tests {
         cancel.cancel();
 
         run_until(|| stats.snapshot().jobs_aborted > 0).await;
-        let seen = seen.lock().unwrap();
+        let tags = event_tags(&seen);
         assert!(
-            seen.iter().any(|e| matches!(
-                e,
-                PlaybackEvent::Aborted {
-                    reason: AbortReason::Cancelled,
-                    ..
-                }
-            )),
-            "cancellation aborts with Cancelled",
+            tags.iter().any(|t| t.starts_with("aborted")),
+            "cancellation aborts: {tags:?}",
+        );
+        assert!(
+            !tags
+                .iter()
+                .any(|t| t.starts_with("audible") || t == "silent"),
+            "nothing was ever banked, so there is no floor move to report: {tags:?}",
         );
         assert_eq!(stats.snapshot().eoa_written, 0, "no EndOfAudio on cancel");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_with_a_bank_silences_the_pod_after_the_whole_aborted_set() {
+        // The device is holding audio the host can no longer account for: one
+        // silence, and it comes after every abort, so nothing downstream sees a
+        // closed floor with jobs still reporting themselves.
+        let cancel = CancellationToken::new();
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (dev, mut host) = duplex(1 << 16);
+        let reader = tokio::spawn(async move {
+            let mut tmp = [0u8; 4096];
+            while host.read(&mut tmp).await.expect("read") != 0 {}
+        });
+        let handle = PlaybackWriter::spawn(
+            dev,
+            PodId("pod-x".into()),
+            PacerConfig {
+                lead_ms: 1_000,
+                job_queue_depth: 4,
+                ..PacerConfig::default()
+            },
+            Arc::clone(&stats),
+            events,
+            cancel.clone(),
+        );
+
+        handle
+            .try_play(job_with_id(vec![1i16; AUDIO_SAMPLES_PER_FRAME * 3], 42))
+            .unwrap();
+        handle
+            .try_play(job_with_id(vec![2i16; AUDIO_SAMPLES_PER_FRAME * 3], 43))
+            .unwrap();
+        // Both are banked inside the lead with no time advanced, so neither has been
+        // heard out when the cancel lands.
+        run_until(|| stats.snapshot().jobs_completed == 2).await;
+        cancel.cancel();
+        run_until(|| stats.snapshot().jobs_aborted == 2).await;
+
+        let tags = event_tags(&seen);
+        assert_eq!(
+            tags.iter().filter(|t| *t == "silent").count(),
+            1,
+            "one silence: {tags:?}",
+        );
+        assert_eq!(tags.last().map(String::as_str), Some("silent"), "{tags:?}");
+        assert_eq!(
+            tags.iter().filter(|t| t.starts_with("aborted")).count(),
+            2,
+            "both banked jobs abort: {tags:?}",
+        );
+        drop(handle);
+        reader.await.expect("reader");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1362,20 +1863,23 @@ mod tests {
         drop(handle);
 
         reader.await.expect("reader");
-        // The whole stream drained under paused time: total wall time advanced is the
-        // pacer's, which must be at least (audio − lead − one frame) and at most the
-        // full audio duration. This bounds the aggregate pacing without per-frame
-        // plumbing: had the pacer free-run, elapsed would be ~0; had it lagged,
-        // elapsed would exceed the audio duration.
+        // The whole stream drained under paused time, and the writer stayed until
+        // its bank was heard out, so the wall time advanced is the pacer's plus the
+        // device's playout hop: at least (audio − lead − one frame), at most the
+        // audio duration plus the hop. This bounds the aggregate pacing without
+        // per-frame plumbing: had the pacer free-run, elapsed would be ~0; had it
+        // lagged, elapsed would exceed the audio duration by more than the hop.
         let elapsed_ms = Instant::now().duration_since(start).as_millis() as u64;
         let audio_ms = n_frames as u64 * FRAME_MS;
+        let hop_ms = audio_pipeline::playback::PLAYBACK_PLAYOUT_HOP_MS;
         assert!(
             elapsed_ms + lead_ms + FRAME_MS >= audio_ms,
             "paced too slow: elapsed {elapsed_ms} ms, audio {audio_ms} ms",
         );
         assert!(
-            elapsed_ms <= audio_ms,
-            "paced ahead of real time: elapsed {elapsed_ms} ms, audio {audio_ms} ms",
+            elapsed_ms <= audio_ms + hop_ms,
+            "paced ahead of real time: elapsed {elapsed_ms} ms, audio {audio_ms} ms \
+             plus a {hop_ms} ms hop",
         );
         assert_eq!(stats.snapshot().frames_written, n_frames as u64);
     }
@@ -1546,14 +2050,19 @@ mod tests {
             .try_play(job_with_id(vec![3i16; AUDIO_SAMPLES_PER_FRAME * 250], 42))
             .unwrap();
         run_until(|| stats.snapshot().frames_written > 0).await;
-        // Advance into the clip so the heard estimate is non-trivial.
-        tokio::time::advance(Duration::from_millis(200)).await;
+        // Advance past the device's playout hop and into the clip, so the heard
+        // estimate is non-trivial: before the hop elapses the device has banked
+        // audio and played none of it.
+        let advanced = audio_pipeline::playback::PLAYBACK_PLAYOUT_HOP_MS + 200;
+        tokio::time::advance(Duration::from_millis(advanced)).await;
         run_until(|| stats.snapshot().frames_written >= 10).await;
 
         let progress = handle.flush(UtteranceId(42)).expect("playing turn flushes");
         assert!(
-            progress.heard_ms > 0 && progress.heard_ms <= 300,
-            "heard {} ms is within the advanced time plus the lead",
+            progress.heard_ms > 0
+                && progress.heard_ms
+                    <= advanced - audio_pipeline::playback::PLAYBACK_PLAYOUT_HOP_MS,
+            "heard {} ms is the advanced time less the hop the device spends banking",
             progress.heard_ms,
         );
         assert_eq!(progress.total_ms, 5_000, "clip is 5 s of audio");
@@ -1734,10 +2243,680 @@ mod tests {
         reader.await.expect("reader");
     }
 
+    /// Every event the writer emitted, as `kind:turn` tags in order. The whole
+    /// point of the `Audible` checks is where the event falls in the sequence, so
+    /// the assertion is the sequence.
+    fn event_tags(seen: &Arc<Mutex<Vec<PlaybackEvent>>>) -> Vec<String> {
+        fn turn(id: &Option<UtteranceId>) -> String {
+            id.map_or_else(|| "-".to_string(), |u| u.0.to_string())
+        }
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PlaybackEvent::Started { in_reply_to, .. } => {
+                    Some(format!("started:{}", turn(in_reply_to)))
+                }
+                PlaybackEvent::Written { in_reply_to, .. } => {
+                    Some(format!("written:{}", turn(in_reply_to)))
+                }
+                PlaybackEvent::Finished { in_reply_to, .. } => {
+                    Some(format!("finished:{}", turn(in_reply_to)))
+                }
+                PlaybackEvent::Aborted { in_reply_to, .. } => {
+                    Some(format!("aborted:{}", turn(in_reply_to)))
+                }
+                PlaybackEvent::Flushed {
+                    in_reply_to,
+                    was_playing,
+                    ..
+                } => Some(format!(
+                    "flushed{}:{}",
+                    if *was_playing { "" } else { "-evicted" },
+                    turn(in_reply_to)
+                )),
+                PlaybackEvent::Audible { job, .. } => Some(match job {
+                    Some(j) => format!("audible:{}", turn(&j.in_reply_to)),
+                    None => "silent".to_string(),
+                }),
+                PlaybackEvent::HelloWritten { .. } | PlaybackEvent::HelloFailed { .. } => None,
+            })
+            .collect()
+    }
+
+    /// A writer whose device end is drained to EOF by a background task, so nothing
+    /// in these checks is waiting on socket backpressure.
+    fn drained_writer(
+        cfg: PacerConfig,
+        stats: &Arc<PlaybackStats>,
+        events: PlaybackEventFn,
+    ) -> (PlaybackHandle, tokio::task::JoinHandle<()>) {
+        let (dev, mut host) = duplex(1 << 16);
+        let reader = tokio::spawn(async move {
+            let mut tmp = [0u8; 4096];
+            while host.read(&mut tmp).await.expect("read") != 0 {}
+        });
+        let handle = PlaybackWriter::spawn(
+            dev,
+            PodId("pod-x".into()),
+            cfg,
+            Arc::clone(stats),
+            events,
+            CancellationToken::new(),
+        );
+        (handle, reader)
+    }
+
+    /// A writer parked mid-stream: reply 42 audible, 43 banked behind it inside the
+    /// lead, 44 taken and waiting on the pacer's slot for its first frame, and a
+    /// second clip of 42 still in the queue. The shape a barge for 42 has to sort
+    /// out, and the only one where the writer holds a job it has not written.
+    async fn parked_three_deep(
+        stats: &Arc<PlaybackStats>,
+        events: PlaybackEventFn,
+    ) -> (PlaybackHandle, tokio::task::JoinHandle<()>) {
+        // 42's and 43's frames fill the lead, so 44 parks on the slot for its first
+        // frame and 42's second clip never leaves the queue.
+        parked_over(stats, events, &[(42, 3), (43, 3), (44, 3), (42, 2)]).await
+    }
+
+    /// A writer parked mid-stream over `clips`, each `(turn, frames)` in the order
+    /// they were queued: with a 100 ms lead and 20 ms frames, the first two fill it
+    /// and everything after them is taken-but-unwritten or still in the queue. The
+    /// shape a barge has to sort out, over whatever mix of turns the case is about.
+    async fn parked_over(
+        stats: &Arc<PlaybackStats>,
+        events: PlaybackEventFn,
+        clips: &[(u64, usize)],
+    ) -> (PlaybackHandle, tokio::task::JoinHandle<()>) {
+        let (handle, reader) = drained_writer(
+            PacerConfig {
+                lead_ms: 100,
+                job_queue_depth: 8,
+                ..PacerConfig::default()
+            },
+            stats,
+            events,
+        );
+        for (id, frames) in clips {
+            handle
+                .try_play(job_with_id(
+                    vec![1i16; AUDIO_SAMPLES_PER_FRAME * frames],
+                    *id,
+                ))
+                .unwrap();
+        }
+        run_until(|| stats.snapshot().jobs_completed == 2).await;
+        (handle, reader)
+    }
+
+    /// Every `Flushed` for audio nobody heard, as `(turn, frames_written,
+    /// total_ms)`. The frame count separates a clip the device already held from
+    /// one that never reached the stream.
+    fn evicted(seen: &Arc<Mutex<Vec<PlaybackEvent>>>) -> Vec<(Option<u64>, u64, u64)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PlaybackEvent::Flushed {
+                    in_reply_to,
+                    was_playing: false,
+                    frames_written,
+                    progress,
+                    ..
+                } => Some((in_reply_to.map(|u| u.0), *frames_written, progress.total_ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The clip lengths `evicted` reports for `frames` frames of audio.
+    fn clip_ms(frames: u64) -> u64 {
+        audio_ms(frames * AUDIO_SAMPLES_PER_FRAME as u64)
+    }
+
+    /// Every write pass in the run, as `turn`s in order.
+    fn writes(seen: &Arc<Mutex<Vec<PlaybackEvent>>>) -> Vec<Option<u64>> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PlaybackEvent::Written { in_reply_to, .. } => Some(in_reply_to.map(|u| u.0)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn flush_for_a_finished_turn_is_a_no_op() {
-        // The signal names a turn whose job already ended: the writer must drop it
-        // rather than cut whatever plays next.
+    async fn a_barge_evicts_the_banked_clips_of_the_reply_it_cuts() {
+        // The ordinary barge on a multi-clip reply: clip 1 is audible, clip 2 is
+        // already in the device's bank, and another reply is waiting behind them.
+        // The cut has to take the whole reply — a banked clip left on the stream is
+        // the robot talking on after being stopped — and it reports the audio nobody
+        // heard with that clip's own length, not a zero.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = parked_over(&stats, events, &[(42, 3), (42, 3), (43, 3)]).await;
+
+        handle.flush(UtteranceId(42)).expect("42 is audible");
+        run_until(|| stats.snapshot().jobs_completed == 3).await;
+
+        drop(handle);
+        reader.await.expect("reader");
+
+        assert_eq!(
+            evicted(&seen),
+            [(Some(42), 3, clip_ms(3))],
+            "the banked second clip is thrown away with the reply it belongs to, \
+             and its frames were written: {:?}",
+            event_tags(&seen),
+        );
+        assert_eq!(
+            writes(&seen),
+            [Some(42), Some(42), Some(43)],
+            "nothing of 42 is written after the cut, and 43 is written once",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_barge_evicts_the_clip_the_writer_had_taken_but_not_written() {
+        // The same reply's next clip can also be the job the writer holds and has
+        // not put a frame on the stream for. It is evicted with its own length and
+        // no frames, while the other turn banked ahead of it is re-written.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = parked_over(&stats, events, &[(42, 3), (43, 3), (42, 2)]).await;
+
+        handle.flush(UtteranceId(42)).expect("42 is audible");
+        run_until(|| stats.snapshot().jobs_completed == 3).await;
+
+        drop(handle);
+        reader.await.expect("reader");
+
+        assert_eq!(
+            evicted(&seen),
+            [(Some(42), 0, clip_ms(2))],
+            "a clip that never reached the stream still reports the audio it was: \
+             {:?}",
+            event_tags(&seen),
+        );
+        assert_eq!(
+            writes(&seen),
+            [Some(42), Some(43), Some(43)],
+            "43 is written again after the cut and 42's unwritten clip never is",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_barge_evicts_the_reply_an_earlier_barge_parked() {
+        // A reply parked by an earlier cut waits in `deferred`, which `next_step`
+        // plays before anything else. Barging *that* reply has to reach it there:
+        // its first clip is audible and its second is parked, and a cut that only
+        // walked the stream would speak the second one immediately after silencing
+        // the first.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(
+            PacerConfig {
+                lead_ms: 100,
+                job_queue_depth: 8,
+                ..PacerConfig::default()
+            },
+            &stats,
+            events,
+        );
+        for (id, frames) in [(41, 3), (42, 20), (42, 2)] {
+            handle
+                .try_play(job_with_id(
+                    vec![1i16; AUDIO_SAMPLES_PER_FRAME * frames],
+                    id,
+                ))
+                .unwrap();
+        }
+        // 41 is heard out of the way and 42's first clip — too long for the lead —
+        // is banked behind it with its second clip still queued. The cut parks both.
+        run_until(|| {
+            let snap = stats.snapshot();
+            snap.jobs_completed == 1 && snap.frames_written > 3
+        })
+        .await;
+        handle.flush(UtteranceId(41)).expect("41 is audible");
+        run_until(|| handle.current_turn() == Some(UtteranceId(42))).await;
+
+        handle.flush(UtteranceId(42)).expect("42 is audible again");
+        drop(handle);
+        reader.await.expect("reader");
+
+        assert_eq!(
+            evicted(&seen),
+            [(Some(42), 0, clip_ms(2))],
+            "the parked second clip is cut with the reply it belongs to: {:?}",
+            event_tags(&seen),
+        );
+        assert_eq!(
+            stats.snapshot().jobs_completed,
+            1,
+            "only 41 was ever written through; both passes over 42's first clip \
+             were cut and its second clip was never written: {:?}",
+            event_tags(&seen),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_replays_the_banked_job_before_the_one_it_had_not_written() {
+        // The cut takes the stream out from under two replies at once: 43's frames
+        // were banked and 44 had been taken but not written. 44 is the newer of the
+        // two, so it plays second — a reply order the speaker gives away and no
+        // single-overlap test can see.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = parked_three_deep(&stats, events).await;
+
+        handle.flush(UtteranceId(42)).expect("42 is audible");
+        run_until(|| stats.snapshot().jobs_completed == 4).await;
+
+        drop(handle);
+        reader.await.expect("reader");
+
+        let tags = event_tags(&seen);
+        let writes: Vec<&String> = tags.iter().filter(|t| t.starts_with("written:")).collect();
+        assert_eq!(
+            writes,
+            ["written:42", "written:43", "written:43", "written:44"],
+            "43 was on the stream before 44 was taken, so it is spoken first \
+             again: {tags:?}",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_evicted_clip_reports_the_length_nobody_heard() {
+        // Every eviction shape reports the clip it threw away the same way, so a
+        // consumer reading `playback_flushed` is not told a length for one and a
+        // zero for another.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = parked_three_deep(&stats, events).await;
+
+        handle.flush(UtteranceId(42)).expect("42 is audible");
+        run_until(|| stats.snapshot().jobs_completed == 4).await;
+
+        drop(handle);
+        reader.await.expect("reader");
+
+        assert_eq!(
+            evicted(&seen),
+            [(Some(42), 0, clip_ms(2))],
+            "the queued second clip of the barged reply is the only audio the cut \
+             threw away, and its length is its own",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_re_written_job_says_so_on_its_second_write() {
+        // A job whose banked frames the flush discarded repeats no `Started`, so its
+        // second `Written` is the only place a reader can learn that two write
+        // passes were one answer.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = parked_three_deep(&stats, events).await;
+
+        handle.flush(UtteranceId(42)).expect("42 is audible");
+        run_until(|| stats.snapshot().jobs_completed == 4).await;
+
+        drop(handle);
+        reader.await.expect("reader");
+
+        let passes: Vec<(Option<u64>, bool)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PlaybackEvent::Written {
+                    in_reply_to,
+                    rewritten,
+                    ..
+                } => Some((in_reply_to.map(|u| u.0), *rewritten)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            passes,
+            [
+                (Some(42), false),
+                (Some(43), false),
+                (Some(43), true),
+                (Some(44), false)
+            ],
+            "only 43's second pass is a re-write; 44 had never reached the stream",
+        );
+        let snap = stats.snapshot();
+        assert_eq!(
+            (snap.jobs_completed, snap.jobs_rewritten),
+            (4, 1),
+            "four write passes, three answers",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audible_opens_at_the_first_write_and_closes_at_the_audible_end() {
+        // The floor the listener runs on: the pod is heard from the first frame
+        // written until the last one is played, which trails the write by the
+        // device's playout hop. Nothing else in the run moves it.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(PacerConfig::default(), &stats, events);
+
+        handle
+            .try_play(job_with_id(vec![1i16; AUDIO_SAMPLES_PER_FRAME * 3], 42))
+            .unwrap();
+        run_until(|| stats.snapshot().jobs_completed == 1).await;
+        assert_eq!(
+            event_tags(&seen),
+            ["started:42", "audible:42", "written:42"],
+            "written, and still being heard",
+        );
+
+        drop(handle);
+        reader.await.expect("reader");
+        assert_eq!(
+            event_tags(&seen),
+            [
+                "started:42",
+                "audible:42",
+                "written:42",
+                "finished:42",
+                "silent",
+            ],
+            "the pod falls silent at the audible end, after the event that dates it",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_clips_of_one_reply_move_the_floor_once() {
+        // A reply split into clips is one stretch of speech. The hand-over emits no
+        // `Audible` at all, so the barge guard's sustain run survives the boundary
+        // instead of being reset mid-sentence.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(PacerConfig::default(), &stats, events);
+
+        handle
+            .try_play(job_with_id(vec![1i16; AUDIO_SAMPLES_PER_FRAME * 3], 42))
+            .unwrap();
+        handle
+            .try_play(job_with_id(vec![2i16; AUDIO_SAMPLES_PER_FRAME * 3], 42))
+            .unwrap();
+        drop(handle);
+        reader.await.expect("reader");
+
+        let tags = event_tags(&seen);
+        assert_eq!(
+            tags.iter().filter(|t| t.starts_with("audible")).count(),
+            1,
+            "one open for the whole reply: {tags:?}",
+        );
+        assert_eq!(
+            tags.iter().filter(|t| *t == "silent").count(),
+            1,
+            "one close, at the second clip's audible end: {tags:?}",
+        );
+        assert_eq!(tags.first().map(String::as_str), Some("started:42"));
+        assert_eq!(tags.last().map(String::as_str), Some("silent"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hand_over_to_another_turn_is_reported_at_the_first_ones_audible_end() {
+        // Two replies back to back on one stream. The second's first write is not a
+        // change — the first is still being heard — so the floor moves at the
+        // hand-over, which is the boundary a listener hears rather than the one the
+        // pacer writes. A short lead keeps the second clip being written across it.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(
+            PacerConfig {
+                lead_ms: 100,
+                job_queue_depth: 4,
+                ..PacerConfig::default()
+            },
+            &stats,
+            events,
+        );
+
+        handle
+            .try_play(job_with_id(vec![1i16; AUDIO_SAMPLES_PER_FRAME * 3], 42))
+            .unwrap();
+        handle
+            .try_play(job_with_id(vec![2i16; AUDIO_SAMPLES_PER_FRAME * 30], 43))
+            .unwrap();
+        drop(handle);
+        reader.await.expect("reader");
+
+        assert_eq!(
+            event_tags(&seen),
+            [
+                "started:42",
+                "audible:42",
+                "written:42",
+                "started:43",
+                "finished:42",
+                "audible:43",
+                "written:43",
+                "finished:43",
+                "silent",
+            ],
+            "each `Audible` trails the event that caused it, and 43's first write \
+             changes nothing while 42 is still being heard",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_audible_job_is_published_before_the_event_that_hands_it_over() {
+        // `publish_current` is synchronous and runs ahead of the lifecycle event it
+        // belongs to, so a flush landing between that event and the `Audible` behind
+        // it reads the new front rather than the job that just retired. Moving the
+        // publish after the event's `.await` — tempting, since `emit_audible`
+        // recomputes the same front — makes a barge at a first write refuse as
+        // `NotPlaying` and one at a hand-over target a job `take_flush_for` then
+        // drops. Both are a cut that silently does nothing, and the event-order
+        // checks stay green through either.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let progress: Arc<Mutex<Option<Arc<JobProgress>>>> = Arc::new(Mutex::new(None));
+        // Each lifecycle event, with the turn `progress.current` named as it was
+        // emitted.
+        type AskedAt = Arc<Mutex<Vec<(String, Option<u64>)>>>;
+        let asked: AskedAt = Arc::new(Mutex::new(Vec::new()));
+        let events: PlaybackEventFn = {
+            let (sink, published, at) = (seen.clone(), progress.clone(), asked.clone());
+            Arc::new(move |e| {
+                let tag = match &e {
+                    PlaybackEvent::Started { in_reply_to, .. } => {
+                        Some(format!("started:{}", in_reply_to.expect("a reply").0))
+                    }
+                    PlaybackEvent::Finished { in_reply_to, .. } => {
+                        Some(format!("finished:{}", in_reply_to.expect("a reply").0))
+                    }
+                    _ => None,
+                };
+                if let Some(tag) = tag {
+                    // What a flush arriving right here would target.
+                    let turn = published.lock().unwrap().as_ref().and_then(|p| {
+                        p.current
+                            .lock()
+                            .expect("job progress mutex")
+                            .and_then(|c| c.turn)
+                            .map(|u| u.0)
+                    });
+                    at.lock().unwrap().push((tag, turn));
+                }
+                sink.lock().unwrap().push(e);
+                Box::pin(std::future::ready(()))
+            })
+        };
+
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(
+            PacerConfig {
+                lead_ms: 100,
+                job_queue_depth: 4,
+                ..PacerConfig::default()
+            },
+            &stats,
+            events,
+        );
+        *progress.lock().unwrap() = Some(Arc::clone(&handle.progress));
+
+        handle
+            .try_play(job_with_id(vec![1i16; AUDIO_SAMPLES_PER_FRAME * 3], 42))
+            .unwrap();
+        handle
+            .try_play(job_with_id(vec![2i16; AUDIO_SAMPLES_PER_FRAME * 30], 43))
+            .unwrap();
+        drop(handle);
+        reader.await.expect("reader");
+
+        let recorded = asked.lock().unwrap();
+        assert_eq!(
+            *recorded,
+            [
+                ("started:42".to_string(), Some(42)),
+                ("started:43".to_string(), Some(42)),
+                ("finished:42".to_string(), Some(43)),
+                ("finished:43".to_string(), None),
+            ],
+            "the first write publishes before its `Started`, and the hand-over \
+             publishes 43 before 42's `Finished`: {:?}",
+            event_tags(&seen),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_silences_the_pod_and_a_re_written_job_speaks_again() {
+        // A barge on reply 42 while reply 43 sits banked behind it. The device's
+        // whole bank goes, so 43 was heard by nobody and is written again from its
+        // first frame — reported as audible a second time, with no second `Started`
+        // for the ledger or the analyzer to trip over.
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(
+            PacerConfig {
+                lead_ms: 1_000,
+                job_queue_depth: 4,
+                ..PacerConfig::default()
+            },
+            &stats,
+            events,
+        );
+
+        handle
+            .try_play(job_with_id(vec![1i16; AUDIO_SAMPLES_PER_FRAME * 3], 42))
+            .unwrap();
+        handle
+            .try_play(job_with_id(vec![2i16; AUDIO_SAMPLES_PER_FRAME * 3], 43))
+            .unwrap();
+        // Both are banked inside the lead with no time advanced, so 42 is still the
+        // audible one and 43 has been written but heard by nobody.
+        run_until(|| stats.snapshot().jobs_completed == 2).await;
+        handle.flush(UtteranceId(42)).expect("42 is audible");
+        run_until(|| stats.snapshot().jobs_flushed == 1).await;
+
+        drop(handle);
+        reader.await.expect("reader");
+
+        let tags = event_tags(&seen);
+        assert_eq!(
+            tags.iter().filter(|t| *t == "started:43").count(),
+            1,
+            "the re-written job starts once, whatever the device threw away: {tags:?}",
+        );
+        let audible: Vec<&String> = tags
+            .iter()
+            .filter(|t| t.starts_with("audible") || *t == "silent")
+            .collect();
+        assert_eq!(
+            audible,
+            ["audible:42", "silent", "audible:43", "silent"],
+            "the cut silences the pod and 43's re-write is what opens the floor for \
+             it: {tags:?}",
+        );
+        assert!(
+            tags.iter()
+                .position(|t| t == "flushed:42")
+                .zip(tags.iter().position(|t| t == "silent"))
+                .is_some_and(|(cut, quiet)| cut < quiet),
+            "the silence trails the cut that caused it: {tags:?}",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_after_the_last_write_cuts_the_audible_tail() {
+        // A barge in a reply's last lead: every frame is written, the writer is idle
+        // between jobs, and up to a lead of the clip is still coming out of the
+        // speaker. The cut has to land there — that tail is exactly the audio the
+        // barge is trying to stop.
+        let (dev, mut host) = duplex(1 << 16);
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let lead_ms = 1_000u64;
+        let handle = PlaybackWriter::spawn(
+            dev,
+            PodId("pod-x".into()),
+            PacerConfig {
+                lead_ms,
+                ..PacerConfig::default()
+            },
+            Arc::clone(&stats),
+            events,
+            CancellationToken::new(),
+        );
+        let reader = tokio::spawn(async move {
+            let mut tmp = [0u8; 4096];
+            while host.read(&mut tmp).await.expect("read") != 0 {}
+        });
+
+        // 500 ms of audio inside a 1 s lead: the whole clip is written in one burst
+        // with no time advancing, so `Written` lands and `Finished` does not.
+        handle
+            .try_play(job_with_id(vec![5i16; AUDIO_SAMPLES_PER_FRAME * 25], 42))
+            .unwrap();
+        run_until(|| stats.snapshot().eoa_written == 1).await;
+        // Into the audible part of the tail, still short of its end.
+        tokio::time::advance(Duration::from_millis(
+            audio_pipeline::playback::PLAYBACK_PLAYOUT_HOP_MS + 100,
+        ))
+        .await;
+        run_until(|| stats.snapshot().jobs_completed == 1).await;
+
+        let progress = handle
+            .flush(UtteranceId(42))
+            .expect("the tail is still audible, so the turn flushes");
+        assert!(
+            progress.heard_ms > 0 && progress.heard_ms < 500,
+            "heard {} ms: part of the clip, not all of it",
+            progress.heard_ms,
+        );
+        run_until(|| stats.snapshot().jobs_flushed == 1).await;
+        assert_eq!(
+            flushed_events(&seen),
+            vec![(Some(UtteranceId(42)), true, progress)],
+            "the tail is reported cut, with what was heard of it",
+        );
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, PlaybackEvent::Finished { .. })),
+            "a cut tail is never heard to its end",
+        );
+
+        drop(handle);
+        reader.await.expect("reader");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_after_the_audible_end_is_a_no_op() {
+        // The signal names a turn whose job has been heard out: the writer must drop
+        // it rather than cut whatever plays next.
         let (dev, mut host) = duplex(1 << 16);
         let (events, seen) = event_collector();
         let stats = Arc::new(PlaybackStats::default());
@@ -1758,15 +2937,29 @@ mod tests {
             while host.read(&mut tmp).await.expect("read") != 0 {}
         });
 
-        // Turn 42's job plays and finishes.
+        // Turn 42's job plays and is heard out: the clock has to pass its audible
+        // end, which trails the last write by the device's playout hop.
         handle
             .try_play(job_with_id(vec![1i16; AUDIO_SAMPLES_PER_FRAME], 42))
             .unwrap();
         run_until(|| stats.snapshot().jobs_completed == 1).await;
-        // Its flush now arrives late — the turn is over and nothing is current.
+        tokio::time::advance(Duration::from_millis(
+            audio_pipeline::playback::PLAYBACK_PLAYOUT_HOP_MS + FRAME_MS,
+        ))
+        .await;
+        // Wait for the retirement itself, not for the flush to start refusing:
+        // asking early would set a target the writer then has to drop.
+        run_until(|| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, PlaybackEvent::Finished { .. }))
+        })
+        .await;
         assert_eq!(
             handle.flush(UtteranceId(42)),
-            Err(FlushRejected::NotPlaying)
+            Err(FlushRejected::NotPlaying),
+            "nothing is audible once the clip has been heard out",
         );
 
         // Turn 43's long job must play unharmed.
@@ -1779,7 +2972,7 @@ mod tests {
 
         assert!(
             flushed_events(&seen).is_empty(),
-            "a flush for a finished turn cuts nothing",
+            "a flush for a turn heard out cuts nothing",
         );
         assert_eq!(stats.snapshot().jobs_flushed, 0);
     }
@@ -1825,7 +3018,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn eoa_write_failure_reports_finished_without_eoa_and_drains_racer() {
+    async fn eoa_write_failure_reports_written_then_aborted_and_drains_racer() {
         // Size the pipe to hold Hello + one audio frame but not the trailing
         // EndOfAudio: the audio write succeeds, then the EndOfAudio write parks (no
         // reader) until it times out. A second job that races into the queue during
@@ -1874,18 +3067,34 @@ mod tests {
         drop(handle);
         tokio::time::advance(Duration::from_millis(1_001)).await;
         run_until(|| stats.snapshot().jobs_aborted > 0).await;
+        assert_eq!(
+            event_tags(&seen).last().map(String::as_str),
+            Some("silent"),
+            "one silence, after the whole aborted set",
+        );
 
         let seen = seen.lock().unwrap();
-        assert!(
-            seen.iter().any(|e| matches!(
-                e,
-                PlaybackEvent::Finished {
+        let kinds: Vec<&str> = seen
+            .iter()
+            .filter_map(|e| match e {
+                PlaybackEvent::Written {
                     in_reply_to: Some(UtteranceId(10)),
                     eoa_written: false,
                     ..
-                }
-            )),
-            "the completed job is Finished with eoa_written:false",
+                } => Some("written"),
+                PlaybackEvent::Aborted {
+                    in_reply_to: Some(UtteranceId(10)),
+                    ..
+                } => Some("aborted"),
+                PlaybackEvent::Finished { .. } => Some("finished"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["written", "aborted"],
+            "the job's audio was all written and then lost with the stream: no \
+             `Finished` claims a tail the host cannot see the end of",
         );
         assert!(
             seen.iter().any(|e| matches!(
@@ -1899,11 +3108,77 @@ mod tests {
             "the raced-in job is aborted, not silently dropped",
         );
         let snap = stats.snapshot();
-        assert_eq!(snap.jobs_completed, 1);
+        assert_eq!(snap.jobs_completed, 1, "every frame of it went out");
         assert_eq!(snap.eoa_written, 0);
-        assert_eq!(snap.jobs_aborted, 1);
+        assert_eq!(
+            snap.jobs_aborted, 2,
+            "the job whose stream was lost, and the racer behind it"
+        );
         assert_eq!(snap.write_timeouts, 1);
         assert_eq!(snap.eoa_write_failures, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_clips_eoa_failure_leaves_the_banked_job_its_own_ending() {
+        // An empty clip never reaches the stream, so it is not the job on the back
+        // of `pending` — the previous job, still audible, is. When the drain's
+        // `EndOfAudio` fails under an empty clip, the ledger's one invariant still
+        // has to hold: every job that started gets exactly one terminal event, and
+        // it is the one describing what happened to *it*.
+        let mut sizing = [0u8; MAX_FRAME_BYTES + 2];
+        let hello = StreamFrame::Hello(Hello {
+            version: AUDIO_PROTOCOL_VERSION,
+            pod_id: HString::try_from(SENDER_POD_ID).unwrap(),
+            sample_rate_hz: SPINE_FORMAT.sample_rate_hz,
+            bits_per_sample: SPINE_FORMAT.bits_per_sample,
+            channels: SPINE_FORMAT.channels,
+            codec: SPINE_FORMAT.codec,
+            channel_source: ChannelSource::CommunicationBeam,
+        });
+        let hello_len = encode_frame(&hello, &mut sizing).unwrap();
+        let audio = build_audio_frame(&[0i16; AUDIO_SAMPLES_PER_FRAME]);
+        let audio_len = encode_frame(&audio, &mut sizing).unwrap();
+
+        // Room for Hello and the one audio frame, and nothing for the EndOfAudio.
+        let (_dev_read, host) = duplex(hello_len + audio_len);
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let handle = PlaybackWriter::spawn(
+            host,
+            PodId("pod-x".into()),
+            PacerConfig {
+                write_timeout_ms: 1_000,
+                job_queue_depth: 4,
+                ..PacerConfig::default()
+            },
+            Arc::clone(&stats),
+            events,
+            CancellationToken::new(),
+        );
+        // Both queued before the writer runs, so 10 has a job behind it and writes
+        // no end-of-audio of its own; 11's drain is the one that fails.
+        handle
+            .try_play(job_with_id(vec![0i16; AUDIO_SAMPLES_PER_FRAME], 10))
+            .unwrap();
+        handle.try_play(job_with_id(Vec::new(), 11)).unwrap();
+        drop(handle);
+        // Let the writer send Hello + audio and park in the EndOfAudio write.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(1_001)).await;
+        run_until(|| stats.snapshot().jobs_aborted == 2).await;
+
+        let tags = event_tags(&seen);
+        let terminal: Vec<&String> = tags
+            .iter()
+            .filter(|t| t.starts_with("finished:") || t.starts_with("aborted:"))
+            .collect();
+        assert_eq!(
+            terminal,
+            ["aborted:11", "aborted:10"],
+            "one ending each, and the banked job's is its own: {tags:?}",
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2006,13 +3281,9 @@ mod tests {
         run_until(|| handle.try_play(job(vec![0i16])) == Err(PlayRejected::WriterDead)).await;
     }
 
-    #[tokio::test]
-    async fn take_flush_for_drops_a_signal_naming_another_turn() {
-        // The writer-side re-check: a flush signal could race a job boundary and end
-        // up naming a turn other than the one now playing. Such a signal is dropped
-        // (never taken) and cleared, so it cannot later cut the wrong response.
-        let (dev, _host) = duplex(1 << 16);
-        let writer = Writer {
+    /// A bare writer over `dev`, for the unit-level checks on `take_flush_for`.
+    fn bare_writer(dev: DuplexStream) -> Writer<DuplexStream> {
+        Writer {
             io: dev,
             pod: PodId("pod-x".into()),
             cfg: PacerConfig::default(),
@@ -2024,22 +3295,85 @@ mod tests {
             buf: [0u8; MAX_FRAME_BYTES + 2],
             anchor: None,
             frames_in_stream: 0,
+            pending: VecDeque::new(),
             deferred: VecDeque::new(),
-        };
+            queue_closed: false,
+            last_audible: None,
+        }
+    }
+
+    /// One banked job for `turn`, as `pending` holds it: audible from `now`, its
+    /// end not yet dated.
+    fn banked(turn: u64) -> Pending {
+        Pending {
+            job: job_with_id(vec![0i16; AUDIO_SAMPLES_PER_FRAME], turn),
+            frames: 1,
+            samples: AUDIO_SAMPLES_PER_FRAME as u64,
+            eoa_written: false,
+            starts_at: Instant::now(),
+            ends_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn take_flush_for_drops_a_signal_naming_another_turn() {
+        // The writer-side re-check: a flush signal could race a retirement and end
+        // up naming a turn nobody can still hear. Such a signal is dropped (never
+        // taken) and cleared, so it cannot later cut the wrong response.
+        let (dev, _host) = duplex(1 << 16);
+        let mut writer = bare_writer(dev);
+        writer.pending.push_back(banked(1));
 
         *writer.flush_signal.target.lock().unwrap() = Some(UtteranceId(2));
-        assert!(
-            !writer.take_flush_for(Some(UtteranceId(1))),
-            "a signal for another turn is not taken",
+        assert_eq!(
+            writer.take_flush_for(),
+            None,
+            "a signal for a turn other than the audible one is not taken",
         );
         assert!(
             writer.flush_signal.target.lock().unwrap().is_none(),
             "the stale target is cleared, not left to fire on a later job",
         );
 
-        // A signal naming the current turn is taken and consumed.
-        *writer.flush_signal.target.lock().unwrap() = Some(UtteranceId(5));
-        assert!(writer.take_flush_for(Some(UtteranceId(5))));
+        // A signal naming the audible turn is taken and consumed.
+        *writer.flush_signal.target.lock().unwrap() = Some(UtteranceId(1));
+        assert_eq!(writer.take_flush_for(), Some(Some(UtteranceId(1))));
+        assert!(writer.flush_signal.target.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn take_flush_for_matches_the_audible_job_not_the_one_being_written() {
+        // The case the front-of-queue match exists for: clip A's tail is still
+        // audible while clip B of a later turn is being written. A barge against A
+        // is the legitimate one, and comparing against the job under the write head
+        // would swallow it.
+        let (dev, _host) = duplex(1 << 16);
+        let mut writer = bare_writer(dev);
+        writer.pending.push_back(banked(1));
+        writer.pending.push_back(banked(2));
+
+        *writer.flush_signal.target.lock().unwrap() = Some(UtteranceId(2));
+        assert_eq!(
+            writer.take_flush_for(),
+            None,
+            "the turn being written is not the audible one",
+        );
+        *writer.flush_signal.target.lock().unwrap() = Some(UtteranceId(1));
+        assert_eq!(
+            writer.take_flush_for(),
+            Some(Some(UtteranceId(1))),
+            "the audible turn matches even with a later turn on the stream",
+        );
+    }
+
+    #[tokio::test]
+    async fn take_flush_for_with_nothing_banked_drops_the_signal() {
+        // Nothing is audible, so no target can be legitimate; the handle would
+        // have answered `NotPlaying` before setting one.
+        let (dev, _host) = duplex(1 << 16);
+        let writer = bare_writer(dev);
+        *writer.flush_signal.target.lock().unwrap() = Some(UtteranceId(1));
+        assert_eq!(writer.take_flush_for(), None);
         assert!(writer.flush_signal.target.lock().unwrap().is_none());
     }
 }

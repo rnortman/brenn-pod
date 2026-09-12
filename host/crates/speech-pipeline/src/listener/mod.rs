@@ -26,7 +26,7 @@ pub use event::{
 pub use oww_stream::{OwwConfig, OwwModels, OwwStream, ScoredChunk, WakeDetected};
 pub use ring::PcmRing;
 pub use runtime::{
-    BargeInConfig, FeedPermit, FeedSender, Listener, ListenerConfig, ListenerHandle, ListenerState,
+    BargeInConfig, FeedSender, Listener, ListenerConfig, ListenerHandle, ListenerState,
     ListenerStats, ListenerStatsSnapshot,
 };
 pub use silero::{SileroConfig, SileroModel, SileroVad};

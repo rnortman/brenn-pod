@@ -6235,9 +6235,7 @@ mod tests {
     use pod_transport::test_support::{FakePort, make_harness};
 
     fn make_build_id(commit: &str, dirty: bool) -> BuildId {
-        let mut c = heapless::String::<40>::new();
-        let _ = c.push_str(&commit[..commit.len().min(40)]);
-        BuildId { commit: c, dirty }
+        BuildId::truncating(commit, dirty)
     }
 
     // ── Build-ID compare tests ────────────────────────────────────────────────

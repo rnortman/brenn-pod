@@ -255,6 +255,27 @@ const _: () = assert!(
     "default playback burst lead + escalated preroll cap + one max frame must fit in the inbound PCM ring"
 );
 
+/// Device playout hop in **milliseconds**: how far the first sample *heard* trails the first sample
+/// *written* on a fresh stream. Derived from [`PLAYBACK_PREROLL_TARGET_BYTES`] at the raw-mono wire
+/// rate (`SAMPLE_RATE_HZ / 1_000 × WIRE_BYTES_PER_SAMPLE` = 32 B/ms), because the drain loop does not
+/// start playing until that much raw PCM is banked: 7 680 / 32 = 240 ms.
+///
+/// A **lower bound**, not a measurement, and the host's pacer models the audible end of a stream with
+/// it. What it does not include:
+///
+/// - The I2S/ALSA period on the unit (320 frames × 4, ≈ 80 ms) and USB/link jitter.
+/// - Preroll escalation after a mid-stream underrun: the target doubles toward
+///   [`PLAYBACK_PREROLL_MAX_TARGET_BYTES`] (960 ms) or is preempted by the
+///   `PLAYBACK_PREROLL_MAX_WAIT_MS` (500 ms) fallback, and the underrun itself stalls playout for the
+///   length of the gap.
+///
+/// So a stream's true audible end never precedes the host's estimate and can trail it by the stall
+/// plus most of a second on a link that underran. Measuring it honestly would need the device to
+/// report its playout position on the wire; a larger constant here would be a guess dressed as one.
+pub const PLAYBACK_PLAYOUT_HOP_MS: u64 = (PLAYBACK_PREROLL_TARGET_BYTES
+    / ((crate::ring::SAMPLE_RATE_HZ as usize / 1_000) * WIRE_BYTES_PER_SAMPLE))
+    as u64;
+
 /// Pre-roll / minimum-fill target in **bytes** of buffered *raw* inbound PCM before the capture-thread
 /// drain loop begins playing a fresh stream (the pcm-ring ADR's preroll cushion, re-based to raw
 /// units in design §3.1) — 240 ms at the raw-mono rate (`12 × 640 = 7 680 bytes = 240 ms`).
@@ -2572,7 +2593,7 @@ mod tests {
 
     use super::{
         DrainRun, INBOUND_PCM_RING_BYTES, INBOUND_PCM_WRITE_UNIT_BYTES, InboundRingProducer,
-        PLAYBACK_PREROLL_TARGET_BYTES, RING_EOA_MARK_CAP,
+        PLAYBACK_PLAYOUT_HOP_MS, PLAYBACK_PREROLL_TARGET_BYTES, RING_EOA_MARK_CAP,
     };
 
     /// Write `bytes` into the ring through the producer, returning whether it fit. The `fill`
@@ -3263,6 +3284,10 @@ mod tests {
         assert_eq!(
             PLAYBACK_PREROLL_TARGET_BYTES, 7_680,
             "240 ms raw preroll target (design-delta-14 §2)"
+        );
+        assert_eq!(
+            PLAYBACK_PLAYOUT_HOP_MS, 240,
+            "the preroll target is the playout hop, in ms at 32 B/ms raw-mono"
         );
         assert_eq!(
             INBOUND_PCM_WRITE_UNIT_BYTES, 640,

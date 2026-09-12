@@ -17,9 +17,8 @@
 //! writer took is settled by the playback event that ends it; one no writer took
 //! has no such event, so nothing else would ever account for it.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use audio_pipeline::vad::VAD_HANGOVER_MS;
@@ -30,8 +29,8 @@ use pod_ingest::HostMicros;
 use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
-    FRAME_MS, Feed, FeedPermit, PlayRejected, PlaybackEvent, PlaybackEventFn, PlaybackJob, PodId,
-    SpeakBody, SpeakCmd, StageTimings, SynthesisError, Synthesizer, UtteranceId, signed_offset_us,
+    FRAME_MS, Feed, PlayRejected, PlaybackEvent, PlaybackEventFn, PlaybackJob, PodId, SpeakBody,
+    SpeakCmd, StageTimings, SynthesisError, Synthesizer, UtteranceId, signed_offset_us,
     stage_delta_us,
 };
 use tokio_util::sync::CancellationToken;
@@ -441,36 +440,17 @@ fn emit_outcome(
 /// fan-out actually needs is what makes the floor's behaviour testable without one.
 pub(crate) type FeedFn = Arc<dyn Fn(PodId, Feed) -> BoxFuture<'static, ()> + Send + Sync>;
 
-/// Reserves one listener feed slot, for the floor-close timer: it must decide and
-/// feed atomically under the generation lock, and a permit's send is the only
-/// non-awaiting way to reach the channel. `None` means the listener is gone or
-/// wedged and the close is abandoned.
-pub(crate) type ReserveFn = Arc<dyn Fn() -> BoxFuture<'static, Option<FeedPermit>> + Send + Sync>;
-
 /// What the playback-event adapter fans each event out to, beyond its JSONL line:
 /// the listener's playback floor and the barge-in ledger's settlement accounting.
 /// Absent in pipelines with no listener and no barge-in path (the replay rigs).
 pub(crate) struct PlaybackFanout {
     pub(crate) feed: FeedFn,
-    pub(crate) reserve: ReserveFn,
     pub(crate) ledger: Arc<TurnLedger>,
     /// The motion scripter, when a presence channel is configured. It reads the
     /// same accounting the ledger keeps: when a turn's speech started and how
     /// long it is, which is what schedules the head's ending.
     pub(crate) scripter: Option<ScriptHandle>,
-    /// The pacer's lead, which is how long the floor stays open past the last
-    /// write. See [`schedule_floor_close`].
-    pub(crate) lead_ms: u64,
 }
-
-/// The per-pod floor-close generation, latest-wins: every event that moves a pod's
-/// floor bumps its generation, and a scheduled close captures the generation live
-/// at scheduling and feeds the close only if it is still current when the timer
-/// fires. `JoinHandle::abort` alone cannot retract a timer whose final poll is
-/// already running, so a bare abort-on-supersede leaves a window where a stale
-/// close lands after the next job's `Started` opened the floor and blinds barge
-/// detection for that whole response. The generation re-check closes that window.
-type FloorGens = Arc<Mutex<HashMap<PodId, u64>>>;
 
 /// Build the `PlaybackEventFn` handed to every `PlaybackWriter` at spawn: the
 /// closure that turns each writer-emitted `PlaybackEvent` into one JSONL line, and
@@ -489,18 +469,16 @@ pub(crate) fn playback_event_adapter(
     clock_step_clamps: Arc<AtomicU64>,
     fanout: Option<PlaybackFanout>,
 ) -> PlaybackEventFn {
-    let gens: FloorGens = Arc::new(Mutex::new(HashMap::new()));
     // `Arc`'d so each emitted event's future owns a cheap handle rather than
     // borrowing the closure's capture.
     let fanout = Arc::new(fanout);
     Arc::new(move |event| {
         let fanout = Arc::clone(&fanout);
-        let gens = Arc::clone(&gens);
         let jsonl = jsonl.clone();
         let clock_step_clamps = Arc::clone(&clock_step_clamps);
         Box::pin(async move {
             if let Some(fanout) = fanout.as_ref() {
-                fan_out_playback_event(&event, fanout, &gens).await;
+                fan_out_playback_event(&event, fanout).await;
             }
             emit_playback_event(event, &jsonl, &clock_step_clamps);
         })
@@ -511,10 +489,10 @@ pub(crate) fn playback_event_adapter(
 /// changed it answered. The one home for that report: the playback fan-out uses
 /// it for every terminal event, and the router for every command it gives up on.
 ///
-/// Tapped at the event rather than at the listener floor's `lead_ms` delay: the
-/// head's timings are seconds and a second of pacer lead is noise, and the
-/// horizon this carries is dated from when the clip started, not from when
-/// anybody heard about it.
+/// Tapped at the event: the horizon this carries is dated from when the clip
+/// started, not from when anybody heard about it, and the head's timings are
+/// seconds, so the pacer's lead between the first write and the first heard
+/// sample is noise at that scale.
 ///
 /// A turn the ledger no longer holds — interrupted, or completed and retired —
 /// answers nothing, and there is nothing to say about it: the barge that cut it
@@ -537,19 +515,27 @@ fn tell_scripter(
 /// Drive the listener floor and the ledger from one playback event.
 ///
 /// The floor tells detection whether the pod is speaking, which is what gates the
-/// barge trigger. It opens at `Started` and closes on every way a job can end. The
-/// ledger settles every terminal event, so a turn's cmds account for themselves
-/// whatever became of them; `clean` is true only for a job that played out and
-/// wrote its end-of-audio marker. `Started` is recorded there too, with the job's
-/// sample count: that is what dates the end of the turn's audio while it is still
-/// playing, rather than at the `Finished` that reports it after the fact.
-async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout, gens: &FloorGens) {
+/// barge trigger. It follows `Audible` and no other event: the floor is one state
+/// per pod, and the job-lifecycle events cannot express it once several jobs share
+/// a stream — a reply's second clip starts before the first one's audible end, and
+/// a job re-written after a flush repeats no lifecycle event at all. The pacer
+/// holds the answer and says so.
+///
+/// The ledger settles every terminal event, so a turn's cmds account for themselves
+/// whatever became of them; `clean` is true for a job heard to its end and false
+/// for an abort or a cut. `Started` is recorded there too, with the job's sample
+/// count: that is what dates the end of the turn's audio while it is still playing,
+/// rather than at the ending that reports it after the fact.
+///
+/// The last write itself — `Written` — moves neither: the audio it hands over is
+/// still coming out of the speaker, which is the whole reason the two events are
+/// separate. It carries one JSONL line and nothing else.
+async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout) {
     match event {
         PlaybackEvent::Started {
             pod,
             in_reply_to,
             samples,
-            interruptible,
             ..
         } => {
             // The tokio clock, not the std one this module measures spans with: the
@@ -561,125 +547,46 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout, 
                 tokio::time::Instant::now(),
             );
             tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
-            cancel_floor_close(gens, pod);
+        }
+        PlaybackEvent::Audible { pod, job } => {
             (fanout.feed)(
                 pod.clone(),
                 Feed::PlaybackState {
-                    active: true,
-                    interruptible: *interruptible,
+                    active: job.is_some(),
+                    interruptible: job.as_ref().is_some_and(|j| j.interruptible),
                 },
             )
             .await;
         }
+        // The audio is banked on the device, not heard: nothing to settle and
+        // nothing to tell the listener.
+        PlaybackEvent::Written { .. } => {}
         PlaybackEvent::Finished {
-            pod,
-            in_reply_to,
-            writer_dying,
-            ..
+            pod, in_reply_to, ..
         } => {
-            // A fully-played job settles clean whether or not it drained the
+            // A job heard to its end settles clean whether or not it drained the
             // stream: a clip that finishes with another queued behind it writes no
-            // end-of-audio yet delivered all its audio. Only a writer dying on a
-            // failed end-of-audio write settles unclean. The floor closes on every
-            // `Finished` shape regardless — a live writer's next `Started`
-            // supersedes the scheduled close, and a dying writer needs it (possibly
-            // no `Aborted` follows, its queue may be empty), or the floor stays open
-            // until the next reconnect and sustained room speech mints a wake-less
-            // dispatch.
-            let audio = fanout.ledger.settle_job(pod, *in_reply_to, !*writer_dying);
+            // end-of-audio yet delivered all its audio. Whether the pod fell silent
+            // here is the `Audible` behind this event's business, not this arm's.
+            let audio = fanout.ledger.settle_job(pod, *in_reply_to, true);
             tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
-            schedule_floor_close(fanout, gens, pod);
         }
         PlaybackEvent::Aborted {
             pod, in_reply_to, ..
         } => {
             let audio = fanout.ledger.settle_job(pod, *in_reply_to, false);
             tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
-            schedule_floor_close(fanout, gens, pod);
         }
         PlaybackEvent::Flushed {
-            pod,
-            in_reply_to,
-            was_playing,
-            ..
+            pod, in_reply_to, ..
         } => {
+            // Both halves of a cut settle the same way: the job that was audible and
+            // every job of its turn evicted behind it delivered no whole reply.
             let audio = fanout.ledger.settle_job(pod, *in_reply_to, false);
             tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
-            if *was_playing {
-                // The barge already happened and the device has discarded its bank;
-                // nothing is audible, so the floor closes now rather than on the
-                // lead delay a natural ending needs.
-                cancel_floor_close(gens, pod);
-                close_floor(fanout, pod).await;
-            }
         }
         PlaybackEvent::HelloWritten { .. } | PlaybackEvent::HelloFailed { .. } => {}
     }
-}
-
-/// Close the pod's floor `lead_ms` after the job ended, latest-wins.
-///
-/// `Finished` fires at the last *write*, and the pacer runs up to `lead_ms` ahead
-/// of real time — so up to a second of audio is still coming out of the speaker.
-/// Closing the floor at the event would blind detection for the response's final
-/// second, which is exactly when a user who has heard enough speaks up.
-fn schedule_floor_close(fanout: &PlaybackFanout, gens: &FloorGens, pod: &PodId) {
-    let generation = bump_generation(gens, pod);
-    let delay = std::time::Duration::from_millis(fanout.lead_ms);
-    let reserve = Arc::clone(&fanout.reserve);
-    let gens = Arc::clone(gens);
-    let target = pod.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        // Reserve the channel slot *before* taking the lock: the send under the
-        // lock must not await, and a permit's send cannot.
-        let Some(permit) = reserve().await else {
-            return;
-        };
-        // Re-check under the same lock every floor move takes to bump the
-        // generation: only feed the close if it is still the pod's current
-        // generation, and feed it while holding the lock so a concurrent `Started`
-        // (which bumps the generation before it opens the floor) cannot interleave
-        // its open between this check and this feed. A superseded close feeds
-        // nothing.
-        let map = gens.lock().expect("floor generations poisoned");
-        if map.get(&target) == Some(&generation) {
-            permit.send(
-                target.clone(),
-                Feed::PlaybackState {
-                    active: false,
-                    interruptible: false,
-                },
-            );
-        }
-        // A superseded close drops the permit here, releasing the slot.
-    });
-}
-
-/// Bump `pod`'s floor generation, invalidating any pending close, and return the
-/// new value for a freshly scheduled close to capture.
-fn bump_generation(gens: &FloorGens, pod: &PodId) -> u64 {
-    let mut map = gens.lock().expect("floor generations poisoned");
-    let g = map.entry(pod.clone()).or_insert(0);
-    *g = g.wrapping_add(1);
-    *g
-}
-
-/// Drop any pending floor close for `pod` without closing the floor: bumping the
-/// generation makes an in-flight close timer for the pod feed nothing when it wakes.
-fn cancel_floor_close(gens: &FloorGens, pod: &PodId) {
-    bump_generation(gens, pod);
-}
-
-async fn close_floor(fanout: &PlaybackFanout, pod: &PodId) {
-    (fanout.feed)(
-        pod.clone(),
-        Feed::PlaybackState {
-            active: false,
-            interruptible: false,
-        },
-    )
-    .await;
 }
 
 /// The `latency_summary` line: the whole segment-and-response cycle accounted for
@@ -787,13 +694,45 @@ fn emit_playback_event(event: PlaybackEvent, jsonl: &JsonlHandle, clamps: &Atomi
                 &latency_summary(&pod, in_reply_to, &timings, speak_rx, first_write, clamps),
             );
         }
+        PlaybackEvent::Written {
+            pod,
+            in_reply_to,
+            frames,
+            samples,
+            eoa_written,
+            rewritten,
+            plays_until,
+        } => {
+            jsonl.emit(
+                "playback_written",
+                &json!({
+                    "pod": pod,
+                    "utterance": in_reply_to,
+                    "frames": frames,
+                    "samples": samples,
+                    "eoa_written": eoa_written,
+                    // A second pass over a job whose banked frames a flush threw
+                    // away. It repeats no `playback_started`, so this is what says
+                    // two of these lines for one reply are one answer written
+                    // twice rather than two answers.
+                    "rewritten": rewritten,
+                    // The lead still outstanding at the last write: how much of this
+                    // clip the device holds and has not played. The pacer front-loads
+                    // up to `lead_ms` of audio, so this is what separates this line's
+                    // timestamp from `playback_finished`'s, and it is the number that
+                    // says whether the audible-end estimate is worth refining.
+                    "banked_ms": plays_until
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis() as u64,
+                }),
+            );
+        }
         PlaybackEvent::Finished {
             pod,
             in_reply_to,
             frames,
             samples,
             eoa_written,
-            writer_dying: _,
         } => {
             jsonl.emit(
                 "playback_finished",
@@ -804,12 +743,25 @@ fn emit_playback_event(event: PlaybackEvent, jsonl: &JsonlHandle, clamps: &Atomi
                     "samples": samples,
                     "eoa_written": eoa_written,
                     // Nominal audio duration: frame count times one frame's playout
-                    // span. Not the measured wall time the writer spent — the pacer
-                    // front-loads up to `lead_ms` of audio in one burst before any
-                    // sleep, so the real first-write-to-EndOfAudio wall span is
-                    // shorter by up to `lead_ms`. The event carries no wall
-                    // timestamps, so only the nominal duration is available here.
+                    // span. Not a measured wall span — the line's own timestamp dates
+                    // the estimated audible end, and the pacer's estimate of that is
+                    // a lower bound.
                     "nominal_audio_ms": frames * FRAME_MS,
+                }),
+            );
+        }
+        PlaybackEvent::Audible { pod, job } => {
+            // The floor's own record. Every other line dates a job's lifecycle;
+            // this one dates what the pod is heard to be saying, which is the thing
+            // detection is gated on — and the only line at all for a hand-over to
+            // another turn or for a job re-written after a flush.
+            jsonl.emit(
+                "playback_audible",
+                &json!({
+                    "pod": pod,
+                    "active": job.is_some(),
+                    "utterance": job.as_ref().and_then(|j| j.in_reply_to),
+                    "interruptible": job.as_ref().map(|j| j.interruptible),
                 }),
             );
         }
@@ -853,8 +805,8 @@ mod tests {
 
     use serde_json::Value;
     use speech_pipeline::{
-        AbortReason, InterruptProgress, PacerConfig, PcmChunk, PlaybackEventFn, PlaybackStats,
-        PlaybackWriter, StageTimings,
+        AbortReason, AudibleJob, InterruptProgress, PacerConfig, PcmChunk, PlaybackEventFn,
+        PlaybackStats, PlaybackWriter, StageTimings,
     };
 
     use crate::config::JsonlSink;
@@ -1479,7 +1431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_finished_aborted_map_to_their_lines() {
+    async fn hello_audible_finished_aborted_map_to_their_lines() {
         let pod = PodId("pod-x".into());
         let (lines, _) = run_adapter(vec![
             PlaybackEvent::HelloWritten { pod: pod.clone() },
@@ -1493,7 +1445,13 @@ mod tests {
                 frames: 3,
                 samples: 960,
                 eoa_written: true,
-                writer_dying: false,
+            },
+            PlaybackEvent::Audible {
+                pod: pod.clone(),
+                job: Some(AudibleJob {
+                    in_reply_to: Some(UtteranceId(3)),
+                    interruptible: false,
+                }),
             },
             PlaybackEvent::Aborted {
                 pod,
@@ -1517,9 +1475,80 @@ mod tests {
         // Nominal audio duration: 3 frames × 20 ms/frame.
         assert_eq!(finished["nominal_audio_ms"], 60);
 
+        let audible = find(&lines, "playback_audible");
+        assert_eq!(audible["pod"], "pod-x");
+        assert_eq!(audible["active"], true);
+        assert_eq!(audible["utterance"], 3);
+        assert_eq!(audible["interruptible"], false);
+
         let aborted = find(&lines, "playback_aborted");
         assert_eq!(aborted["utterance"], 4);
         assert_eq!(aborted["reason"], "write_error");
+    }
+
+    /// `banked_ms` is the only derived number on any of these lines, and it is what
+    /// an operator is told to read as the audio the device still holds. A reversed
+    /// subtraction or a units slip would leave a plausible constant on every line,
+    /// which no ordering or presence check can see.
+    #[tokio::test(start_paused = true)]
+    async fn the_written_line_carries_the_lead_still_outstanding() {
+        let pod = PodId("pod-x".into());
+        let (lines, _) = run_adapter(vec![
+            PlaybackEvent::Written {
+                pod: pod.clone(),
+                in_reply_to: Some(UtteranceId(3)),
+                frames: 96,
+                samples: 30_720,
+                eoa_written: true,
+                rewritten: true,
+                plays_until: tokio::time::Instant::now() + std::time::Duration::from_millis(800),
+            },
+            // A second pass whose audible end is already behind it: the estimate is
+            // a lower bound, so this is reachable, and it reads as nothing banked
+            // rather than as a wrapped duration.
+            PlaybackEvent::Written {
+                pod,
+                in_reply_to: None,
+                frames: 1,
+                samples: 320,
+                eoa_written: false,
+                rewritten: false,
+                plays_until: tokio::time::Instant::now() - std::time::Duration::from_millis(50),
+            },
+        ])
+        .await;
+
+        let written: Vec<&Value> = lines
+            .iter()
+            .filter(|v| v["event"] == "playback_written")
+            .collect();
+        assert_eq!(written.len(), 2, "{lines:?}");
+        assert_eq!(written[0]["pod"], "pod-x");
+        assert_eq!(written[0]["utterance"], 3);
+        assert_eq!(written[0]["frames"], 96);
+        assert_eq!(written[0]["samples"], 30_720);
+        assert_eq!(written[0]["eoa_written"], true);
+        assert_eq!(written[0]["rewritten"], true);
+        assert_eq!(written[0]["banked_ms"], 800);
+        assert!(written[1]["utterance"].is_null());
+        assert_eq!(written[1]["eoa_written"], false);
+        assert_eq!(written[1]["rewritten"], false);
+        assert_eq!(written[1]["banked_ms"], 0, "a past end banks nothing");
+    }
+
+    /// Silence has no job to name, so the two job-shaped fields are null rather
+    /// than carrying the turn that just stopped.
+    #[tokio::test]
+    async fn a_silent_pod_emits_an_audible_line_with_no_job() {
+        let (lines, _) = run_adapter(vec![PlaybackEvent::Audible {
+            pod: PodId("pod-x".into()),
+            job: None,
+        }])
+        .await;
+        let audible = find(&lines, "playback_audible");
+        assert_eq!(audible["active"], false);
+        assert!(audible["utterance"].is_null());
+        assert!(audible["interruptible"].is_null());
     }
 
     /// t0 for the timing fixtures: host receipt of the utterance's first audio.
@@ -2255,82 +2284,9 @@ mod tests {
         }
     }
 
-    /// A fanout whose feed and reserve hooks are supplied by the caller, for the
-    /// floor-close timer paths that never reach the adapter.
-    fn fanout_with(feed: FeedFn, reserve: ReserveFn, lead_ms: u64) -> PlaybackFanout {
-        PlaybackFanout {
-            feed,
-            reserve,
-            ledger: Arc::new(TurnLedger::new()),
-            scripter: None,
-            lead_ms,
-        }
-    }
-
-    /// A wedged or dead listener hands back no permit; the timer abandons the
-    /// close rather than panicking or feeding a stale `active: false`.
-    #[tokio::test]
-    async fn floor_close_timer_abandons_the_close_without_a_permit() {
-        let (feed, _reserve, mut rx) = spy_feed();
-        let reserve: ReserveFn = Arc::new(|| Box::pin(async { None }));
-        let fanout = fanout_with(feed, reserve, 1);
-        let gens: FloorGens = Arc::new(Mutex::new(HashMap::new()));
-        let pod = PodId("pod-x".into());
-
-        schedule_floor_close(&fanout, &gens, &pod);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        assert!(
-            rx.try_recv().is_err(),
-            "no floor move is fed when the reserve fails"
-        );
-    }
-
-    /// Every superseded close gives its reserved slot back: without that, a long
-    /// session leaks one channel slot per supersede until markers start timing out.
-    #[tokio::test]
-    async fn superseded_floor_closes_release_their_permits() {
-        // A bounded channel with no consumer: only permit *release* can keep
-        // capacity available across repeated superseded closes.
-        let (tx, _raw_rx) = tokio::sync::mpsc::channel::<(PodId, Feed)>(2);
-        let sender = speech_pipeline::FeedSender::detached_for_tests(tx);
-        let feed_sender = sender.clone();
-        let feed: FeedFn = Arc::new(move |pod, f| {
-            let sender = feed_sender.clone();
-            Box::pin(async move { sender.feed(pod, f).await })
-        });
-        let reserve_sender = sender.clone();
-        let reserve: ReserveFn = Arc::new(move || {
-            let sender = reserve_sender.clone();
-            Box::pin(async move { sender.reserve_marker().await })
-        });
-        let fanout = fanout_with(feed, reserve, 1);
-        let gens: FloorGens = Arc::new(Mutex::new(HashMap::new()));
-        let pod = PodId("pod-x".into());
-
-        for _ in 0..8 {
-            schedule_floor_close(&fanout, &gens, &pod);
-            // Supersede it before its permit is sent.
-            bump_generation(&gens, &pod);
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let permit = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            sender.reserve_marker(),
-        )
-        .await
-        .expect("capacity is still available, so reserving is immediate");
-        assert!(permit.is_some(), "the channel is neither full nor closed");
-    }
-
     /// A feed sink recording the `PlaybackState` changes the adapter drives, in
     /// place of the real listener (which owns an inference thread).
-    fn spy_feed() -> (
-        FeedFn,
-        ReserveFn,
-        tokio::sync::mpsc::UnboundedReceiver<Feed>,
-    ) {
+    fn spy_feed() -> (FeedFn, tokio::sync::mpsc::UnboundedReceiver<Feed>) {
         // A real bounded feed channel, so the permit path under test is the one
         // production takes; a forwarder republishes onto an unbounded receiver so
         // assertions never have to keep up with the adapter.
@@ -2347,35 +2303,28 @@ mod tests {
             let sender = feed_sender.clone();
             Box::pin(async move { sender.feed(pod, f).await })
         });
-        let reserve: ReserveFn = Arc::new(move || {
-            let sender = sender.clone();
-            Box::pin(async move { sender.reserve_marker().await })
-        });
-        (feed, reserve, rx)
+        (feed, rx)
     }
 
     /// Feed `events` through an adapter wired to a spy listener and a ledger,
     /// returning the floor changes it fed and the ledger it settled against.
     async fn run_fanout(
         events: Vec<PlaybackEvent>,
-        lead_ms: u64,
     ) -> (tokio::sync::mpsc::UnboundedReceiver<Feed>, Arc<TurnLedger>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(path))
             .await
             .unwrap();
-        let (feed, reserve, rx) = spy_feed();
+        let (feed, rx) = spy_feed();
         let ledger = Arc::new(TurnLedger::new());
         let adapter = playback_event_adapter(
             jsonl.clone(),
             Arc::new(AtomicU64::new(0)),
             Some(PlaybackFanout {
                 feed,
-                reserve,
                 ledger: Arc::clone(&ledger),
                 scripter: None,
-                lead_ms,
             }),
         );
         for e in events {
@@ -2403,7 +2352,7 @@ mod tests {
             .await
             .unwrap();
         let (handle, mut inbox) = crate::scripter::channel(jsonl.clone());
-        let (feed, reserve, _rx) = spy_feed();
+        let (feed, _rx) = spy_feed();
         let ledger = Arc::new(TurnLedger::new());
         for _ in 0..cmds {
             ledger.record_cmd(&PodId("pod-x".into()), UtteranceId(1), None);
@@ -2413,10 +2362,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Some(PlaybackFanout {
                 feed,
-                reserve,
                 ledger,
                 scripter: Some(handle.clone()),
-                lead_ms: 1,
             }),
         );
         for e in events {
@@ -2471,7 +2418,6 @@ mod tests {
         let cases = [
             started_for(1),
             finished(1, true),
-            finished_writer_dying(1),
             PlaybackEvent::Aborted {
                 pod: pod.clone(),
                 in_reply_to: Some(UtteranceId(1)),
@@ -2553,29 +2499,35 @@ mod tests {
             frames: 3,
             samples: 960,
             eoa_written,
-            writer_dying: false,
         }
     }
 
-    /// A `Finished` for a job that played out but whose end-of-audio write failed:
-    /// the writer is exiting, and the turn settles unclean.
-    fn finished_writer_dying(utterance: u64) -> PlaybackEvent {
-        PlaybackEvent::Finished {
+    /// The pacer's report that `utterance`'s clip is what the pod is heard saying.
+    fn audible(utterance: u64, interruptible: bool) -> PlaybackEvent {
+        PlaybackEvent::Audible {
             pod: PodId("pod-x".into()),
-            in_reply_to: Some(UtteranceId(utterance)),
-            frames: 3,
-            samples: 960,
-            eoa_written: false,
-            writer_dying: true,
+            job: Some(AudibleJob {
+                in_reply_to: Some(UtteranceId(utterance)),
+                interruptible,
+            }),
+        }
+    }
+
+    /// The pacer's report that the pod's bank is empty.
+    fn silent() -> PlaybackEvent {
+        PlaybackEvent::Audible {
+            pod: PodId("pod-x".into()),
+            job: None,
         }
     }
 
     /// Assert the floor does not move for `ms`. A closed channel counts as quiet:
-    /// the adapter and any timer it spawned are gone, so nothing can move it.
-    async fn floor_quiet(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Feed>, ms: u64) {
+    /// the adapter is gone, so nothing can move it. `what` names the event under
+    /// test, so a case that regresses says which one it was.
+    async fn floor_quiet(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Feed>, ms: u64, what: &str) {
         match tokio::time::timeout(std::time::Duration::from_millis(ms), rx.recv()).await {
             Err(_) | Ok(None) => {}
-            Ok(Some(feed)) => panic!("the floor moved: {feed:?}"),
+            Ok(Some(feed)) => panic!("{what} moved the floor: {feed:?}"),
         }
     }
 
@@ -2596,127 +2548,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_started_job_opens_the_floor_with_its_interruptibility() {
+    async fn an_audible_job_opens_the_floor_with_its_interruptibility() {
         // The floor is what gates detection; a non-interruptible job (an alert)
-        // opens it closed to barge-in, which is the flag's whole purpose.
+        // opens it closed to barge-in, which is the flag's whole purpose. A pod with
+        // an empty bank closes it, with nothing to be interruptible about.
         for interruptible in [true, false] {
-            let (mut rx, _) = run_fanout(
-                vec![PlaybackEvent::Started {
-                    pod: PodId("pod-x".into()),
-                    in_reply_to: Some(UtteranceId(1)),
-                    timings: Box::new(full_timings()),
-                    speak_rx: at_ms(1_740).unwrap(),
-                    first_write: at_ms(2_101).unwrap(),
-                    samples: 320,
-                    interruptible,
-                }],
-                50,
-            )
-            .await;
-
+            let (mut rx, _) = run_fanout(vec![audible(1, interruptible)]).await;
             assert_eq!(next_floor(&mut rx).await, (true, interruptible));
         }
+        let (mut rx, _) = run_fanout(vec![silent()]).await;
+        assert_eq!(next_floor(&mut rx).await, (false, false));
     }
 
     #[tokio::test]
-    async fn every_way_a_job_ends_eventually_closes_the_floor() {
-        // Including a writer dying on a failed end-of-audio write, which may have no
-        // `Aborted` behind it: a floor left open there would let sustained room
-        // speech mint a wake-less dispatch until the next reconnect. A plain
-        // not-drained `Finished` closes the floor too (its scheduled close stands
-        // when no next `Started` supersedes it).
-        let ends = [
+    async fn the_floor_follows_audible_and_no_other_event_moves_it() {
+        // A per-pod state cannot be driven off per-job events: a reply's second clip
+        // starts before the first one's audible end, a job re-written after a flush
+        // repeats no lifecycle event, and a cut that never reached the device is not
+        // a silence the host can vouch for. Every one of these carries its JSONL
+        // line and its settlement and says nothing to the listener.
+        let others = [
+            started_event(full_timings()),
+            PlaybackEvent::Written {
+                pod: PodId("pod-x".into()),
+                in_reply_to: Some(UtteranceId(1)),
+                frames: 3,
+                samples: 960,
+                eoa_written: true,
+                rewritten: false,
+                plays_until: tokio::time::Instant::now(),
+            },
             finished(1, true),
             finished(1, false),
-            finished_writer_dying(1),
             PlaybackEvent::Aborted {
                 pod: PodId("pod-x".into()),
                 in_reply_to: Some(UtteranceId(1)),
                 reason: AbortReason::WriteError,
             },
-        ];
-        for end in ends {
-            let label = format!("{end:?}");
-            let (mut rx, _) = run_fanout(vec![end], 1).await;
-            assert_eq!(next_floor(&mut rx).await, (false, false), "{label}");
-        }
-    }
-
-    /// The floor's opens and closes reach the listener in the order they
-    /// happened, over the same bounded channel production uses. A close that
-    /// overtook the open behind it would blind detection for a whole response.
-    #[tokio::test]
-    async fn floor_moves_stay_ordered_over_the_real_feed_channel() {
-        let flushed_after_barge = PlaybackEvent::Flushed {
-            pod: PodId("pod-x".into()),
-            in_reply_to: Some(UtteranceId(2)),
-            was_playing: true,
-            frames_written: 3,
-            progress: InterruptProgress {
-                heard_ms: 10,
-                total_ms: 20,
-            },
-        };
-        let (mut rx, _) = run_fanout(
-            vec![
-                started_event(full_timings()),
-                flushed_after_barge,
-                started_event(full_timings()),
-            ],
-            1,
-        )
-        .await;
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            seen.push(next_floor(&mut rx).await.0);
-        }
-        assert_eq!(seen, [true, false, true], "floor moves in order");
-    }
-
-    #[tokio::test]
-    async fn the_floor_stays_open_for_the_pacers_lead_after_the_last_write() {
-        // `Finished` fires at the last *write*, up to `lead_ms` before the last
-        // audible sample. Closing the floor there would blind detection for the
-        // response's final second — exactly when someone who has heard enough
-        // speaks up.
-        let (mut rx, _) = run_fanout(vec![finished(1, true)], 300).await;
-
-        floor_quiet(&mut rx, 100).await;
-        assert_eq!(next_floor(&mut rx).await, (false, false));
-    }
-
-    #[tokio::test]
-    async fn a_new_job_supersedes_a_pending_floor_close() {
-        // Back-to-back clips: the first one's pending close must not land during
-        // the second one's playback and blind detection mid-response.
-        let (mut rx, _) = run_fanout(
-            vec![
-                finished(1, true),
-                PlaybackEvent::Started {
-                    pod: PodId("pod-x".into()),
-                    in_reply_to: Some(UtteranceId(2)),
-                    timings: Box::new(full_timings()),
-                    speak_rx: at_ms(1_740).unwrap(),
-                    first_write: at_ms(2_101).unwrap(),
-                    samples: 320,
-                    interruptible: true,
-                },
-            ],
-            50,
-        )
-        .await;
-
-        assert_eq!(next_floor(&mut rx).await, (true, true));
-        // The first clip's pending close was superseded, not merely delayed.
-        floor_quiet(&mut rx, 150).await;
-    }
-
-    #[tokio::test]
-    async fn a_flush_closes_the_floor_at_once() {
-        // The barge already happened and the device has discarded its bank, so
-        // there is no lead left to wait out.
-        let (mut rx, _) = run_fanout(
-            vec![PlaybackEvent::Flushed {
+            PlaybackEvent::Flushed {
                 pod: PodId("pod-x".into()),
                 in_reply_to: Some(UtteranceId(1)),
                 was_playing: true,
@@ -2725,21 +2594,8 @@ mod tests {
                     heard_ms: 200,
                     total_ms: 1_000,
                 },
-            }],
-            60_000,
-        )
-        .await;
-
-        // The lead is a minute; only the immediate path can produce this.
-        assert_eq!(next_floor(&mut rx).await, (false, false));
-    }
-
-    #[tokio::test]
-    async fn an_evicted_job_settles_without_touching_the_floor() {
-        // A queued job flushed behind the playing one was never audible, so it has
-        // nothing to say about whether the pod is speaking.
-        let (mut rx, _) = run_fanout(
-            vec![PlaybackEvent::Flushed {
+            },
+            PlaybackEvent::Flushed {
                 pod: PodId("pod-x".into()),
                 in_reply_to: Some(UtteranceId(1)),
                 was_playing: false,
@@ -2748,12 +2604,30 @@ mod tests {
                     heard_ms: 0,
                     total_ms: 0,
                 },
-            }],
-            50,
-        )
-        .await;
+            },
+        ];
+        for event in others {
+            let label = format!("{event:?}");
+            let (mut rx, _) = run_fanout(vec![event]).await;
+            floor_quiet(&mut rx, 150, &label).await;
+        }
+    }
 
-        floor_quiet(&mut rx, 150).await;
+    /// The floor's opens and closes reach the listener in the order they
+    /// happened, over the same bounded channel production uses. A close that
+    /// overtook the open behind it would blind detection for a whole response.
+    #[tokio::test]
+    async fn floor_moves_stay_ordered_over_the_real_feed_channel() {
+        // A barge and the reply that answers it: closed, then open for the new
+        // turn. The events also carry a hand-over between two clips of one reply,
+        // which the pacer reports as no change at all.
+        let (mut rx, _) =
+            run_fanout(vec![audible(1, true), silent(), audible(2, true), silent()]).await;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(next_floor(&mut rx).await.0);
+        }
+        assert_eq!(seen, [true, false, true, false], "floor moves in order");
     }
 
     #[tokio::test]
@@ -2762,12 +2636,12 @@ mod tests {
         // each terminal shape has to carry the right verdict. A job that played out
         // is clean whether it drained the stream (`eoa_written: true`) or finished
         // with another job queued behind it (`eoa_written: false`, no end-of-audio
-        // yet all its audio delivered). Only a writer dying on a failed end-of-audio
-        // write, an abort, or a flush settles unclean.
+        // yet all its audio delivered). An abort or a flush settles unclean — a job
+        // whose end-of-audio write failed is one of the aborts, because the host
+        // lost the stream and cannot say the tail was heard.
         let cases = [
             (finished(1, true), true),
             (finished(1, false), true),
-            (finished_writer_dying(1), false),
             (
                 PlaybackEvent::Aborted {
                     pod: PodId("pod-x".into()),
@@ -2812,16 +2686,14 @@ mod tests {
             let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
                 .await
                 .unwrap();
-            let (feed, reserve, _rx2) = spy_feed();
+            let (feed, _rx2) = spy_feed();
             let adapter = playback_event_adapter(
                 jsonl.clone(),
                 Arc::new(AtomicU64::new(0)),
                 Some(PlaybackFanout {
                     feed,
-                    reserve,
                     ledger: Arc::clone(&ledger),
                     scripter: None,
-                    lead_ms: 1,
                 }),
             );
             adapter(event).await;
@@ -2851,16 +2723,14 @@ mod tests {
         let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
             .await
             .unwrap();
-        let (feed, reserve, _rx) = spy_feed();
+        let (feed, _rx) = spy_feed();
         let adapter = playback_event_adapter(
             jsonl.clone(),
             Arc::new(AtomicU64::new(0)),
             Some(PlaybackFanout {
                 feed,
-                reserve,
                 ledger: Arc::clone(&ledger),
                 scripter: None,
-                lead_ms: 1,
             }),
         );
         adapter(PlaybackEvent::Started {

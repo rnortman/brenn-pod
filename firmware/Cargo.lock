@@ -1795,6 +1795,7 @@ version = "0.1.0"
 dependencies = [
  "alsa",
  "audio-pipeline",
+ "build-id",
  "device-protocol",
  "libc",
  "log",

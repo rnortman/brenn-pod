@@ -688,13 +688,29 @@ pub fn run_replay(addr: &str, pace: &str, framelog: &Path) -> std::process::Outp
     run_replay_with(addr, pace, framelog, &[])
 }
 
-/// Run `replay-pod` against `addr` at `fast` pace with `--linger-until-eoa`:
-/// it stays connected past end-of-log until the daemon's playback `EndOfAudio`
-/// is observed, so the playback the daemon queues actually crosses the wire and
-/// the drain can tally it. Returns the finished process output.
+/// Run `replay-pod` against `addr` at `fast` pace with `--linger-until-eoa` and a
+/// playout hold: it stays connected past end-of-log until the daemon's playback
+/// `EndOfAudio` is observed, then a further [`PLAYOUT_HOLD_MS`] as a device
+/// playing out its bank does, so the playback the daemon queues crosses the wire,
+/// the drain can tally it, and the daemon reaches the clip's audible end with the
+/// connection still up. Returns the finished process output.
 pub fn run_replay_linger(addr: &str, framelog: &Path) -> std::process::Output {
-    run_replay_with(addr, "fast", framelog, &["--linger-until-eoa"])
+    run_replay_with(
+        addr,
+        "fast",
+        framelog,
+        &["--linger-until-eoa", "--linger-playout-ms", PLAYOUT_HOLD_MS],
+    )
 }
+
+/// How long a lingering replay holds its connection after the `EndOfAudio`, as the
+/// `--linger-playout-ms` argument. The daemon dates a clip's audible end at the
+/// device's playout hop (240 ms) plus the clip's own length, and the longest clip
+/// either lingering test plays is 60 ms of framed audio — so 300 ms is the
+/// requirement and this is that with room for a slow runner. A FIN before it is a
+/// lost stream mid-clip, which the daemon reports as an abort rather than a
+/// playback heard to its end.
+const PLAYOUT_HOLD_MS: &str = "1000";
 
 /// The named report line from `replay-pod`'s stdout (e.g. `replay_complete`),
 /// parsed as JSON. Panics with the full stdout if absent — the report is the

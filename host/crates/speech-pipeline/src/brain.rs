@@ -55,6 +55,17 @@ pub enum BrainEvent {
         no_speech_prob: f32,
         avg_logprob: f32,
     },
+    /// An utterance carved over the pod's own playback without cutting it, whose
+    /// STT confidence tripped the gate: the residual of a reply leaking back
+    /// through the mic, declined rather than answered. Nothing was interrupted
+    /// and the reply is still playing or has played to its end, so unlike a barge
+    /// this reaches no brain hook — it is a record and a counter.
+    EchoDeclined {
+        utterance: UtteranceId,
+        audio_ref: AudioSpan,
+        no_speech_prob: f32,
+        avg_logprob: f32,
+    },
     /// A brain that answers over a link could not hand the utterance to its peer;
     /// the turn is over with nothing said (beyond a configured spoken fallback).
     /// `detail` is the transport's own rendering of the refusal.
@@ -146,6 +157,7 @@ pub struct BrainStats {
     no_transcript: AtomicU64,
     wake_command_absent: AtomicU64,
     barge_command_absent: AtomicU64,
+    echo_declined: AtomicU64,
     link_publish_failures: AtomicU64,
     link_response_timeouts: AtomicU64,
     link_tags_stripped: AtomicU64,
@@ -169,6 +181,11 @@ pub struct BrainStatsSnapshot {
     /// speech as likely hallucination. Not a failure: the playback was already
     /// cut, and declining the phantom text is the honest outcome.
     pub barge_command_absent: u64,
+    /// Utterances carved over the pod's own playback and declined because STT
+    /// confidence flagged them as likely hallucination — the residual of a reply
+    /// leaking back through the mic. Not a failure: nothing was interrupted, and
+    /// a count that tracks the replies is the leak rate showing itself.
+    pub echo_declined: u64,
     /// Turns whose utterance the link refused to carry to the peer.
     pub link_publish_failures: u64,
     /// Turns that waited out a response window — initial or continuation.
@@ -205,6 +222,11 @@ impl BrainStats {
     /// Count a barge-in utterance declined for tripping the confidence gate.
     pub fn record_barge_command_absent(&self) {
         self.barge_command_absent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an utterance over the pod's own playback declined by the gate.
+    pub fn record_echo_declined(&self) {
+        self.echo_declined.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a turn whose utterance the link refused to carry.
@@ -245,6 +267,7 @@ impl BrainStats {
             no_transcript: self.no_transcript.load(Ordering::Relaxed),
             wake_command_absent: self.wake_command_absent.load(Ordering::Relaxed),
             barge_command_absent: self.barge_command_absent.load(Ordering::Relaxed),
+            echo_declined: self.echo_declined.load(Ordering::Relaxed),
             link_publish_failures: self.link_publish_failures.load(Ordering::Relaxed),
             link_response_timeouts: self.link_response_timeouts.load(Ordering::Relaxed),
             link_tags_stripped: self.link_tags_stripped.load(Ordering::Relaxed),

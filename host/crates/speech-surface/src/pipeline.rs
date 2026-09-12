@@ -221,6 +221,9 @@ struct Carve {
     /// This carve is the speech that barged in on playback, so the mint attaches
     /// the pod's context chain to it.
     barge_in: bool,
+    /// This carve's speech was heard over the pod's own playback, whether or not
+    /// it cut it. The gate below makes such a carve prove it is speech.
+    over_playback: bool,
     /// The listener's host-receipt stamps for this utterance's audio, from t0 to
     /// the carve. Copied onto the minted `Utterance`'s `StageTimings`.
     timing: CarveTiming,
@@ -988,6 +991,7 @@ fn spawn_stt(
         wake,
         cause,
         barge_in,
+        over_playback,
         timing,
     } = utterance;
     let carve = Carve {
@@ -999,6 +1003,7 @@ fn spawn_stt(
         // STT runs on the audio the same way whatever opened the floor; the mark
         // rides through so the mint on the far side can chain the interrupted turns.
         barge_in,
+        over_playback,
         timing,
         sent_from,
     };
@@ -1161,6 +1166,7 @@ async fn handle_stt_done(
         endpoint_cause: done.carve.cause,
         wake: done.carve.wake,
         barge_in: barge_context,
+        over_playback: done.carve.over_playback,
     };
     jsonl.emit(
         "utterance",
@@ -1177,10 +1183,14 @@ async fn handle_stt_done(
     };
     // STT-confidence gate: a trigger whose text trips the gate is a likely
     // hallucination — declined as a no-command outcome, never echoed. Fail-open on a
-    // missing summary; a no-wake, no-barge or empty transcript is never
-    // gated. A scored wake accept is gated through its wake provenance; a barge-in
-    // utterance has no wake word, so a second arm keyed on the barge mark declines
-    // the barging speech that transcribed to nothing — the playback is already cut.
+    // missing summary; an utterance with no wake, no barge, no overlap with the
+    // pod's own voice, or an empty transcript is never gated. A scored wake accept
+    // is gated through its wake provenance; a barge-in utterance has no wake word,
+    // so a second arm keyed on the barge mark declines the barging speech that
+    // transcribed to nothing — the playback is already cut. A third arm catches
+    // the case the guard let past: audio over the robot's own playback that never
+    // sustained enough to cut it, which under a bypassed wake gate would otherwise
+    // reach the brain on the strength of the reply's own echo.
     let confidence_reject = utterance
         .transcript
         .as_ref()
@@ -1190,13 +1200,19 @@ async fn handle_stt_done(
     let gate = match (utterance.wake, confidence_reject) {
         (Some(wake), Some(reject)) => GateOutcome::DeclineWake(wake, reject),
         (None, Some(reject)) if done.carve.barge_in => GateOutcome::DeclineBarge(reject),
+        (None, Some(reject)) if done.carve.over_playback => GateOutcome::DeclineEcho(reject),
         _ => GateOutcome::Dispatch,
     };
-    // A decline is a raise that produced no turn: the head is up and nothing
-    // will follow, so the settle starts here rather than waiting for the
-    // engagement's ceiling.
+    // A wake or barge decline is a raise that produced no turn: the head is up and
+    // nothing will follow, so the settle starts here rather than waiting for the
+    // engagement's ceiling. An echo decline is not a raise — nobody raised, and
+    // `Unanswered` clears the pod's current turn, which would cut short the script
+    // of the very reply the echo came from.
     if let Some(scripter) = scripter
-        && !matches!(gate, GateOutcome::Dispatch)
+        && matches!(
+            gate,
+            GateOutcome::DeclineWake(..) | GateOutcome::DeclineBarge(..)
+        )
     {
         scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
     }
@@ -1212,6 +1228,7 @@ async fn handle_stt_done(
             // contract, like `interrupt`.
             wiring.brain.barge_declined(&utterance);
         }
+        GateOutcome::DeclineEcho(reject) => decline_echo(&utterance, reject, wiring),
         GateOutcome::Dispatch => {
             // Brain begin gets its own console instant. Emitted here, past the
             // gate, so the line marks a real dispatch — unlike `brain_dispatched`
@@ -1358,11 +1375,14 @@ fn push_bounded<T>(dq: &mut VecDeque<T>, item: T) {
 
 /// What the STT-confidence gate decided for a minted utterance: dispatch it, or
 /// decline it as a likely hallucination — through the wake provenance for a scored
-/// wake accept, or through the barge mark for a barge-in utterance with no wake.
+/// wake accept, through the barge mark for a barge-in utterance with no wake, or
+/// through the overlap mark for one carved over the pod's own voice that cut
+/// nothing.
 enum GateOutcome {
     Dispatch,
     DeclineWake(WakeConfirmation, GateReject),
     DeclineBarge(GateReject),
+    DeclineEcho(GateReject),
 }
 
 /// Report a confidence-gated scored-wake accept through the brain's event/counter
@@ -1398,6 +1418,19 @@ fn decline_barge_low_confidence(utterance: &Utterance, reject: GateReject, wirin
         avg_logprob: reject.avg_logprob,
     });
     wiring.stats.record_barge_command_absent();
+}
+
+/// Report an utterance carved over the pod's own playback whose transcript tripped
+/// the gate. No brain hook: nothing was cut, so there is no interrupted turn to
+/// tell the brain about.
+fn decline_echo(utterance: &Utterance, reject: GateReject, wiring: &BrainWiring) {
+    (wiring.events)(BrainEvent::EchoDeclined {
+        utterance: utterance.id,
+        audio_ref: utterance.audio_ref.clone(),
+        no_speech_prob: reject.no_speech_prob,
+        avg_logprob: reject.avg_logprob,
+    });
+    wiring.stats.record_echo_declined();
 }
 
 /// Label one segment's sidecar entry as a single locked read-modify-write; awaited
@@ -1543,6 +1576,7 @@ mod tests {
             wake,
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
+            over_playback: false,
             timing: CarveTiming::default(),
         }
     }
@@ -2471,6 +2505,7 @@ mod tests {
                 wake: None,
                 cause: EndpointCause::SoftEndpoint,
                 barge_in: false,
+                over_playback: false,
                 timing: CarveTiming::default(),
                 sent_from: Some(0),
             },
@@ -2753,6 +2788,7 @@ mod tests {
             wake: None,
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
+            over_playback: false,
             timing: CarveTiming::default(),
             sent_from: Some(0),
         };
@@ -3964,6 +4000,196 @@ mod tests {
 
         assert_eq!(cmds.len(), 1, "a confident barge dispatches");
         assert_eq!(stats.snapshot().barge_command_absent, 0);
+    }
+
+    #[tokio::test]
+    async fn an_echo_of_the_pods_own_reply_is_declined_not_dispatched() {
+        // The residual of a reply leaking back through the mic: it never sustained
+        // enough to cut the playback, so it carries no barge mark and — under a
+        // bypassed wake gate — no wake either. Before the overlap arm it reached the
+        // brain on the strength of its own echo.
+        let echo = CarvedUtterance {
+            over_playback: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .brain()
+            .transcriber(FakeTranscriber(Some((
+                "the weather today is".into(),
+                Some(conf(0.37, -0.99)),
+            ))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let events_seen = h.events.clone();
+        let stats = h.stats.clone();
+        let nudges = h.nudges.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(echo)]).await;
+
+        assert!(cmds.is_empty(), "the robot does not answer itself");
+        assert!(
+            !lines.iter().any(|v| v["event"] == "brain_dispatched"),
+            "and nothing was dispatched: {lines:?}"
+        );
+        assert_eq!(stats.snapshot().echo_declined, 1);
+        assert_eq!(stats.snapshot().barge_command_absent, 0);
+        let evs = events_seen.lock().unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(
+            matches!(evs[0], BrainEvent::EchoDeclined { .. }),
+            "the decline carries the overlap mark: {:?}",
+            evs[0]
+        );
+        assert!(
+            nudges.lock().unwrap().barge_declined.is_empty(),
+            "nothing was cut, so the brain hears nothing about a cut turn"
+        );
+        // The `utterance` line carries the mark the gate read.
+        let u = lines.iter().find(|v| v["event"] == "utterance").unwrap();
+        assert_eq!(u["over_playback"], true);
+    }
+
+    #[tokio::test]
+    async fn a_confident_utterance_over_playback_still_dispatches() {
+        // A person genuinely talking over the parrot scores like speech. The arm
+        // declines hallucinations, not overlap.
+        let over = CarvedUtterance {
+            over_playback: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .brain()
+            .transcriber(FakeTranscriber(Some((
+                "stop talking".into(),
+                Some(conf(0.05, -0.20)),
+            ))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let stats = h.stats.clone();
+        let (_lines, cmds) = h.run(vec![soft_endpoint(over)]).await;
+
+        assert_eq!(cmds.len(), 1, "confident speech over a reply is answered");
+        assert_eq!(stats.snapshot().echo_declined, 0);
+    }
+
+    #[tokio::test]
+    async fn an_echo_decline_is_not_a_raise_and_a_barge_decline_still_is() {
+        // `Unanswered` clears the pod's current turn. For a barge that is right — a
+        // raise produced no turn. For an echo it would cut short the script of the
+        // very reply the echo came from, and nobody raised in the first place.
+        //
+        // A barge carve always carries the overlap mark too (the `debug_assert` in
+        // `carve_utterance` says so), so it is the only carve that can tell the two
+        // arms apart. Each case reads its own counter and brain event as well as the
+        // scripter, or a reordering of the arms would re-file every barge decline as
+        // an echo and read as a scripter bug.
+        for (carve, expected, barges, echoes) in [
+            (
+                CarvedUtterance {
+                    over_playback: true,
+                    ..carved(1, 0, 16, None)
+                },
+                vec![],
+                0,
+                1,
+            ),
+            (
+                CarvedUtterance {
+                    barge_in: true,
+                    over_playback: true,
+                    ..carved(1, 0, 16, None)
+                },
+                vec![ScriptInput::Unanswered(pod())],
+                1,
+                0,
+            ),
+        ] {
+            let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+            let (handle, rx) = crate::scripter::channel(jsonl.clone());
+            let h = Harness::new()
+                .brain()
+                .transcriber(FakeTranscriber(Some((
+                    "phantom".into(),
+                    Some(conf(0.37, -0.99)),
+                ))))
+                .barge(Arc::new(TurnLedger::new()), Err(FlushRejected::NotPlaying))
+                .gate(ConfidenceGate {
+                    no_speech_max: 0.2,
+                    avg_logprob_min: None,
+                })
+                .scripter(handle.clone());
+            let events_seen = h.events.clone();
+            let stats = h.stats.clone();
+            h.run(vec![soft_endpoint(carve)]).await;
+
+            assert_eq!(script_inputs(handle, rx).await, expected);
+            let snap = stats.snapshot();
+            assert_eq!(
+                (snap.barge_command_absent, snap.echo_declined),
+                (barges, echoes),
+                "the decline is filed under the arm that made it",
+            );
+            {
+                let evs = events_seen.lock().unwrap();
+                assert_eq!(evs.len(), 1, "{evs:?}");
+                if barges == 1 {
+                    assert!(
+                        matches!(evs[0], BrainEvent::BargeCommandAbsent { .. }),
+                        "a cut turn is what the brain is told about: {:?}",
+                        evs[0]
+                    );
+                } else {
+                    assert!(
+                        matches!(evs[0], BrainEvent::EchoDeclined { .. }),
+                        "nothing was cut: {:?}",
+                        evs[0]
+                    );
+                }
+            }
+            drop(jsonl);
+            writer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wake_carve_over_playback_declines_through_its_wake_provenance() {
+        // The arms are ordered, and the gated policy's outcomes do not move: a
+        // scored wake accept that happens to overlap a reply is still a wake
+        // decline, with the wake context its consumers expect.
+        let wake = Some(WakeConfirmation {
+            score: 0.99,
+            wake_end_sample: 8,
+            stt_trim_samples: 0,
+        });
+        let carve = CarvedUtterance {
+            over_playback: true,
+            ..carved(1, 0, 16, wake)
+        };
+        let h = Harness::new()
+            .brain()
+            .transcriber(FakeTranscriber(Some((
+                "phantom".into(),
+                Some(conf(0.37, -0.99)),
+            ))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let events_seen = h.events.clone();
+        let stats = h.stats.clone();
+        h.run(vec![soft_endpoint(carve)]).await;
+
+        assert_eq!(stats.snapshot().wake_command_absent, 1);
+        assert_eq!(stats.snapshot().echo_declined, 0);
+        let evs = events_seen.lock().unwrap();
+        assert!(
+            matches!(evs[0], BrainEvent::WakeCommandAbsent { .. }),
+            "the wake arm comes first: {:?}",
+            evs[0]
+        );
     }
 
     #[tokio::test]

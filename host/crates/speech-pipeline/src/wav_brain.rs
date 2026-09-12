@@ -98,6 +98,7 @@ mod tests {
             endpoint_cause: crate::types::EndpointCause::SoftEndpoint,
             wake: None,
             barge_in: None,
+            over_playback: false,
         }
     }
 

@@ -332,6 +332,16 @@ pub struct ListenerState {
     /// The barge mark on the utterance currently accumulating, reused across
     /// continuations exactly as `current_wake` is.
     current_barge: bool,
+    /// Whether the speech now in flight has been heard over this pod's own
+    /// playback at any point in its life. A latch over the chunk stream rather
+    /// than a property of an identity, because identity is minted at the first
+    /// carve — after the speech, and for an echo of a reply after the floor has
+    /// closed again. Reset at the endpointer's onset, OR-ed with the floor on
+    /// every chunk the endpointer is out of `Idle`.
+    speech_over_playback: bool,
+    /// The overlap mark on the utterance currently accumulating, reused across
+    /// continuations exactly as `current_barge` is.
+    current_over_playback: bool,
     /// The open transport segment's timing anchors, if one is open.
     segment: Option<SegmentOpen>,
     /// Host receipt of the chunk that drove the current utterance's `Onset`, and
@@ -391,6 +401,8 @@ impl ListenerState {
             playback: PlaybackFloor::default(),
             barge_pending: false,
             current_barge: false,
+            speech_over_playback: false,
+            current_over_playback: false,
             segment: None,
             current_onset_rx: None,
             current_wake_rx: None,
@@ -511,11 +523,12 @@ impl ListenerState {
         self.current_id = None;
         self.current_start = None;
         self.current_wake = None;
-        // A reconnect killed the writer, so the floor is genuinely closed — and
-        // the pending trigger belongs to a response nobody can still be hearing.
+        // A reconnect killed the writer, so the floor is genuinely closed. The
+        // pending trigger and the overlap latch went with the stream reset above:
+        // they belong to speech nobody can still be hearing.
         self.playback = PlaybackFloor::default();
-        self.barge_pending = false;
         self.current_barge = false;
+        self.current_over_playback = false;
         self.segment = None;
         self.current_onset_rx = None;
         self.current_wake_rx = None;
@@ -529,11 +542,19 @@ impl ListenerState {
     /// Flushes the model accumulators first: chunks scored before a discontinuity,
     /// reconnect, or segment re-anchor are as diagnostic as any others, and the
     /// reset is about to make their sample indexes meaningless.
+    ///
+    /// The chunk-stream marks go with the endpointer, because the speech they
+    /// describe is gone: a discontinuity abandons the in-progress utterance with
+    /// no carve, and a segment re-anchor follows a close that either carved the
+    /// speech or dropped it. A trigger left standing would otherwise leak into
+    /// the next unrelated carve as a barge.
     fn reset_stream(&mut self, pod: &PodId, anchor: u64, events: &mut Vec<ListenerEvent>) {
         self.flush_model_stats(pod, StatsFlushCause::Reset, events);
         self.oww.reset();
         self.silero.reset();
         self.endpointer.reset(anchor);
+        self.barge_pending = false;
+        self.speech_over_playback = false;
         self.silero_pending.clear();
         self.oww_base = anchor;
         self.silero_cursor = anchor;
@@ -722,6 +743,13 @@ impl ListenerState {
         // included. The drain is also where an `Onset` gets its receipt stamp:
         // `push` is the only call that can produce one.
         self.drain_transitions(pod, Some(host_rx), events);
+        // The overlap latch: settled before the boundary event below can carve on
+        // it, and monotonic — a fresh onset seeds it from the floor; every later
+        // chunk can only OR into it. Stream order is the overlap test, so no
+        // timestamp arithmetic.
+        if self.endpointer.utterance_in_progress() {
+            self.speech_over_playback |= self.playback.active;
+        }
         if let Some(ev) = ev {
             self.apply_endpoint_event(pod, ev, host_rx, events);
         }
@@ -1109,6 +1137,18 @@ impl ListenerState {
             }
         };
         let pcm = self.ring.carve(start, end);
+        // Folded in at every carve, so a continuation that ran into playback after
+        // the first carve marks the concatenation it is part of. The latch only
+        // grows within one identity's life — it resets at an onset, and a
+        // continuation resumes under `Continuation` — so this cannot unmark.
+        self.current_over_playback |= self.speech_over_playback;
+        // The guard fires only on a chunk with the floor open, and the config
+        // invariant puts the endpointer's onset at or before that chunk, so the
+        // latch saw the floor active during this very speech.
+        debug_assert!(
+            !self.current_barge || self.current_over_playback,
+            "a barge carve is by construction speech over playback",
+        );
         // Derived once per utterance and reused: a continuation moves the endpoint,
         // never the origin the endpoint is measured from.
         let anchor = match self.current_anchor {
@@ -1127,6 +1167,7 @@ impl ListenerState {
             wake,
             cause,
             barge_in: self.current_barge,
+            over_playback: self.current_over_playback,
             timing: CarveTiming {
                 first_audio_rx: anchor.first_audio_rx,
                 t0_projected: anchor.t0_projected,
@@ -1256,6 +1297,11 @@ impl ListenerState {
         for transition in drained {
             if transition.cause == TransitionCause::Onset {
                 self.current_onset_rx = rx;
+                // A new speech begins here, so the overlap latch starts from
+                // this chunk's floor rather than carrying the previous speech's
+                // answer. Only a genuine onset resets it: a continuation resumes
+                // the same speech under `Continuation`.
+                self.speech_over_playback = self.playback.active;
             }
             events.push(ListenerEvent::EndpointerTransition {
                 pod: pod.clone(),
@@ -1280,6 +1326,8 @@ impl ListenerState {
         self.current_start = None;
         self.current_wake = None;
         self.current_barge = false;
+        self.current_over_playback = false;
+        self.speech_over_playback = false;
         self.current_onset_rx = None;
         self.current_wake_rx = None;
         self.current_anchor = None;
@@ -1551,13 +1599,17 @@ impl Listener {
 /// A permit for one reserved slot in the feed channel. Sending through it is
 /// synchronous and cannot block, so a caller may hold a `std::sync::Mutex` across
 /// the send. Dropping the permit unused releases the slot.
-pub struct FeedPermit {
+///
+/// Crate-private: the reliable-marker path inside [`FeedSender::feed`] is the only
+/// caller, and feeding the listener from under a blocking lock is not a shape this
+/// crate offers its embedders.
+pub(crate) struct FeedPermit {
     permit: mpsc::OwnedPermit<(PodId, Feed)>,
 }
 
 impl FeedPermit {
     /// Place the item in the reserved slot. Never blocks.
-    pub fn send(self, pod: PodId, feed: Feed) {
+    pub(crate) fn send(self, pod: PodId, feed: Feed) {
         self.permit.send((pod, feed));
     }
 }
@@ -1626,7 +1678,7 @@ impl FeedSender {
     /// `None` means the slot could not be had — a wedged consumer
     /// (`marker_send_timeouts`) or an exited thread (`channel_closed`) — and the
     /// caller should abandon the marker.
-    pub async fn reserve_marker(&self) -> Option<FeedPermit> {
+    pub(crate) async fn reserve_marker(&self) -> Option<FeedPermit> {
         match tokio::time::timeout(MARKER_SEND_TIMEOUT, self.tx.clone().reserve_owned()).await {
             Ok(Ok(permit)) => Some(FeedPermit { permit }),
             Ok(Err(_)) => {
@@ -2971,6 +3023,168 @@ mod tests {
             carved[0].barge_in,
             "the continuation carries the barge mark"
         );
+    }
+
+    /// The run-2 shape: the residual of a reply leaks back through the mic while
+    /// the reply is still audible, sustains too little to trip the guard, and
+    /// endpoints after the floor has closed again. Its identity is minted at that
+    /// carve — long after the overlap — so the latch, not the carve's instant, is
+    /// what marks it. A continuation of it keeps the mark, as the barge mark is
+    /// kept.
+    #[test]
+    fn an_echo_carves_over_playback_though_the_floor_closed_before_its_endpoint() {
+        let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        state.set_playback(true, true);
+        let mut cursor = 0u64;
+
+        // Two chunks of echo: the onset confirms, the guard's run stays short.
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        assert!(barge_triggers(&events).is_empty(), "no cut: {events:?}");
+        // The reply plays out and the floor closes, before the echo endpoints.
+        state.set_playback(false, false);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "the echo carves: {events:?}");
+        assert!(
+            carved[0].over_playback,
+            "its speech was heard over the reply, whatever the floor says now"
+        );
+        assert!(!carved[0].barge_in, "it cut nothing");
+
+        // A continuation of the same speech, entirely after the floor closed.
+        events.extend(drive(&mut state, 0.9, 1, &mut cursor));
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 2, "two carves of one utterance: {events:?}");
+        assert_eq!(carved[1].utterance_id.seq, carved[0].utterance_id.seq);
+        assert!(
+            carved[1].over_playback,
+            "the continuation is the same speech and carries the same mark"
+        );
+    }
+
+    /// Speech that onsets with nothing playing is not marked — the whole point of
+    /// the mark is that it separates an echo from a person in a quiet room. And
+    /// the latch does not survive the utterance that set it: the speech after a
+    /// terminal endpoint answers for itself.
+    #[test]
+    fn speech_with_the_floor_shut_is_not_over_playback_and_the_latch_does_not_leak() {
+        let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        state.set_playback(true, true);
+        let mut cursor = 0u64;
+
+        // One utterance over playback, carried to a terminal endpoint.
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        events.extend(drive(&mut state, 0.1, 7, &mut cursor));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::UtteranceClosed { .. })),
+            "the continuation window ran out: {events:?}"
+        );
+        assert!(soft_endpoints(&events)[0].over_playback);
+
+        // The next speech, with the reply long over.
+        state.set_playback(false, false);
+        let next = drive(&mut state, 0.9, 2, &mut cursor);
+        let next = {
+            let mut evs = next;
+            evs.extend(drive(&mut state, 0.1, 3, &mut cursor));
+            evs
+        };
+        let carved = soft_endpoints(&next);
+        assert_eq!(carved.len(), 1, "the second utterance carves: {next:?}");
+        assert!(
+            !carved[0].over_playback,
+            "nothing was playing over this one: {next:?}"
+        );
+    }
+
+    /// Speech already in flight when a reply starts is over playback too: the mark
+    /// is a latch over the speech's whole life, not a judgement of its onset.
+    #[test]
+    fn speech_that_runs_into_a_reply_is_over_playback() {
+        let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        state.set_playback(false, false);
+        let mut cursor = 0u64;
+
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        state.set_playback(true, false); // a non-interruptible job: no guard, no cut
+        events.extend(drive(&mut state, 0.9, 1, &mut cursor));
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "one carve: {events:?}");
+        assert!(
+            carved[0].over_playback,
+            "the speech ran into the pod's own voice: {events:?}"
+        );
+        assert!(barge_triggers(&events).is_empty(), "and cut nothing");
+    }
+
+    /// The ordinary barge order — the trigger fires, the flush closes the floor,
+    /// and the carve lands after it — still carries both marks. `barge_in` implies
+    /// `over_playback` by construction, and the debug assertion in `carve_utterance`
+    /// says so; this is the path that would falsify it if the latch were read at the
+    /// carve rather than latched over the speech.
+    #[test]
+    fn a_barge_carve_after_the_flush_carries_both_marks() {
+        let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        state.set_playback(true, true);
+        let mut cursor = 0u64;
+
+        let mut events = drive(&mut state, 0.9, 3, &mut cursor);
+        assert_eq!(barge_triggers(&events).len(), 1, "the cut fired");
+        // The flush closes the floor before the barging speech endpoints.
+        state.set_playback(false, false);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "the barging speech carves: {events:?}");
+        assert!(carved[0].barge_in, "it is the barge");
+        assert!(
+            carved[0].over_playback,
+            "and a barge is speech over playback by construction"
+        );
+    }
+
+    /// A trigger fired during speech a hole then swallows dies with that speech.
+    /// The stream reset drops the pending trigger and the overlap latch together —
+    /// without that, the next unrelated carve would inherit a barge mark for a
+    /// response it never interrupted, and the carve's own invariant would be false.
+    #[test]
+    fn a_stream_reset_drops_the_pending_trigger_and_the_latch() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        open(&mut state, 0, &mut oww, &mut silero);
+        state.set_playback(true, true);
+        let mut cursor = 0u64;
+
+        let fired = drive(&mut state, 0.9, 3, &mut cursor);
+        assert_eq!(barge_triggers(&fired).len(), 1, "a trigger fired");
+        assert!(state.barge_pending, "with no identity yet to hold it");
+
+        // A hole in the stream: the speech that barged is abandoned uncarved.
+        feed_audio(&mut state, 20_000, &vec![0_i16; 512], &mut oww, &mut silero);
+        assert!(!state.barge_pending, "the trigger went with the speech");
+        assert!(!state.speech_over_playback, "and so did the overlap latch");
+
+        // Unrelated speech after the hole, with the reply over.
+        state.set_playback(false, false);
+        cursor = 20_000;
+        let mut after = drive(&mut state, 0.9, 2, &mut cursor);
+        after.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&after);
+        assert_eq!(carved.len(), 1, "the later speech carves: {after:?}");
+        assert!(!carved[0].barge_in, "it barged in on nothing");
+        assert!(!carved[0].over_playback, "and nothing was playing over it");
     }
 
     /// Speech with the floor closed stays wake-gated: no trigger means no gate

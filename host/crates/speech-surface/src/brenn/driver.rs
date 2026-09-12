@@ -837,6 +837,7 @@ mod tests {
             endpoint_cause: EndpointCause::SoftEndpoint,
             wake: None,
             barge_in: None,
+            over_playback: false,
         }
     }
 

@@ -712,16 +712,8 @@ impl Server {
                         None => Box::pin(std::future::ready(())),
                     })
                 },
-                reserve: {
-                    let sender = weak_feed_sender(listener);
-                    Arc::new(move || match sender() {
-                        Some(sender) => Box::pin(async move { sender.reserve_marker().await }),
-                        None => Box::pin(std::future::ready(None)),
-                    })
-                },
                 ledger: turn_ledger.clone(),
                 scripter: script_handle.clone(),
-                lead_ms: config.playback.lead_ms,
             }),
         );
 
@@ -1467,13 +1459,14 @@ fn presence_channel(config: &Config) -> Option<&str> {
 /// A weak accessor for the listener's [`FeedSender`], for the playback fanout hooks.
 ///
 /// Weak, not a clone: shutdown joins the listener thread through `Arc::into_inner`,
-/// which needs the server task to hold the last reference. A strong clone in the
-/// adapter (or in every floor-close timer it spawns) would leave the thread
-/// unjoinable and the shutdown drain waiting on it forever. A listener already gone
-/// has no floor left to move, hence `None`.
+/// which needs the server task to hold the last reference. A strong clone held by
+/// the fan-out closure would leave the thread unjoinable and the shutdown drain
+/// waiting on it forever. A listener already gone has no floor left to move, hence
+/// `None`.
 ///
-/// The upgrade is dropped before returning, so only a `FeedSender` clone can live
-/// across a marker await; that delays the thread join by at most the marker timeout.
+/// The upgrade is dropped before returning, so only a `FeedSender` clone lives
+/// across the feed's await; that delays the thread join by at most the marker
+/// timeout.
 fn weak_feed_sender(listener: &Arc<ListenerHandle>) -> impl Fn() -> Option<FeedSender> + use<> {
     let listener = Arc::downgrade(listener);
     move || listener.upgrade().map(|l| l.feed_sender())
@@ -1819,6 +1812,26 @@ fn brain_event_adapter(jsonl: JsonlHandle) -> BrainEventFn {
         } => {
             jsonl.emit(
                 "barge_command_absent",
+                &json!({
+                    "utterance": utterance,
+                    "log": audio_ref.log,
+                    "start_sample": audio_ref.start_sample,
+                    "end_sample": audio_ref.end_sample,
+                    "segments": audio_ref.segments,
+                    "reason": "low_confidence",
+                    "no_speech": no_speech_prob,
+                    "logprob": avg_logprob,
+                }),
+            );
+        }
+        BrainEvent::EchoDeclined {
+            utterance,
+            audio_ref,
+            no_speech_prob,
+            avg_logprob,
+        } => {
+            jsonl.emit(
+                "echo_declined",
                 &json!({
                     "utterance": utterance,
                     "log": audio_ref.log,
@@ -3800,6 +3813,44 @@ mod tests {
         assert!((absent[0]["no_speech"].as_f64().unwrap() - 0.42).abs() < 1e-6);
         assert!((absent[0]["logprob"].as_f64().unwrap() - -1.10).abs() < 1e-6);
         assert!(absent[0].get("score").is_none());
+    }
+
+    #[tokio::test]
+    async fn brain_event_adapter_maps_echo_declined() {
+        use pod_ingest::SegmentRef;
+        use speech_pipeline::{AudioSpan, UtteranceId};
+
+        let lines = adapter_lines(vec![BrainEvent::EchoDeclined {
+            utterance: UtteranceId(12),
+            audio_ref: AudioSpan {
+                log: "pod-fbe2f8_0.framelog".into(),
+                start_sample: 3_000,
+                end_sample: 21_000,
+                segments: vec![SegmentRef {
+                    log: "pod-fbe2f8_0.framelog".into(),
+                    segment_id: 10,
+                    part: 0,
+                }],
+            },
+            no_speech_prob: 0.29,
+            avg_logprob: -0.88,
+        }])
+        .await;
+
+        // Its own event name: nothing was cut, so this is not a barge decline, and
+        // there is no wake vocabulary to borrow either.
+        assert!(events_named(&lines, "barge_command_absent").is_empty());
+        assert!(events_named(&lines, "wake_command_absent").is_empty());
+        let declined = events_named(&lines, "echo_declined");
+        assert_eq!(declined.len(), 1);
+        assert_eq!(declined[0]["utterance"], 12);
+        assert_eq!(declined[0]["log"], "pod-fbe2f8_0.framelog");
+        assert_eq!(declined[0]["start_sample"], 3_000);
+        assert_eq!(declined[0]["end_sample"], 21_000);
+        assert_eq!(declined[0]["segments"][0]["segment_id"], 10);
+        assert_eq!(declined[0]["reason"], "low_confidence");
+        assert!((declined[0]["no_speech"].as_f64().unwrap() - 0.29).abs() < 1e-6);
+        assert!((declined[0]["logprob"].as_f64().unwrap() - -0.88).abs() < 1e-6);
     }
 
     #[tokio::test]

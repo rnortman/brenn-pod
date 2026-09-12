@@ -34,14 +34,14 @@ pub use http::{
 };
 pub use listener::{
     BargeInConfig, CarveTiming, CarvedUtterance, EndpointEvent, EndpointState, EndpointTransition,
-    Endpointer, EndpointerConfig, Feed, FeedPermit, FeedSender, Listener, ListenerConfig,
-    ListenerEvent, ListenerHandle, ListenerState, ListenerStats, ListenerStatsSnapshot,
-    ListenerUtteranceId, MODEL_STATS_FLUSH_CHUNKS, OwwModels, OwwStream, PcmRing, ScoreStats,
-    ScoreSummary, ScoredChunk, SileroConfig, SileroModel, SileroVad, StatsFlushCause, StatsModel,
-    TransitionCause, WakeDetected, WakePolicy,
+    Endpointer, EndpointerConfig, Feed, FeedSender, Listener, ListenerConfig, ListenerEvent,
+    ListenerHandle, ListenerState, ListenerStats, ListenerStatsSnapshot, ListenerUtteranceId,
+    MODEL_STATS_FLUSH_CHUNKS, OwwModels, OwwStream, PcmRing, ScoreStats, ScoreSummary, ScoredChunk,
+    SileroConfig, SileroModel, SileroVad, StatsFlushCause, StatsModel, TransitionCause,
+    WakeDetected, WakePolicy,
 };
 pub use playback::{
-    AbortReason, FRAME_MS, FlushRejected, PacerConfig, PlayRejected, PlaybackEvent,
+    AbortReason, AudibleJob, FRAME_MS, FlushRejected, PacerConfig, PlayRejected, PlaybackEvent,
     PlaybackEventFn, PlaybackHandle, PlaybackJob, PlaybackStats, PlaybackStatsSnapshot,
     PlaybackWriter, audio_ms,
 };

@@ -155,6 +155,10 @@ pub struct CarvedUtterance {
     /// the wake gate on the barge-in trigger rather than on a wake arm, so `wake`
     /// is `None` and nothing is trimmed (there is no wake word to trim).
     pub barge_in: bool,
+    /// This utterance's speech was heard over this pod's own playback at some
+    /// point in its life: the floor was open on a chunk between its onset and its
+    /// endpoint. `barge_in` implies this.
+    pub over_playback: bool,
     /// Host-receipt stamps for this utterance's audio, from t0 to the carve.
     pub timing: CarveTiming,
 }

@@ -1125,6 +1125,26 @@ pub struct BuildId {
     pub dirty: bool,
 }
 
+impl BuildId {
+    /// A build identity from a commit string of any length, truncated to the
+    /// 40 hex chars a SHA-1 takes. Longer input is a caller's bug rather than a
+    /// wire condition, and a hash is still recognisable truncated, so this keeps
+    /// the prefix instead of failing — which is also what a shallow clone's
+    /// shorter hash needs.
+    pub fn truncating(commit: &str, dirty: bool) -> BuildId {
+        let mut stamped = heapless::String::<40>::new();
+        for ch in commit.chars().take(40) {
+            // Infallible: at most 40 chars into a capacity-40 string, and a
+            // non-ASCII char would be a non-hash caller's bug either way.
+            let _ = stamped.push(ch);
+        }
+        BuildId {
+            commit: stamped,
+            dirty,
+        }
+    }
+}
+
 // ── Log frame ─────────────────────────────────────────────────────────────────
 
 /// Unsolicited log record emitted by the device's custom `log::Log` backend.
@@ -2889,12 +2909,7 @@ mod tests {
     #[test]
     fn struct_truncated_payload_errors() {
         // Serialize a valid BuildId, then truncate the last byte.
-        let mut commit = heapless::String::<40>::new();
-        commit.push_str("aabbccdd").unwrap();
-        let id = BuildId {
-            commit,
-            dirty: false,
-        };
+        let id = BuildId::truncating("aabbccdd", false);
         let mut buf = [0u8; 64];
         let encoded = postcard::to_slice(&id, &mut buf).expect("encode failed");
         let encoded_len = encoded.len();

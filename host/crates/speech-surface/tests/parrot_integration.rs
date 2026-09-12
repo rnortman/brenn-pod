@@ -1,11 +1,13 @@
 //! End-to-end parrot mode: a daemon running the
 //! streaming listener, `[brain] mode = "echo"`, and `[stt]`/`[tts]` pointed at an
 //! in-process fake speaches container reads back what it "heard". `replay-pod
-//! --linger-until-eoa` streams a checked-in capture and stays connected through
-//! the daemon's synthesized readback, so the assertion is both JSONL-side (the
-//! `utterance` → `synth` → `playback_started` → `playback_finished` sequence with
-//! the per-stage latency breakdown) and device-side (the readback frames actually
-//! crossed the wire back and tally to the fake TTS clip).
+//! --linger-until-eoa --linger-playout-ms` streams a checked-in capture and stays
+//! connected through the daemon's synthesized readback and past its audible end, as
+//! a device playing out its bank does — so the assertion is both JSONL-side (the
+//! `utterance` → `synth` → `playback_started` → `playback_written` →
+//! `playback_finished` sequence with the per-stage latency breakdown) and
+//! device-side (the readback frames actually crossed the wire back and tally to the
+//! fake TTS clip).
 
 mod common;
 
@@ -48,17 +50,19 @@ fn echo_brain_reads_back_transcript_end_to_end() {
     let out = common::run_replay_linger(&addr, &framelog);
     common::assert_replay_ok(&out, &daemon);
 
-    // The linger held the connection open through the readback; the daemon emits
-    // `playback_finished` exactly when it writes `EndOfAudio`, so draining through
-    // it orders every parrot line onto disk before the snapshot.
+    // The linger held the connection open through the readback and past its audible
+    // end, which is what `playback_finished` dates — it trails the last write by
+    // whatever the device still had banked. It is the last playback line, so waiting
+    // for it orders every parrot line onto disk before the snapshot.
     common::wait_for_event(&daemon, "playback_finished", common::EVENT_DEADLINE, |v| {
         v["event"] == "playback_finished"
     });
 
     let events = common::read_events(&jsonl_path);
 
-    // The parrot sequence: utterance → synth → playback_started → playback_finished,
-    // each exactly once and strictly ordered.
+    // The parrot sequence: utterance → synth → playback_started → playback_written
+    // → playback_finished, each exactly once and strictly ordered. The write and the
+    // audible end are separate events, in that order.
     let pos = |name: &str| {
         let idxs: Vec<usize> = events
             .iter()
@@ -77,11 +81,18 @@ fn echo_brain_reads_back_transcript_end_to_end() {
     let utt = pos("utterance");
     let synth = pos("synth");
     let started = pos("playback_started");
+    let written = pos("playback_written");
     let finished = pos("playback_finished");
     assert!(
-        utt < synth && synth < started && started < finished,
+        utt < synth && synth < started && started < written && written < finished,
         "parrot sequence must be utterance({utt}) < synth({synth}) < \
-         playback_started({started}) < playback_finished({finished})\n{}",
+         playback_started({started}) < playback_written({written}) < \
+         playback_finished({finished})\n{}",
+        daemon.diagnostics()
+    );
+    assert!(
+        !events.iter().any(|v| v["event"] == "playback_aborted"),
+        "the readback was heard to its end; nothing lost the stream\n{}",
         daemon.diagnostics()
     );
 

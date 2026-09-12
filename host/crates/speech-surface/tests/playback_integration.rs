@@ -3,9 +3,10 @@
 //! - **Brain-positive**: a daemon with the streaming listener and `[brain] mode =
 //!   "wav"` answers a carved utterance by queueing its configured clip as paced
 //!   playback back over the same TCP connection the pod streamed in on. `replay-pod
-//!   --linger-until-eoa` holds the connection open through the daemon's playback
-//!   and decodes the returned frames, so the assertion is device-side (the frames
-//!   actually crossed the wire) as well as JSONL-side.
+//!   --linger-until-eoa --linger-playout-ms` holds the connection open through the
+//!   daemon's playback and past the clip's audible end, as a device playing out its
+//!   bank does, and decodes the returned frames — so the assertion is device-side
+//!   (the frames actually crossed the wire) as well as JSONL-side.
 //! - **No-`[brain]`**: the same wake phrase through a listener daemon with no brain
 //!   still carves an utterance, but nothing answers it — no playback lifecycle line
 //!   is ever emitted, only the eager `playback_hello` (writers spawn regardless of
@@ -56,7 +57,7 @@ fn write_clip_wav(path: &Path, n: usize) {
 /// The wake phrase, replayed against a listener + `wav`-brain daemon, arms
 /// openWakeWord, the endpointer carves one utterance, and the brain
 /// answers it with the configured clip queued as paced playback. The daemon writes
-/// the clip back over the same connection; `replay-pod --linger-until-eoa` stays
+/// the clip back over the same connection; the lingering `replay-pod` stays
 /// connected, decodes the returned `Hello`/`Audio`/`EndOfAudio`, and reports the
 /// tally — so this asserts both the JSONL latency-decomposition lines and the
 /// device-side wire tally.
@@ -80,16 +81,20 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
     let out = common::run_replay_linger(&addr, &framelog);
     common::assert_replay_ok(&out, &daemon);
 
-    // The linger held the connection open through playback; the daemon emits
-    // `playback_finished` exactly when it writes `EndOfAudio`, so draining
-    // through it orders every playback line onto disk before the snapshot.
+    // The linger held the connection open through playback and past the clip's
+    // audible end, which is what `playback_finished` dates — it trails the last
+    // write by whatever the device still had banked. It is the last playback line,
+    // so waiting for it orders them all onto disk before the snapshot.
     common::wait_for_event(&daemon, "playback_finished", common::EVENT_DEADLINE, |v| {
         v["event"] == "playback_finished"
     });
 
     let events = common::read_events(&jsonl_path);
 
-    // JSONL sequence: utterance → playback_started → playback_finished, each once.
+    // JSONL sequence: utterance → playback_started → playback_written →
+    // playback_finished, each once. The last two are separate events and land in
+    // that order: the write hands the audio to the device, and the device is still
+    // playing it when it does.
     let pos = |name: &str| {
         let idxs: Vec<usize> = events
             .iter()
@@ -107,11 +112,23 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
     };
     let utt = pos("utterance");
     let started = pos("playback_started");
+    let written = pos("playback_written");
     let finished = pos("playback_finished");
     assert!(
-        utt < started && started < finished,
+        utt < started && started < written && written < finished,
         "sequence must be utterance({utt}) < playback_started({started}) < \
-         playback_finished({finished})\n{}",
+         playback_written({written}) < playback_finished({finished})\n{}",
+        daemon.diagnostics()
+    );
+    assert_eq!(
+        events[written]["rewritten"],
+        serde_json::json!(false),
+        "the clip was written once — nothing flushed the device's bank\n{}",
+        daemon.diagnostics()
+    );
+    assert!(
+        !events.iter().any(|v| v["event"] == "playback_aborted"),
+        "the clip was heard to its end; nothing lost the stream\n{}",
         daemon.diagnostics()
     );
 

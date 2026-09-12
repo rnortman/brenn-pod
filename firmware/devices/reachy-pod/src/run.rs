@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use audio_pipeline::inbound::{InboundObserver, InboundWaypoint};
 use audio_pipeline::ring::{CaptureRing, RING_CAPACITY_SAMPLES, RingIndex};
 use audio_pipeline::wire::PlaybackFormat;
+use build_id::{build_id, stamp};
 use pod_streamer::idle::should_log_provisioning_failure;
 use pod_streamer::run::{StreamerExit, StreamerRuntime, run_streamer_loop};
 use pod_streamer::segment::{ObsEvent, STREAMER_CHAN_CAPACITY, StreamerMsg};
@@ -521,7 +522,8 @@ pub fn run() -> u8 {
     };
     let capture_channel = routing.channel(config.channel);
     log::info!(
-        "startup: pod_id={pod_id} host={} {} vad_threshold={} vad_hangover_ms={}",
+        "startup: pod_id={pod_id} build={} host={} {} vad_threshold={} vad_hangover_ms={}",
+        stamp(&build_id()),
         config.addr,
         routing.channel_note(config.channel),
         config.vad_threshold,

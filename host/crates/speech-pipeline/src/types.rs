@@ -604,6 +604,9 @@ pub struct Utterance {
     /// context chain of every interrupted turn since the last clean completion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub barge_in: Option<BargeInContext>,
+    /// This utterance's speech was heard over the pod's own playback at some
+    /// point in its life, whether or not it cut it.
+    pub over_playback: bool,
 }
 
 /// Host-clock stamps at each pipeline boundary, one `Option` per stage. Grows a
@@ -779,6 +782,7 @@ pub(crate) fn test_utterance() -> Utterance {
         endpoint_cause: EndpointCause::SoftEndpoint,
         wake: None,
         barge_in: None,
+        over_playback: false,
     }
 }
 
@@ -946,6 +950,7 @@ mod tests {
             endpoint_cause: EndpointCause::SoftEndpoint,
             wake: None,
             barge_in: None,
+            over_playback: false,
         };
         // Round-trips through serde (the surface-envelope requirement).
         let json = serde_json::to_string(&utt).unwrap();
