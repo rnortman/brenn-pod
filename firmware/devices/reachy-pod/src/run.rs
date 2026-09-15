@@ -43,7 +43,7 @@ use crate::alsa_capture::{
     select_card,
 };
 use crate::chip::{self, Routing, StateLineCadence};
-use crate::cli::EXIT_FAILED;
+use crate::cli::{EXIT_FAILED, EXIT_OK};
 use crate::config::{Config, ConfigError, RECHECK_INTERVAL};
 use crate::playback::{AlsaOut, open_playback_on, playback_pair, run_drain_loop};
 use crate::usb_ctrl::{Board, UsbControl, find_boards, select_board};
@@ -486,15 +486,66 @@ fn card_present() -> Result<(), String> {
     select_card(&cards).map(|_| ())
 }
 
-/// The chip's bring-up, on this unit's real bus, card and clock.
-fn bring_up_chip() -> Result<(UsbControl, Routing), String> {
-    chip::bring_up(
+/// Open the chip's control plane, on this unit's real bus, card and clock.
+///
+/// `already_rebooted` is what the launcher's pre-launch step leaves behind: the
+/// board has been reset once in this launch and resetting it again would take the
+/// servo bus down under processes that are already commissioning it.
+fn bring_up_chip(already_rebooted: bool) -> Result<(UsbControl, Routing), String> {
+    let open = |board| UsbControl::open(board).map_err(|e| format!("{board} will not open: {e}"));
+    let board = if already_rebooted {
+        chip::locate(&the_board)?
+    } else {
+        chip::reboot::<UsbControl>(
+            &open,
+            &the_board,
+            &card_present,
+            &Instant::now,
+            &std::thread::sleep,
+        )?
+        .board
+    };
+    chip::attach(board, &open, &Instant::now, &std::thread::sleep)
+}
+
+/// Reboot the audio chip and wait for it to come back. Nothing else.
+///
+/// The launcher's pre-launch step: it runs to completion before any app starts, so
+/// the USB re-enumeration the reboot costs happens while nothing is streaming audio
+/// and — the reason this exists as its own entry point — while nothing is
+/// commissioning the servo bus, which goes unanswered in short bursts across it.
+///
+/// No `audio.conf` is read. The reboot needs no configuration, and a pre-launch
+/// that waited for a per-unit file would hold up every process on the unit.
+pub fn reboot_chip() -> u8 {
+    let rebooted = chip::reboot::<UsbControl>(
         &|board| UsbControl::open(board).map_err(|e| format!("{board} will not open: {e}")),
         &the_board,
         &card_present,
         &Instant::now,
         &std::thread::sleep,
-    )
+    );
+    match rebooted {
+        // A board that was never seen leaving may not have rebooted; it is
+        // back with its card, which is what the apps behind this step need.
+        Ok(_) => EXIT_OK,
+        Err(why) => {
+            log::error!("reboot-chip: {why}");
+            EXIT_FAILED
+        }
+    }
+}
+
+/// What the startup line says about when the audio chip was reset: this process
+/// did it, or a step ahead of this process did. The reachy analyzers tell an
+/// operator to read this field off the startup line when the servo bus shows
+/// misses, so the two spellings are a contract with them.
+const fn chip_note(already_rebooted: bool) -> &'static str {
+    if already_rebooted {
+        "prelaunched"
+    } else {
+        "rebooted"
+    }
 }
 
 /// Bring up the pipeline and run it until a thread ends.
@@ -503,9 +554,11 @@ fn bring_up_chip() -> Result<(UsbControl, Routing), String> {
 /// board that is absent or a card that refuses the pipeline's parameters is a
 /// startup failure with one clear line, not four threads racing to report it.
 /// The chip comes first of all, because bringing it up reboots it and the sound
-/// card goes away with it. Configuration is the exception — a missing `audio.conf`
-/// is waited for, because it arrives per unit and may simply not be placed yet.
-pub fn run() -> u8 {
+/// card goes away with it — unless the launcher already did that, in which case
+/// this attaches to the board it finds. Configuration is the exception — a missing
+/// `audio.conf` is waited for, because it arrives per unit and may simply not be
+/// placed yet.
+pub fn run(chip_rebooted: bool) -> u8 {
     let config = wait_for_config(&mut Config::load, &std::thread::sleep);
     let pod_id = config::hostname();
     if let Err(why) = config::check_pod_id(&pod_id) {
@@ -513,7 +566,7 @@ pub fn run() -> u8 {
         return EXIT_FAILED;
     }
 
-    let (control, routing) = match bring_up_chip() {
+    let (control, routing) = match bring_up_chip(chip_rebooted) {
         Ok(brought_up) => brought_up,
         Err(e) => {
             log::error!("startup: {e}");
@@ -521,8 +574,10 @@ pub fn run() -> u8 {
         }
     };
     let capture_channel = routing.channel(config.channel);
+    let chip_note = chip_note(chip_rebooted);
     log::info!(
-        "startup: pod_id={pod_id} build={} host={} {} vad_threshold={} vad_hangover_ms={}",
+        "startup: pod_id={pod_id} build={} host={} chip={chip_note} {} vad_threshold={} \
+         vad_hangover_ms={}",
         stamp(&build_id()),
         config.addr,
         routing.channel_note(config.channel),
@@ -710,6 +765,18 @@ mod tests {
     use audio_pipeline::playback::PlaybackSink;
     use audio_pipeline::ring::SAMPLE_RATE_HZ;
     use std::collections::VecDeque;
+
+    /// The field an operator is pointed at when the bus shows misses: the reset
+    /// this process made, or one a step ahead of it made.
+    #[test]
+    fn the_startup_line_says_which_step_reset_the_chip() {
+        assert_eq!(chip_note(false), "rebooted", "this process reset it");
+        assert_eq!(
+            chip_note(true),
+            "prelaunched",
+            "a step ahead of this process reset it"
+        );
+    }
 
     const KEY_HEX: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
 

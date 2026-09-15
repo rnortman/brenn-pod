@@ -13,6 +13,13 @@
 //! bus and comes back as a fresh sound card, so a capture stream opened before it
 //! would be opened on a card about to vanish.
 //!
+//! The first two steps and the third are separately reachable, as [`reboot`] and
+//! [`attach`], because the reboot costs more than this process's own audio: while
+//! the board re-enumerates, the servo bus on the same board answers nothing in
+//! short bursts, so a composition that commissions servos runs the reboot to
+//! completion before it starts any app. [`bring_up`] is the two in sequence, which
+//! is what a pod started on its own does.
+//!
 //! Everything here that talks to the chip is generic over [`ControlTransport`], and
 //! the bus and the card are reached through function seams, so the whole sequence
 //! is decidable off the device.
@@ -538,33 +545,44 @@ where
 
 // ── The sequence ──────────────────────────────────────────────────────────────
 
-/// Open the chip's control plane and put the chip in the state this pipeline runs
-/// on: rebooted, with the beamformer's ASR output routed to the right channel.
+/// Find the board, with the line a caller that cannot go on without one prints.
+///
+/// One spelling, because the reboot and the attach are separate entry points
+/// and a bus with no board on it says the same thing to both.
+pub fn locate(find: &dyn Fn() -> Result<Board, String>) -> Result<Board, String> {
+    find().map_err(|e| format!("no XVF3800 control interface: {e}"))
+}
+
+/// The board a reboot left on the bus, and whether it was seen going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rebooted {
+    pub board: Board,
+    /// False when the board answered a look all the way through the settle: it may
+    /// never have rebooted, and its adaptive state may be the state it had.
+    pub left_the_bus: bool,
+}
+
+/// Reboot the chip and wait for the board and its sound card to come back.
 ///
 /// The reboot is what makes the chip's adaptive state — the only state on this path
 /// that outlives a process restart — start where every other part of the pipeline
-/// starts. It costs the board leaving the USB bus, which is why the caller opens
-/// nothing else until this returns.
-///
-/// A routing the chip does not take is not fatal and is not retried: the refusal is
-/// deterministic, so exiting would loop forever with no pipeline ever running. The
-/// lines say so and the run streams the post-processed channel instead.
-///
-/// Every moving part is a seam — the bus, the card, the clock, the sleep and the
-/// open — so the order of the whole sequence is decidable off the device, which is
-/// where its two load-bearing orderings live: the handle is dropped before the
-/// board goes, and the routing is written to the board that came back.
-pub fn bring_up<T: ControlTransport>(
+/// starts. It costs the board leaving the USB bus, which is why nothing else on
+/// this unit opens a device until this returns: a capture stream opened across it
+/// would be opened on a card about to vanish, and the servo bus on this board goes
+/// unanswered in short bursts while the kernel re-enumerates. That second cost is
+/// why this is reachable on its own, ahead of every process a composition starts,
+/// and not only as the first half of [`bring_up`].
+pub fn reboot<T: ControlTransport>(
     open: &dyn Fn(Board) -> Result<T, String>,
     find: &dyn Fn() -> Result<Board, String>,
     card_ready: &dyn Fn() -> Result<(), String>,
     now: &dyn Fn() -> Instant,
     sleep: &dyn Fn(Duration),
-) -> Result<(T, Routing), String>
+) -> Result<Rebooted, String>
 where
     T::Error: fmt::Display,
 {
-    let board = find().map_err(|e| format!("no XVF3800 control interface: {e}"))?;
+    let board = locate(find)?;
     log_generation(board);
     let mut control = keep_trying(&|| open(board), NODE_ACCESS_TIMEOUT, now, sleep)
         .map_err(|e| format!("cannot open {board} for control transfers: {e}"))?;
@@ -592,9 +610,35 @@ where
             REBOOT_SETTLE.as_secs()
         );
     }
+    Ok(Rebooted {
+        board,
+        left_the_bus,
+    })
+}
+
+/// Open the board's control plane and put the chip in the state this pipeline runs
+/// on: the beamformer's ASR output routed to the right channel, and one state line.
+///
+/// The board is the caller's, so the routing is written to the board that came
+/// back from the reboot rather than to whatever a fresh look finds — the ordering
+/// [`bring_up`] exists to keep, and the reason this takes a [`Board`] and not a
+/// `find` seam.
+///
+/// A routing the chip does not take is not fatal and is not retried: the refusal is
+/// deterministic, so exiting would loop forever with no pipeline ever running. The
+/// lines say so and the run streams the post-processed channel instead.
+pub fn attach<T: ControlTransport>(
+    board: Board,
+    open: &dyn Fn(Board) -> Result<T, String>,
+    now: &dyn Fn() -> Instant,
+    sleep: &dyn Fn(Duration),
+) -> Result<(T, Routing), String>
+where
+    T::Error: fmt::Display,
+{
     log_generation(board);
     let mut control = keep_trying(&|| open(board), NODE_ACCESS_TIMEOUT, now, sleep)
-        .map_err(|e| format!("cannot re-open {board} after the reboot: {e}"))?;
+        .map_err(|e| format!("cannot open {board} for the pipeline's control transfers: {e}"))?;
 
     // Dropped intentionally; `state_line` re-reads and prints these registers.
     let RoutingRead { routing, notes, .. } = apply_asr_routing(&mut control);
@@ -615,6 +659,32 @@ where
     let state = state_line(&mut control, now);
     log::info!("{state}");
     Ok((control, routing))
+}
+
+/// The whole sequence in one process: reboot the chip, then attach to the board
+/// that came back.
+///
+/// What a pod started by hand does. Under a launcher the two halves are split —
+/// the reboot runs before any app, because the servo bus goes unanswered while
+/// the board re-enumerates and the process that commissions it must not be
+/// running then — and the pipeline calls [`attach`] alone.
+///
+/// Every moving part is a seam — the bus, the card, the clock, the sleep and the
+/// open — so the order of the whole sequence is decidable off the device, which is
+/// where its two load-bearing orderings live: the handle is dropped before the
+/// board goes, and the routing is written to the board that came back.
+pub fn bring_up<T: ControlTransport>(
+    open: &dyn Fn(Board) -> Result<T, String>,
+    find: &dyn Fn() -> Result<Board, String>,
+    card_ready: &dyn Fn() -> Result<(), String>,
+    now: &dyn Fn() -> Instant,
+    sleep: &dyn Fn(Duration),
+) -> Result<(T, Routing), String>
+where
+    T::Error: fmt::Display,
+{
+    let rebooted = reboot::<T>(open, find, card_ready, now, sleep)?;
+    attach(rebooted.board, open, now, sleep)
 }
 
 // ── The state line ────────────────────────────────────────────────────────────
@@ -1382,6 +1452,125 @@ mod tests {
         );
         // The three read-backs and the eleven of the state line.
         assert_eq!(bank.registers.len(), 2 + 3 + 11);
+    }
+
+    /// The reboot half on its own: the identity read, the reboot write, the wait,
+    /// and a board that was seen going. Nothing is routed and no state line is
+    /// read — those belong to the attach.
+    #[test]
+    fn the_reboot_alone_resets_the_board_and_says_it_was_seen_going() {
+        let clock = Clock::new();
+        let chip = a_chip(ASR_ROUTE.to_vec(), 1);
+        let looks = std::cell::Cell::new(0);
+        let rebooted = reboot(
+            &|_board| Ok(chip.clone()),
+            &|| {
+                looks.set(looks.get() + 1);
+                if (2..=3).contains(&looks.get()) {
+                    Err("no XVF3800 board on the bus".to_string())
+                } else {
+                    Ok(a_board())
+                }
+            },
+            &|| Ok(()),
+            &|| clock.now(),
+            &|d| clock.advance(d),
+        )
+        .expect("the board came back");
+        assert_eq!(rebooted.board, a_board());
+        assert!(rebooted.left_the_bus);
+        let bank = chip.0.borrow();
+        assert_eq!(
+            bank.writes,
+            vec![(APPLICATION_SERVICER_RESID, REBOOT_CMD, vec![1u8])],
+            "the reboot and nothing else: the routing is the attach's"
+        );
+        assert_eq!(
+            bank.registers,
+            vec![
+                (APPLICATION_SERVICER_RESID, VERSION_CMD),
+                (APPLICATION_SERVICER_RESID, BLD_MSG_CMD)
+            ],
+            "the identity, and none of the state line"
+        );
+    }
+
+    /// A board that answers every look through the settle was never seen leaving,
+    /// which is a warning and not a failure: it is on the bus with its card, which
+    /// is what the caller waited for.
+    #[test]
+    fn a_reboot_that_never_saw_the_board_go_still_returns_the_board() {
+        let clock = Clock::new();
+        let chip = a_chip(ASR_ROUTE.to_vec(), 1);
+        let rebooted = reboot(
+            &|_board| Ok(chip.clone()),
+            &|| Ok(a_board()),
+            &|| Ok(()),
+            &|| clock.now(),
+            &|d| clock.advance(d),
+        )
+        .expect("the board is there throughout");
+        assert!(!rebooted.left_the_bus);
+    }
+
+    /// The pre-launch's failure: the timeout passes with no board, and the error
+    /// says which half was missing.
+    #[test]
+    fn a_reboot_whose_board_never_returns_names_the_missing_half() {
+        let clock = Clock::new();
+        let chip = a_chip(ASR_ROUTE.to_vec(), 1);
+        let looks = std::cell::Cell::new(0);
+        let why = reboot(
+            &|_board| Ok(chip.clone()),
+            &|| {
+                looks.set(looks.get() + 1);
+                if looks.get() == 1 {
+                    Ok(a_board())
+                } else {
+                    Err("no XVF3800 board on the bus; looked for 38fb:1001".to_string())
+                }
+            },
+            &|| Ok(()),
+            &|| clock.now(),
+            &|d| clock.advance(d),
+        )
+        .expect_err("it never came back");
+        assert!(why.contains("did not come back within 10s"), "{why}");
+        assert!(why.contains("38fb:1001"), "{why}");
+    }
+
+    /// The attach half on its own — what `run --chip-rebooted` does: the routing
+    /// written to the board it is handed, the three read-backs, one state line,
+    /// and no reset of a chip somebody else already reset.
+    #[test]
+    fn the_attach_routes_the_board_it_is_given_and_never_reboots_it() {
+        let clock = Clock::new();
+        let chip = a_chip(ASR_ROUTE.to_vec(), 1);
+        let opens = std::cell::Cell::new(0);
+        let (_control, routing) = attach(
+            a_board(),
+            &|_board| {
+                opens.set(opens.get() + 1);
+                Ok(chip.clone())
+            },
+            &|| clock.now(),
+            &|d| clock.advance(d),
+        )
+        .expect("the board is open");
+        assert_eq!(routing, Routing::Applied);
+        assert_eq!(opens.get(), 1, "one handle, and no board to wait for");
+        let bank = chip.0.borrow();
+        assert_eq!(
+            bank.writes,
+            vec![
+                (AUDIO_MGR_RESID, AUDIO_MGR_OP_R_CMD, ASR_ROUTE.to_vec()),
+                (AEC_RESID, AEC_ASROUTONOFF_CMD, i32_bytes(1)),
+            ],
+            "no REBOOT_CMD: the launcher rebooted this chip before any app started"
+        );
+        // The three read-backs and the eleven of the state line, and no identity
+        // read — that is the reboot's line, printed before the board went.
+        assert_eq!(bank.registers.len(), 3 + 11);
     }
 
     /// A board that never comes back is a startup failure naming what was last

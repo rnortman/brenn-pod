@@ -824,15 +824,12 @@ impl Server {
                         router_stats.clone(),
                         jsonl.clone(),
                         shutdown_token.clone(),
-                        // A wired synthesizer renders `Text` replies to PCM; absent
-                        // `[tts]`, `Text` bodies stay a counted `speak_unsupported`
-                        // rejection.
-                        synthesizer.clone(),
-                        turn_ledger.clone(),
-                        // The same tap the playback fan-out holds: a command the
-                        // router gives up on changes the turn's accounting and
-                        // nothing downstream will ever report it.
-                        script_handle.clone(),
+                        playback_router::RouterWiring {
+                            synthesizer: synthesizer.clone(),
+                            ledger: turn_ledger.clone(),
+                            scripter: script_handle.clone(),
+                            wake_phrase: config.wake.as_ref().and_then(|w| w.phrase.clone()),
+                        },
                     )
                     .run(speak_rx),
                 );

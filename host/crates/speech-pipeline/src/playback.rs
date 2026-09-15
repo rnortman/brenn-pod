@@ -98,6 +98,10 @@ pub struct PlaybackJob {
     /// Whether speech detected during this job may flush it. Copied from the
     /// originating `SpeakCmd`; a false here makes [`PlaybackHandle::flush`] reject.
     pub interruptible: bool,
+    /// Whether this clip's own words carry the wake phrase. Must be set by
+    /// whoever builds the job from a text body; a `Pcm` body, whose words are
+    /// unknown here, is never marked.
+    pub may_wake: bool,
     /// The originating utterance's pipeline stamps.
     pub timings: StageTimings,
     /// The router's `SpeakCmd`-receipt stamp.
@@ -214,14 +218,20 @@ pub enum PlaybackEvent {
 }
 
 /// The audible job [`PlaybackEvent::Audible`] names. Only the fields the floor
-/// carries: the identity is the payload, so two clips of one reply hand over with
-/// no event and the barge guard's sustain run survives the boundary.
+/// carries: two clips of one reply that say the same thing about it hand over with
+/// no event and the barge guard's sustain run survives the boundary, while a clip
+/// that says something new about the same turn is reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudibleJob {
     /// The utterance the audible job answers, if any.
     pub in_reply_to: Option<UtteranceId>,
     /// Whether speech over it may flush it.
     pub interruptible: bool,
+    /// Whether this turn's own words carry the wake phrase, so a wake detection
+    /// over it is the machine hearing itself. Sticky for the turn: the wake model
+    /// scores a phrase after it has been said, so a phrase at the end of one clip
+    /// is detected while the next one is audible.
+    pub may_wake: bool,
 }
 
 /// The sink each writer emits its events into. `Arc`'d so one closure serves every
@@ -566,6 +576,7 @@ impl PlaybackWriter {
             deferred: VecDeque::new(),
             queue_closed: false,
             last_audible: None,
+            marked_turn: None,
         };
         tokio::spawn(writer.run(rx));
         PlaybackHandle {
@@ -611,6 +622,13 @@ struct Writer<W> {
     /// The audible job as last reported by [`PlaybackEvent::Audible`]. Compared
     /// against the front of `pending` to emit on changes only.
     last_audible: Option<AudibleJob>,
+    /// The turn some clip of which has said the wake phrase, held until a clip of
+    /// another turn is audible. Kept beside `last_audible` rather than read off
+    /// it because a turn's clips need not be contiguous: a reply falls silent
+    /// between two segments while the next is synthesized, and the mark has to
+    /// cross that silence or the detection the phrase provokes lands on a clip
+    /// that reports itself unmarked.
+    marked_turn: Option<UtteranceId>,
 }
 
 /// How one frame write ended.
@@ -784,7 +802,8 @@ where
     }
 
     /// Report the audible job if it has changed since the last report: the front
-    /// of `pending`, by turn and interruptibility. Called after each lifecycle
+    /// of `pending`, by turn, interruptibility and whether the turn says the wake
+    /// phrase. Called after each lifecycle
     /// event that can move the front, so a change always trails the event that
     /// caused it.
     ///
@@ -792,10 +811,28 @@ where
     /// every mutation of `pending` so the flush handle never reads a `current`
     /// that lags the queue across an await.
     async fn emit_audible(&mut self) {
-        let job = self.pending.front().map(|p| AudibleJob {
+        let mut job = self.pending.front().map(|p| AudibleJob {
             in_reply_to: p.job.in_reply_to,
             interruptible: p.job.interruptible,
+            may_wake: p.job.may_wake,
         });
+        // Within one turn the mark only ever goes false → true: the phrase was
+        // said, whichever clip of the reply said it, and the detection it provokes
+        // lands on whichever clip is audible by then — which may be a clip that
+        // starts after the reply has been silent for a moment, so the mark is held
+        // against the turn and not against a report. A job that answers no turn is
+        // no turn, so it inherits nothing and marks nothing.
+        if let Some(j) = job.as_mut()
+            && j.in_reply_to.is_some()
+        {
+            if j.may_wake {
+                self.marked_turn = j.in_reply_to;
+            } else if j.in_reply_to == self.marked_turn {
+                j.may_wake = true;
+            } else {
+                self.marked_turn = None;
+            }
+        }
         if job == self.last_audible {
             return;
         }
@@ -1434,10 +1471,16 @@ mod tests {
     }
 
     fn job_with_id(pcm: Vec<i16>, id: u64) -> PlaybackJob {
+        job_saying(pcm, id, false)
+    }
+
+    /// The same, for a clip whose own words carry the wake phrase.
+    fn job_saying(pcm: Vec<i16>, id: u64, may_wake: bool) -> PlaybackJob {
         PlaybackJob {
             pcm: Arc::from(pcm.as_slice()),
             in_reply_to: Some(UtteranceId(id)),
             interruptible: true,
+            may_wake,
             timings: StageTimings::default(),
             speak_rx: HostMicros(1_000),
         }
@@ -2664,6 +2707,148 @@ mod tests {
         assert_eq!(tags.last().map(String::as_str), Some("silent"));
     }
 
+    /// Every `Audible` report as `(turn, may_wake)`, with silence as `None`.
+    fn audible_marks(seen: &Arc<Mutex<Vec<PlaybackEvent>>>) -> Vec<Option<(Option<u64>, bool)>> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                PlaybackEvent::Audible { job, .. } => Some(
+                    job.as_ref()
+                        .map(|j| (j.in_reply_to.map(|u| u.0), j.may_wake)),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A reply is not one clip, and the wake model scores the phrase after it has
+    /// been said — so a phrase at the end of one clip is detected while the next is
+    /// audible. The mark is therefore sticky for the turn: once any clip of it has
+    /// said the phrase, the turn stays marked until another turn takes over.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_that_says_the_phrase_stays_marked_across_its_clips() {
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(
+            PacerConfig {
+                lead_ms: 20,
+                job_queue_depth: 8,
+                ..PacerConfig::default()
+            },
+            &stats,
+            events,
+        );
+
+        for (turn, may_wake) in [(42, false), (42, true), (42, false), (43, false)] {
+            handle
+                .try_play(job_saying(
+                    vec![1i16; AUDIO_SAMPLES_PER_FRAME * 2],
+                    turn,
+                    may_wake,
+                ))
+                .unwrap();
+        }
+        drop(handle);
+        reader.await.expect("reader");
+
+        assert_eq!(
+            audible_marks(&seen),
+            [
+                Some((Some(42), false)),
+                Some((Some(42), true)),
+                Some((Some(43), false)),
+                None,
+            ],
+            "the turn is marked from the clip that says the phrase onward, and the \
+             third clip's hand-over reports nothing because the mark holds",
+        );
+    }
+
+    /// A reply's clips need not be contiguous: `BrennBrain` speaks each segment as
+    /// it arrives, so the reply falls silent while the next is synthesized. The
+    /// mark belongs to the turn, so it crosses that silence — the detection the
+    /// phrase provokes trails the phrase by a few hundred milliseconds and lands
+    /// on the segment after the gap as readily as on the one that said it.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_stays_marked_across_a_silence_between_its_clips() {
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(
+            PacerConfig {
+                lead_ms: 20,
+                job_queue_depth: 8,
+                ..PacerConfig::default()
+            },
+            &stats,
+            events,
+        );
+
+        handle
+            .try_play(job_saying(
+                vec![1i16; AUDIO_SAMPLES_PER_FRAME * 2],
+                42,
+                true,
+            ))
+            .unwrap();
+        // Long enough for the clip's audible end to pass with nothing behind it,
+        // so the front retires and the writer reports silence.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        handle
+            .try_play(job_saying(
+                vec![1i16; AUDIO_SAMPLES_PER_FRAME * 2],
+                42,
+                false,
+            ))
+            .unwrap();
+        drop(handle);
+        reader.await.expect("reader");
+
+        assert_eq!(
+            audible_marks(&seen),
+            [Some((Some(42), true)), None, Some((Some(42), true)), None,],
+            "the second segment of a reply that has already said the phrase is \
+             audible under the mark, silence in between or not",
+        );
+    }
+
+    /// A reply answering no turn is no turn. Two of them in a row are two replies,
+    /// so the mark one of them carries stops with it — otherwise the first
+    /// turn-less reply to say the phrase would exempt every turn-less reply after
+    /// it from the wake barge.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_less_reply_hands_its_mark_to_nobody() {
+        let (events, seen) = event_collector();
+        let stats = Arc::new(PlaybackStats::default());
+        let (handle, reader) = drained_writer(
+            PacerConfig {
+                lead_ms: 20,
+                job_queue_depth: 8,
+                ..PacerConfig::default()
+            },
+            &stats,
+            events,
+        );
+
+        for may_wake in [true, false] {
+            handle
+                .try_play(PlaybackJob {
+                    in_reply_to: None,
+                    may_wake,
+                    ..job_saying(vec![1i16; AUDIO_SAMPLES_PER_FRAME * 2], 1, may_wake)
+                })
+                .unwrap();
+        }
+        drop(handle);
+        reader.await.expect("reader");
+
+        assert_eq!(
+            audible_marks(&seen),
+            [Some((None, true)), Some((None, false)), None],
+            "the second reply is reported on its own words, not the first's",
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_hand_over_to_another_turn_is_reported_at_the_first_ones_audible_end() {
         // Two replies back to back on one stream. The second's first write is not a
@@ -3299,6 +3484,7 @@ mod tests {
             deferred: VecDeque::new(),
             queue_closed: false,
             last_audible: None,
+            marked_turn: None,
         }
     }
 

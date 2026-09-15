@@ -107,6 +107,80 @@ pub(crate) struct Router {
     /// time it gives up on a command, so the tap belongs here as much as on the
     /// playback fan-out.
     scripter: Option<ScriptHandle>,
+    /// The wake phrase, normalised, when one is configured. The router is the only
+    /// place a reply's words and its playback job are both in hand, so it is where
+    /// a reply that says the phrase is marked — the listener then knows not to let
+    /// the machine cut itself off for its own wake word.
+    wake_phrase: Option<String>,
+}
+
+/// A phrase reduced to the words in it: lowercased, with everything that is not a
+/// letter or a digit becoming a separator, and a space at each end. Punctuation,
+/// casing and spacing differ freely between a configured phrase and a
+/// synthesizer's input for the same words, and none of that difference is
+/// audible.
+fn normalise_words(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push(' ');
+    let mut gap = true;
+    for ch in text.chars() {
+        match ch.is_alphanumeric() {
+            true => {
+                out.extend(ch.to_lowercase());
+                gap = false;
+            }
+            false if !gap => {
+                out.push(' ');
+                gap = true;
+            }
+            false => {}
+        }
+    }
+    if !gap {
+        out.push(' ');
+    }
+    out
+}
+
+/// Whether `text` says `phrase`, with `phrase` already normalised. Matched on
+/// whole words — the spaces [`normalise_words`] puts at each end are what keeps
+/// "hey reachy" out of "hey reaching".
+///
+/// A phrase with no words in it matches every text, so every reply is marked and
+/// no wake detection ever cuts one. That is the safe direction, and config refuses
+/// such a phrase before it reaches here.
+fn says_phrase(text: &str, phrase: &str) -> bool {
+    normalise_words(text).contains(phrase)
+}
+
+/// Whether a reply with this body says the wake phrase itself, so a wake detection
+/// over it is this machine hearing its own words rather than a person
+/// interrupting.
+///
+/// A `Pcm` body's words are known nowhere on this path and it is never marked —
+/// the only `Pcm` today is an alert, which is not interruptible and so opens no
+/// barge floor at all. An interruptible `Pcm` reply would need its own answer to
+/// "what does it say", and whoever introduces one owns the mark.
+fn body_may_wake(body: &SpeakBody, phrase: Option<&str>) -> bool {
+    match (body, phrase) {
+        (SpeakBody::Text(text), Some(phrase)) => says_phrase(text, phrase),
+        _ => false,
+    }
+}
+
+/// What the server wires into a [`Router`] beyond the four handles every run
+/// needs.
+pub(crate) struct RouterWiring {
+    /// Renders `Text` replies to PCM; absent `[tts]`, a `Text` body is a counted
+    /// `speak_unsupported` rejection.
+    pub(crate) synthesizer: Option<Arc<dyn Synthesizer>>,
+    pub(crate) ledger: Arc<TurnLedger>,
+    /// The motion scripter, when a presence channel is configured.
+    pub(crate) scripter: Option<ScriptHandle>,
+    /// The words the wake model listens for, as configured and not yet
+    /// normalised. A reply that says the wake phrase is marked so it is not cut
+    /// by the machine hearing itself say it.
+    pub(crate) wake_phrase: Option<String>,
 }
 
 impl Router {
@@ -115,18 +189,17 @@ impl Router {
         stats: Arc<RouterStats>,
         jsonl: JsonlHandle,
         cancel: CancellationToken,
-        synthesizer: Option<Arc<dyn Synthesizer>>,
-        ledger: Arc<TurnLedger>,
-        scripter: Option<ScriptHandle>,
+        wiring: RouterWiring,
     ) -> Self {
         Self {
             registry,
             stats,
             jsonl,
             cancel,
-            synthesizer,
-            ledger,
-            scripter,
+            synthesizer: wiring.synthesizer,
+            ledger: wiring.ledger,
+            scripter: wiring.scripter,
+            wake_phrase: wiring.wake_phrase.as_deref().map(normalise_words),
         }
     }
 
@@ -181,6 +254,8 @@ impl Router {
             self.drop_interrupted(&cmd.target, cmd.in_reply_to, "queue");
             return;
         }
+        // The reply's own words, while they are still in hand.
+        let may_wake = body_may_wake(&cmd.body, self.wake_phrase.as_deref());
         let pcm = match cmd.body {
             SpeakBody::Pcm(pcm) => pcm,
             SpeakBody::Text(text) => {
@@ -255,6 +330,7 @@ impl Router {
             pcm,
             in_reply_to: cmd.in_reply_to,
             interruptible: cmd.interruptible,
+            may_wake,
             timings,
             speak_rx,
         };
@@ -554,6 +630,8 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout) 
                 Feed::PlaybackState {
                     active: job.is_some(),
                     interruptible: job.as_ref().is_some_and(|j| j.interruptible),
+                    may_wake: job.as_ref().is_some_and(|j| j.may_wake),
+                    turn: job.as_ref().and_then(|j| j.in_reply_to),
                 },
             )
             .await;
@@ -878,6 +956,19 @@ mod tests {
         ledger: Arc<TurnLedger>,
         scripter: Option<ScriptHandle>,
     ) -> (Vec<Value>, RouterStatsSnapshot) {
+        run_router_phrased(registry, cmds, synthesizer, ledger, scripter, None).await
+    }
+
+    /// The same, with the configured wake phrase, for a case about the mark a
+    /// reply's own words put on its job.
+    async fn run_router_phrased(
+        registry: PlaybackRegistry,
+        cmds: Vec<SpeakCmd>,
+        synthesizer: Option<Arc<dyn Synthesizer>>,
+        ledger: Arc<TurnLedger>,
+        scripter: Option<ScriptHandle>,
+        wake_phrase: Option<&str>,
+    ) -> (Vec<Value>, RouterStatsSnapshot) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let (jsonl, writer_join) = crate::jsonl::spawn_quiet(&JsonlSink::File(path.clone()))
@@ -896,9 +987,12 @@ mod tests {
             Arc::clone(&stats),
             jsonl.clone(),
             CancellationToken::new(),
-            synthesizer,
-            ledger,
-            scripter,
+            RouterWiring {
+                synthesizer,
+                ledger,
+                scripter,
+                wake_phrase: wake_phrase.map(str::to_owned),
+            },
         )
         .run(rx)
         .await;
@@ -1220,9 +1314,12 @@ mod tests {
                 Arc::clone(&stats),
                 jsonl.clone(),
                 cancel.clone(),
-                Some(synth),
-                Arc::new(TurnLedger::new()),
-                None,
+                RouterWiring {
+                    synthesizer: Some(synth),
+                    ledger: Arc::new(TurnLedger::new()),
+                    scripter: None,
+                    wake_phrase: None,
+                },
             )
             .run(rx),
         );
@@ -1254,6 +1351,7 @@ mod tests {
             pcm: Arc::from(&[0i16][..]),
             in_reply_to: None,
             interruptible: true,
+            may_wake: false,
             timings: StageTimings::default(),
             speak_rx: HostMicros::now(),
         }
@@ -1377,9 +1475,12 @@ mod tests {
                 Arc::clone(&stats),
                 jsonl.clone(),
                 cancel,
-                None,
-                Arc::new(TurnLedger::new()),
-                None,
+                RouterWiring {
+                    synthesizer: None,
+                    ledger: Arc::new(TurnLedger::new()),
+                    scripter: None,
+                    wake_phrase: None,
+                },
             )
             .run(rx),
         )
@@ -1451,6 +1552,7 @@ mod tests {
                 job: Some(AudibleJob {
                     in_reply_to: Some(UtteranceId(3)),
                     interruptible: false,
+                    may_wake: false,
                 }),
             },
             PlaybackEvent::Aborted {
@@ -1947,9 +2049,12 @@ mod tests {
                 Arc::clone(&stats),
                 jsonl.clone(),
                 CancellationToken::new(),
-                Some(synth),
-                Arc::clone(&ledger),
-                None,
+                RouterWiring {
+                    synthesizer: Some(synth),
+                    ledger: Arc::clone(&ledger),
+                    scripter: None,
+                    wake_phrase: None,
+                },
             )
             .run(rx),
         );
@@ -2504,11 +2609,17 @@ mod tests {
 
     /// The pacer's report that `utterance`'s clip is what the pod is heard saying.
     fn audible(utterance: u64, interruptible: bool) -> PlaybackEvent {
+        audible_saying(utterance, interruptible, false)
+    }
+
+    /// The same, for a reply whose own words carry the wake phrase.
+    fn audible_saying(utterance: u64, interruptible: bool, may_wake: bool) -> PlaybackEvent {
         PlaybackEvent::Audible {
             pod: PodId("pod-x".into()),
             job: Some(AudibleJob {
                 in_reply_to: Some(UtteranceId(utterance)),
                 interruptible,
+                may_wake,
             }),
         }
     }
@@ -2542,8 +2653,131 @@ mod tests {
             Feed::PlaybackState {
                 active,
                 interruptible,
+                ..
             } => (active, interruptible),
             other => panic!("expected a PlaybackState feed, got {other:?}"),
+        }
+    }
+
+    /// The next `PlaybackState`'s `(may_wake, turn)`, for the cases about a
+    /// reply's own words rather than the floor opening.
+    async fn next_mark(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Feed>) -> (bool, Option<u64>) {
+        let feed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the floor moves")
+            .expect("the listener handle is alive");
+        match feed {
+            Feed::PlaybackState { may_wake, turn, .. } => (may_wake, turn.map(|u| u.0)),
+            other => panic!("expected a PlaybackState feed, got {other:?}"),
+        }
+    }
+
+    /// A reply whose own words say the wake phrase reaches the listener marked and
+    /// named by its turn, which is what lets the machine's own wake word leave the
+    /// machine talking and a person's cut it off.
+    #[tokio::test]
+    async fn the_floor_carries_whether_the_reply_says_the_wake_phrase() {
+        for may_wake in [true, false] {
+            let (mut rx, _) = run_fanout(vec![audible_saying(9, true, may_wake)]).await;
+            assert_eq!(next_mark(&mut rx).await, (may_wake, Some(9)));
+        }
+        let (mut rx, _) = run_fanout(vec![silent()]).await;
+        assert_eq!(next_mark(&mut rx).await, (false, None));
+    }
+
+    /// Words, not characters: casing, punctuation and spacing differ freely between
+    /// a configured phrase and the text a synthesizer is handed, and none of that
+    /// difference is audible. The boundary is a whole word — a reply about
+    /// something "reaching" does not say "hey reachy".
+    #[test]
+    fn a_reply_says_the_phrase_by_its_words() {
+        let phrase = normalise_words("Hey, Reachy!");
+        for (text, says) in [
+            ("Hey Reachy, I am listening.", true),
+            ("hey reachy", true),
+            ("You said \"hey — reachy\"?", true),
+            ("HEY  REACHY.", true),
+            ("Hey, reaching for it.", false),
+            ("They hey reachyness", false),
+            ("Reachy, hey.", false),
+            ("Nothing of the sort.", false),
+        ] {
+            assert_eq!(says_phrase(text, &phrase), says, "{text:?}");
+        }
+    }
+
+    /// Only a `Text` body's words are known here, and only a configured phrase can
+    /// be looked for. Everything else is unmarked, which leaves the wake word free
+    /// to cut — the case config refuses wherever a listener is built.
+    #[test]
+    fn only_a_text_body_against_a_configured_phrase_is_marked() {
+        let phrase = normalise_words("hey reachy");
+        let text = SpeakBody::Text("Hey Reachy, yes.".into());
+        let other = SpeakBody::Text("Yes.".into());
+        let pcm = SpeakBody::Pcm(Arc::from(&[0i16][..]));
+        assert!(body_may_wake(&text, Some(&phrase)));
+        assert!(!body_may_wake(&other, Some(&phrase)));
+        assert!(!body_may_wake(&pcm, Some(&phrase)));
+        assert!(!body_may_wake(&text, None));
+    }
+
+    /// The router marks the job it delivers, end to end: a `Text` reply whose own
+    /// words say the configured phrase reaches the pacer — and so the listener —
+    /// marked, and one that does not, does not.
+    #[tokio::test]
+    async fn the_router_marks_a_delivered_reply_that_says_the_phrase() {
+        for (text, marked) in [("Hey Reachy, I am here.", true), ("I am here.", false)] {
+            let seen: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            let events: PlaybackEventFn = Arc::new(move |e| {
+                if let PlaybackEvent::Audible { job: Some(job), .. } = e {
+                    sink.lock().unwrap().push(job.may_wake);
+                }
+                Box::pin(std::future::ready(()))
+            });
+            let (_peer, device) = tokio::io::duplex(64 * 1024);
+            let handle = PlaybackWriter::spawn(
+                device,
+                PodId("pod-x".into()),
+                PacerConfig::default(),
+                Arc::new(PlaybackStats::default()),
+                events,
+                CancellationToken::new(),
+            );
+            let registry = empty_registry();
+            playback_register(&registry, "pod-x".into(), 1, handle);
+
+            let cmd = SpeakCmd {
+                target: PodId("pod-x".into()),
+                in_reply_to: Some(UtteranceId(1)),
+                body: SpeakBody::Text(text.into()),
+                interruptible: true,
+                timings: StageTimings::default(),
+            };
+            let synth: Arc<dyn Synthesizer> = Arc::new(FakeSynth::Chunks(vec![vec![7i16; 1_600]]));
+            run_router_phrased(
+                registry,
+                vec![cmd],
+                Some(synth),
+                Arc::new(TurnLedger::new()),
+                None,
+                Some("Hey, Reachy!"),
+            )
+            .await;
+
+            // The pacer reports the audible job on its own task; wait for it rather
+            // than assuming it has run.
+            for _ in 0..50 {
+                if !seen.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                &[marked],
+                "{text:?} should mark {marked}"
+            );
         }
     }
 

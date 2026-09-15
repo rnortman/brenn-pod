@@ -82,7 +82,7 @@ use crate::jsonl::JsonlHandle;
 use crate::time::due;
 
 /// The four intervals a script is measured in.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScriptTiming {
     /// How often the standing script is re-emitted while it still says
     /// something. A lost message is repaired within one of these, and a hold
@@ -106,6 +106,25 @@ pub struct ScriptTiming {
     /// starts down. Absorbs the jitter between an estimate made when playback
     /// started and what the speaker actually did.
     pub stow_margin: Duration,
+}
+
+/// The timings a config that names none of the four presence keys produces.
+///
+/// The same four numbers `[brenn]`'s defaults are built from, so a caller with
+/// no config in hand — a test, a fixture — measures the head the way the
+/// shipped deployment does. [`BrennConfig::script_timing`] must agree with
+/// this, and a test asserts it does.
+///
+/// [`BrennConfig::script_timing`]: crate::config::BrennConfig::script_timing
+impl Default for ScriptTiming {
+    fn default() -> Self {
+        Self {
+            refresh: Duration::from_millis(crate::config::default_presence_refresh_ms()),
+            linger: Duration::from_millis(crate::config::default_presence_linger_ms()),
+            max_engaged: Duration::from_millis(crate::config::default_presence_max_engaged_ms()),
+            stow_margin: Duration::from_millis(crate::config::default_presence_stow_margin_ms()),
+        }
+    }
 }
 
 /// The clock reading one decision is made against.
@@ -1394,6 +1413,76 @@ mod tests {
         );
         assert_eq!(publish.cause, Cause::Closing);
         assert_eq!(publish.script.timeout_ms(), 30_000);
+    }
+
+    /// The invariant behind the closing path, on the default the product runs:
+    /// a stow is never scheduled earlier than the far-end's estimated end plus
+    /// the margin, and a re-emission does not walk it forward.
+    ///
+    /// A stow that lands inside the audio moves the head while the reply is
+    /// still leaving the speaker, which is the one motion-under-far-end shape
+    /// production could produce on its own.
+    #[test]
+    fn no_closing_script_stows_before_the_estimated_end_plus_the_margin() {
+        let default = ScriptTiming::default();
+        assert_eq!(
+            default.stow_margin,
+            Duration::from_millis(500),
+            "the measured margin is what ships"
+        );
+        let mut fx = fixture_with(default);
+        fx.wake_and_dispatch(ZERO);
+
+        // The reply is playing and its audio is estimated to end three seconds
+        // in; the brain's turn closes while it still plays.
+        let speech = Duration::from_secs(3);
+        let horizon = fx.t0 + speech;
+        fx.apply(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(horizon)),
+            },
+            Duration::from_millis(200),
+        );
+        let closed = Duration::from_millis(400);
+        let publish = fx.publish(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            closed,
+        );
+        assert_eq!(
+            stow_ms(&publish),
+            millis(speech + default.stow_margin) - millis(closed),
+            "the stow is dated from the audio's end, not from the decision"
+        );
+
+        // The confirming re-emission says `stow@0`, and it falls after the
+        // audio's end plus the margin rather than inside the reply.
+        let refresh_at = closed + default.refresh;
+        assert!(refresh_at >= speech + default.stow_margin);
+        let refreshed = fx.tick(refresh_at);
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(stow_ms(&refreshed[0]), 0);
+    }
+
+    /// The shipped timings and the compiled-in ones are the same four numbers:
+    /// a `[brenn]` table that names none of the `presence_*_ms` keys measures
+    /// the head exactly as [`ScriptTiming::default`] does.
+    #[test]
+    fn the_default_timing_is_the_configured_default() {
+        let brenn: BrennConfig = toml::from_str(
+            "publish_channel = \"brenn:pod.utterance\"\n\
+             response_channel = \"brenn:pod.speak\"\n\
+             [bridge]\n\
+             server_url = \"wss://peer.example.net/remote/pod-kitchen/ws\"\n\
+             token_file = \"/nonexistent/pod.token\"\n",
+        )
+        .expect("a [brenn] table naming none of the presence keys");
+        assert_eq!(brenn.script_timing(), ScriptTiming::default());
     }
 
     /// A turn that asked to keep listening holds the `<listen/>` window open

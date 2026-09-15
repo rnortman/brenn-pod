@@ -640,3 +640,33 @@ retirement with a target published for the retired turn and reads the ledger aft
 
 See `TODO(flush-stale-target-interrupt)` at `take_flush_for` in
 `host/crates/speech-pipeline/src/playback.rs`.
+
+## `pod-playout-position` — DEFERRED as of 2026-09-15 (needs a wire field and a device-side stamp)
+
+`PLAYBACK_PLAYOUT_HOP_MS` reads a preroll target measured in bytes of audio as if it were wall
+time: 7 680 bytes is 240 ms *of audio*, and its doc calls that "how far the first sample heard
+trails the first sample written". That would be true if the host wrote at real time. It does not —
+the pacer's burst lead is a second, so the first fifty frames leave back to back at socket speed —
+and the device's gate admits on bytes banked, not on time elapsed. The first sample is heard once
+the preroll has crossed the link, plus the ALSA period and the loudspeaker: measured on one unit's
+recorded sessions, about 88 ms after the first write, not 240 ms, and jittering by however long the
+link takes to deliver the preroll.
+
+Everything derived from the constant inherits the error. `heard_ms` on `playback_flushed`
+understates how much of a reply a person heard before they cut it, which is what the brain is told
+about an interrupted turn; the pacer's model of a stream's audible end is off by the same amount;
+and an offline pass that wants a reply's audio on the capture timeline has to search for it rather
+than compute it.
+
+The honest fix is the device saying so: it stamps, on its own clock, the instant a stream's playout
+begins and each instant it resumes after an underrun, and carries them on the wire, so the host
+projects the audible start through the same clock estimate it projects capture through. Deferred
+because it is a wire-format field with a firmware side, not a constant to re-tune — and no barge
+guard waits on it, so it is the pacer's and the flush's fix rather than a blocker.
+
+Done = `playback_started` carries a device-stamped audible start, `heard_ms` is measured from it,
+and the pacer's audible-end estimate agrees with a device stamp to within one ALSA period on five
+whole replies.
+
+See `TODO(pod-playout-position)` at `PLAYBACK_PLAYOUT_HOP_MS` in
+`firmware/crates/audio-pipeline/src/playback.rs`.

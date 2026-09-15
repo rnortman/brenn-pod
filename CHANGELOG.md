@@ -9,6 +9,24 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **Wake-word barge-in is now the default.** A new `[barge] mode` switch
+  controls what may cut an audible reply. Under `"wake"` (the default), only a
+  wake-word detection interrupts; sustained speech over a reply is ignored, since
+  the echo canceller cannot reliably distinguish the robot's own voice once the
+  head moves. `"speech"` restores the previous sustained-speech rule alongside
+  the wake rule. A reply whose text contains the wake phrase is automatically
+  exempt so the robot does not cut itself off by saying its own name. The
+  `barge_in` log line now carries a `cause` field (`wake` or `speech`).
+- **New required config key `[wake] phrase`.**  Existing deployments with a
+  listener must add `phrase = "..."` (the words the wake model listens for)
+  before their next restart; the daemon refuses to start without it.
+- **`reachy-pod reboot-chip` subcommand.** The audio-chip reset is now a
+  separate step so a launcher can finish the reboot before any other process
+  starts. `run --chip-rebooted` then attaches without resetting again. A bare
+  `run` still reboots the chip as before.
+- `ScriptTiming` has a `Default` impl matching the compiled-in presence
+  durations, and a regression test pins that a closing script does not stow
+  before the estimated audible end plus the stow margin.
 - **A pod can forward every utterance, wake word or not.** `[wake] policy =
   "bypass"` sends every utterance to speech-to-text and to the brain with no
   wake word required — a recording or labelling run, where saying the wake word

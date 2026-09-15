@@ -122,6 +122,9 @@ mode = "oww"
 melspectrogram = "models/oww/melspectrogram.onnx"
 embedding      = "models/oww/embedding_model.onnx"
 model          = "models/oww/hey_jarvis_v0.1.onnx"
+# The words the model listens for. Required wherever a listener runs: a reply
+# that says the phrase must not be cut by the machine hearing itself say it.
+phrase         = "hey jarvis"
 threshold      = 0.5
 
 [endpointer]

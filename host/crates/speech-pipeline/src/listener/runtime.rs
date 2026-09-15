@@ -39,14 +39,14 @@ use super::endpointer::{
     EndpointCause, EndpointEvent, Endpointer, EndpointerConfig, TransitionCause,
 };
 use super::event::{
-    CarveTiming, CarvedUtterance, Feed, ListenerEvent, ListenerUtteranceId, StatsFlushCause,
-    StatsModel, WakePolicy,
+    BargeCause, CarveTiming, CarvedUtterance, Feed, ListenerEvent, ListenerUtteranceId,
+    StatsFlushCause, StatsModel, WakePolicy,
 };
 use super::oww_stream::{OwwModels, OwwStream};
 use super::ring::PcmRing;
 use super::silero::{SILERO_CHUNK, SileroModel, SileroVad};
 use super::stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreStats};
-use crate::types::{PodId, SPINE_FORMAT, WakeConfirmation};
+use crate::types::{PodId, SPINE_FORMAT, UtteranceId, WakeConfirmation};
 use crate::wake::WakeError;
 
 /// Depth of the shared `(PodId, Feed)` channel. Audio priority belongs to
@@ -118,11 +118,29 @@ impl Default for ListenerConfig {
     }
 }
 
-/// Barge-in detection knobs: sustained confident speech during interruptible
-/// playback is the trigger. The sustain run is what keeps a dog bark, a TV burst,
-/// or AEC residual from killing a response mid-sentence.
+/// What may cut an audible, interruptible reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BargeMode {
+    /// Only a wake detection cuts. Speech over a reply, however sustained, leaves
+    /// it playing. The default: the wake word is the one interruption this
+    /// machine can tell from its own echo, because the only way it scores the
+    /// phrase on itself is by saying the phrase.
+    #[default]
+    Wake,
+    /// The wake detection cuts, and so does sustained confident speech
+    /// (`sustain_thresh` / `sustain_chunks`). The speech rule fires on the
+    /// machine's own reply leaking back through the microphone whenever the head
+    /// has moved since the reply started, which is most replies.
+    Speech,
+}
+
+/// Barge-in detection knobs: what may cut a reply, and — for the mode that judges
+/// speech — what counts as the speech that does. The sustain run is what keeps a
+/// dog bark, a TV burst, or AEC residual from killing a response mid-sentence.
 #[derive(Debug, Clone, Copy)]
 pub struct BargeInConfig {
+    /// Which rules may cut an audible reply.
+    pub mode: BargeMode,
     /// P(speech) at/above which a chunk counts toward the sustain guard. Must be
     /// ≥ `EndpointerConfig::onset_thresh` (see [`BargeInConfig::validate`]).
     pub sustain_thresh: f32,
@@ -134,6 +152,7 @@ pub struct BargeInConfig {
 impl Default for BargeInConfig {
     fn default() -> BargeInConfig {
         BargeInConfig {
+            mode: BargeMode::default(),
             sustain_thresh: 0.60,
             sustain_chunks: 8,
         }
@@ -169,6 +188,12 @@ impl BargeInConfig {
 struct PlaybackFloor {
     active: bool,
     interruptible: bool,
+    /// The audible reply says the wake phrase itself. A wake detection over it is
+    /// this machine hearing its own words, so it never cuts the reply.
+    may_wake: bool,
+    /// The turn the audible reply answers. The latch below is per turn, and a
+    /// reply of several clips reports the same turn at each handover.
+    turn: Option<UtteranceId>,
     /// Consecutive chunks at/above `sustain_thresh`; any lower chunk resets it.
     sustain_run: u32,
     /// One trigger per playback session: set when it fires, cleared when playback
@@ -329,6 +354,13 @@ pub struct ListenerState {
     /// Needed because utterance identity is minted at first *carve*, not at onset,
     /// so at trigger time there is often no id to mark.
     barge_pending: bool,
+    /// Whether the pending trigger above came from the wake word rather than from
+    /// the speech rule. The speech rule cannot fire without the endpointer having
+    /// onset (the config invariant), so a carve always follows it; the wake word
+    /// can fire on a phrase Silero never took for speech, and a mark left standing
+    /// there would ride the next unrelated carve. So this one expires with the arm
+    /// the detection installed.
+    pending_from_wake: bool,
     /// The barge mark on the utterance currently accumulating, reused across
     /// continuations exactly as `current_wake` is.
     current_barge: bool,
@@ -400,6 +432,7 @@ impl ListenerState {
             current_wake: None,
             playback: PlaybackFloor::default(),
             barge_pending: false,
+            pending_from_wake: false,
             current_barge: false,
             speech_over_playback: false,
             current_over_playback: false,
@@ -503,8 +536,10 @@ impl ListenerState {
             Feed::PlaybackState {
                 active,
                 interruptible,
+                may_wake,
+                turn,
             } => {
-                self.set_playback(active, interruptible);
+                self.set_playback(active, interruptible, may_wake, turn);
                 Ok(Vec::new())
             }
             Feed::SegmentClosed { host_rx, .. } => self.handle_close(pod, host_rx),
@@ -554,6 +589,7 @@ impl ListenerState {
         self.silero.reset();
         self.endpointer.reset(anchor);
         self.barge_pending = false;
+        self.pending_from_wake = false;
         self.speech_over_playback = false;
         self.silero_pending.clear();
         self.oww_base = anchor;
@@ -648,24 +684,9 @@ impl ListenerState {
                 .record(scored.score, self.oww_base + scored.end_sample);
             if let Some(det) = self.oww.arm(&scored) {
                 let wake_end_sample = self.oww_base + det.wake_end_sample;
-                // A prior unconsumed arm is superseded by this fresh wake — it
-                // fired with no command in between. A hold waiting on that arm
-                // goes with it: the repeated wake word starts the turn over.
-                self.hold = None;
-                self.expire_unconsumed_arm(pod, wake_end_sample, &mut events);
-                self.wake = Some(WakeArm {
-                    score: det.score,
-                    wake_end_sample,
-                    // This frame's receipt: its scoring is what completed the
-                    // detection.
-                    detected_rx: Some(host_rx),
-                });
-                events.push(ListenerEvent::WakeDetected {
-                    pod: pod.clone(),
-                    epoch: self.epoch,
-                    score: det.score,
-                    wake_end_sample,
-                });
+                // This frame's receipt: its scoring is what completed the
+                // detection.
+                self.on_wake_detection(pod, det.score, wake_end_sample, host_rx, &mut events);
             }
         }
 
@@ -809,14 +830,37 @@ impl ListenerState {
         self.expire_unconsumed_arm(pod, hold.end_sample, events);
     }
 
-    /// Adopt a new playback state, resetting the trigger with it. A fresh start
-    /// re-arms the latch: each response is interruptible on its own, and so is the
-    /// barge readback that follows one. A stop closes the guard, and the run a
-    /// half-counted burst left behind means nothing to the next response.
-    fn set_playback(&mut self, active: bool, interruptible: bool) {
+    /// Adopt a new playback state. **The floor is per turn.** A fresh start, or a
+    /// report naming a different turn, rebuilds the floor and re-arms the latch:
+    /// each response is interruptible on its own, and so is the barge readback
+    /// that follows one. A stop closes the guard, and the run a half-counted burst
+    /// left behind means nothing to the next response.
+    ///
+    /// A report for the turn already audible is the same reply saying more about
+    /// itself — a later clip of it is interruptible where an earlier one was not,
+    /// or has said the wake phrase. That rewrites what is known and leaves the
+    /// latch and the sustain run alone, so a reply cut once is not cut again at a
+    /// clip boundary and a run counted across one survives it.
+    ///
+    /// A reply that answers no turn is no turn: two of them in a row are two
+    /// replies, each with its own latch, because nothing identifies them as one.
+    fn set_playback(
+        &mut self,
+        active: bool,
+        interruptible: bool,
+        may_wake: bool,
+        turn: Option<UtteranceId>,
+    ) {
+        if self.playback.active && active && turn.is_some() && self.playback.turn == turn {
+            self.playback.interruptible = interruptible;
+            self.playback.may_wake = may_wake;
+            return;
+        }
         self.playback = PlaybackFloor {
             active,
             interruptible,
+            may_wake,
+            turn,
             sustain_run: 0,
             fired: false,
         };
@@ -838,6 +882,11 @@ impl ListenerState {
         host_rx: HostMicros,
         events: &mut Vec<ListenerEvent>,
     ) {
+        // What Silero hears over a reply is the reply itself as often as it is a
+        // person, so only the mode that trusts speech judges it.
+        if self.config.barge_in.mode != BargeMode::Speech {
+            return;
+        }
         if !self.playback.open() {
             return;
         }
@@ -853,6 +902,7 @@ impl ListenerState {
         events.push(ListenerEvent::BargeIn {
             pod: pod.clone(),
             epoch: self.epoch,
+            cause: BargeCause::Speech,
             trigger_sample: chunk_end_sample,
             host_rx,
         });
@@ -862,8 +912,89 @@ impl ListenerState {
         // resumed during playback — takes the mark now; otherwise the next carve
         // consumes the pending trigger.
         match self.current_id.is_some() {
-            true => self.current_barge = true,
-            false => self.barge_pending = true,
+            true => self.mark_current_barge(),
+            false => {
+                self.barge_pending = true;
+                self.pending_from_wake = false;
+            }
+        }
+    }
+
+    /// Put the barge mark on the utterance already accumulating, with the overlap
+    /// it implies. Both rules fire only with the floor open, so the speech they
+    /// mark is over playback; recording it here rather than leaving it to the
+    /// per-chunk latch is what makes that independent of cadence — the wake pass
+    /// runs ahead of a frame's Silero drain and on its own 20 ms frame boundary,
+    /// so a floor that opens and closes between two 512-sample chunks is never
+    /// seen by the latch.
+    fn mark_current_barge(&mut self) {
+        self.current_barge = true;
+        self.current_over_playback = true;
+    }
+
+    /// Handle a fresh wake detection: expire a prior arm, install this one, report
+    /// it, and cut an audible reply if the floor is open.
+    fn on_wake_detection(
+        &mut self,
+        pod: &PodId,
+        score: f32,
+        wake_end_sample: u64,
+        host_rx: HostMicros,
+        events: &mut Vec<ListenerEvent>,
+    ) {
+        // A prior unconsumed arm is superseded by this fresh wake — it fired with
+        // no command in between. A hold waiting on that arm goes with it: the
+        // repeated wake word starts the turn over.
+        self.hold = None;
+        self.expire_unconsumed_arm(pod, wake_end_sample, events);
+        self.wake = Some(WakeArm {
+            score,
+            wake_end_sample,
+            detected_rx: Some(host_rx),
+        });
+        events.push(ListenerEvent::WakeDetected {
+            pod: pod.clone(),
+            epoch: self.epoch,
+            score,
+            wake_end_sample,
+        });
+        self.wake_barge(pod, wake_end_sample, host_rx, events);
+    }
+
+    /// The wake word's barge: a detection while an interruptible reply is audible
+    /// cuts it, at the detection, in either mode. It is the one interruption this
+    /// machine can be sure a person meant — openWakeWord scores a phrase, not
+    /// speech, so the only way the robot trips it on itself is by saying the
+    /// phrase.
+    ///
+    /// Which is why a reply whose own words carry the phrase is exempt: the
+    /// detection is still scored, armed and reported, but the machine cutting
+    /// itself off for its own words and then answering itself is the
+    /// self-conversation this rule exists to avoid.
+    fn wake_barge(
+        &mut self,
+        pod: &PodId,
+        wake_end_sample: u64,
+        host_rx: HostMicros,
+        events: &mut Vec<ListenerEvent>,
+    ) {
+        if !self.playback.open() || self.playback.may_wake {
+            return;
+        }
+        self.playback.fired = true;
+        events.push(ListenerEvent::BargeIn {
+            pod: pod.clone(),
+            epoch: self.epoch,
+            cause: BargeCause::Wake,
+            trigger_sample: wake_end_sample,
+            host_rx,
+        });
+        match self.current_id.is_some() {
+            true => self.mark_current_barge(),
+            false => {
+                self.barge_pending = true;
+                self.pending_from_wake = true;
+            }
         }
     }
 
@@ -1046,6 +1177,7 @@ impl ListenerState {
                 // exactly as a wake arm is. Taken before the gate so it cannot leak
                 // into a later, unrelated utterance.
                 let mut barge = std::mem::take(&mut self.barge_pending);
+                self.pending_from_wake = false;
                 let mut start = start;
                 let wake = match self.policy {
                     // An arm the utterance covers is consumed here as it is under
@@ -1133,6 +1265,12 @@ impl ListenerState {
                 self.current_start = Some(start);
                 self.current_wake = wake;
                 self.current_barge = barge;
+                // A barge mark carries its own overlap wherever it was parked:
+                // both rules fire only with the floor open, so the speech a mark
+                // describes — parked, or carried here by a `WakeHold` — was over
+                // playback, even when the endpointer's onset came after the floor
+                // closed and the per-chunk latch never saw it open.
+                self.current_over_playback |= barge;
                 (id, wake, start)
             }
         };
@@ -1142,9 +1280,11 @@ impl ListenerState {
         // grows within one identity's life — it resets at an onset, and a
         // continuation resumes under `Continuation` — so this cannot unmark.
         self.current_over_playback |= self.speech_over_playback;
-        // The guard fires only on a chunk with the floor open, and the config
-        // invariant puts the endpointer's onset at or before that chunk, so the
-        // latch saw the floor active during this very speech.
+        // Both barge rules fire only with the floor open, so a barge mark always
+        // describes speech that was over playback and brings the overlap in with
+        // it — at the mint path above for a mark that was parked or held, and at
+        // the rule itself for a mark placed on an utterance already in hand. The
+        // latch answers for unmarked speech.
         debug_assert!(
             !self.current_barge || self.current_over_playback,
             "a barge carve is by construction speech over playback",
@@ -1238,6 +1378,13 @@ impl ListenerState {
         let Some(arm) = self.wake.take() else {
             return;
         };
+        // The cut this arm made stands, but its mark goes with the arm: no carve
+        // took it, so the speech it describes never became an utterance and the
+        // next carve is somebody else's.
+        if self.pending_from_wake {
+            self.barge_pending = false;
+            self.pending_from_wake = false;
+        }
         let start = arm
             .wake_end_sample
             .saturating_sub(self.config.endpointer.preroll_pad_samples);
@@ -1331,6 +1478,30 @@ impl ListenerState {
         self.current_onset_rx = None;
         self.current_wake_rx = None;
         self.current_anchor = None;
+    }
+
+    /// One wake detection through the production path — the arm, the report and
+    /// the barge it may cut, minus the model call. [`arm_wake_for_test`] below
+    /// installs an arm and nothing else, which is what a test about the wake
+    /// *gate* wants; this is what a test about the wake *barge* wants.
+    ///
+    /// [`arm_wake_for_test`]: Self::arm_wake_for_test
+    #[cfg(test)]
+    fn detect_wake_for_test(
+        &mut self,
+        pod: &PodId,
+        score: f32,
+        wake_end_sample: u64,
+    ) -> Vec<ListenerEvent> {
+        let mut events = Vec::new();
+        self.on_wake_detection(
+            pod,
+            score,
+            wake_end_sample,
+            rx_at(wake_end_sample),
+            &mut events,
+        );
+        events
     }
 
     #[cfg(test)]
@@ -2848,14 +3019,55 @@ mod tests {
     /// [`synth_config`] with a compact barge guard: 3 chunks (96 ms) of sustain,
     /// still lazier than the synthetic endpointer's 2-chunk onset, so the invariant
     /// the config asserts holds here exactly as it does in production.
+    /// The speech rule at a short sustain run. Every case built on it is about
+    /// that rule, so it names the mode that runs it; the wake rule runs in both
+    /// modes and its cases say which one they mean.
     fn barge_config(policy: WakePolicy) -> ListenerConfig {
         ListenerConfig {
             barge_in: BargeInConfig {
+                mode: BargeMode::Speech,
                 sustain_thresh: 0.6,
                 sustain_chunks: 3,
             },
             ..synth_config(policy)
         }
+    }
+
+    /// A fresh reply becomes audible, or the audible one stops. Each call names a
+    /// turn of its own, which is what a case not about the per-turn rule means by
+    /// "playback starts": a new reply, with its own latch. The cases that are
+    /// about that rule call `set_playback` with the turn they mean.
+    fn play(state: &mut ListenerState, active: bool, interruptible: bool) {
+        static NEXT_TURN: AtomicU64 = AtomicU64::new(1);
+        let turn = active.then(|| UtteranceId(NEXT_TURN.fetch_add(1, Ordering::Relaxed)));
+        state.set_playback(active, interruptible, false, turn);
+    }
+
+    /// The same knobs under the default mode: only a wake detection cuts.
+    fn wake_mode_config() -> ListenerConfig {
+        ListenerConfig {
+            barge_in: BargeInConfig {
+                mode: BargeMode::Wake,
+                ..barge_config(WakePolicy::WakeGated).barge_in
+            },
+            ..synth_config(WakePolicy::WakeGated)
+        }
+    }
+
+    /// Every cut in `events` as `(cause, trigger_sample)` — the reading a case
+    /// about *which* rule fired needs, where [`barge_triggers`] answers only when.
+    fn barge_causes(events: &[ListenerEvent]) -> Vec<(BargeCause, u64)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ListenerEvent::BargeIn {
+                    cause,
+                    trigger_sample,
+                    ..
+                } => Some((*cause, *trigger_sample)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn barge_triggers(events: &[ListenerEvent]) -> Vec<u64> {
@@ -2876,7 +3088,7 @@ mod tests {
     fn sustained_speech_over_interruptible_playback_triggers_once_per_session() {
         let mut state = ListenerState::new(barge_config(WakePolicy::WakeGated));
         state.push_ring_for_test(0, &vec![5_i16; 16_384]);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
 
         let events = drive(&mut state, 0.9, 3, &mut cursor);
@@ -2893,7 +3105,7 @@ mod tests {
         );
 
         // The next response is its own to interrupt.
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let next = drive(&mut state, 0.9, 3, &mut cursor);
         assert_eq!(
             barge_triggers(&next).len(),
@@ -2912,7 +3124,7 @@ mod tests {
         state.push_ring_for_test(0, &vec![5_i16; 16_384]);
         let mut cursor = 0u64;
 
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut events = drive(&mut state, 0.9, 2, &mut cursor);
         events.extend(drive(&mut state, 0.1, 1, &mut cursor));
         events.extend(drive(&mut state, 0.9, 2, &mut cursor));
@@ -2921,14 +3133,14 @@ mod tests {
             "two 2-chunk bursts are not one 3-chunk barge: {events:?}"
         );
 
-        state.set_playback(false, true);
+        play(&mut state, false, true);
         let idle = drive(&mut state, 0.9, 8, &mut cursor);
         assert!(
             barge_triggers(&idle).is_empty(),
             "nothing is playing — there is nothing to barge in on: {idle:?}"
         );
 
-        state.set_playback(true, false);
+        play(&mut state, true, false);
         let alert = drive(&mut state, 0.9, 8, &mut cursor);
         assert!(
             barge_triggers(&alert).is_empty(),
@@ -2940,6 +3152,340 @@ mod tests {
         );
     }
 
+    /// A wake detection while an interruptible reply is audible cuts it, at the
+    /// detection, and the cut says which rule fired. The wake word is the one
+    /// interruption this machine can tell from its own echo.
+    #[test]
+    fn a_wake_over_an_interruptible_reply_cuts_it() {
+        let mut state = ListenerState::new(wake_mode_config());
+        play(&mut state, true, true);
+
+        let events = state.detect_wake_for_test(&pod(), 0.9, 4_096);
+        assert_eq!(
+            barge_causes(&events),
+            vec![(BargeCause::Wake, 4_096)],
+            "the wake end is the trigger: {events:?}"
+        );
+        assert!(
+            state.barge_pending,
+            "and the carve that follows takes the mark"
+        );
+    }
+
+    /// The reply says the wake phrase itself. The detection is scored, armed and
+    /// reported as ever — the machine simply does not cut itself off for its own
+    /// words and then answer itself.
+    #[test]
+    fn a_wake_over_a_reply_that_says_the_phrase_cuts_nothing() {
+        let mut state = ListenerState::new(wake_mode_config());
+        state.set_playback(true, true, true, Some(UtteranceId(7)));
+
+        let events = state.detect_wake_for_test(&pod(), 0.9, 4_096);
+        assert!(
+            barge_causes(&events).is_empty(),
+            "the robot saying the phrase is not a person saying it: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::WakeDetected { .. })),
+            "the detection is still reported: {events:?}"
+        );
+        assert!(state.wake.is_some(), "and still arms the turn that follows");
+        assert!(!state.barge_pending, "no carve takes a mark");
+    }
+
+    /// The wake's cut takes the same one-per-reply latch the speech rule does, and
+    /// nothing is cut with nothing audible to cut.
+    #[test]
+    fn a_wake_cuts_once_per_reply_and_never_into_silence() {
+        let mut state = ListenerState::new(wake_mode_config());
+        play(&mut state, true, true);
+
+        assert_eq!(
+            barge_causes(&state.detect_wake_for_test(&pod(), 0.9, 1_024)),
+            vec![(BargeCause::Wake, 1_024)]
+        );
+        let again = state.detect_wake_for_test(&pod(), 0.9, 2_048);
+        assert!(
+            barge_causes(&again).is_empty(),
+            "one cut per reply: {again:?}"
+        );
+
+        play(&mut state, false, false);
+        let silent = state.detect_wake_for_test(&pod(), 0.9, 3_072);
+        assert!(
+            barge_causes(&silent).is_empty(),
+            "nothing audible, nothing to cut: {silent:?}"
+        );
+
+        play(&mut state, true, false);
+        let alert = state.detect_wake_for_test(&pod(), 0.9, 4_096);
+        assert!(
+            barge_causes(&alert).is_empty(),
+            "an alert is the one reply nothing interrupts, the wake word included: {alert:?}"
+        );
+        assert!(!state.barge_pending, "and no carve takes a mark for it");
+    }
+
+    /// The wake word can fire on a phrase Silero never took for speech — a quiet
+    /// speaker, a threshold tuned high, the canceller's residual. The cut stands,
+    /// but the mark it parks for the carve that was expected to follow expires with
+    /// the arm, because there is no carve: left standing it would ride the next
+    /// unrelated utterance, which is a turn handed to the brain as the speech that
+    /// interrupted a reply it never heard.
+    #[test]
+    fn a_wake_barge_no_speech_followed_leaves_no_mark_behind() {
+        let mut state = ListenerState::new(ListenerConfig {
+            default_policy: WakePolicy::Bypass,
+            ..wake_mode_config()
+        });
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        play(&mut state, true, true);
+        let mut cursor = 0u64;
+
+        let cut = state.detect_wake_for_test(&pod(), 0.9, 1_024);
+        assert_eq!(
+            barge_causes(&cut).len(),
+            1,
+            "the reply is cut on the detection: {cut:?}"
+        );
+        assert!(state.barge_pending, "with the mark parked for a carve");
+
+        // The segment closes with nothing having endpointed: the arm is reported as
+        // the bare detection it was.
+        cursor += 4_096;
+        let closed = state.handle_close(&pod(), rx_at(cursor)).expect("close");
+        assert_eq!(
+            arm_expiries(&closed).len(),
+            1,
+            "the arm expired unconsumed: {closed:?}"
+        );
+        assert!(
+            !state.barge_pending,
+            "and the mark went with it: {closed:?}"
+        );
+
+        // Somebody speaks later, with nothing playing. It is their turn, not a
+        // barge on a reply that stopped long ago.
+        play(&mut state, false, false);
+        let mut later = drive(&mut state, 0.9, 3, &mut cursor);
+        later.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&later);
+        assert_eq!(carved.len(), 1, "one carve: {later:?}");
+        assert!(!carved[0].barge_in, "which interrupted nothing: {later:?}");
+    }
+
+    /// The command that follows a wake the endpointer never took for speech onsets
+    /// after the cut reply has stopped, so the per-chunk overlap latch — seeded at
+    /// that onset from a floor now closed — never sees the reply. The mark the wake
+    /// rule parked carries the overlap itself: the carve that takes it is the speech
+    /// that interrupted the reply, and says so.
+    #[test]
+    fn a_wake_barge_marks_a_carve_that_onsets_after_the_reply_stopped() {
+        let mut state = ListenerState::new(ListenerConfig {
+            default_policy: WakePolicy::Bypass,
+            ..wake_mode_config()
+        });
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        play(&mut state, true, true);
+        let mut cursor = 0u64;
+
+        let cut = state.detect_wake_for_test(&pod(), 0.9, 1_024);
+        assert_eq!(barge_causes(&cut).len(), 1, "the reply is cut: {cut:?}");
+        assert!(state.barge_pending, "with the mark parked for a carve");
+
+        // The flush lands: the reply stops before the speaker's command onsets.
+        play(&mut state, false, false);
+        let mut spoken = drive(&mut state, 0.9, 3, &mut cursor);
+        spoken.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&spoken);
+        assert_eq!(carved.len(), 1, "one carve: {spoken:?}");
+        assert!(carved[0].barge_in, "which took the mark: {spoken:?}");
+        assert!(
+            carved[0].over_playback,
+            "and is the speech that was over the reply: {spoken:?}"
+        );
+    }
+
+    /// The default mode judges no speech at all: a person talking over a reply,
+    /// however sustained, leaves it playing — what Silero hears over a reply at a
+    /// moved head is as likely to be the reply itself. The same drive under the
+    /// speech mode cuts, and says which rule did it.
+    #[test]
+    fn under_wake_mode_sustained_speech_over_a_reply_cuts_nothing() {
+        let mut state = ListenerState::new(wake_mode_config());
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        play(&mut state, true, true);
+        let mut cursor = 0u64;
+
+        let held = drive(&mut state, 0.9, 30, &mut cursor);
+        assert!(
+            barge_causes(&held).is_empty(),
+            "the speech rule does not run under the default: {held:?}"
+        );
+        assert!(!state.barge_pending, "and no carve takes a mark");
+
+        let mut spoken = ListenerState::new(barge_config(WakePolicy::WakeGated));
+        spoken.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        play(&mut spoken, true, true);
+        let mut cursor = 0u64;
+        let cut = drive(&mut spoken, 0.9, 30, &mut cursor);
+        assert_eq!(
+            barge_causes(&cut).len(),
+            1,
+            "the mode that judges speech cuts on it: {cut:?}"
+        );
+        assert_eq!(barge_causes(&cut)[0].0, BargeCause::Speech);
+    }
+
+    /// A wake landing while an utterance is already accumulating marks that
+    /// utterance rather than the carve after it — the speech rule's own placement,
+    /// because identity is minted at the first carve either way.
+    #[test]
+    fn a_wake_marks_the_utterance_already_accumulating() {
+        let mut state = ListenerState::new(ListenerConfig {
+            default_policy: WakePolicy::Bypass,
+            ..wake_mode_config()
+        });
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        play(&mut state, true, true);
+        let mut cursor = 0u64;
+
+        // Speech carried to a carve, then resumed inside its continuation window:
+        // the identity is minted, so the utterance is in hand.
+        drive(&mut state, 0.9, 2, &mut cursor);
+        drive(&mut state, 0.1, 3, &mut cursor);
+        drive(&mut state, 0.9, 1, &mut cursor);
+        assert!(state.current_id.is_some(), "an utterance is in progress");
+
+        let events = state.detect_wake_for_test(&pod(), 0.9, cursor);
+        assert_eq!(
+            barge_causes(&events).len(),
+            1,
+            "the wake cut it: {events:?}"
+        );
+        assert!(state.current_barge, "the utterance in hand takes the mark");
+        assert!(!state.barge_pending, "so nothing is left pending");
+    }
+
+    /// The mark placed on an utterance already in hand brings its overlap with it,
+    /// rather than waiting for a chunk to latch the floor. The wake pass runs
+    /// ahead of a frame's Silero drain and on the 20 ms frame boundary, so a reply
+    /// that becomes audible and is flushed between two 512-sample chunks is never
+    /// seen by the latch — and the carve that takes the mark would otherwise
+    /// report a barge that was never over playback.
+    #[test]
+    fn a_wake_barge_on_an_utterance_in_hand_carries_the_overlap() {
+        let mut state = ListenerState::new(ListenerConfig {
+            default_policy: WakePolicy::Bypass,
+            ..wake_mode_config()
+        });
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        play(&mut state, false, false);
+        let mut cursor = 0u64;
+
+        // Speech in a quiet room, carved and now inside its continuation window.
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "the speech carves: {events:?}");
+        assert!(!carved[0].over_playback, "nothing was playing over it");
+
+        // A reply to the previous turn becomes audible during the pause, the wake
+        // fires over it, and the flush closes the floor again — all of it between
+        // two Silero chunks.
+        play(&mut state, true, true);
+        let cut = state.detect_wake_for_test(&pod(), 0.9, cursor);
+        assert_eq!(barge_causes(&cut).len(), 1, "the wake cut it: {cut:?}");
+        assert!(state.current_barge, "the utterance in hand takes the mark");
+        play(&mut state, false, false);
+
+        // The continuation resumes and closes with no chunk having seen the floor
+        // open.
+        let mut later = drive(&mut state, 0.9, 1, &mut cursor);
+        later.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&later);
+        assert_eq!(carved.len(), 1, "the continuation carves: {later:?}");
+        assert!(carved[0].barge_in, "carrying the barge mark");
+        assert!(
+            carved[0].over_playback,
+            "which is speech over playback: {later:?}"
+        );
+    }
+
+    /// The floor is per turn. A later clip of the reply already audible refines
+    /// what is known about it and leaves the latch — and the speech rule's run —
+    /// where they are; a clip of another turn is another reply, with its own.
+    #[test]
+    fn a_same_turn_report_keeps_the_latch_and_a_new_turn_resets_it() {
+        let turn = Some(UtteranceId(4));
+        let mut state = ListenerState::new(wake_mode_config());
+        state.set_playback(true, true, false, turn);
+        assert_eq!(
+            barge_causes(&state.detect_wake_for_test(&pod(), 0.9, 1_024)).len(),
+            1
+        );
+
+        // The next clip of the same reply, the one that says the phrase.
+        state.set_playback(true, true, true, turn);
+        assert!(
+            state.playback.fired,
+            "the reply is still the one already cut"
+        );
+        assert!(state.playback.may_wake, "and now known to say the phrase");
+
+        state.set_playback(true, true, false, Some(UtteranceId(5)));
+        assert!(
+            !state.playback.fired,
+            "another reply is another cut to make"
+        );
+        assert_eq!(
+            barge_causes(&state.detect_wake_for_test(&pod(), 0.9, 2_048)).len(),
+            1
+        );
+
+        // The speech rule's run survives a same-turn report for the same reason.
+        let mut spoken = ListenerState::new(barge_config(WakePolicy::WakeGated));
+        spoken.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        spoken.set_playback(true, true, false, turn);
+        let mut cursor = 0u64;
+        drive(&mut spoken, 0.9, 2, &mut cursor);
+        spoken.set_playback(true, true, false, turn);
+        let events = drive(&mut spoken, 0.9, 1, &mut cursor);
+        assert_eq!(
+            barge_causes(&events).len(),
+            1,
+            "the third chunk of one run fires across the clip boundary: {events:?}"
+        );
+    }
+
+    /// A reply answering no turn is no turn. Two of them in a row rebuild the
+    /// floor, so a latch that fired on one never suppresses the cut on the next
+    /// and a mark never carries across.
+    #[test]
+    fn a_turn_less_report_is_always_a_fresh_floor() {
+        let mut state = ListenerState::new(wake_mode_config());
+        state.set_playback(true, true, false, None);
+        assert_eq!(
+            barge_causes(&state.detect_wake_for_test(&pod(), 0.9, 1_024)).len(),
+            1
+        );
+
+        state.set_playback(true, true, true, None);
+        assert!(!state.playback.fired, "the next reply is its own to cut");
+
+        state.set_playback(true, true, false, None);
+        assert!(
+            !state.playback.may_wake,
+            "and says nothing the last one said"
+        );
+        assert_eq!(
+            barge_causes(&state.detect_wake_for_test(&pod(), 0.9, 2_048)).len(),
+            1
+        );
+    }
+
     /// A job that starts non-interruptible mid-count stops the run: the `Started`
     /// feed's floor is what counts, not the one the chunks began under.
     #[test]
@@ -2947,9 +3493,9 @@ mod tests {
         let mut state = ListenerState::new(barge_config(WakePolicy::WakeGated));
         state.push_ring_for_test(0, &vec![5_i16; 16_384]);
         let mut cursor = 0u64;
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         drive(&mut state, 0.9, 2, &mut cursor);
-        state.set_playback(true, false);
+        play(&mut state, true, false);
         let events = drive(&mut state, 0.9, 8, &mut cursor);
         assert!(
             barge_triggers(&events).is_empty(),
@@ -2965,7 +3511,7 @@ mod tests {
     fn barge_trigger_carves_a_wakeless_utterance_and_the_mark_survives_continuation() {
         let mut state = ListenerState::new(barge_config(WakePolicy::WakeGated));
         state.push_ring_for_test(0, &vec![7_i16; 16_384]);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
 
         let mut events = drive(&mut state, 0.9, 3, &mut cursor); // onset, then trigger
@@ -3009,7 +3555,7 @@ mod tests {
         );
 
         // Playback starts; the same utterance continues and sustains through it.
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut resumed = drive(&mut state, 0.9, 3, &mut cursor);
         assert_eq!(barge_triggers(&resumed).len(), 1);
         assert!(
@@ -3035,14 +3581,14 @@ mod tests {
     fn an_echo_carves_over_playback_though_the_floor_closed_before_its_endpoint() {
         let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
         state.push_ring_for_test(0, &vec![7_i16; 16_384]);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
 
         // Two chunks of echo: the onset confirms, the guard's run stays short.
         let mut events = drive(&mut state, 0.9, 2, &mut cursor);
         assert!(barge_triggers(&events).is_empty(), "no cut: {events:?}");
         // The reply plays out and the floor closes, before the echo endpoints.
-        state.set_playback(false, false);
+        play(&mut state, false, false);
         events.extend(drive(&mut state, 0.1, 3, &mut cursor));
 
         let carved = soft_endpoints(&events);
@@ -3073,7 +3619,7 @@ mod tests {
     fn speech_with_the_floor_shut_is_not_over_playback_and_the_latch_does_not_leak() {
         let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
         state.push_ring_for_test(0, &vec![7_i16; 16_384]);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
 
         // One utterance over playback, carried to a terminal endpoint.
@@ -3088,7 +3634,7 @@ mod tests {
         assert!(soft_endpoints(&events)[0].over_playback);
 
         // The next speech, with the reply long over.
-        state.set_playback(false, false);
+        play(&mut state, false, false);
         let next = drive(&mut state, 0.9, 2, &mut cursor);
         let next = {
             let mut evs = next;
@@ -3109,11 +3655,11 @@ mod tests {
     fn speech_that_runs_into_a_reply_is_over_playback() {
         let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
         state.push_ring_for_test(0, &vec![7_i16; 16_384]);
-        state.set_playback(false, false);
+        play(&mut state, false, false);
         let mut cursor = 0u64;
 
         let mut events = drive(&mut state, 0.9, 2, &mut cursor);
-        state.set_playback(true, false); // a non-interruptible job: no guard, no cut
+        play(&mut state, true, false); // a non-interruptible job: no guard, no cut
         events.extend(drive(&mut state, 0.9, 1, &mut cursor));
         events.extend(drive(&mut state, 0.1, 3, &mut cursor));
 
@@ -3135,13 +3681,13 @@ mod tests {
     fn a_barge_carve_after_the_flush_carries_both_marks() {
         let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
         state.push_ring_for_test(0, &vec![7_i16; 16_384]);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
 
         let mut events = drive(&mut state, 0.9, 3, &mut cursor);
         assert_eq!(barge_triggers(&events).len(), 1, "the cut fired");
         // The flush closes the floor before the barging speech endpoints.
-        state.set_playback(false, false);
+        play(&mut state, false, false);
         events.extend(drive(&mut state, 0.1, 3, &mut cursor));
 
         let carved = soft_endpoints(&events);
@@ -3164,7 +3710,7 @@ mod tests {
         let mut state = ListenerState::new(barge_config(WakePolicy::Bypass));
         state.push_ring_for_test(0, &vec![7_i16; 16_384]);
         open(&mut state, 0, &mut oww, &mut silero);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
 
         let fired = drive(&mut state, 0.9, 3, &mut cursor);
@@ -3177,7 +3723,7 @@ mod tests {
         assert!(!state.speech_over_playback, "and so did the overlap latch");
 
         // Unrelated speech after the hole, with the reply over.
-        state.set_playback(false, false);
+        play(&mut state, false, false);
         cursor = 20_000;
         let mut after = drive(&mut state, 0.9, 2, &mut cursor);
         after.extend(drive(&mut state, 0.1, 3, &mut cursor));
@@ -3210,7 +3756,7 @@ mod tests {
         let mut silero = silero_model();
         let mut state = ListenerState::new(barge_config(WakePolicy::WakeGated));
         state.push_ring_for_test(0, &vec![5_i16; 8_192]);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
         let fired = drive(&mut state, 0.9, 3, &mut cursor);
         assert_eq!(barge_triggers(&fired).len(), 1);
@@ -3244,6 +3790,8 @@ mod tests {
                 Feed::PlaybackState {
                     active: true,
                     interruptible: true,
+                    may_wake: false,
+                    turn: Some(UtteranceId(1)),
                 },
                 &mut oww,
                 &mut silero,
@@ -4199,6 +4747,7 @@ mod tests {
     fn hold_barge_config() -> ListenerConfig {
         ListenerConfig {
             barge_in: BargeInConfig {
+                mode: BargeMode::Speech,
                 sustain_thresh: 0.6,
                 sustain_chunks: 3,
             },
@@ -4213,7 +4762,7 @@ mod tests {
     fn a_barge_taken_by_a_held_carve_lands_on_the_command() {
         let mut state = ListenerState::new(hold_barge_config());
         state.push_ring_for_test(0, &vec![5_i16; 16_384]);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         state.arm_wake_for_test(0.9, 1_024);
         let mut cursor = 0u64;
         let mut events = drive(&mut state, 0.9, 3, &mut cursor); // barges at 1536
@@ -4229,6 +4778,8 @@ mod tests {
             "the held carve took the trigger — it cannot fire again"
         );
 
+        // The flush lands: the reply stops while the hold waits for the command.
+        play(&mut state, false, false);
         let mut command = drive(&mut state, 0.1, 4, &mut cursor); // the pause: 5120
         command.extend(drive(&mut state, 0.9, 2, &mut cursor)); // the command: 6144
         command.extend(drive(&mut state, 0.1, 3, &mut cursor));
@@ -4237,6 +4788,58 @@ mod tests {
         assert!(
             carved[0].barge_in,
             "and carries the barge the wake word triggered"
+        );
+        assert!(
+            carved[0].over_playback,
+            "which is speech over the reply it cut: {command:?}"
+        );
+        assert_eq!(carved[0].start_sample, 0, "from the held start");
+    }
+
+    /// The default mode's own shape of the case above: the wake detection alone
+    /// cuts the reply and parks the mark, the phrase is carved wake-only and holds,
+    /// and the reply has stopped by the time the command onsets — so the per-chunk
+    /// overlap latch, re-seeded at that onset from a closed floor, never sees it.
+    /// The mark the hold carries brings the overlap with it.
+    #[test]
+    fn a_wake_barge_held_for_its_command_carries_the_overlap() {
+        let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        play(&mut state, true, true);
+
+        let cut = state.detect_wake_for_test(&pod(), 0.9, 1_024);
+        assert_eq!(
+            barge_causes(&cut),
+            vec![(BargeCause::Wake, 1_024)],
+            "the phrase cuts the reply: {cut:?}"
+        );
+        assert!(state.barge_pending, "with the mark parked for a carve");
+
+        let mut cursor = 0u64;
+        let mut events = drive(&mut state, 0.9, 3, &mut cursor); // the phrase: 1536
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor)); // held at 3072
+        assert_eq!(
+            wake_helds(&events).len(),
+            1,
+            "the wake word is held: {events:?}"
+        );
+        assert!(
+            state.hold.is_some_and(|h| h.barge),
+            "and the hold carries the mark"
+        );
+        assert!(!state.barge_pending, "which is no longer parked");
+
+        // The flush lands: the reply stops before the command onsets.
+        play(&mut state, false, false);
+        let mut command = drive(&mut state, 0.1, 4, &mut cursor); // the pause: 5120
+        command.extend(drive(&mut state, 0.9, 2, &mut cursor)); // the command: 6144
+        command.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&command);
+        assert_eq!(carved.len(), 1, "the command publishes: {command:?}");
+        assert!(carved[0].barge_in, "carrying the wake's mark: {command:?}");
+        assert!(
+            carved[0].over_playback,
+            "which is speech over the reply it cut: {command:?}"
         );
         assert_eq!(carved[0].start_sample, 0, "from the held start");
     }
@@ -4247,7 +4850,7 @@ mod tests {
     fn a_barge_on_an_expiring_hold_is_dropped_with_it() {
         let mut state = ListenerState::new(hold_barge_config());
         state.push_ring_for_test(0, &vec![5_i16; 16_384]);
-        state.set_playback(true, true);
+        play(&mut state, true, true);
         state.arm_wake_for_test(0.9, 1_024);
         let mut cursor = 0u64;
         let mut events = drive(&mut state, 0.9, 3, &mut cursor);
@@ -5417,6 +6020,8 @@ mod tests {
             Feed::PlaybackState {
                 active: false,
                 interruptible: false,
+                may_wake: false,
+                turn: None,
             },
         );
         assert!(matches!(

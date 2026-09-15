@@ -18,8 +18,8 @@ use audio_pipeline::playback::{
 use audio_pipeline::wire::MAX_AUDIO_PAYLOAD;
 use serde::Deserialize;
 use speech_pipeline::{
-    ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, FRAME_MS, ListenerConfig,
-    PacerConfig, Url, WakePolicy,
+    BargeMode, ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, FRAME_MS,
+    ListenerConfig, PacerConfig, Url, WakePolicy,
 };
 
 use crate::psk::parse_psk_hex;
@@ -60,6 +60,11 @@ pub struct Config {
     /// writers exist (every registered pod), brain or no brain.
     #[serde(default)]
     pub playback: PlaybackConfig,
+    /// Barge-in configuration: what may cut an audible, interruptible reply.
+    /// Every key defaults, so an absent `[barge]` table is the wake word as the
+    /// only interruption.
+    #[serde(default)]
+    pub barge: BargeConfig,
     /// Wake-gate configuration. `None` when the `[wake]` table is absent — no
     /// continuous listener is built, so the daemon records and tracks segments
     /// but mints no utterances and no brain answer.
@@ -152,6 +157,26 @@ impl Config {
         }
         if let Some(tts) = &self.tts {
             tts.validate()?;
+        }
+        // Cross-table: a listener runs the wake rule in either mode, and the rule
+        // needs the phrase written out. With no phrase nothing marks a reply that
+        // says the wake word, and the first reply that says the robot's name cuts
+        // the robot off and then answers itself. Gated on the pair that builds a
+        // listener at all, so a config with neither is unaffected.
+        if self.wake.is_some()
+            && self.endpointer.is_some()
+            && self
+                .wake
+                .as_ref()
+                .and_then(|w| w.phrase.as_deref())
+                .is_none()
+        {
+            return Err(
+                "a listener ([wake] with [endpointer]) requires wake.phrase (the \
+                 words a reply is checked against, so the wake barge does not cut the \
+                 robot off for saying them itself)"
+                    .to_string(),
+            );
         }
         // Cross-table: a brain that answers in words needs both a transcriber (to
         // hear) and a synthesizer (to speak), and the bus brain additionally needs
@@ -537,6 +562,17 @@ pub struct WakeConfig {
     /// openWakeWord wake-phrase model. Required.
     #[serde(default)]
     pub model: Option<PathBuf>,
+    /// The words the wake model listens for, written out. Not derived from
+    /// `model`: a stock model file happens to be named for its phrase, a custom
+    /// one is named whatever it was trained under, and a guess that is right for
+    /// the stock file and wrong for the production one is a robot that cuts
+    /// itself off on its own name.
+    ///
+    /// Read on the playback side, to mark a reply that says the phrase itself so
+    /// the wake word's barge leaves it alone. **Required wherever a listener is
+    /// built** — both barge modes run the wake rule, so both need the exemption.
+    #[serde(default)]
+    pub phrase: Option<String>,
     /// Sigmoid score above which a segment wakes. Must be in `(0.0, 1.0)`.
     #[serde(default = "default_wake_threshold")]
     pub threshold: f32,
@@ -594,7 +630,52 @@ impl WakeConfig {
                 return Err(format!("wake.{field} is required when [wake] is present"));
             }
         }
+        // A phrase of punctuation alone normalises to nothing, which matches every
+        // reply and so silently disarms the wake word's barge.
+        if self
+            .phrase
+            .as_deref()
+            .is_some_and(|p| !p.chars().any(char::is_alphanumeric))
+        {
+            return Err("wake.phrase must contain at least one word".to_string());
+        }
         Ok(())
+    }
+}
+
+/// What may cut an audible, interruptible reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BargeModeConfig {
+    /// Only a wake detection cuts. The default: openWakeWord scores a phrase
+    /// rather than speech, so it is the one interruption this machine can tell
+    /// from its own reply leaking back through the microphone.
+    #[default]
+    Wake,
+    /// The wake detection cuts, and so does sustained confident speech. On this
+    /// machine that second rule fires on the robot's own echo whenever the head
+    /// has moved since the reply started, which is most replies.
+    Speech,
+}
+
+/// Barge-in configuration. One key, because it is one decision — what may cut a
+/// reply. The guard's sustain knobs stay compiled-in: this table selects a rule,
+/// it is not a tuning surface.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BargeConfig {
+    /// Which rules may cut an audible, interruptible reply.
+    #[serde(default)]
+    pub mode: BargeModeConfig,
+}
+
+impl BargeConfig {
+    /// The listener-crate mode this table names.
+    pub fn to_listener(&self) -> BargeMode {
+        match self.mode {
+            BargeModeConfig::Wake => BargeMode::Wake,
+            BargeModeConfig::Speech => BargeMode::Speech,
+        }
     }
 }
 
@@ -1382,23 +1463,23 @@ fn default_brenn_continuation_timeout_ms() -> u64 {
 }
 // Well inside any plausible consumer lease, so two lost refreshes in a row still
 // leave the head up.
-fn default_presence_refresh_ms() -> u64 {
+pub(crate) fn default_presence_refresh_ms() -> u64 {
     5_000
 }
 // Wide enough to bridge the gap between the answer to one question and the wake
 // word starting the next.
-fn default_presence_linger_ms() -> u64 {
+pub(crate) fn default_presence_linger_ms() -> u64 {
     8_000
 }
 // Well past any plausible utterance capture, well short of a head left up
 // unattended.
-fn default_presence_max_engaged_ms() -> u64 {
+pub(crate) fn default_presence_max_engaged_ms() -> u64 {
     30_000
 }
 // Half a second of slack over the estimated end of the audio: wide enough that
 // the ordinary gap between two of a turn's clips does not dip the head, narrow
 // enough that the stow reads as a response to the speech ending.
-fn default_presence_stow_margin_ms() -> u64 {
+pub(crate) fn default_presence_stow_margin_ms() -> u64 {
     500
 }
 // Apologetic, short, and content-free: it is spoken when the bus failed, so it
@@ -1408,7 +1489,7 @@ fn default_brenn_failure_message() -> String {
 }
 
 /// A config text whose `[wake]` table is in the streaming listener's required
-/// form (`mode = "oww"` plus the three model paths) and whose `[endpointer]`
+/// form (`mode = "oww"`, the three model paths and the phrase) and whose `[endpointer]`
 /// table is present, with `extra` appended to `[wake]`. The one copy of that
 /// literal for the tests of both this module and `replay`, so a new required
 /// `[wake]` key is added in one place. Returns the text rather than a parsed
@@ -1416,7 +1497,7 @@ fn default_brenn_failure_message() -> String {
 #[cfg(test)]
 pub(crate) fn wake_table_toml(extra: &str) -> String {
     format!(
-        "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\n{extra}\n[endpointer]\nmodel = \"/m/silero.onnx\"\n"
+        "listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\nphrase = \"hey jarvis\"\n{extra}\n[endpointer]\nmodel = \"/m/silero.onnx\"\n"
     )
 }
 
@@ -1699,6 +1780,65 @@ threshold = 0.7
             config.wake.as_ref().expect("wake table").policy,
             WakePolicyConfig::Gated
         );
+    }
+
+    /// A listener runs the wake rule in either mode, and the rule needs the words
+    /// to recognise the robot's own reply by. With no phrase every reply is
+    /// unmarked and the first one that says the robot's name cuts it off
+    /// mid-sentence and then answers itself — so the refusal is at startup, where
+    /// it is fixable, not at that reply.
+    #[test]
+    fn a_listener_requires_the_wake_phrase() {
+        for mode in [
+            "",
+            "[barge]\nmode = \"wake\"\n",
+            "[barge]\nmode = \"speech\"\n",
+        ] {
+            let text = wake_table_toml("").replace("phrase = \"hey jarvis\"\n", "");
+            let err = Config::parse(&format!("{text}{mode}"))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(err.contains("wake.phrase"), "message: {err}");
+
+            let phrased = Config::parse(&format!("{}{mode}", wake_table_toml(""))).expect("parse");
+            assert!(phrased.validate().is_ok(), "with the phrase it starts");
+        }
+
+        // No listener is built without an `[endpointer]` table, and nothing marks
+        // a reply nothing can cut: such a config is untouched by the rule.
+        let listener_less = Config::parse(&with_addr(
+            "[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\n\
+             embedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"\n",
+        ))
+        .expect("parse");
+        assert!(listener_less.validate().is_ok());
+    }
+
+    /// A phrase of punctuation alone normalises to no words, which would match
+    /// every reply and silently disarm the wake word's barge.
+    #[test]
+    fn a_wake_phrase_must_carry_a_word() {
+        let text = wake_table_toml("").replace("\"hey jarvis\"", "\"---\"");
+        let err = Config::parse(&text).expect("parse").validate().unwrap_err();
+        assert!(err.contains("wake.phrase"), "message: {err}");
+    }
+
+    /// No `[barge]` table is the wake word as the only interruption: the rule
+    /// that cannot fire on the machine's own echo.
+    #[test]
+    fn the_default_barge_mode_is_wake() {
+        let absent = Config::parse(&with_addr("")).expect("parse");
+        assert_eq!(absent.barge.mode, BargeModeConfig::Wake);
+        assert_eq!(absent.barge.to_listener(), BargeMode::Wake);
+
+        let spoken = Config::parse(&with_addr("[barge]\nmode = \"speech\"")).expect("parse");
+        assert_eq!(spoken.barge.mode, BargeModeConfig::Speech);
+        assert_eq!(spoken.barge.to_listener(), BargeMode::Speech);
+
+        assert!(Config::parse(&with_addr("[barge]\nmode = \"off\"")).is_err());
+        let err = Config::parse(&with_addr("[barge]\nbogus = 1")).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "message: {err}");
     }
 
     #[test]

@@ -24,7 +24,14 @@ pub const EXIT_USAGE: u8 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// Bring the pipeline up and hold it there.
-    Run,
+    ///
+    /// `chip_rebooted` says the audio chip was already rebooted in this launch by
+    /// whoever started this process, so the pipeline attaches to the board it finds
+    /// and does not reset it again.
+    Run { chip_rebooted: bool },
+    /// Reboot the audio chip, wait for the board and its sound card to come back,
+    /// and exit.
+    RebootChip,
     /// Run the bring-up registry and report.
     Selftest,
     /// Run the bench registry — the cases that need someone at the array.
@@ -41,7 +48,13 @@ pub enum Command {
 /// than one refused.
 pub fn parse(args: &[String]) -> Command {
     match args {
-        [command] if command == "run" => Command::Run,
+        [command] if command == "run" => Command::Run {
+            chip_rebooted: false,
+        },
+        [command, flag] if command == "run" && flag == "--chip-rebooted" => Command::Run {
+            chip_rebooted: true,
+        },
+        [command] if command == "reboot-chip" => Command::RebootChip,
         [command] if command == "selftest" => Command::Selftest,
         [command, flag] if command == "selftest" && flag == "--manual" => Command::SelftestManual,
         _ => Command::Unrecognized,
@@ -70,11 +83,23 @@ pub fn usage(err: &mut dyn io::Write, given: &[String]) -> u8 {
     if !given.is_empty() {
         let _ = writeln!(err, "reachy-pod: unrecognized command: {}", given.join(" "));
     }
-    let _ = writeln!(err, "usage: reachy-pod run | selftest [--manual]");
+    let _ = writeln!(
+        err,
+        "usage: reachy-pod run [--chip-rebooted] | reboot-chip | selftest [--manual]"
+    );
     let _ = writeln!(err);
     let _ = writeln!(
         err,
         "  run                 capture, gate, stream to the audio host, and play back"
+    );
+    let _ = writeln!(
+        err,
+        "  run --chip-rebooted the same, on a chip whoever started this process has \
+         already rebooted"
+    );
+    let _ = writeln!(
+        err,
+        "  reboot-chip         reboot the audio chip, wait for it to come back, and exit"
     );
     let _ = writeln!(
         err,
@@ -119,7 +144,34 @@ mod tests {
     #[test]
     fn only_the_exact_subcommand_selects_a_job() {
         assert_eq!(parse(&args(&["selftest"])), Command::Selftest);
-        assert_eq!(parse(&args(&["run"])), Command::Run);
+        assert_eq!(
+            parse(&args(&["run"])),
+            Command::Run {
+                chip_rebooted: false
+            }
+        );
+        assert_eq!(
+            parse(&args(&["run", "--chip-rebooted"])),
+            Command::Run {
+                chip_rebooted: true
+            },
+            "a launcher that rebooted the chip before starting anything says so"
+        );
+        assert_eq!(parse(&args(&["reboot-chip"])), Command::RebootChip);
+        assert_eq!(
+            parse(&args(&["reboot-chip", "--wait"])),
+            Command::Unrecognized,
+            "the reboot takes no settings; an argument here meant something else"
+        );
+        assert_eq!(
+            parse(&args(&["run", "--chip-rebooted", "--again"])),
+            Command::Unrecognized
+        );
+        assert_eq!(
+            parse(&args(&["run", "--chip_rebooted"])),
+            Command::Unrecognized,
+            "one spelling, so a launcher's typo is a refusal and not a second reboot"
+        );
         assert_eq!(
             parse(&args(&["selftest", "--manual"])),
             Command::SelftestManual,
@@ -207,7 +259,9 @@ mod tests {
             "{printed}"
         );
         assert!(
-            printed.contains("usage: reachy-pod run | selftest [--manual]"),
+            printed.contains(
+                "usage: reachy-pod run [--chip-rebooted] | reboot-chip | selftest [--manual]"
+            ),
             "{printed}"
         );
         assert!(
@@ -221,7 +275,9 @@ mod tests {
         let printed = String::from_utf8(err).expect("utf8");
         assert!(!printed.contains("unrecognized"), "{printed}");
         assert!(
-            printed.contains("usage: reachy-pod run | selftest [--manual]"),
+            printed.contains(
+                "usage: reachy-pod run [--chip-rebooted] | reboot-chip | selftest [--manual]"
+            ),
             "{printed}"
         );
     }

@@ -166,10 +166,14 @@ fn replay_log(path: &Path, listener: &mut ReplayListener) -> Result<LogCounts, R
             // A framelog carries no playback state, so the floor never opens on
             // replay and this arm is unreachable today. It stays for the day a log
             // records playback: a barge is exactly the event a tuning run wants.
-            ListenerEvent::BargeIn { trigger_sample, .. } => {
+            ListenerEvent::BargeIn {
+                cause,
+                trigger_sample,
+                ..
+            } => {
                 emit(
                     "barge_in",
-                    json!({ "log": log_name, "trigger_sample": trigger_sample }),
+                    json!({ "log": log_name, "cause": cause, "trigger_sample": trigger_sample }),
                 );
             }
             ListenerEvent::Superseded { utterance_id, .. } => {

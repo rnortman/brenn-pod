@@ -51,10 +51,22 @@ const FLUSH_DEADLINE: Duration = Duration::from_secs(20);
 /// backend's latency, which a zero-latency fake misrepresents.
 const TTS_DELAY: Duration = Duration::from_millis(250);
 
+/// How long a reply that must not be cut is watched for a flush after the
+/// detection it provokes has been reported. The cut, were it to happen, is made
+/// on the detection itself and is on the wire within a frame of it, so this is a
+/// margin over a decision already taken and not a race against one pending.
+const NO_CUT_WINDOW: Duration = Duration::from_millis(500);
+
 #[test]
 fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
     let speaches_url = common::spawn_fake_speaches_with_tts_delay(TTS_SAMPLES, TTS_DELAY);
-    let mut daemon = common::spawn_daemon(&common::echo_parrot_config(&speaches_url));
+    // This case injects sustained speech, not the wake phrase: it is the speech
+    // rule's end-to-end pin, and it names the mode that runs that rule.
+    let config = format!(
+        "{}[barge]\nmode = \"speech\"\n",
+        common::echo_parrot_config(&speaches_url)
+    );
+    let mut daemon = common::spawn_daemon(&config);
     let jsonl_path = daemon.jsonl_path.clone();
     let addr = daemon.listen_addr();
 
@@ -123,6 +135,12 @@ fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
 
     // Detection → Mouth: one `barge_in` trigger, then the flush lands on the wire.
     let barge = common::expect_one(&events, "barge_in", &daemon);
+    assert_eq!(
+        barge["cause"],
+        "speech",
+        "the sustained-speech rule is what cut it\n{}",
+        daemon.diagnostics()
+    );
     assert_eq!(
         barge["pod"],
         common::BARGE_POD_ID,
@@ -234,5 +252,113 @@ fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
         health["router"]["interrupted"].as_u64().unwrap_or(0),
         0,
         "no queued or in-flight cmd needed eviction in this single-cmd-per-turn run: {health}"
+    );
+}
+
+/// The same loop under the shipping default, where the wake word is the only
+/// thing that cuts: the second segment is the wake phrase, and the detection
+/// itself — not any sustain run behind it — flushes the reply that is playing.
+#[test]
+fn a_wake_over_the_readback_cuts_it() {
+    let speaches_url = common::spawn_fake_speaches_with_tts_delay(TTS_SAMPLES, TTS_DELAY);
+    let daemon = common::spawn_daemon(&common::echo_parrot_config(&speaches_url));
+    let jsonl_path = daemon.jsonl_path.clone();
+    let addr = daemon.listen_addr();
+
+    let pcm = common::read_wav_pcm(Path::new(common::WAKE_PHRASE_WAV));
+    let seg1 = common::session_frames(&pcm, UTTERANCE_SEGMENT_ID, 0);
+    let seg2 = common::session_frames(&pcm, BARGE_SEGMENT_ID, pcm.len() as u64);
+
+    let mut pod = common::FakePod::connect(&addr);
+    pod.send_frames(&seg1);
+    assert!(
+        pod.wait_playback_audio(AUDIO_DEADLINE),
+        "the echo response never began playing\n{}",
+        daemon.diagnostics()
+    );
+
+    // The reply's own words are the transcript echoed back, which is not the wake
+    // phrase — so the detection this segment provokes is a person's, and cuts.
+    pod.send_frames(&seg2[1..]);
+    assert!(
+        pod.wait_flush(FLUSH_DEADLINE),
+        "no FlushPlayback frame crossed the wire\n{}",
+        daemon.diagnostics()
+    );
+
+    let tally = pod.finish();
+    assert!(
+        tally.flush >= 1,
+        "the drain decoded a FlushPlayback frame: {tally:?}"
+    );
+
+    let events = common::read_events(&jsonl_path);
+    let barge = common::expect_one(&events, "barge_in", &daemon);
+    assert_eq!(
+        barge["cause"],
+        "wake",
+        "the wake word is what cut it, under a mode that judges no speech\n{}",
+        daemon.diagnostics()
+    );
+    let flushed = common::expect_one(&events, "playback_flushed", &daemon);
+    assert_eq!(
+        flushed["was_playing"],
+        true,
+        "the flush cut the playing clip\n{}",
+        daemon.diagnostics()
+    );
+}
+
+/// The exemption, end to end, over the one wire between the configured
+/// `wake.phrase` and the router that marks a reply.
+///
+/// The parrot reads back what it heard, so a fake STT that transcribes the wake
+/// phrase makes the reply's own words the wake phrase. The second segment's
+/// detection is then the machine hearing itself: it is scored, armed and
+/// reported, and it cuts nothing. Were the phrase not to reach the router this is
+/// the self-conversation the mode exists to prevent — the robot cuts itself off
+/// and answers itself — with every unit test still passing.
+#[test]
+fn a_reply_that_says_the_wake_phrase_is_not_cut_by_its_own_words() {
+    let speaches_url =
+        common::spawn_fake_speaches_saying(common::WAKE_PHRASE, TTS_SAMPLES, TTS_DELAY);
+    let daemon = common::spawn_daemon(&common::echo_parrot_config(&speaches_url));
+    let jsonl_path = daemon.jsonl_path.clone();
+    let addr = daemon.listen_addr();
+
+    let pcm = common::read_wav_pcm(Path::new(common::WAKE_PHRASE_WAV));
+    let seg1 = common::session_frames(&pcm, UTTERANCE_SEGMENT_ID, 0);
+    let seg2 = common::session_frames(&pcm, BARGE_SEGMENT_ID, pcm.len() as u64);
+
+    let mut pod = common::FakePod::connect(&addr);
+    pod.send_frames(&seg1);
+    assert!(
+        pod.wait_playback_audio(AUDIO_DEADLINE),
+        "the echo response never began playing\n{}",
+        daemon.diagnostics()
+    );
+
+    // The same phrase again, over the reply that is now saying it back. The wait
+    // is on the detection itself — segment 2 lies past segment 1 on the sample
+    // timeline, so its wake end is the one beyond the first segment's audio.
+    pod.send_frames(&seg2[1..]);
+    let second = pcm.len() as u64;
+    common::wait_for_event(&daemon, "the second wake detection", FLUSH_DEADLINE, |v| {
+        v["event"] == "wake_detected" && v["wake_end_sample"].as_u64().is_some_and(|s| s >= second)
+    });
+    assert!(
+        !pod.wait_flush(NO_CUT_WINDOW),
+        "the reply was cut by its own words\n{}",
+        daemon.diagnostics()
+    );
+
+    let tally = pod.finish();
+    assert_eq!(tally.flush, 0, "no FlushPlayback frame crossed: {tally:?}");
+
+    let events = common::read_events(&jsonl_path);
+    assert!(
+        events.iter().all(|e| e["event"] != "barge_in"),
+        "and no rule claims to have cut it\n{}",
+        daemon.diagnostics()
     );
 }

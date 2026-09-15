@@ -20,13 +20,13 @@ pub use endpointer::{
     EndpointEvent, EndpointState, EndpointTransition, Endpointer, EndpointerConfig, TransitionCause,
 };
 pub use event::{
-    CarveTiming, CarvedUtterance, Feed, ListenerEvent, ListenerUtteranceId, StatsFlushCause,
-    StatsModel, WakePolicy,
+    BargeCause, CarveTiming, CarvedUtterance, Feed, ListenerEvent, ListenerUtteranceId,
+    StatsFlushCause, StatsModel, WakePolicy,
 };
 pub use oww_stream::{OwwConfig, OwwModels, OwwStream, ScoredChunk, WakeDetected};
 pub use ring::PcmRing;
 pub use runtime::{
-    BargeInConfig, FeedSender, Listener, ListenerConfig, ListenerHandle, ListenerState,
+    BargeInConfig, BargeMode, FeedSender, Listener, ListenerConfig, ListenerHandle, ListenerState,
     ListenerStats, ListenerStatsSnapshot,
 };
 pub use silero::{SileroConfig, SileroModel, SileroVad};

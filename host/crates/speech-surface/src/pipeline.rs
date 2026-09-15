@@ -764,6 +764,7 @@ async fn handle_listener(
         ListenerEvent::BargeIn {
             pod,
             epoch,
+            cause,
             trigger_sample,
             host_rx,
         } => {
@@ -775,6 +776,7 @@ async fn handle_listener(
                 &json!({
                     "pod": pod.0,
                     "epoch": epoch,
+                    "cause": cause,
                     "trigger_sample": trigger_sample,
                     "host_rx_us": host_rx.0,
                 }),
@@ -1530,10 +1532,10 @@ mod tests {
     use futures::stream::BoxStream;
     use serde_json::Value;
     use speech_pipeline::{
-        CarveTiming, DropOldestQueue, EndpointState, EndpointTransition, InterruptProgress,
-        ScoreSummary, SegmentAudio, SegmentEndCause, SegmentEndInfo, SpeakBody, StatsFlushCause,
-        StatsModel, TranscriptConfidence, TranscriptEvent, TransitionCause, TurnEnd,
-        WakeConfirmation,
+        BargeCause, CarveTiming, DropOldestQueue, EndpointState, EndpointTransition,
+        InterruptProgress, ScoreSummary, SegmentAudio, SegmentEndCause, SegmentEndInfo, SpeakBody,
+        StatsFlushCause, StatsModel, TranscriptConfidence, TranscriptEvent, TransitionCause,
+        TurnEnd, WakeConfirmation,
     };
     use std::sync::Mutex;
 
@@ -2697,6 +2699,7 @@ mod tests {
                 listener(ListenerEvent::BargeIn {
                     pod: pod(),
                     epoch: 1,
+                    cause: BargeCause::Speech,
                     trigger_sample: 16,
                     host_rx: HostMicros(1),
                 }),
@@ -3729,6 +3732,7 @@ mod tests {
         PipelineItem::Listener(ListenerEvent::BargeIn {
             pod: pod(),
             epoch: 1,
+            cause: BargeCause::Speech,
             trigger_sample: 4_800,
             host_rx: HostMicros(2_000_000),
         })
@@ -3775,6 +3779,29 @@ mod tests {
             Some("it is half past three")
         );
         assert_eq!(chain.chain[0].interrupted.heard_ms, 400);
+    }
+
+    /// The cut's own line says which rule fired. A wake barge and a speech barge
+    /// are handled identically from here on, so the line is the only place the
+    /// difference is on the record — and under the default mode a `speech` cause
+    /// is a deployment running the other one.
+    #[tokio::test]
+    async fn the_barge_line_names_the_rule_that_fired() {
+        for (cause, name) in [(BargeCause::Speech, "speech"), (BargeCause::Wake, "wake")] {
+            let event = PipelineItem::Listener(ListenerEvent::BargeIn {
+                pod: pod(),
+                epoch: 1,
+                cause,
+                trigger_sample: 4_800,
+                host_rx: HostMicros(2_000_000),
+            });
+            let (lines, _) = Harness::new().run(vec![event]).await;
+            let barge = lines
+                .iter()
+                .find(|v| v["event"] == "barge_in")
+                .expect("a barge_in line");
+            assert_eq!(barge["cause"], name);
+        }
     }
 
     #[tokio::test]

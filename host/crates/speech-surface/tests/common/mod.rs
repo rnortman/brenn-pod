@@ -850,6 +850,10 @@ pub const SILERO_MODEL: &str = concat!(
 /// committed models. Shared by every `oww_*` config builder so the model wiring
 /// lives in exactly one place.
 ///
+/// `phrase` is the words the committed model listens for, written out: it is what
+/// a reply is checked against so the wake barge does not cut the robot off for
+/// saying them itself.
+///
 /// The wake-command hold is off here. The harness clip is the wake phrase with
 /// nothing after it, which is precisely what the hold keeps back and reports as a
 /// bare wake; these tests are about what happens to a carved utterance, so they
@@ -861,6 +865,7 @@ fn oww_wake_block() -> String {
          melspectrogram = \"{OWW_MELSPECTROGRAM}\"\n\
          embedding = \"{OWW_EMBEDDING}\"\n\
          model = \"{OWW_MODEL}\"\n\
+         phrase = \"hey jarvis\"\n\
          command_wait_ms = 0\n"
     )
 }
@@ -916,6 +921,10 @@ pub fn oww_daemon_config(record_dir: Option<&Path>) -> String {
 /// The transcript the fake speaches STT endpoint returns for every request — the
 /// text `EchoBrain` reads back and the TTS then renders.
 pub const FAKE_TRANSCRIPT: &str = "hello parrot";
+
+/// The words the committed wake model listens for, as `oww_wake_block` configures
+/// them. A reply that says these is the machine saying its own name.
+pub const WAKE_PHRASE: &str = "hey jarvis";
 
 /// A harness daemon config for parrot mode: the streaming listener (real oww +
 /// Silero), an `echo` brain, and `[stt]`/`[tts]` both pointed at `speaches_url` —
@@ -976,6 +985,18 @@ pub fn spawn_fake_speaches(tts_samples: usize) -> String {
     spawn_fake_speaches_with_tts_delay(tts_samples, Duration::ZERO)
 }
 
+/// [`spawn_fake_speaches_with_tts_delay`] answering transcriptions with
+/// `transcript` instead of [`FAKE_TRANSCRIPT`]. What the parrot hears is what it
+/// says, so this is how a scenario chooses the words of the reply — the wake
+/// phrase, for the case where a reply must not cut itself off.
+pub fn spawn_fake_speaches_saying(
+    transcript: &str,
+    tts_samples: usize,
+    tts_delay: Duration,
+) -> String {
+    spawn_speaches(transcript.to_owned(), tts_samples, tts_delay)
+}
+
 /// [`spawn_fake_speaches`] whose `/v1/audio/speech` route holds each response
 /// for `tts_delay` before writing it, so synthesis takes about as long as a real
 /// backend's would instead of returning in the same scheduler tick. STT stays
@@ -987,13 +1008,18 @@ pub fn spawn_fake_speaches(tts_samples: usize) -> String {
 /// overlaps a TTS hold; a scenario with concurrent requests would see them
 /// serialized.
 pub fn spawn_fake_speaches_with_tts_delay(tts_samples: usize, tts_delay: Duration) -> String {
+    spawn_speaches(FAKE_TRANSCRIPT.to_owned(), tts_samples, tts_delay)
+}
+
+/// The one server behind the three spawners above.
+fn spawn_speaches(transcript: String, tts_samples: usize, tts_delay: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake speaches");
     let addr = listener.local_addr().expect("fake speaches addr");
     let tts_body = tts_wav_body(tts_samples);
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
-                Ok(mut s) => serve_fake_speaches(&mut s, &tts_body, tts_delay),
+                Ok(mut s) => serve_fake_speaches(&mut s, &transcript, &tts_body, tts_delay),
                 Err(_) => break,
             }
         }
@@ -1004,7 +1030,12 @@ pub fn spawn_fake_speaches_with_tts_delay(tts_samples: usize, tts_delay: Duratio
 /// Read one framed HTTP request, route on its path, and write the canned
 /// response. A request to neither known endpoint gets a `404` so a mis-pathed
 /// call fails loudly rather than being answered as if it hit the right route.
-fn serve_fake_speaches(stream: &mut TcpStream, tts_body: &[u8], tts_delay: Duration) {
+fn serve_fake_speaches(
+    stream: &mut TcpStream,
+    transcript: &str,
+    tts_body: &[u8],
+    tts_delay: Duration,
+) {
     let req = read_http_request(stream);
     let head = String::from_utf8_lossy(&req);
     let request_line = head.lines().next().unwrap_or("");
@@ -1012,7 +1043,7 @@ fn serve_fake_speaches(stream: &mut TcpStream, tts_body: &[u8], tts_delay: Durat
     {
         (
             "application/json",
-            format!("{{\"text\":\"{FAKE_TRANSCRIPT}\"}}").into_bytes(),
+            format!("{{\"text\":\"{transcript}\"}}").into_bytes(),
         )
     } else if request_line.contains("/v1/audio/speech") {
         thread::sleep(tts_delay);

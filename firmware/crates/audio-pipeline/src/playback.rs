@@ -272,6 +272,12 @@ const _: () = assert!(
 /// So a stream's true audible end never precedes the host's estimate and can trail it by the stall
 /// plus most of a second on a link that underran. Measuring it honestly would need the device to
 /// report its playout position on the wire; a larger constant here would be a guess dressed as one.
+///
+/// It is also wrong in the other direction, and by more: the preroll gate admits on bytes *banked*,
+/// not on time elapsed, and the host writes the first second of a stream at socket speed, so on a
+/// healthy link the first sample is heard ~88 ms after the first write rather than 240 ms. A
+/// constant cannot say which — only the device can.
+// TODO(pod-playout-position)
 pub const PLAYBACK_PLAYOUT_HOP_MS: u64 = (PLAYBACK_PREROLL_TARGET_BYTES
     / ((crate::ring::SAMPLE_RATE_HZ as usize / 1_000) * WIRE_BYTES_PER_SAMPLE))
     as u64;

@@ -21,11 +21,11 @@ use pod_ingest::{
     SessionEvent, SessionFsm,
 };
 use speech_pipeline::{
-    Feed, ListenerConfig, ListenerEvent, ListenerState, OwwConfig, OwwModels, PodId, SPINE_FORMAT,
-    SegmentEndCause, SileroConfig, SileroModel, WakeError,
+    BargeInConfig, Feed, ListenerConfig, ListenerEvent, ListenerState, OwwConfig, OwwModels, PodId,
+    SPINE_FORMAT, SegmentEndCause, SileroConfig, SileroModel, WakeError,
 };
 
-use crate::config::{Config, EndpointerConfig, WakeConfig, WakeMode};
+use crate::config::{BargeConfig, Config, EndpointerConfig, WakeConfig, WakeMode};
 
 /// The listener's outer-boundary cause for a session close. The listener treats
 /// every device close as the same authoritative outer boundary (it does not
@@ -152,20 +152,29 @@ pub struct ReplayListener {
     config: ListenerConfig,
 }
 
-/// The per-pod [`ListenerConfig`] a `[wake]` + `[endpointer]` pair describes.
+/// The per-pod [`ListenerConfig`] a `[wake]` + `[endpointer]` pair describes,
+/// with the barge mode the `[barge]` table names when there is one to read. The
+/// live daemon and a replay both build through here, so they agree by
+/// construction.
 fn listener_config(
     wake: &WakeConfig,
     endpointer: &EndpointerConfig,
+    barge: Option<&BargeConfig>,
     max_utterance_samples: u64,
 ) -> ListenerConfig {
     let (wake_tail_samples, command_wait_samples) = wake.hold_to_listener();
+    let defaults = ListenerConfig::default();
     ListenerConfig {
         oww_threshold: wake.threshold,
         endpointer: endpointer.to_listener(max_utterance_samples),
         wake_tail_samples,
         command_wait_samples,
         default_policy: wake.policy.to_listener(),
-        ..ListenerConfig::default()
+        barge_in: BargeInConfig {
+            mode: barge.map_or(defaults.barge_in.mode, BargeConfig::to_listener),
+            ..defaults.barge_in
+        },
+        ..defaults
     }
 }
 
@@ -210,7 +219,8 @@ impl ReplayListener {
         })?;
         let max_utterance_samples =
             config.pipeline.max_segment_seconds * u64::from(SPINE_FORMAT.sample_rate_hz);
-        let listener_config = listener_config(wake, endpointer, max_utterance_samples);
+        let listener_config =
+            listener_config(wake, endpointer, Some(&config.barge), max_utterance_samples);
         Ok(Some(ReplayListener::new(oww, silero, listener_config)))
     }
 
@@ -348,7 +358,7 @@ fn drive(
 mod tests {
     use super::*;
     use crate::config::wake_table_toml;
-    use speech_pipeline::WakePolicy;
+    use speech_pipeline::{BargeMode, WakePolicy};
 
     /// Every knob the assembly sets lands in its own field. The two ms values are
     /// mutually distinguishable on purpose: the sample counts arrive as a tuple,
@@ -362,7 +372,7 @@ mod tests {
         .expect("parse");
         let wake = config.wake.as_ref().expect("wake table");
         let endpointer = config.endpointer.as_ref().expect("endpointer table");
-        let built = listener_config(wake, endpointer, 16_000);
+        let built = listener_config(wake, endpointer, None, 16_000);
         assert_eq!(built.oww_threshold, 0.42, "the configured wake threshold");
         assert_eq!(built.wake_tail_samples, 12_000, "750 ms at 16 kHz");
         assert_eq!(built.command_wait_samples, 32_000, "2000 ms at 16 kHz");
@@ -387,10 +397,43 @@ mod tests {
             let wake = config.wake.as_ref().expect("wake table");
             let endpointer = config.endpointer.as_ref().expect("endpointer table");
             assert_eq!(
-                listener_config(wake, endpointer, 16_000).default_policy,
+                listener_config(wake, endpointer, None, 16_000).default_policy,
                 want,
                 "policy line: {extra:?}"
             );
         }
+    }
+
+    /// The other mapping this module owns: the `[barge] mode` a config names
+    /// reaches the listener's guard, and a call with no table in hand keeps the
+    /// compiled-in default. The live daemon builds through here too, so the two
+    /// cannot disagree.
+    #[test]
+    fn the_barge_mode_reaches_the_listener_config() {
+        for (table, want) in [
+            ("", BargeMode::Wake),
+            ("[barge]\nmode = \"wake\"\n", BargeMode::Wake),
+            ("[barge]\nmode = \"speech\"\n", BargeMode::Speech),
+        ] {
+            let config = Config::parse(&format!("{}{table}", wake_table_toml(""))).expect("parse");
+            let wake = config.wake.as_ref().expect("wake table");
+            let endpointer = config.endpointer.as_ref().expect("endpointer table");
+            let built = listener_config(wake, endpointer, Some(&config.barge), 16_000);
+            assert_eq!(built.barge_in.mode, want, "barge table: {table:?}");
+            assert_eq!(
+                built.barge_in.sustain_chunks,
+                ListenerConfig::default().barge_in.sustain_chunks,
+                "the sustain knobs are not a configuration surface"
+            );
+        }
+        let config = Config::parse(&wake_table_toml("")).expect("parse");
+        let wake = config.wake.as_ref().expect("wake table");
+        let endpointer = config.endpointer.as_ref().expect("endpointer table");
+        assert_eq!(
+            listener_config(wake, endpointer, None, 16_000)
+                .barge_in
+                .mode,
+            ListenerConfig::default().barge_in.mode,
+        );
     }
 }

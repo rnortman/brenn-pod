@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use super::endpointer::{EndpointCause, EndpointTransition};
 use super::stats::ScoreSummary;
-use crate::types::{PodId, SegmentEndCause, WakeConfirmation};
+use crate::types::{PodId, SegmentEndCause, UtteranceId, WakeConfirmation};
 
 /// One item the connection task forwards to the listener for a pod. Sample indexes
 /// are absolute (the `SessionEvent::Audio.first_sample_index` domain); the listener
@@ -61,7 +61,19 @@ pub enum Feed {
     /// tasks), which the ± `lead_ms` accuracy of the progress estimate already
     /// absorbs. `interruptible` mirrors the playing job's flag: a
     /// non-interruptible response (alerts) never opens the barge-in floor.
-    PlaybackState { active: bool, interruptible: bool },
+    PlaybackState {
+        active: bool,
+        interruptible: bool,
+        /// Whether the audible reply's own words carry the wake phrase. A wake
+        /// detection over such a reply is the machine hearing itself say the
+        /// phrase, so it never becomes a barge; the detection is still scored,
+        /// armed and reported.
+        may_wake: bool,
+        /// The turn this reply answers, when it answers one. The floor is per
+        /// turn: a report naming the turn already audible refines it and leaves
+        /// the latch alone, while a different turn is a new reply to cut.
+        turn: Option<UtteranceId>,
+    },
     /// The transport segment closed (the authoritative outer boundary). Finalizes
     /// any in-progress utterance and clears the wake arm.
     SegmentClosed {
@@ -163,6 +175,20 @@ pub struct CarvedUtterance {
     pub timing: CarveTiming,
 }
 
+/// Which rule cut a reply.
+///
+/// The two are not alternatives and are not ordered: the wake word cuts whatever
+/// else the machine believes, and the speech rule cuts a wake-less interruption
+/// in the mode that runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BargeCause {
+    /// Sustained confident speech, under the mode that trusts it.
+    Speech,
+    /// The wake phrase, detected while an interruptible reply was audible.
+    Wake,
+}
+
 /// What the listener emits back to the pipeline.
 #[derive(Debug, Clone)]
 pub enum ListenerEvent {
@@ -177,16 +203,18 @@ pub enum ListenerEvent {
         score: f32,
         wake_end_sample: u64,
     },
-    /// Sustained speech crossed the barge-in guard while interruptible playback
-    /// was active for this pod: cut the response. Fires at most once per playback
+    /// An interruption crossed the barge-in guard while interruptible playback was
+    /// active for this pod: cut the response. Fires at most once per playback
     /// session (the latch re-arms when playback next starts). The speech that
     /// triggered it goes on to carve as an ordinary utterance, marked
     /// [`CarvedUtterance::barge_in`].
     BargeIn {
         pod: PodId,
         epoch: u64,
+        /// Which of the two rules fired.
+        cause: BargeCause,
         /// Absolute index one past the last sample of the chunk that completed the
-        /// sustain run.
+        /// sustain run, or of the wake phrase that cut.
         trigger_sample: u64,
         /// Host receipt of the audio that drove the trigger.
         host_rx: HostMicros,
