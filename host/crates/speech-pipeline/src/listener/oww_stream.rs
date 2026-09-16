@@ -23,13 +23,15 @@
 //! that. Each chunk runs the mel session over (raw-PCM lookback + new chunk) and
 //! appends only the frames that are genuinely new — the ones the lookback alone
 //! did not already cover ([`mel_frame_count`]). Because the lookback carries the
-//! window's left context, those frames are bit-identical to a whole-segment pass.
-//! Frames then drive the embedding/wake windows on the exact 8-frame cadence the
-//! batch path used, so batch scoring — reconstructed by feeding a fresh
+//! window's left context, those frames have the same framing as a whole-segment
+//! pass. Frames then drive one embedding per processed chunk, on the same
+//! cadence as the batch path, so batch scoring — reconstructed by feeding a fresh
 //! `OwwStream` chunk-by-chunk (the [`OwwGate`](crate::wake::OwwGate) wrapper) —
-//! reproduces the whole-segment result exactly, cold-start windows and all. The
+//! replays the same chunked-stream decisions once its real embedding history is
+//! ready. Streamed mel values can differ slightly from a whole-segment pass. The mel window cold-starts from ones and the embedding
+//! window from zeros, but the wake model never sees placeholder embeddings. The
 //! first chunk yields 5 frames (no left context to fill the window); every chunk
-//! after adds exactly 8.
+//! after adds exactly 8, with one embedding produced for each chunk.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -50,8 +52,8 @@ pub(crate) const EMB_DIM: usize = 96;
 pub(crate) const WAKE_WINDOW: usize = 16;
 /// Samples per processing chunk (80 ms at 16 kHz).
 pub(crate) const CHUNK: usize = 1280;
-/// Mel frames between successive embeddings (one 80 ms chunk of audio). One
-/// embedding + wake score is produced per 8 frames appended.
+/// Mel frames between successive embeddings after the first chunk (one 80 ms
+/// chunk of audio). One embedding is produced per processed chunk.
 pub(crate) const EMB_STEP: usize = 8;
 /// Audio samples one mel frame advances (10 ms at 16 kHz): the mel model's STFT
 /// hop.
@@ -62,14 +64,15 @@ pub(crate) const SAMPLES_PER_MEL_FRAME: usize = CHUNK / EMB_STEP;
 /// for `n >= MEL_STFT_WINDOW` and none below. A model change breaks that test.
 pub(crate) const MEL_STFT_WINDOW: usize = 640;
 
-/// Raw-PCM samples of lookback prepended to each chunk before the mel pass. One
-/// full chunk exceeds [`MEL_STFT_WINDOW`], so every appended frame carries full
-/// left context and matches the contiguous batch stream.
-pub(crate) const MEL_LOOKBACK_SAMPLES: usize = CHUNK;
+/// Raw-PCM samples of lookback prepended to each chunk before the mel pass. This
+/// carries the preceding 30 ms of audio used by the streaming mel pipeline.
+pub(crate) const MEL_LOOKBACK_SAMPLES: usize = 3 * SAMPLES_PER_MEL_FRAME;
 
 /// Samples after a detection during which further detections are suppressed
 /// (~2 s at 16 kHz), so one spoken phrase arms the wake once, not repeatedly.
 pub(crate) const REFRACTORY_SAMPLES: u64 = 32_000;
+/// Samples by which the threshold-crossing cursor leads phrase completion.
+pub(crate) const WAKE_END_LAG_SAMPLES: u64 = CHUNK as u64;
 
 /// Frames `run_mel` emits for `n` raw samples under the model's valid framing.
 /// The join between "which frames has the lookback already contributed" and
@@ -94,7 +97,7 @@ pub struct OwwConfig {
     pub threshold: f32,
 }
 
-/// One embedding step's wake score plus the frame-derived sample offset at which
+/// One embedding step's wake score plus the chunk-derived sample offset at which
 /// its scoring window ends (relative to the stream's last reset). The listener
 /// adds the pod's segment base to reach a pod-absolute index; the batch wrapper
 /// treats it as an offset into the segment PCM.
@@ -240,12 +243,12 @@ impl OwwModels {
     }
 }
 
-/// One pod's rolling openWakeWord state. Cold-starts from zeros; drive it with
+/// One pod's rolling openWakeWord state. The mel window cold-starts from ones
+/// and the embedding window from zeros; drive it with
 /// [`push`](OwwStream::push) as audio arrives, [`flush`](OwwStream::flush) at a
 /// segment's trailing partial chunk, and [`reset`](OwwStream::reset) on a
 /// discontinuity. [`arm`](OwwStream::arm) applies the threshold + refractory to a
-/// scored step; [`force_score`](OwwStream::force_score) squeezes a final score
-/// from a sub-`EMB_STEP` tail (the batch fallback).
+/// scored step.
 pub struct OwwStream {
     /// Last `MEL_LOOKBACK_SAMPLES` raw samples, prepended to the next chunk for
     /// mel left context. Empty at cold-start, so the first chunk matches a
@@ -253,16 +256,15 @@ pub struct OwwStream {
     lookback: Vec<f32>,
     /// Real samples not yet forming a whole chunk.
     pending: VecDeque<f32>,
-    /// Persistent 76-frame mel window (cold-started from zeros).
+    /// Persistent 76-frame mel window (cold-started from ones).
     mel_window: VecDeque<[f32; MEL_BINS]>,
     /// Persistent 16-embedding window (cold-started from zeros).
     emb_window: VecDeque<[f32; EMB_DIM]>,
-    /// Mel frames appended since the last embedding step; an embedding fires at
-    /// `EMB_STEP`.
-    frames_since_emb: usize,
-    /// Total mel frames appended since the last reset — the `end_sample` cursor
-    /// (in units of `SAMPLES_PER_MEL_FRAME`).
-    total_frames: u64,
+    /// Number of real embeddings in `emb_window`; wake scoring waits for a full
+    /// history so zero placeholders never reach the wake model.
+    real_embeddings: usize,
+    /// Number of complete audio chunks processed since the last reset.
+    total_chunks: u64,
     /// Sigmoid threshold strictly above which `arm` fires.
     threshold: f32,
     /// No detection arms while `end_sample < refractory_until`.
@@ -270,15 +272,15 @@ pub struct OwwStream {
 }
 
 impl OwwStream {
-    /// A fresh stream with cold-zero rolling state and the given wake threshold.
+    /// A fresh stream with rolling model state and the given wake threshold.
     pub fn new(threshold: f32) -> OwwStream {
         OwwStream {
             lookback: Vec::new(),
             pending: VecDeque::new(),
-            mel_window: VecDeque::from(vec![[0.0; MEL_BINS]; EMB_WINDOW]),
+            mel_window: VecDeque::from(vec![[1.0; MEL_BINS]; EMB_WINDOW]),
             emb_window: VecDeque::from(vec![[0.0; EMB_DIM]; WAKE_WINDOW]),
-            frames_since_emb: 0,
-            total_frames: 0,
+            real_embeddings: 0,
+            total_chunks: 0,
             threshold,
             refractory_until: 0,
         }
@@ -289,16 +291,16 @@ impl OwwStream {
     pub fn reset(&mut self) {
         self.lookback.clear();
         self.pending.clear();
-        self.mel_window = VecDeque::from(vec![[0.0; MEL_BINS]; EMB_WINDOW]);
+        self.mel_window = VecDeque::from(vec![[1.0; MEL_BINS]; EMB_WINDOW]);
         self.emb_window = VecDeque::from(vec![[0.0; EMB_DIM]; WAKE_WINDOW]);
-        self.frames_since_emb = 0;
-        self.total_frames = 0;
+        self.real_embeddings = 0;
+        self.total_chunks = 0;
         self.refractory_until = 0;
     }
 
     /// Feed real PCM. Processes every whole chunk now available, returning a
     /// [`ScoredChunk`] for each embedding step that completed (roughly one per
-    /// chunk, none for the very first). A trailing partial chunk stays buffered
+    /// chunk, with no wake score until the first 15 embeddings). A trailing partial chunk stays buffered
     /// for the next `push` or a `flush`.
     pub fn push(
         &mut self,
@@ -315,9 +317,8 @@ impl OwwStream {
     }
 
     /// Score a trailing partial chunk, zero-padded up to a whole chunk (the batch
-    /// tail-padding). Returns any embedding steps the padded frames completed;
-    /// nothing when the buffer is empty. A sub-`EMB_STEP` remainder completes no
-    /// step — use [`force_score`](OwwStream::force_score) for a guaranteed score.
+    /// tail-padding). Returns the embedding step completed by the padded chunk;
+    /// nothing when the buffer is empty.
     pub fn flush(&mut self, models: &mut OwwModels) -> Result<Vec<ScoredChunk>, WakeError> {
         if self.pending.is_empty() {
             return Ok(Vec::new());
@@ -327,30 +328,18 @@ impl OwwStream {
         self.step(models, &chunk)
     }
 
-    /// Force one embedding + wake score from the current mel window, regardless of
-    /// how many frames have accumulated since the last step. The batch fallback:
-    /// a segment too short for a full [`EMB_STEP`] still yields one score over its
-    /// (mostly cold) window. `end_sample` is the frame cursor.
-    pub fn force_score(&mut self, models: &mut OwwModels) -> Result<ScoredChunk, WakeError> {
-        let emb = models.run_embedding(&self.mel_window)?;
-        self.emb_window.pop_front();
-        self.emb_window.push_back(emb);
-        let score = models.run_wake(&self.emb_window)?;
-        Ok(ScoredChunk {
-            score,
-            end_sample: self.total_frames * SAMPLES_PER_MEL_FRAME as u64,
-        })
-    }
-
     /// Apply the threshold + refractory to a freshly-scored step. Fires (and
     /// re-arms the refractory) on a threshold crossing outside the refractory
-    /// window; returns `None` otherwise.
+    /// window; provenance is reported one chunk before the scoring cursor.
     pub fn arm(&mut self, chunk: &ScoredChunk) -> Option<WakeDetected> {
+        if self.real_embeddings < WAKE_WINDOW {
+            return None;
+        }
         if chunk.score > self.threshold && chunk.end_sample >= self.refractory_until {
             self.refractory_until = chunk.end_sample + REFRACTORY_SAMPLES;
             Some(WakeDetected {
                 score: chunk.score,
-                wake_end_sample: chunk.end_sample,
+                wake_end_sample: chunk.end_sample.saturating_sub(WAKE_END_LAG_SAMPLES),
             })
         } else {
             None
@@ -359,7 +348,7 @@ impl OwwStream {
 
     /// One chunk step: mel over (lookback + chunk), append only the genuinely new
     /// frames (those the lookback did not already cover), and drive the
-    /// embedding/wake windows on the `EMB_STEP` cadence. Updates the rolling
+    /// embedding/wake windows once per processed chunk. Updates the rolling
     /// windows and lookback.
     fn step(
         &mut self,
@@ -380,19 +369,18 @@ impl OwwStream {
         for frame in &frames[already..] {
             self.mel_window.pop_front();
             self.mel_window.push_back(*frame);
-            self.total_frames += 1;
-            self.frames_since_emb += 1;
-            if self.frames_since_emb == EMB_STEP {
-                self.frames_since_emb = 0;
-                let emb = models.run_embedding(&self.mel_window)?;
-                self.emb_window.pop_front();
-                self.emb_window.push_back(emb);
-                let score = models.run_wake(&self.emb_window)?;
-                scores.push(ScoredChunk {
-                    score,
-                    end_sample: self.total_frames * SAMPLES_PER_MEL_FRAME as u64,
-                });
-            }
+        }
+        self.total_chunks += 1;
+        let emb = models.run_embedding(&self.mel_window)?;
+        self.emb_window.pop_front();
+        self.emb_window.push_back(emb);
+        self.real_embeddings = (self.real_embeddings + 1).min(WAKE_WINDOW);
+        if self.real_embeddings == WAKE_WINDOW {
+            let score = models.run_wake(&self.emb_window)?;
+            scores.push(ScoredChunk {
+                score,
+                end_sample: self.total_chunks * CHUNK as u64,
+            });
         }
 
         let keep = input.len().min(MEL_LOOKBACK_SAMPLES);
@@ -424,14 +412,11 @@ mod tests {
         oww_model_dir()
     }
 
-    /// Reference batch scorer: the retired whole-segment algorithm, reimplemented
-    /// here as the parity oracle. Runs the mel model once over the padded segment,
-    /// slides the embedding/wake windows over the contiguous frames from cold
-    /// zeros, and returns the maximum per-window sigmoid score. Streaming must
-    /// reproduce this exactly.
-    fn batch_reference_max(models: &mut OwwModels, pcm: &[i16]) -> f32 {
+    /// Reference batch scorer over a complete real embedding history. Streaming
+    /// must preserve the decision; incomplete histories produce no score.
+    fn batch_reference_max(models: &mut OwwModels, pcm: &[i16]) -> Option<f32> {
         let mut mel_window: VecDeque<[f32; MEL_BINS]> =
-            VecDeque::from(vec![[0.0; MEL_BINS]; EMB_WINDOW]);
+            VecDeque::from(vec![[1.0; MEL_BINS]; EMB_WINDOW]);
         let mut emb_window: VecDeque<[f32; EMB_DIM]> =
             VecDeque::from(vec![[0.0; EMB_DIM]; WAKE_WINDOW]);
         let mut samples: Vec<f32> = pcm.iter().map(|&s| f32::from(s)).collect();
@@ -439,32 +424,30 @@ mod tests {
         samples.resize(target, 0.0);
 
         let frames = models.run_mel(&samples).unwrap();
-        let mut since = 0usize;
+        let mut frame_count = 0usize;
+        let mut real_embeddings = 0usize;
         let mut best: Option<f32> = None;
         for frame in frames {
             mel_window.pop_front();
             mel_window.push_back(frame);
-            since += 1;
-            if since == EMB_STEP {
-                since = 0;
+            frame_count += 1;
+            if frame_count == 5 || (frame_count > 5 && (frame_count - 5).is_multiple_of(EMB_STEP)) {
                 let emb = models.run_embedding(&mel_window).unwrap();
                 emb_window.pop_front();
                 emb_window.push_back(emb);
-                let score = models.run_wake(&emb_window).unwrap();
-                best = Some(best.map_or(score, |b| b.max(score)));
+                real_embeddings += 1;
+                if real_embeddings >= WAKE_WINDOW {
+                    let score = models.run_wake(&emb_window).unwrap();
+                    best = Some(best.map_or(score, |b| b.max(score)));
+                }
             }
         }
-        best.unwrap_or_else(|| {
-            let emb = models.run_embedding(&mel_window).unwrap();
-            emb_window.pop_front();
-            emb_window.push_back(emb);
-            models.run_wake(&emb_window).unwrap()
-        })
+        best
     }
 
-    /// Feed a whole segment through a fresh stream (push + flush + force-fallback)
+    /// Feed a whole segment through a fresh stream (push + flush)
     /// and return the maximum score — the batch verdict, derived from streaming.
-    fn stream_max(models: &mut OwwModels, pcm: &[i16]) -> f32 {
+    fn stream_max(models: &mut OwwModels, pcm: &[i16]) -> Option<f32> {
         let mut stream = OwwStream::new(0.5);
         let mut best: Option<f32> = None;
         let fold = |b: &mut Option<f32>, s: f32| *b = Some(b.map_or(s, |x: f32| x.max(s)));
@@ -474,10 +457,7 @@ mod tests {
         for sc in stream.flush(models).unwrap() {
             fold(&mut best, sc.score);
         }
-        if best.is_none() {
-            fold(&mut best, stream.force_score(models).unwrap().score);
-        }
-        best.expect("a segment produces at least one score")
+        best
     }
 
     /// Pins the mel model's valid-framing geometry (`MEL_STFT_WINDOW`, hop): the
@@ -511,14 +491,14 @@ mod tests {
         );
     }
 
-    /// Streaming reproduces the batch oracle on the wake phrase — exactly, since
-    /// the frame stream and scoring cadence are identical.
+    /// Streaming and batch agree on the wake decision. Streamed mel values can
+    /// differ slightly from whole-segment values near phrase edges.
     #[test]
     fn stream_matches_batch_on_wake_phrase() {
         let mut models = test_models();
         let pcm = wake_phrase_pcm();
-        let reference = batch_reference_max(&mut models, &pcm);
-        let streamed = stream_max(&mut models, &pcm);
+        let reference = batch_reference_max(&mut models, &pcm).unwrap();
+        let streamed = stream_max(&mut models, &pcm).unwrap();
         assert!(
             reference > 0.5,
             "batch oracle must detect the wake phrase, got {reference}"
@@ -528,8 +508,10 @@ mod tests {
             "streaming must detect the wake phrase, got {streamed}"
         );
         assert!(
-            (reference - streamed).abs() < 1e-3,
-            "streaming score {streamed} diverges from batch {reference}"
+            // Streaming mel values may differ near phrase edges; 0.01 preserves
+            // the accept/reject parity check while allowing that model variance.
+            (reference - streamed).abs() < 0.01,
+            "streaming score {streamed} diverges materially from batch {reference}"
         );
     }
 
@@ -538,8 +520,8 @@ mod tests {
     fn stream_matches_batch_on_noise() {
         let mut models = test_models();
         let pcm = seeded_noise(1, 32_000);
-        let reference = batch_reference_max(&mut models, &pcm);
-        let streamed = stream_max(&mut models, &pcm);
+        let reference = batch_reference_max(&mut models, &pcm).unwrap();
+        let streamed = stream_max(&mut models, &pcm).unwrap();
         assert!(
             reference <= 0.5,
             "noise must not wake the oracle: {reference}"
@@ -552,19 +534,19 @@ mod tests {
     }
 
     /// Scores are finite and in `[0, 1]`; a 32 000-sample feed produces one score
-    /// per `EMB_STEP` of frames (none from the first chunk), each end-sample a
-    /// whole chunk further along.
+    /// per processed chunk (none from the first fifteen), each end-sample a whole
+    /// chunk further along.
     #[test]
     fn push_scores_on_the_embedding_cadence() {
         let mut models = test_models();
         let mut stream = OwwStream::new(0.5);
         let pcm = seeded_noise(2, 32_000);
         let scored = stream.push(&mut models, &pcm).unwrap();
-        let total_frames = mel_frame_count(32_000);
+        let chunk_count = 32_000_usize.div_ceil(CHUNK);
         assert_eq!(
             scored.len(),
-            total_frames / EMB_STEP,
-            "one score per {EMB_STEP} frames over {total_frames} frames"
+            chunk_count.saturating_sub(WAKE_WINDOW - 1),
+            "one score per chunk after {WAKE_WINDOW} real embeddings over {chunk_count} chunks"
         );
         for (i, sc) in scored.iter().enumerate() {
             assert!(sc.score.is_finite(), "score {} not finite: {}", i, sc.score);
@@ -576,16 +558,64 @@ mod tests {
             );
             assert_eq!(
                 sc.end_sample,
-                (i as u64 + 1) * CHUNK as u64,
+                (i as u64 + WAKE_WINDOW as u64) * CHUNK as u64,
                 "score {i} window-end cursor"
             );
         }
     }
 
-    /// A sub-chunk feed completes no embedding step; `force_score` still yields a
-    /// finite score over the (mostly cold) window.
+    /// Wake scoring starts only after sixteen real embeddings, at the exact
+    /// sample cursor of the sixteenth embedding.
     #[test]
-    fn sub_chunk_needs_force_score() {
+    fn first_score_waits_for_sixteen_real_embeddings() {
+        let mut models = test_models();
+        let mut stream = OwwStream::new(0.5);
+        let pcm = seeded_noise(8, 17 * CHUNK);
+        let scored = stream.push(&mut models, &pcm).unwrap();
+        assert_eq!(scored.len(), 2, "embeddings 16 and 17 are scored");
+        assert_eq!(
+            scored[0].end_sample,
+            WAKE_WINDOW as u64 * CHUNK as u64,
+            "the first score ends at the sixteenth embedding"
+        );
+    }
+
+    /// Pins per-step scores captured from Python openWakeWord 0.6.0
+    /// `Model.predict` on 1,280-sample chunks using the committed models.
+    #[test]
+    fn python_per_step_scores_regression() {
+        let mut models = test_models();
+        let mut stream = OwwStream::new(0.5);
+        let mut pcm = vec![0_i16; 32_000];
+        pcm.extend(wake_phrase_pcm());
+        let mut scored = stream.push(&mut models, &pcm).unwrap();
+        scored.extend(stream.flush(&mut models).unwrap());
+        let expected = [
+            (20_480, 0.000010639),
+            (43_520, 0.022298783),
+            (46_080, 0.197_546_24),
+            (47_360, 0.609_890_46),
+            (48_640, 0.852_638_8),
+            (49_920, 0.578_628_96),
+            (51_200, 0.989_247_9),
+            (53_760, 0.994_896_7),
+        ];
+        for (end_sample, expected_score) in expected {
+            let actual = scored
+                .iter()
+                .find(|sc| sc.end_sample == end_sample)
+                .unwrap_or_else(|| panic!("missing score at {end_sample}"))
+                .score;
+            assert!(
+                (actual - expected_score).abs() <= 0.001,
+                "score at {end_sample}: expected {expected_score}, got {actual}"
+            );
+        }
+    }
+
+    /// A sub-chunk feed computes one embedding on flush but cannot be wake-scored.
+    #[test]
+    fn sub_chunk_does_not_score() {
         let mut models = test_models();
         let mut stream = OwwStream::new(0.5);
         let pcm = seeded_noise(3, 100);
@@ -595,15 +625,9 @@ mod tests {
         );
         assert!(
             stream.flush(&mut models).unwrap().is_empty(),
-            "5 frames is under one embedding step"
+            "one embedding is below the sixteen-embedding wake history"
         );
-        let forced = stream.force_score(&mut models).unwrap();
-        assert!(forced.score.is_finite());
-        assert_eq!(
-            forced.end_sample,
-            mel_frame_count(CHUNK) as u64 * SAMPLES_PER_MEL_FRAME as u64,
-            "cursor reflects the 5 frames the padded remainder produced"
-        );
+        assert!(stream.push(&mut models, &[]).unwrap().is_empty());
     }
 
     /// Chunks feed identically whether delivered whole or split at ragged offsets:
@@ -627,8 +651,7 @@ mod tests {
         );
     }
 
-    /// `reset` returns the stream to cold-start, so post-reset scoring is
-    /// bit-identical to a fresh stream — no state bleeds across a discontinuity.
+    /// `reset` returns the stream to cold-start, including wake readiness.
     #[test]
     fn reset_restores_cold_start() {
         let mut models = test_models();
@@ -648,11 +671,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reset_clears_wake_readiness() {
+        let mut models = test_models();
+        let mut stream = OwwStream::new(-1.0);
+        let chunk_count = WAKE_WINDOW;
+        assert_eq!(
+            stream
+                .push(&mut models, &seeded_noise(8, chunk_count * CHUNK))
+                .unwrap()
+                .len(),
+            1,
+            "a warmed stream scores"
+        );
+        stream.reset();
+        let chunk_count = WAKE_WINDOW - 1;
+        assert!(
+            stream
+                .push(&mut models, &seeded_noise(9, chunk_count * CHUNK))
+                .unwrap()
+                .is_empty()
+        );
+        let scored = stream.push(&mut models, &seeded_noise(10, CHUNK)).unwrap();
+        assert_eq!(scored.len(), 1, "reset requires sixteen fresh embeddings");
+    }
+
+    #[test]
+    fn arm_rejects_synthetic_chunk_before_ready() {
+        let mut stream = OwwStream::new(-1.0);
+        assert!(
+            stream
+                .arm(&ScoredChunk {
+                    score: 1.0,
+                    end_sample: 0
+                })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn digital_silence_stays_unarmed_across_reset() {
+        let mut models = test_models();
+        let mut stream = OwwStream::new(0.5);
+        let silence = vec![0_i16; 32_000];
+        for scored in stream.push(&mut models, &silence).unwrap() {
+            assert!(stream.arm(&scored).is_none());
+        }
+        stream.reset();
+        for scored in stream.push(&mut models, &silence).unwrap() {
+            assert!(stream.arm(&scored).is_none());
+        }
+    }
+
     /// `arm` fires on a threshold crossing, then suppresses further crossings for
     /// `REFRACTORY_SAMPLES`, then fires again once the window elapses.
     #[test]
     fn arm_enforces_threshold_and_refractory() {
         let mut stream = OwwStream::new(0.5);
+        stream.real_embeddings = WAKE_WINDOW;
         // Below threshold: no arm, refractory untouched.
         assert_eq!(
             stream.arm(&ScoredChunk {
@@ -668,7 +744,7 @@ mod tests {
                 end_sample: 2 * CHUNK as u64,
             })
             .expect("crossing arms");
-        assert_eq!(first.wake_end_sample, 2 * CHUNK as u64);
+        assert_eq!(first.wake_end_sample, CHUNK as u64);
         // A crossing inside the refractory window is suppressed.
         assert_eq!(
             stream.arm(&ScoredChunk {

@@ -1,14 +1,10 @@
 //! `OwwGate`: the batch openWakeWord wake gate, now a thin wrapper over the
 //! streaming core ([`crate::listener::oww_stream`]).
 //!
-//! Segment-batch scoring is derived from streaming, not a separate code path: a
-//! fresh [`OwwStream`] is fed the segment chunk-by-chunk and the maximum
-//! per-step sigmoid score is compared to the threshold. Because the streaming
-//! core's raw-PCM mel lookback makes its frame stream prefix-identical to a
-//! whole-segment mel pass and it scores on the same 8-frame cadence, the
-//! reconstructed batch score matches the retired whole-segment result exactly —
-//! so this wrapper is a parity oracle and replay tool while the listener is
-//! stood up. Fresh state per call means no bleed across segments or pods.
+//! Segment-batch scoring feeds a fresh [`OwwStream`] chunk-by-chunk and compares
+//! the maximum per-step sigmoid score with the threshold. The gate requires
+//! sixteen real embeddings; short segments return a finite zero rejection.
+//! Fresh state per call means no bleed across segments or pods.
 //!
 //! `OwwGate` is retired once the pipeline rework routes wake through the listener
 //! thread; until then it keeps the segment-shaped [`WakeGate`] seam working.
@@ -58,12 +54,10 @@ impl OwwGate {
         for sc in stream.flush(&mut self.models)? {
             keep_best(&mut best, sc);
         }
-        // A segment too short for one embedding step still scores (batch fallback).
-        if best.is_none() {
-            keep_best(&mut best, stream.force_score(&mut self.models)?);
-        }
-
-        let best = best.expect("a non-empty segment produces at least one score");
+        // A segment without a complete real embedding history cannot be scored.
+        let Some(best) = best else {
+            return Ok(WakeOutcome::Rejected { score: 0.0 });
+        };
         Ok(if best.score > self.threshold {
             WakeOutcome::Detected {
                 score: best.score,
@@ -131,35 +125,21 @@ mod tests {
     }
 
     #[test]
-    fn sub_chunk_segment_is_padded_and_scored() {
+    fn sub_chunk_segment_rejects_without_score() {
         let mut gate = test_gate();
-        // Fewer than one chunk: flushed with zero-padding and scored, no panic.
+        // Fewer than sixteen real embeddings is rejected without invoking wake.
         let outcome = gate.gate(&seg_with_pcm(seeded_noise(3, 100))).unwrap();
-        let score = match outcome {
-            WakeOutcome::Detected { score, .. } | WakeOutcome::Rejected { score } => score,
-        };
-        assert!(
-            score.is_finite(),
-            "sub-chunk score must be finite, got {score}"
-        );
+        assert_eq!(outcome, WakeOutcome::Rejected { score: 0.0 });
     }
 
     #[test]
-    fn sub_chunk_detected_clamps_window_end_to_real_pcm() {
-        // A threshold below the sigmoid range forces detection on the flushed
-        // sub-chunk remainder; its window end clamps to the 100 real samples.
+    fn sub_chunk_does_not_detect_with_negative_threshold() {
+        // A negative threshold cannot bypass the real-history requirement.
         let mut gate = test_gate_with_threshold(-1.0);
-        let pcm = seeded_noise(3, 100);
-        match gate.gate(&seg_with_pcm(pcm.clone())).unwrap() {
-            WakeOutcome::Detected {
-                wake_end_sample, ..
-            } => assert_eq!(
-                wake_end_sample,
-                pcm.len(),
-                "sub-chunk detection clamps the window end to real PCM"
-            ),
-            other => panic!("threshold -1.0 must detect, got {other:?}"),
-        }
+        assert_eq!(
+            gate.gate(&seg_with_pcm(seeded_noise(3, 100))).unwrap(),
+            WakeOutcome::Rejected { score: 0.0 }
+        );
     }
 
     #[test]

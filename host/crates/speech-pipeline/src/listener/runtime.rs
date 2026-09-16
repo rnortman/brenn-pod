@@ -2162,9 +2162,8 @@ mod tests {
             .expect("close feed")
     }
 
-    /// Silence never wakes and never opens an utterance. It is not *event*-silent:
-    /// the close reports what both models scored across it, which is the whole
-    /// point — a quiet room is the case the transition stream cannot describe.
+    /// Silence never wakes and never opens an utterance. The close reports
+    /// Silero's scores; OWW has not reached its 20,480-sample readiness window.
     #[test]
     fn silence_is_inert() {
         let mut oww = oww_models();
@@ -2193,7 +2192,11 @@ mod tests {
         // And the observability that makes a silent room legible rather than
         // indistinguishable from a dead listener.
         let stats = model_stats(&events);
-        assert_eq!(stats.len(), 2, "both models report on the close: {stats:?}");
+        assert_eq!(
+            stats.len(),
+            1,
+            "only Silero reports before wake readiness: {stats:?}"
+        );
         for (model, cause, s) in stats {
             assert_eq!(cause, StatsFlushCause::SegmentClose, "{model:?}");
             assert!(
@@ -2214,8 +2217,11 @@ mod tests {
         let mut silero = silero_model();
         let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
         open(&mut state, 0, &mut oww, &mut silero);
+        let silence = vec![0_i16; 16_000];
         let phrase = wake_phrase_pcm();
-        let events = feed_audio_chunkwise(&mut state, 0, &phrase, &mut oww, &mut silero);
+        let mut audio = silence;
+        audio.extend_from_slice(&phrase);
+        let events = feed_audio_chunkwise(&mut state, 0, &audio, &mut oww, &mut silero);
         let detections: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -2227,8 +2233,8 @@ mod tests {
             .collect();
         assert!(!detections.is_empty(), "wake phrase must arm a wake");
         assert!(
-            detections[0] > 0 && detections[0] <= phrase.len() as u64,
-            "wake end {} within the phrase",
+            detections[0] > 16_000 && detections[0] <= audio.len() as u64,
+            "wake end {} within the prefixed phrase",
             detections[0]
         );
         let carved = soft_endpoints(&events);
@@ -2799,8 +2805,8 @@ mod tests {
         let mut state = ListenerState::new(config);
         open(&mut state, 0, &mut oww, &mut silero);
 
-        // phrase | pause | phrase | trailing silence past the continuation window.
-        let mut audio: Vec<i16> = Vec::new();
+        // silence | phrase | pause | phrase | trailing silence past the continuation window.
+        let mut audio: Vec<i16> = vec![0_i16; 16_000];
         audio.extend_from_slice(&phrase);
         audio.extend(std::iter::repeat_n(0_i16, pause as usize));
         audio.extend_from_slice(&phrase);
@@ -4260,9 +4266,11 @@ mod tests {
         let mut silero = silero_model();
         let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
         let phrase = wake_phrase_pcm();
+        let mut first_audio = vec![0_i16; 16_000];
+        first_audio.extend_from_slice(&phrase);
         // Segment 1 carries the wake phrase and closes right after it.
         open(&mut state, 0, &mut oww, &mut silero);
-        let mut events = feed_audio_chunkwise(&mut state, 0, &phrase, &mut oww, &mut silero);
+        let mut events = feed_audio_chunkwise(&mut state, 0, &first_audio, &mut oww, &mut silero);
         let wakes = events
             .iter()
             .filter(|e| matches!(e, ListenerEvent::WakeDetected { .. }))
@@ -4277,7 +4285,7 @@ mod tests {
             "the phrase carves once on the natural path: {events:?}"
         );
         assert!(state.wake.is_none(), "the carve consumed the arm");
-        events = close_segment(&mut state, phrase.len() as u64, &mut oww, &mut silero);
+        events = close_segment(&mut state, first_audio.len() as u64, &mut oww, &mut silero);
         assert!(
             !events
                 .iter()
@@ -4287,15 +4295,15 @@ mod tests {
 
         // Segment 2 opens with a preroll covering the tail of the phrase: the same
         // audio, re-sent under its original indexes.
-        let overlap = 8_192.min(phrase.len() as u64);
-        let base = phrase.len() as u64 - overlap;
+        let overlap = 8_192.min(first_audio.len() as u64);
+        let base = first_audio.len() as u64 - overlap;
         open_segment(&mut state, base, overlap as u32, &mut oww, &mut silero);
         let trimmed_before = state.take_overlap_trimmed();
         assert_eq!(trimmed_before, 0);
         events = feed_audio_chunkwise(
             &mut state,
             base,
-            &phrase[base as usize..],
+            &first_audio[base as usize..],
             &mut oww,
             &mut silero,
         );
@@ -4323,7 +4331,7 @@ mod tests {
 
         // The recovery that matters: a phrase spoken *in* the new segment arms
         // fresh across the overlap boundary and gates its own carve.
-        let idx = phrase.len() as u64;
+        let idx = first_audio.len() as u64;
         events = feed_audio(&mut state, idx, &phrase, &mut oww, &mut silero);
         assert_eq!(
             events
@@ -5145,8 +5153,10 @@ mod tests {
         let mut state = ListenerState::new(real_hold_config(WakePolicy::WakeGated));
         open(&mut state, 0, &mut oww, &mut silero);
         let phrase = wake_phrase_pcm();
+        let mut first_audio = vec![0_i16; 16_000];
+        first_audio.extend_from_slice(&phrase);
 
-        let events = feed_audio_chunkwise(&mut state, 0, &phrase, &mut oww, &mut silero);
+        let events = feed_audio_chunkwise(&mut state, 0, &first_audio, &mut oww, &mut silero);
         let held = wake_helds(&events);
         assert_eq!(held.len(), 1, "the phrase alone is held: {events:?}");
         assert!(
@@ -5159,7 +5169,7 @@ mod tests {
         let gap = 24_576_u64;
         let quiet = feed_audio_chunkwise(
             &mut state,
-            phrase.len() as u64,
+            first_audio.len() as u64,
             &vec![0_i16; gap as usize],
             &mut oww,
             &mut silero,
@@ -5171,15 +5181,15 @@ mod tests {
         // And the wait has to outlast both phrases and the gap, or this test would
         // be measuring the deadline instead of the fresh wake.
         assert!(
-            held[0].3 > 2 * phrase.len() as u64 + gap,
+            held[0].3 > first_audio.len() as u64 + gap + phrase.len() as u64,
             "deadline {} vs {} samples fed",
             held[0].3,
-            2 * phrase.len() as u64 + gap
+            first_audio.len() as u64 + gap + phrase.len() as u64
         );
 
         let again = feed_audio_chunkwise(
             &mut state,
-            phrase.len() as u64 + gap,
+            first_audio.len() as u64 + gap,
             &phrase,
             &mut oww,
             &mut silero,
