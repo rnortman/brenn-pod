@@ -2,18 +2,17 @@
 //! `Segment`, derived from the streaming listener core (`listener::oww_stream`).
 //!
 //! `OwwGate` (`wake::oww`) drives a fresh streaming pass over a whole segment and
-//! takes the max-score verdict, so batch behaviour is derived-from-streaming and
-//! parity holds by construction. Live wake detection runs in the continuous
-//! listener; this gate survives only as the replay/parity tool the framelog corpus
-//! is scored through.
+//! takes the max-score verdict after a complete real embedding history. Segments
+//! without that history are rejected with score `0.0`. Live wake detection runs
+//! in the continuous listener; this gate survives as a replay tool.
 
 pub mod oww;
 
 pub use oww::{OwwConfig, OwwGate};
 
-/// Verdict for one batch-scored segment: a scored accept (`positive`) or a scored
-/// reject (`negative`). The batch gate is a replay/parity oracle, so it always
-/// scores — there is no bypass verdict.
+/// Verdict for one batch-scored segment: a scored accept (`positive`), a scored
+/// reject (`negative`), or a zero rejection when the real embedding history is
+/// incomplete.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WakeOutcome {
     /// The gate passed on a score above threshold. Sidecar class `positive`.
