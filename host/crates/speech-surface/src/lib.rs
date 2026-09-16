@@ -50,8 +50,9 @@ pub use recorder::{
 };
 pub use replay::{ReplayError, ReplayListener, ReplaySummary, StopReason, replay_framelog};
 pub use scripter::{
-    BusSink, Cause, Now, SCRIPT_QUEUE_DEPTH, ScriptHandle, ScriptInbox, ScriptInput, ScriptOut,
-    ScriptPublish, ScriptSink, ScriptTask, ScriptTiming, Scripter,
+    BusSink, Cause, DEFAULT_PRESENCE_POSE, Now, Raise, SCRIPT_QUEUE_DEPTH, ScriptHandle,
+    ScriptInbox, ScriptInput, ScriptOut, ScriptPublish, ScriptRaises, ScriptSink, ScriptTask,
+    ScriptTiming, Scripter,
 };
 /// The motion seams a composing process fills in place of the bus.
 pub use server::Sinks;

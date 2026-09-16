@@ -475,7 +475,7 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
     }
 }
 
-/// The head's new timeline as prose: `head up@0 stow@6740 (closing) seq=17865`.
+/// The head's new timeline as prose: `head peek@0 stow@6740 (closing) seq=17865`.
 /// A script with no steps reads `head -` — lawful, and the timeout is then its
 /// whole effect. Every field degrades to `?` when absent or the wrong type.
 fn narrate_motion_script(fields: &Value) -> String {
@@ -485,7 +485,7 @@ fn narrate_motion_script(fields: &Value) -> String {
             .map(|step| {
                 format!(
                     "{}@{}",
-                    fmt_str(step.get("posture")),
+                    fmt_str(step.get("pose")),
                     fmt_u64(step.get("after_ms"))
                 )
             })
@@ -1769,8 +1769,8 @@ mod tests {
                     "pod": "pod-a1b2c3",
                     "seq": 1_786_543_210_123_u64,
                     "steps": [
-                        { "after_ms": 0, "posture": "up" },
-                        { "after_ms": 6740, "posture": "stow" },
+                        { "after_ms": 0, "pose": "peek" },
+                        { "after_ms": 6740, "pose": "stow" },
                     ],
                     "timeout_ms": 30_000,
                     "cause": "closing",
@@ -1778,7 +1778,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            line.ends_with("head up@0 stow@6740 (closing) seq=1786543210123"),
+            line.ends_with("head peek@0 stow@6740 (closing) seq=1786543210123"),
             "{line}"
         );
         assert!(!line.contains("!!!"), "a change is calm: {line}");

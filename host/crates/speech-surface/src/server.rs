@@ -5611,7 +5611,7 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&out.body).expect("the offered body is JSON");
         assert_eq!(body["pod"], "pod-srv");
-        assert_eq!(body["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(body["steps"], json!([{ "after_ms": 0, "pose": "neutral" }]));
 
         teardown.cancel();
         run.await.unwrap();

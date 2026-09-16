@@ -9,6 +9,14 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **The head's poses are named per event.** Five new optional `[brenn]` keys:
+  `presence_wake_pose` (where the head goes on a wake word and on a barge —
+  listening) and `presence_turn_pose` (where it goes when an utterance is
+  dispatched — answering), both defaulting to `neutral`; and
+  `presence_wake_move_ms`, `presence_turn_move_ms` and `presence_stow_move_ms`,
+  which state how fast each of those moves goes. A pace left unset leaves the
+  move at the pace the daemon's own library holds for that pose. A deployment
+  that names none of the five behaves exactly as before.
 - **Wake-word barge-in is now the default.** A new `[barge] mode` switch
   controls what may cut an audible reply. Under `"wake"` (the default), only a
   wake-word detection interrupts; sustained speech over a reply is ignored, since
@@ -114,6 +122,13 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Changed
 
+- **Motion scripts name a pose instead of one of two postures.** A base step
+  now carries `"pose": "<name>"` — a name the daemon resolves against its
+  deployed pose library — and may carry `"move_ms"`, the pace of the move to
+  it; the old `"posture": "up" | "stow"` spelling is gone and a body carrying
+  it is refused. This side's `motion-proto` pin moves to the brenn-reachy
+  revision that publishes that contract, so a daemon older than it cannot
+  execute what this scripter now sends.
 - **Playback events now distinguish "written to the device" from "heard to the
   end".** The old `playback_finished` fired when the last frame was handed to
   the device, up to a second before the audio played out. A new

@@ -3,7 +3,7 @@
 //! The pipeline knows a dozen ways an interaction starts and stops, and it also
 //! knows — from the moment playback begins — how long the speech it queued is
 //! going to take. This module turns both into [`MotionScript`]s: a timeline of
-//! postures the motion daemon executes on its own clock, rather than a stream of
+//! poses the motion daemon executes on its own clock, rather than a stream of
 //! states it has to reduce.
 //!
 //! That is the whole reason the ordinary conversation is *one* message. The
@@ -15,14 +15,25 @@
 //! the script it wants standing at the daemon, emitted when that answer changes
 //! and re-emitted on a refresh cadence. Two answers exist:
 //!
-//! - **hold** — `up@0`. The head is up and the timeline is not known yet: a wake
-//!   with no utterance yet, an utterance with the brain still thinking, a barge
-//!   over someone else's answer. Its timeout is the bound that matters, and the
-//!   refresh is what keeps a long think from crossing it.
-//! - **closing** — `up@0, stow@t`. The whole turn in one message: the head is up
-//!   now and comes down at `t`, which is where the turn's speech is estimated to
-//!   end plus a margin. Re-emitting it recomputes the offset from that same
-//!   absolute instant, so a re-emission never moves the stow.
+//! - **hold** — `<pose>@0`. The head is at a pose and the timeline is not known
+//!   yet: a wake with no utterance yet, an utterance with the brain still
+//!   thinking, a barge over someone else's answer. Its timeout is the bound that
+//!   matters, and the refresh is what keeps a long think from crossing it.
+//! - **closing** — `<pose>@0, stow@t`. The whole turn in one message: the head
+//!   is at that pose now and comes down at `t`, which is where the turn's speech
+//!   is estimated to end plus a margin. Re-emitting it recomputes the offset
+//!   from that same absolute instant, so a re-emission never moves the stow.
+//!
+//! Which pose is the event's: a wake and a barge are *listening* and take
+//! [`ScriptRaises::wake`], a dispatched utterance is *answering* and takes
+//! [`ScriptRaises::turn`]. A hold whose pose changed is a new answer and is
+//! published; the same event always produces the same pose, whatever the head
+//! was doing. A closing script never retargets — it is built from the pose the
+//! hold it closes was carrying — so a re-emission moves nobody.
+//!
+//! A step may state a pace of its own, which is what each [`Raise`]'s own
+//! `move_ms` puts on the wire; absent, the library's default for that pose
+//! applies.
 //!
 //! There is no third answer for "down": a script that has run its stow leaves
 //! the daemon resting, which is its default state, so the scripter goes quiet —
@@ -68,7 +79,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use brenn_bridge::{BridgeHandle, PublishRequest, Urgency};
-use motion_proto::{MAX_TIMEOUT_MS, MotionScript, Posture, SeqSource, Step, unix_millis};
+use motion_proto::{MAX_TIMEOUT_MS, MotionScript, STOW_POSE, SeqSource, Step, unix_millis};
 use serde_json::json;
 use speech_pipeline::{PodId, TurnEnd, UtteranceId};
 use tokio::sync::{Notify, mpsc};
@@ -81,6 +92,84 @@ use crate::config::BrennConfig;
 use crate::jsonl::JsonlHandle;
 use crate::time::due;
 
+/// The pose a config that names none takes for both of its presence events.
+///
+/// Every deployment's library holds it under this name, and a configuration
+/// that names no pose gets it for both events: one place the head goes for
+/// every raise, which is a deployment that has not decided to tell listening
+/// and answering apart.
+pub const DEFAULT_PRESENCE_POSE: &str = "neutral";
+
+/// The move one presence event asks for: a pose, and the pace of the move to it.
+///
+/// One value, because the two are one decision — choosing where the head goes
+/// is choosing how fast it gets there — and because a want carries what it is
+/// standing at, so a re-paced raise is a different answer and is published.
+/// Where the pose *is* stays the daemon's library's; a name this side cannot
+/// resolve is not an error it can detect.
+///
+/// The name is held as [`Arc<str>`] because every hold and every closing want
+/// carries it, and those are cloned per input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Raise {
+    /// The pose's name in the daemon's library.
+    pub pose: Arc<str>,
+    /// The pace stated for the move, or `None` to leave it to the library.
+    pub move_ms: Option<u64>,
+}
+
+impl Raise {
+    /// A raise to `pose` at the library's own pace.
+    #[must_use]
+    pub fn to(pose: &str) -> Self {
+        Self {
+            pose: pose.into(),
+            move_ms: None,
+        }
+    }
+
+    /// This raise as a base step due `after_ms` past the script's arrival.
+    pub(crate) fn step(&self, after_ms: u64) -> Step {
+        match self.move_ms {
+            Some(move_ms) => Step::timed(after_ms, self.pose.as_ref(), move_ms),
+            None => Step::new(after_ms, self.pose.as_ref()),
+        }
+    }
+}
+
+/// The three moves this scripter ever asks for.
+///
+/// Pose and pace together per event, rather than the poses here and the paces
+/// among the intervals a script is measured in: the scripter reads one of these
+/// per cause, so a split would be one fact held twice — in the value it was
+/// configured as and in the raise published from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptRaises {
+    /// Where the head goes on a wake word and on a barge: *listening*.
+    pub wake: Raise,
+    /// Where the head goes when an utterance is dispatched: *answering*.
+    pub turn: Raise,
+    /// The stow every step this scripter emits names: the reserved pose, at
+    /// whatever pace the configuration gives the scripter's own endings.
+    pub stow: Raise,
+}
+
+/// The raises a config that names none of the presence keys produces.
+///
+/// [`BrennConfig::script_raises`] must agree with this, and a test asserts it
+/// does.
+///
+/// [`BrennConfig::script_raises`]: crate::config::BrennConfig::script_raises
+impl Default for ScriptRaises {
+    fn default() -> Self {
+        Self {
+            wake: Raise::to(DEFAULT_PRESENCE_POSE),
+            turn: Raise::to(DEFAULT_PRESENCE_POSE),
+            stow: Raise::to(STOW_POSE),
+        }
+    }
+}
+
 /// The four intervals a script is measured in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScriptTiming {
@@ -88,7 +177,9 @@ pub struct ScriptTiming {
     /// something. A lost message is repaired within one of these, and a hold
     /// script is kept clear of its own timeout by them. Also the headroom every
     /// emitted timeout carries past its own last step, so a re-emission always
-    /// has room to land. Must not exceed [`MAX_TIMEOUT_MS`].
+    /// has room to land; on a timeline ending at the stow, a stow paced longer
+    /// than this sets that headroom instead, because that last step's own move
+    /// has to fit inside the timeout too. Must not exceed [`MAX_TIMEOUT_MS`].
     pub refresh: Duration,
     /// How long the head stays up after a turn that asked to keep listening, and
     /// after a raise that produced no turn at all. The `<listen/>` window.
@@ -108,12 +199,13 @@ pub struct ScriptTiming {
     pub stow_margin: Duration,
 }
 
-/// The timings a config that names none of the four presence keys produces.
+/// The timings a config that names none of the presence keys produces.
 ///
 /// The same four numbers `[brenn]`'s defaults are built from, so a caller with
 /// no config in hand — a test, a fixture — measures the head the way the
-/// shipped deployment does. [`BrennConfig::script_timing`] must agree with
-/// this, and a test asserts it does.
+/// shipped deployment does.
+/// [`BrennConfig::script_timing`] must agree with this, and a test asserts
+/// it does.
 ///
 /// [`BrennConfig::script_timing`]: crate::config::BrennConfig::script_timing
 impl Default for ScriptTiming {
@@ -270,15 +362,23 @@ pub struct ScriptPublish {
 }
 
 /// What the scripter wants standing at the daemon for one pod.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum Want {
     /// Nothing. The daemon's default state is rest, so silence is the ask.
     #[default]
     Quiet,
-    /// Head up, timeline unknown.
-    Hold,
-    /// Head up now, down at this instant.
+    /// Head at a pose, timeline unknown.
+    Hold {
+        /// The pose the head is held at, and the pace the move to it states.
+        /// Part of the want, so a hold whose pose or pace changed is a
+        /// different answer and is published.
+        at: Raise,
+    },
+    /// Head at a pose now, down at this instant.
     Closing {
+        /// The pose the head stays at until it starts down: whatever the hold
+        /// this closes was carrying, so closing retargets nobody.
+        at: Raise,
         /// When the head starts down, as an absolute instant, so that
         /// re-emissions do not move it.
         stow_at: Instant,
@@ -298,21 +398,25 @@ impl Want {
     /// nothing left to schedule — nothing wanted at all, or a stow whose
     /// instant has already arrived. What to do about the second case is the
     /// caller's: it depends on what is standing at the daemon.
-    fn steps(self, now: Instant) -> Option<Vec<Step>> {
+    fn steps(&self, now: Instant, stow: &Raise) -> Option<Vec<Step>> {
         match self {
             Want::Quiet | Want::Stowing => None,
-            Want::Hold => Some(vec![Step::new(0, Posture::Up)]),
+            Want::Hold { at } => Some(vec![at.step(0)]),
             // A raise and a stow at the same offset is not a timeline, so a
             // stow that is already due has no future to describe.
-            Want::Closing { stow_at } => {
-                let after_ms = millis_between(now, stow_at);
-                (after_ms > 0).then(|| {
-                    vec![
-                        Step::new(0, Posture::Up),
-                        Step::new(after_ms, Posture::Stow),
-                    ]
-                })
+            Want::Closing { at, stow_at } => {
+                let after_ms = millis_between(now, *stow_at);
+                (after_ms > 0).then(|| vec![at.step(0), stow.step(after_ms)])
             }
+        }
+    }
+
+    /// The raise this want is standing at, or `None` for a want that holds the
+    /// head nowhere.
+    fn at(&self) -> Option<&Raise> {
+        match self {
+            Want::Hold { at } | Want::Closing { at, .. } => Some(at),
+            Want::Quiet | Want::Stowing => None,
         }
     }
 }
@@ -347,6 +451,13 @@ impl PodScript {
 /// The scripter: inputs and a clock in, scripts out.
 pub struct Scripter {
     timing: ScriptTiming,
+    /// Where each presence event puts the head, paired with the pace its own
+    /// timing states, so a raise is one lookup by cause.
+    wake: Raise,
+    turn: Raise,
+    /// The stow every step this scripter emits names: the reserved pose, at
+    /// whatever pace the configuration gives the scripter's own endings.
+    stow: Raise,
     pods: HashMap<PodId, PodScript>,
     /// One source across every pod. Numbers only have to climb per pod, and a
     /// single strictly-increasing stream satisfies that for all of them.
@@ -356,8 +467,11 @@ pub struct Scripter {
 impl Scripter {
     /// A scripter with nothing to say about any pod.
     #[must_use]
-    pub fn new(timing: ScriptTiming) -> Self {
+    pub fn new(timing: ScriptTiming, raises: ScriptRaises) -> Self {
         Self {
+            wake: raises.wake,
+            turn: raises.turn,
+            stow: raises.stow,
             timing,
             pods: HashMap::new(),
             seq: SeqSource::new(),
@@ -397,8 +511,18 @@ impl Scripter {
                 None
             }
             ScriptInput::Unanswered(_) => {
-                self.pods.entry(pod.clone()).or_default().clear_turn();
-                let (want, clamped) = self.closing(&pod, now, now.at + self.timing.linger);
+                // The head stays where the raise put it and folds after the
+                // linger, so the closing carries the standing raise. The branch
+                // above has already refused every want that holds the head
+                // nowhere, so there is one to carry.
+                let p = self.pods.entry(pod.clone()).or_default();
+                p.clear_turn();
+                let at = p
+                    .want
+                    .at()
+                    .cloned()
+                    .expect("a want the branch above did not refuse holds the head somewhere");
+                let (want, clamped) = self.closing(&pod, now, at, now.at + self.timing.linger);
                 self.set(&pod, now, want, Cause::Unanswered, clamped)
             }
             ScriptInput::Audio { turn, audio, .. } => {
@@ -445,13 +569,37 @@ impl Scripter {
         self.pods.values().filter_map(|p| p.refresh).min()
     }
 
-    /// Put the head up and start the turn's facts over. Already up means the
-    /// refresh cadence carries it and nothing is said: a wake, its utterance and
-    /// a barge over the answer are three raises in a few seconds, and they are
-    /// one hold script.
+    /// Put the head at the pose this cause means and start the turn's facts
+    /// over. Already held at that pose means the refresh cadence carries it and
+    /// nothing is said: a wake, its utterance and a barge over the answer are
+    /// three raises in a few seconds, and where two of them agree they are one
+    /// hold script. Where they do not, the base retargets mid-hold — which is
+    /// the whole point of naming a pose per event.
     fn raise(&mut self, pod: &PodId, now: Now, cause: Cause) -> Option<ScriptPublish> {
+        let at = match cause {
+            Cause::Turn => self.turn.clone(),
+            _ => self.wake.clone(),
+        };
         self.pods.entry(pod.clone()).or_default().clear_turn();
-        self.set(pod, now, Want::Hold, cause, None)
+        self.set(pod, now, Want::Hold { at }, cause, None)
+    }
+
+    /// The room a timeout keeps past its own last step when that step is the
+    /// stow.
+    ///
+    /// The refresh period is the floor: a re-emission that lands late still
+    /// finds the previous script standing. A stow paced longer than that sets
+    /// the room instead, because the daemon measures a stow-terminal timeline
+    /// as its last step plus the pace that step states — a timeout shorter than
+    /// that sum is a script it refuses whole, so the head would come down on
+    /// nothing the configuration asked for.
+    ///
+    /// A script whose last step is not the stow keeps the refresh period alone:
+    /// a move it does not carry has no room to buy, and charging it the stow's
+    /// pace would lift the daemon's backstop on a raised head past the
+    /// configured engagement ceiling.
+    fn stow_headroom_ms(&self) -> u64 {
+        millis(self.timing.refresh).max(self.stow.move_ms.unwrap_or(0))
     }
 
     /// A stow at `stow_at` as a want, cut back to the last instant a script
@@ -460,9 +608,11 @@ impl Scripter {
     ///
     /// Every script carries a timeout that covers its own timeline, and no
     /// timeout may exceed [`MAX_TIMEOUT_MS`], so the furthest stow this scripter
-    /// can express is the ceiling less the headroom every timeout keeps past its
-    /// last step. Bounding the plan here rather than letting the emission fail
-    /// is what keeps script construction infallible, and it is the host-side
+    /// can express is the ceiling less the room a stow-terminal timeout keeps
+    /// past its last step — and the script this bounds is stow-terminal, so the
+    /// rule cut from here is the rule that sizes it. Bounding the plan here
+    /// rather than letting the emission fail is what keeps script construction
+    /// infallible, and it is the host-side
     /// half of the slip protection: a stow instant computed from seconds where
     /// milliseconds were meant lands at the ceiling, minutes out and narrated,
     /// rather than hours out.
@@ -478,18 +628,22 @@ impl Scripter {
     /// exposure measured from the last fact instead of from the decision. This
     /// is the rule the no-horizon branch of [`Scripter::reconsider`] already
     /// keeps, for the same reason.
-    fn closing(&self, pod: &PodId, now: Now, stow_at: Instant) -> (Want, Option<u64>) {
-        let headroom = Duration::from_millis(MAX_TIMEOUT_MS).saturating_sub(self.timing.refresh);
+    fn closing(&self, pod: &PodId, now: Now, at: Raise, stow_at: Instant) -> (Want, Option<u64>) {
+        let headroom =
+            Duration::from_millis(MAX_TIMEOUT_MS.saturating_sub(self.stow_headroom_ms()));
         let ceiling = now.at + headroom;
         if stow_at <= ceiling {
-            return (Want::Closing { stow_at }, None);
+            return (Want::Closing { at, stow_at }, None);
         }
-        let scheduled = match self.pods.get(pod).map(|p| p.want) {
-            Some(Want::Closing { stow_at }) => stow_at.min(ceiling),
+        let scheduled = match self.pods.get(pod).map(|p| &p.want) {
+            Some(Want::Closing { stow_at, .. }) => (*stow_at).min(ceiling),
             _ => ceiling,
         };
         (
-            Want::Closing { stow_at: scheduled },
+            Want::Closing {
+                at,
+                stow_at: scheduled,
+            },
             Some(millis_between(now.at, stow_at)),
         )
     }
@@ -505,14 +659,18 @@ impl Scripter {
     /// pod with nothing standing is dropped from the map, so the caller's turn
     /// check finds no turn to match and refuses it before this is called.
     fn reconsider(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
+        // The pose the closing holds is the one the standing want is already at,
+        // so an ending retargets nothing: `reconsider` runs on every further
+        // fact about the turn, and a closing built from the event's own pose
+        // would move the head each time one arrived.
+        //
+        // This is also the one refusal of a want that holds the head nowhere,
+        // `Want::Stowing` included: the stow has been said and is being
+        // confirmed, and a further fact about a turn that is over must not
+        // reopen an ending already in front of the daemon.
+        let at = self.pods.get(pod)?.want.at()?.clone();
         let stow_at = {
             let p = self.pods.get(pod)?;
-            // The stow has been said and is being confirmed. The turn is over
-            // as far as this pod is concerned, and a further fact about it must
-            // not reopen an ending already in front of the daemon.
-            if p.want == Want::Stowing {
-                return None;
-            }
             let end = p.end?;
             let audio = p.audio?;
             if !audio.dispatch_done || audio.awaiting_start > 0 {
@@ -531,13 +689,13 @@ impl Scripter {
                 Some(horizon) => horizon + tail,
                 // Nothing has played. Keep an ending already scheduled rather
                 // than sliding it forward on each further fact.
-                None => match p.want {
-                    Want::Closing { .. } | Want::Stowing => return None,
+                None => match &p.want {
+                    Want::Closing { .. } => return None,
                     _ => now.at + tail,
                 },
             }
         };
-        let (want, clamped) = self.closing(pod, now, stow_at);
+        let (want, clamped) = self.closing(pod, now, at, stow_at);
         self.set(pod, now, want, Cause::Closing, clamped)
     }
 
@@ -573,8 +731,8 @@ impl Scripter {
     /// `stow@0` here means every closing instruction is sent at least twice, so
     /// a single lost message is repaired within one refresh period — and it is
     /// safe when nothing was lost, because a stow-resolving script at a resting
-    /// daemon commands nothing and this script cannot raise a head: it has no
-    /// `up` step, and a wake arriving first replaces the want outright.
+    /// daemon commands nothing and this script cannot raise a head: its only
+    /// step is the stow, and a wake arriving first replaces the want outright.
     ///
     /// A stow that was *already* due when the want was decided — a short answer
     /// whose facts settle after its own audio finished — reaches that branch on
@@ -592,18 +750,24 @@ impl Scripter {
     ) -> Option<ScriptPublish> {
         let refresh = self.timing.refresh;
         let floor_ms = millis(self.timing.max_engaged);
+        let refresh_ms = millis(refresh);
+        let stow_headroom_ms = self.stow_headroom_ms();
+        let stow = self.stow.clone();
         let p = self.pods.get_mut(pod)?;
         // A repair publish is a change whatever the caller thought: it puts a
         // stow in front of a daemon holding a script that has none. Without
         // this the refresh path would publish it and never narrate it.
         let mut change = change;
-        let steps = match p.want.steps(now.at) {
+        // Whether the timeline this publish carries ends at the stow, which is
+        // what decides how much room the timeout keeps past it.
+        let mut stow_terminal = matches!(p.want, Want::Closing { .. });
+        let steps = match p.want.steps(now.at, &stow) {
             Some(steps) => {
                 p.refresh = Some(now.at + refresh);
                 steps
             }
             None => {
-                match p.want {
+                match &p.want {
                     // A stow already due when the want was born: this publish is
                     // its first, so it is owed the second that every other
                     // closing instruction gets from the refresh cadence. One
@@ -620,31 +784,49 @@ impl Scripter {
                         p.refresh = None;
                     }
                     // Nothing was wanted, so there is nothing to confirm.
-                    Want::Quiet | Want::Hold => {
+                    Want::Quiet | Want::Hold { .. } => {
                         p.want = Want::Quiet;
                         p.refresh = None;
                         return None;
                     }
                 }
                 change = true;
-                vec![Step::new(0, Posture::Stow)]
+                stow_terminal = true;
+                vec![stow.step(0)]
             }
         };
         // The timeout is a ceiling on this script's own timeline, so it is the
-        // configured bound or the timeline plus one refresh period, whichever is
+        // configured bound or the timeline plus its headroom, whichever is
         // larger — a stow that outruns the bound takes the timeout with it
         // rather than being executed past a number the message contradicts. The
-        // refresh period is the headroom: a re-emission that lands late still
-        // finds the previous script standing.
+        // headroom is a refresh period, so a re-emission that lands late still
+        // finds the previous script standing; on a timeline ending at the stow
+        // it is the stow's own stated pace when that is longer, so the closing
+        // move fits inside the timeout the daemon measures it against. A hold
+        // script carries no stow, so it keeps the configured bound.
+        let headroom_ms = if stow_terminal {
+            stow_headroom_ms
+        } else {
+            refresh_ms
+        };
         let last_step_ms = steps.last().map_or(0, |step| step.after_ms);
-        let timeout_ms = floor_ms.max(last_step_ms.saturating_add(millis(refresh)));
+        let timeout_ms = floor_ms.max(last_step_ms.saturating_add(headroom_ms));
         let seq = self.seq.next(now.unix_ms);
         // Every refusal is unreachable by construction: the steps ascend from
-        // zero; the timeout exceeds the last step by a refresh period, which
-        // config validation keeps positive; and `Scripter::closing` bounds the
-        // stow so that sum stays inside `MAX_TIMEOUT_MS`, which config
-        // validation also holds `max_engaged` under. The expect states that
-        // rather than pushing an impossible error onto every caller.
+        // zero; the timeout exceeds the last step by the headroom, which is a
+        // refresh period config validation keeps positive, or on a stow-terminal
+        // timeline the stow's own stated pace when that is longer; and
+        // `Scripter::closing` bounds the stow by that same stow-terminal
+        // headroom so the sum stays inside `MAX_TIMEOUT_MS`, which config
+        // validation also holds `max_engaged` under. The headroom covering the
+        // stow pace is also what keeps the daemon's own room check for a
+        // stow-terminal timeline — its last step plus the pace that step
+        // states, against this timeout — satisfied for every script emitted
+        // here. The two refusals a step
+        // carries are screened at the same door: every pose name here is either
+        // `STOW_POSE` or one config validation has already offered to this same
+        // constructor, and every stated pace is one it has bounded. The expect
+        // states that rather than pushing an impossible error onto every caller.
         let script = MotionScript::new(pod.0.clone(), seq, steps, timeout_ms)
             .expect("the scripter's timelines ascend inside a timeout sized to cover them");
         Some(ScriptPublish {
@@ -669,7 +851,7 @@ impl Scripter {
     /// nothing, which is exactly [`Want::Quiet`]: `tidy` turns the one state
     /// into the other, and no caller may tell them apart.
     fn want(&self, pod: &PodId) -> Want {
-        self.pods.get(pod).map_or(Want::Quiet, |p| p.want)
+        self.pods.get(pod).map_or(Want::Quiet, |p| p.want.clone())
     }
 }
 
@@ -1041,7 +1223,7 @@ impl ScriptTask {
         jsonl: JsonlHandle,
     ) -> Self {
         Self {
-            core: Scripter::new(config.script_timing()),
+            core: Scripter::new(config.script_timing(), config.script_raises()),
             rx: inbox.rx,
             sink,
             jsonl,
@@ -1193,12 +1375,30 @@ mod tests {
     const MARGIN: Duration = Duration::from_millis(500);
     const ZERO: Duration = Duration::ZERO;
 
+    /// The pose both presence events take when a configuration names neither,
+    /// which is what every case below that is not about poses runs on: one
+    /// place the head goes for every raise.
+    const NEUTRAL: &str = DEFAULT_PRESENCE_POSE;
+    /// The poses of a deployment that tells its two presence events apart.
+    const PEEK: &str = "peek";
+
     fn timing() -> ScriptTiming {
         ScriptTiming {
             refresh: REFRESH,
             linger: LINGER,
             max_engaged: CEILING,
             stow_margin: MARGIN,
+        }
+    }
+
+    /// The hold want a raise to `pose` at the library's own pace produces, for
+    /// the cases that assert what a pod is being asked for.
+    fn holding(pose: &str) -> Want {
+        Want::Hold {
+            at: Raise {
+                pose: pose.into(),
+                move_ms: None,
+            },
         }
     }
 
@@ -1241,11 +1441,27 @@ mod tests {
         fixture_with(timing())
     }
 
+    /// A scripter whose wake and turn poses differ, as the acceptance
+    /// deployment's do: peek to listen, neutral to answer.
+    fn two_pose_fixture() -> Fx {
+        Fx {
+            scripter: Scripter::new(
+                timing(),
+                ScriptRaises {
+                    wake: Raise::to(PEEK),
+                    turn: Raise::to(NEUTRAL),
+                    ..ScriptRaises::default()
+                },
+            ),
+            t0: Instant::now(),
+        }
+    }
+
     /// The same, on timings a test chooses — for the ones about what the
     /// configuration's own admitted extremes do to the arithmetic.
     fn fixture_with(timing: ScriptTiming) -> Fx {
         Fx {
-            scripter: Scripter::new(timing),
+            scripter: Scripter::new(timing, ScriptRaises::default()),
             t0: Instant::now(),
         }
     }
@@ -1293,24 +1509,55 @@ mod tests {
         }
     }
 
-    /// The posture a scripter-built step names. The scripter emits base
-    /// posture steps and nothing else, so anything else here is a bug in the
-    /// test rather than a case to handle.
-    fn posture_of(step: &Step) -> Posture {
+    /// The pose a scripter-built step names. The scripter emits base steps and
+    /// nothing else, so anything else here is a bug in the test rather than a
+    /// case to handle.
+    fn pose_of(step: &Step) -> &str {
         step.action
             .base()
-            .and_then(motion_proto::Base::posture)
-            .expect("the scripter emits posture steps")
+            .and_then(motion_proto::Base::pose)
+            .expect("the scripter emits base steps naming a pose")
     }
 
-    /// The steps of a script, as (offset, posture) pairs.
-    fn steps(publish: &ScriptPublish) -> Vec<(u64, Posture)> {
+    /// The steps of a script, as (offset, pose) pairs.
+    fn steps(publish: &ScriptPublish) -> Vec<(u64, &str)> {
         publish
             .script
             .steps()
             .iter()
-            .map(|step| (step.after_ms, posture_of(step)))
+            .map(|step| (step.after_ms, pose_of(step)))
             .collect()
+    }
+
+    /// The steps of a script, as (offset, pose, stated pace) triples, for the
+    /// cases that are about the pace a step carries.
+    fn paced(publish: &ScriptPublish) -> Vec<(u64, &str, Option<u64>)> {
+        publish
+            .script
+            .steps()
+            .iter()
+            .map(|step| {
+                let base = step.action.base().expect("a base step");
+                (step.after_ms, pose_of(step), base.move_ms())
+            })
+            .collect()
+    }
+
+    /// The room the daemon measures a stow-terminal script by: its last step
+    /// plus the pace that step states, against the timeout the script carries.
+    ///
+    /// Restated here because the compiler that applies it is in the other
+    /// repository, behind a published pin: what this side can hold is the
+    /// arithmetic, on the scripts it actually builds.
+    fn stow_fits(publish: &ScriptPublish) -> bool {
+        let last = publish.script.steps().last().expect("a step");
+        let pace = last
+            .action
+            .base()
+            .expect("a base step")
+            .move_ms()
+            .unwrap_or(0);
+        last.after_ms + pace <= publish.script.timeout_ms()
     }
 
     /// The offset of a script's stow step.
@@ -1319,7 +1566,7 @@ mod tests {
             .script
             .steps()
             .iter()
-            .find(|step| posture_of(step) == Posture::Stow)
+            .find(|step| pose_of(step) == STOW_POSE)
             .expect("a closing script stows")
             .after_ms
     }
@@ -1330,7 +1577,7 @@ mod tests {
     fn a_wake_holds_the_head_up_under_the_ceiling() {
         let mut fx = fixture();
         let publish = fx.publish(ScriptInput::Wake(pod()), ZERO);
-        assert_eq!(steps(&publish), vec![(0, Posture::Up)]);
+        assert_eq!(steps(&publish), vec![(0, NEUTRAL)]);
         assert_eq!(publish.script.pod(), "pod-kitchen");
         assert_eq!(publish.script.timeout_ms(), 30_000);
         assert_eq!(publish.cause, Cause::Wake);
@@ -1345,7 +1592,7 @@ mod tests {
         let mut fx = fixture();
         let barge = fx.publish(ScriptInput::Barge(pod()), ZERO);
         assert_eq!(barge.cause, Cause::Barge);
-        assert_eq!(steps(&barge), vec![(0, Posture::Up)]);
+        assert_eq!(steps(&barge), vec![(0, NEUTRAL)]);
         assert!(
             fx.apply(
                 ScriptInput::TurnStarted {
@@ -1367,7 +1614,172 @@ mod tests {
             ZERO,
         );
         assert_eq!(turn.cause, Cause::Turn);
-        assert_eq!(steps(&turn), vec![(0, Posture::Up)]);
+        assert_eq!(steps(&turn), vec![(0, NEUTRAL)]);
+    }
+
+    /// The sequence a person sees on a deployment whose two presence events
+    /// name different poses: peek to listen, neutral to answer, and the base
+    /// retargeting mid-hold when the utterance is dispatched.
+    #[test]
+    fn a_wake_peeks_and_the_dispatched_utterance_answers() {
+        let mut fx = two_pose_fixture();
+        let wake = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        assert_eq!(steps(&wake), vec![(0, PEEK)]);
+        let turn = fx.publish(
+            ScriptInput::TurnStarted {
+                pod: pod(),
+                turn: TURN,
+            },
+            ZERO,
+        );
+        assert_eq!(steps(&turn), vec![(0, NEUTRAL)], "the base retargets");
+        assert_eq!(turn.cause, Cause::Turn);
+        assert!(turn.change, "a hold whose pose changed is a new script");
+    }
+
+    /// Every listening event takes the wake pose, whatever the head was doing:
+    /// a barge over live playback, and a second wake mid-conversation. Each is
+    /// a change when the head was answering, and each is followed by the turn
+    /// pose when an utterance is dispatched.
+    #[test]
+    fn a_barge_and_a_second_wake_both_peek_again() {
+        for listening in [ScriptInput::Barge(pod()), ScriptInput::Wake(pod())] {
+            let mut fx = two_pose_fixture();
+            fx.wake_and_dispatch(ZERO);
+            assert_eq!(fx.want(), holding(NEUTRAL), "answering");
+
+            let again = fx.publish(listening.clone(), ZERO);
+            assert_eq!(steps(&again), vec![(0, PEEK)], "{listening:?}");
+            let turn = fx.publish(
+                ScriptInput::TurnStarted {
+                    pod: pod(),
+                    turn: UtteranceId(8),
+                },
+                ZERO,
+            );
+            assert_eq!(steps(&turn), vec![(0, NEUTRAL)], "{listening:?}");
+        }
+    }
+
+    /// A raise to the pose the head is already at says nothing: the same event
+    /// always produces the same pose, so a wake over a peek is the standing
+    /// script and the refresh cadence carries it.
+    #[test]
+    fn a_raise_to_the_standing_pose_publishes_nothing() {
+        let mut fx = two_pose_fixture();
+        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        assert!(
+            fx.apply(ScriptInput::Barge(pod()), ZERO).is_none(),
+            "already peeking"
+        );
+        assert!(
+            fx.apply(ScriptInput::Wake(pod()), ZERO).is_none(),
+            "still peeking"
+        );
+    }
+
+    /// A closing script holds the pose the head is at, and never retargets: an
+    /// unanswered peek folds from the peek, and a closed turn from the pose the
+    /// dispatch put the head at.
+    #[test]
+    fn a_closing_script_keeps_the_pose_the_hold_carried() {
+        let mut fx = two_pose_fixture();
+        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        let unanswered = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
+        assert_eq!(steps(&unanswered), vec![(0, PEEK), (8_000, STOW_POSE)]);
+
+        let mut answered = two_pose_fixture();
+        answered.wake_and_dispatch(ZERO);
+        answered.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        let closing = answered.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(answered.t0 + Duration::from_secs(6))),
+            },
+            ZERO,
+        );
+        assert_eq!(steps(&closing), vec![(0, NEUTRAL), (6_500, STOW_POSE)]);
+    }
+
+    /// A configured pace is stated on the wire per step, and each of the three
+    /// reaches the step it paces. A pace nobody configured states nothing and
+    /// leaves the move at the library's own.
+    #[test]
+    fn a_configured_pace_is_stated_on_the_step_it_paces() {
+        let mut fx = Fx {
+            scripter: Scripter::new(
+                timing(),
+                ScriptRaises {
+                    wake: Raise {
+                        pose: PEEK.into(),
+                        move_ms: Some(600),
+                    },
+                    turn: Raise {
+                        pose: NEUTRAL.into(),
+                        move_ms: Some(900),
+                    },
+                    stow: Raise {
+                        pose: STOW_POSE.into(),
+                        move_ms: Some(1_500),
+                    },
+                },
+            ),
+            t0: Instant::now(),
+        };
+        let wake = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        assert_eq!(paced(&wake), vec![(0, PEEK, Some(600))]);
+        let turn = fx.publish(
+            ScriptInput::TurnStarted {
+                pod: pod(),
+                turn: TURN,
+            },
+            ZERO,
+        );
+        assert_eq!(paced(&turn), vec![(0, NEUTRAL, Some(900))]);
+        let closing = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
+        assert_eq!(
+            paced(&closing),
+            vec![(0, NEUTRAL, Some(900)), (8_000, STOW_POSE, Some(1_500))],
+            "the closing keeps the hold's pace and states the stow's"
+        );
+
+        let mut unpaced = fixture();
+        let wake = unpaced.publish(ScriptInput::Wake(pod()), ZERO);
+        assert_eq!(paced(&wake), vec![(0, NEUTRAL, None)], "the library's pace");
+    }
+
+    /// The confirming stow — the one the overdue branch emits — is the
+    /// scripter's own stow step and carries the configured stow pace too.
+    #[test]
+    fn the_confirming_stow_states_the_configured_stow_pace() {
+        let mut fx = Fx {
+            scripter: Scripter::new(
+                timing(),
+                ScriptRaises {
+                    stow: Raise {
+                        pose: STOW_POSE.into(),
+                        move_ms: Some(1_200),
+                    },
+                    ..ScriptRaises::default()
+                },
+            ),
+            t0: Instant::now(),
+        };
+        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.publish(ScriptInput::Unanswered(pod()), ZERO);
+        let confirming = fx.tick(LINGER);
+        assert_eq!(
+            confirming.iter().map(paced).collect::<Vec<_>>(),
+            vec![vec![(0, STOW_POSE, Some(1_200))]]
+        );
     }
 
     /// A raise that produced no turn comes down at the linger.
@@ -1376,10 +1788,7 @@ mod tests {
         let mut fx = fixture();
         fx.publish(ScriptInput::Wake(pod()), ZERO);
         let publish = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
-        assert_eq!(
-            steps(&publish),
-            vec![(0, Posture::Up), (8_000, Posture::Stow)]
-        );
+        assert_eq!(steps(&publish), vec![(0, NEUTRAL), (8_000, STOW_POSE)]);
         assert_eq!(publish.cause, Cause::Unanswered);
         assert!(publish.change);
     }
@@ -1407,10 +1816,7 @@ mod tests {
             },
             ZERO,
         );
-        assert_eq!(
-            steps(&publish),
-            vec![(0, Posture::Up), (6_740, Posture::Stow)]
-        );
+        assert_eq!(steps(&publish), vec![(0, NEUTRAL), (6_740, STOW_POSE)]);
         assert_eq!(publish.cause, Cause::Closing);
         assert_eq!(publish.script.timeout_ms(), 30_000);
     }
@@ -1469,9 +1875,10 @@ mod tests {
         assert_eq!(stow_ms(&refreshed[0]), 0);
     }
 
-    /// The shipped timings and the compiled-in ones are the same four numbers:
-    /// a `[brenn]` table that names none of the `presence_*_ms` keys measures
-    /// the head exactly as [`ScriptTiming::default`] does.
+    /// The shipped presence settings and the compiled-in ones agree: a
+    /// `[brenn]` table that names none of the presence keys measures the head
+    /// exactly as [`ScriptTiming::default`] does and puts it exactly where
+    /// [`ScriptRaises::default`] does.
     #[test]
     fn the_default_timing_is_the_configured_default() {
         let brenn: BrennConfig = toml::from_str(
@@ -1483,6 +1890,12 @@ mod tests {
         )
         .expect("a [brenn] table naming none of the presence keys");
         assert_eq!(brenn.script_timing(), ScriptTiming::default());
+        assert_eq!(brenn.script_raises(), ScriptRaises::default());
+        assert_eq!(
+            ScriptRaises::default().wake,
+            ScriptRaises::default().turn,
+            "a deployment that names no pose does not tell its two events apart"
+        );
     }
 
     /// A turn that asked to keep listening holds the `<listen/>` window open
@@ -1549,6 +1962,10 @@ mod tests {
             assert_eq!(
                 fx.want(),
                 Want::Closing {
+                    at: Raise {
+                        pose: NEUTRAL.into(),
+                        move_ms: None,
+                    },
                     stow_at: fx.t0 + horizon + MARGIN
                 }
             );
@@ -1580,7 +1997,7 @@ mod tests {
             )
             .is_none()
         );
-        assert_eq!(fx.want(), Want::Hold);
+        assert_eq!(fx.want(), holding(NEUTRAL));
     }
 
     /// A cmd that dies in synthesis resolves without ever starting, and that
@@ -1763,7 +2180,7 @@ mod tests {
         // it.
         let repair = fx.tick(REFRESH);
         assert_eq!(repair.len(), 1, "the stow is confirmed: {repair:?}");
-        assert_eq!(steps(&repair[0]), vec![(0, Posture::Stow)]);
+        assert_eq!(steps(&repair[0]), vec![(0, STOW_POSE)]);
         assert_eq!(repair[0].cause, Cause::Refresh);
         assert!(
             repair[0].change,
@@ -1799,7 +2216,7 @@ mod tests {
         for round in 1..=4 {
             let out = fx.tick(REFRESH * round);
             assert_eq!(out.len(), 1, "round {round}");
-            assert_eq!(steps(&out[0]), vec![(0, Posture::Up)]);
+            assert_eq!(steps(&out[0]), vec![(0, NEUTRAL)]);
             assert_eq!(out[0].cause, Cause::Refresh);
             assert!(out[0].script.seq() > last);
             last = out[0].script.seq();
@@ -1836,7 +2253,11 @@ mod tests {
                 "the turn was cut"
             );
         }
-        assert_eq!(fx.want(), Want::Hold, "the barge's hold script governs");
+        assert_eq!(
+            fx.want(),
+            holding(NEUTRAL),
+            "the barge's hold script governs"
+        );
     }
 
     /// A wake starting a fresh interaction does the same for the previous turn's
@@ -1862,7 +2283,7 @@ mod tests {
             ZERO,
         );
         let raise = fx.publish(ScriptInput::Wake(pod()), Duration::from_secs(1));
-        assert_eq!(steps(&raise), vec![(0, Posture::Up)], "back to a hold");
+        assert_eq!(steps(&raise), vec![(0, NEUTRAL)], "back to a hold");
         assert!(
             fx.apply(
                 ScriptInput::Audio {
@@ -1874,7 +2295,7 @@ mod tests {
             )
             .is_none()
         );
-        assert_eq!(fx.want(), Want::Hold);
+        assert_eq!(fx.want(), holding(NEUTRAL));
     }
 
     /// A second utterance in the same exchange — the `<listen/>` case, with no
@@ -1917,7 +2338,7 @@ mod tests {
             .is_none(),
             "this turn's brain has not said how it ends"
         );
-        assert_eq!(fx.want(), Want::Hold);
+        assert_eq!(fx.want(), holding(NEUTRAL));
     }
 
     /// Two pods are two interactions. Each carries its own timeline, and the
@@ -1955,7 +2376,7 @@ mod tests {
         assert_eq!(then[0].pod, other);
 
         fx.publish(ScriptInput::Unanswered(pod()), Duration::from_secs(6));
-        assert_eq!(fx.scripter.want(&other), Want::Hold, "untouched");
+        assert_eq!(fx.scripter.want(&other), holding(NEUTRAL), "untouched");
     }
 
     /// The three closing facts can complete after the stow they schedule was
@@ -2010,7 +2431,7 @@ mod tests {
             },
             late,
         );
-        assert_eq!(steps(&publish), vec![(0, Posture::Stow)]);
+        assert_eq!(steps(&publish), vec![(0, STOW_POSE)]);
         assert_eq!(publish.cause, Cause::Closing);
         assert!(publish.change);
 
@@ -2020,7 +2441,7 @@ mod tests {
         assert_eq!(fx.scripter.deadline(), Some(fx.t0 + late + REFRESH));
         let again = fx.tick(late + REFRESH);
         assert_eq!(again.len(), 1, "the stow was said once only: {again:?}");
-        assert_eq!(steps(&again[0]), vec![(0, Posture::Stow)]);
+        assert_eq!(steps(&again[0]), vec![(0, STOW_POSE)]);
         assert!(
             again[0].change,
             "a stow the daemon may not have is a change"
@@ -2065,12 +2486,12 @@ mod tests {
 
         let raised = fx.publish(ScriptInput::Wake(pod()), late + Duration::from_millis(1));
 
-        assert_eq!(steps(&raised), vec![(0, Posture::Up)]);
-        assert_eq!(fx.want(), Want::Hold);
+        assert_eq!(steps(&raised), vec![(0, NEUTRAL)]);
+        assert_eq!(fx.want(), holding(NEUTRAL));
         assert!(
             fx.tick(late + REFRESH)
                 .iter()
-                .all(|out| steps(out) == vec![(0, Posture::Up)]),
+                .all(|out| steps(out) == vec![(0, NEUTRAL)]),
             "the head was put back down under a live interaction"
         );
     }
@@ -2129,16 +2550,94 @@ mod tests {
             },
             ZERO,
         );
-        assert_eq!(
-            steps(&publish),
-            vec![(0, Posture::Up), (40_500, Posture::Stow)]
-        );
+        assert_eq!(steps(&publish), vec![(0, NEUTRAL), (40_500, STOW_POSE)]);
         assert_eq!(
             publish.script.timeout_ms(),
             45_500,
             "the timeline plus a refresh period, not the configured floor"
         );
         assert!(publish.clamped_from_ms.is_none(), "well inside the ceiling");
+    }
+
+    /// A stow paced past both the refresh period and the engagement ceiling
+    /// still fits inside the timeout of every script that carries it.
+    ///
+    /// The daemon measures a stow-terminal timeline as its last step plus the
+    /// pace that step states, and refuses a script whose timeout is shorter.
+    /// `presence_stow_move_ms` is admitted up to the protocol's own ceiling, so
+    /// the headroom the timeout keeps is the refresh period or that pace,
+    /// whichever is longer — otherwise a configuration in the admitted range
+    /// produces closings the daemon throws away and a head that only ever comes
+    /// down on the timeout's compiled-in stow.
+    ///
+    /// The hold script in the same run carries no stow, so it keeps the
+    /// configured engagement ceiling: the room a stow needs is not charged to a
+    /// timeline without one, where it would only lengthen how long a head stays
+    /// up after the host goes quiet.
+    #[test]
+    fn a_stow_paced_past_the_ceiling_still_fits_inside_its_own_timeout() {
+        const PACE_MS: u64 = 45_000;
+        let mut fx = Fx {
+            scripter: Scripter::new(
+                timing(),
+                ScriptRaises {
+                    stow: Raise {
+                        pose: STOW_POSE.into(),
+                        move_ms: Some(PACE_MS),
+                    },
+                    ..ScriptRaises::default()
+                },
+            ),
+            t0: Instant::now(),
+        };
+        let hold = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        assert_eq!(paced(&hold), vec![(0, NEUTRAL, None)]);
+        assert_eq!(
+            hold.script.timeout_ms(),
+            millis(CEILING),
+            "a hold script carries no stow, so the stow's pace is not its room",
+        );
+        fx.apply(
+            ScriptInput::TurnStarted {
+                pod: pod(),
+                turn: TURN,
+            },
+            ZERO,
+        );
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        let closing = fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0 + Duration::from_secs(40))),
+            },
+            ZERO,
+        );
+        assert_eq!(
+            paced(&closing),
+            vec![(0, NEUTRAL, None), (40_500, STOW_POSE, Some(PACE_MS))],
+        );
+        assert_eq!(
+            closing.script.timeout_ms(),
+            40_500 + PACE_MS,
+            "the timeline plus the pace its own last step states",
+        );
+        assert!(stow_fits(&closing), "{closing:?}");
+
+        // The confirming stow, whose whole timeline is the paced move.
+        let confirming = fx.tick(Duration::from_secs(41));
+        let [confirming] = confirming.as_slice() else {
+            panic!("the stow is confirmed once: {confirming:?}");
+        };
+        assert_eq!(paced(confirming), vec![(0, STOW_POSE, Some(PACE_MS))]);
+        assert!(stow_fits(confirming), "{confirming:?}");
     }
 
     /// The ordinary turn is untouched by the sizing rule: its stow is well
@@ -2366,12 +2865,12 @@ mod tests {
         );
         // The stow is due at 2.5 s; the wake lands at 3 s, before the refresh.
         let raise = fx.publish(ScriptInput::Wake(pod()), Duration::from_secs(3));
-        assert_eq!(steps(&raise), vec![(0, Posture::Up)]);
+        assert_eq!(steps(&raise), vec![(0, NEUTRAL)]);
 
         let due = fx.tick(REFRESH + Duration::from_secs(3));
         assert_eq!(due.len(), 1, "the hold's own re-emission: {due:?}");
-        assert_eq!(steps(&due[0]), vec![(0, Posture::Up)], "no stow went out");
-        assert_eq!(fx.want(), Want::Hold);
+        assert_eq!(steps(&due[0]), vec![(0, NEUTRAL)], "no stow went out");
+        assert_eq!(fx.want(), holding(NEUTRAL));
     }
 
     /// Sequence numbers are the wall clock, so a restarted scripter resumes
@@ -2385,7 +2884,7 @@ mod tests {
         let second = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
         assert_eq!(second.script.seq(), 1_786_543_210_124, "same millisecond");
 
-        let mut restarted = Scripter::new(timing());
+        let mut restarted = Scripter::new(timing(), ScriptRaises::default());
         let after = restarted
             .apply(
                 ScriptInput::Wake(pod()),
@@ -2566,14 +3065,14 @@ mod tests {
         let body = body_of(&published);
         assert_eq!(body["type"], "motion-script");
         assert_eq!(body["pod"], "pod-kitchen");
-        assert_eq!(body["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(body["steps"], json!([{ "after_ms": 0, "pose": NEUTRAL }]));
         assert_eq!(body["timeout_ms"], 30_000);
 
         let line = expect_line(&fx.path, "motion_script").await;
         assert_eq!(line["pod"], "pod-kitchen");
         assert_eq!(line["cause"], "wake");
         assert_eq!(line["timeout_ms"], 30_000);
-        assert_eq!(line["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(line["steps"], json!([{ "after_ms": 0, "pose": NEUTRAL }]));
         assert_eq!(line["seq"], body["seq"]);
         fx.stop().await;
     }
@@ -2625,7 +3124,7 @@ mod tests {
             turn: TURN,
         });
         let hold = body_of(&peer.answer_publish("Ok").await);
-        assert_eq!(hold["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(hold["steps"], json!([{ "after_ms": 0, "pose": NEUTRAL }]));
 
         fx.send(ScriptInput::TurnEnded {
             pod: pod(),
@@ -2640,8 +3139,8 @@ mod tests {
         let closing = body_of(&peer.answer_publish("Ok").await);
         let steps = closing["steps"].as_array().expect("a timeline").clone();
         assert_eq!(steps.len(), 2, "{closing}");
-        assert_eq!(steps[0], json!({ "after_ms": 0, "posture": "up" }));
-        assert_eq!(steps[1]["posture"], "stow");
+        assert_eq!(steps[0], json!({ "after_ms": 0, "pose": NEUTRAL }));
+        assert_eq!(steps[1]["pose"], "stow");
         let stow_ms = steps[1]["after_ms"].as_u64().expect("an offset");
         // Six seconds of audio plus the shipped 500 ms margin, less however long
         // the two facts took to cross the queue.
@@ -2680,7 +3179,7 @@ mod tests {
             turn: TURN,
         });
         let hold = body_of(&peer.answer_publish("Ok").await);
-        assert_eq!(hold["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(hold["steps"], json!([{ "after_ms": 0, "pose": NEUTRAL }]));
 
         // A silent turn: the stow is the 500 ms margin alone, a dozen refresh
         // periods out, so the re-emissions walk it down to zero.
@@ -2695,7 +3194,7 @@ mod tests {
             audio: audio(true, 0, 0, None),
         });
 
-        let confirming = json!([{ "after_ms": 0, "posture": "stow" }]);
+        let confirming = json!([{ "after_ms": 0, "pose": STOW_POSE }]);
         let mut walked = 0;
         let stow = loop {
             let body = body_of(&peer.answer_publish("Ok").await);
@@ -2889,7 +3388,7 @@ mod tests {
         }));
         let next = body_of(&peer.answer_publish("Ok").await);
         assert_eq!(next["seq"].as_u64(), Some(newest));
-        assert_eq!(next["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(next["steps"], json!([{ "after_ms": 0, "pose": NEUTRAL }]));
 
         fx.stop_and_flush().await;
         assert!(
@@ -2947,7 +3446,7 @@ mod tests {
             turn: TURN,
         });
         let hold = body_of(&peer.answer_publish("Ok").await);
-        assert_eq!(hold["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(hold["steps"], json!([{ "after_ms": 0, "pose": NEUTRAL }]));
 
         // A silent turn: nothing played, so the ending is the margin alone —
         // 500 ms, a tenth of the 5 s refresh.
@@ -2963,7 +3462,7 @@ mod tests {
         });
         let closing = body_of(&peer.answer_publish("Failed").await);
         let stow = closing["steps"][1].clone();
-        assert_eq!(stow["posture"], "stow");
+        assert_eq!(stow["pose"], "stow");
         assert!(
             stow["after_ms"].as_u64().expect("an offset") <= 500,
             "the stow is due long before a refresh: {closing}"
@@ -3134,7 +3633,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&out.body).expect("the body is JSON");
         assert_eq!(body["type"], "motion-script");
         assert_eq!(body["pod"], "pod-kitchen");
-        assert_eq!(body["steps"], json!([{ "after_ms": 0, "posture": "up" }]));
+        assert_eq!(body["steps"], json!([{ "after_ms": 0, "pose": NEUTRAL }]));
         assert_eq!(body["timeout_ms"], 30_000);
         assert_eq!(out.pod, "pod-kitchen");
         assert_eq!(body["seq"].as_u64(), Some(out.seq));
@@ -3168,8 +3667,8 @@ mod tests {
         assert_eq!(
             closing["steps"],
             json!([
-                { "after_ms": 0, "posture": "up" },
-                { "after_ms": 8_000, "posture": "stow" },
+                { "after_ms": 0, "pose": NEUTRAL },
+                { "after_ms": 8_000, "pose": STOW_POSE },
             ]),
             "the second script is the close, not a re-render of the raise"
         );

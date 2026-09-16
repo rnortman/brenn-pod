@@ -2341,7 +2341,7 @@ mod tests {
     /// wait out the hold script's timeout instead.
     #[tokio::test]
     async fn a_turn_the_router_gave_up_on_still_gets_its_closing_script() {
-        use crate::scripter::{Cause, Now, ScriptTiming, Scripter};
+        use crate::scripter::{Cause, Now, ScriptRaises, ScriptTiming, Scripter};
         use speech_pipeline::TurnEnd;
         use std::time::Duration;
 
@@ -2352,7 +2352,7 @@ mod tests {
             stow_margin: Duration::from_millis(500),
         };
         for shape in GIVE_UP_SHAPES {
-            let mut scripter = Scripter::new(timing);
+            let mut scripter = Scripter::new(timing, ScriptRaises::default());
             let pod = PodId("pod-x".into());
             scripter.apply(
                 ScriptInput::TurnStarted {
@@ -2376,10 +2376,14 @@ mod tests {
             let publish = closing.unwrap_or_else(|| panic!("{shape:?} scheduled no ending"));
             assert_eq!(publish.cause, Cause::Closing, "{shape:?}");
             let steps = publish.script.steps();
-            assert_eq!(steps.len(), 2, "{shape:?}: up now, down at the margin");
             assert_eq!(
-                steps[1].action.base().and_then(motion_proto::Base::posture),
-                Some(motion_proto::Posture::Stow),
+                steps.len(),
+                2,
+                "{shape:?}: the pose now, down at the margin"
+            );
+            assert_eq!(
+                steps[1].action.base().and_then(motion_proto::Base::pose),
+                Some(motion_proto::STOW_POSE),
                 "{shape:?}"
             );
             assert_eq!(

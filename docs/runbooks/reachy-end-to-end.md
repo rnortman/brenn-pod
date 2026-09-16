@@ -310,10 +310,17 @@ whichever `speech-surface` config the daemon is actually started with (`SPEECH_C
 | `presence_linger_ms` | `[brenn]` | 8000 | How long the head stays up after a turn that asked to keep listening, and after a wake that produced no turn at all |
 | `presence_max_engaged_ms` | `[brenn]` | 30000 | The floor under the timeout every script carries: the daemon stows this long after receipt whatever else happens. The bound that matters while the brain is still thinking. A turn whose speech reaches further carries a timeout sized from its own timeline instead — a script's timeout is a ceiling on that timeline, never shorter than it. Capped at 600000 (the protocol's own ceiling); a config past that is refused at startup |
 | `presence_stow_margin_ms` | `[brenn]` | 500 | How long after the estimated end of the speech the head starts down. Absorbs playback jitter |
+| `presence_wake_pose` | `[brenn]` | `neutral` | The pose the head takes on a wake word and on a barge: what listening looks like. A name in the daemon's pose library; one no library holds is refused there, and named by `reachy_host --check` in the preflight |
+| `presence_turn_pose` | `[brenn]` | `neutral` | The pose the head takes when an utterance goes to the brain: what answering looks like. Same as the wake pose means the two events look alike and the head does not move between them |
+| `presence_wake_move_ms` | `[brenn]` | unset | How long the move to `presence_wake_pose` takes. Unset leaves it to the library's own pace for that pose. Capped at 600000, the protocol's ceiling |
+| `presence_turn_move_ms` | `[brenn]` | unset | The same for the move to `presence_turn_pose` |
+| `presence_stow_move_ms` | `[brenn]` | unset | The same for every stow step the scripter emits. The daemon's own stows — the one its compiler appends, the one its fault ladder commands — take the library's pace and never read this |
 
-**The head's timings** are brenn-reachy's — the machine's own file and the motion stack's
-configuration, both authored and pushed from that clone. They are documented there,
-because a second copy of a duration is a copy that goes stale.
+Where the head's poses are, and how fast the head goes to one when nobody says, are
+brenn-reachy's: authored in the pose documents and pushed from that clone. How fast the
+*scripter's* raise, turn and stow go is a speech-configuration key above — a command this
+side puts on the wire, not a copy of a duration held elsewhere; absent, the library's own
+pace applies.
 
 ## When it does not work
 

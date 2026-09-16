@@ -930,6 +930,30 @@ pub struct BrennConfig {
     /// steps have to be at different instants.
     #[serde(default = "default_presence_stow_margin_ms")]
     pub presence_stow_margin_ms: u64,
+    /// The pose the head takes on a wake word and on a barge: what *listening*
+    /// looks like. A name in the daemon's pose library, which this side cannot
+    /// resolve — it validates only wire constraints. Must be non-empty, no
+    /// longer than an asset name, and not the reserved `keep`.
+    #[serde(default = "default_presence_wake_pose")]
+    pub presence_wake_pose: String,
+    /// The pose the head takes when an utterance goes to the brain: what
+    /// *answering* looks like. Same library and same rules as
+    /// [`BrennConfig::presence_wake_pose`]; equal to it means the two events
+    /// look alike and the head does not move between them.
+    #[serde(default = "default_presence_turn_pose")]
+    pub presence_turn_pose: String,
+    /// How long the move to [`BrennConfig::presence_wake_pose`] takes. Absent
+    /// leaves the pace to the library's own for that pose. Must be greater
+    /// than zero and no larger than the protocol's timeout ceiling.
+    #[serde(default)]
+    pub presence_wake_move_ms: Option<u64>,
+    /// The same for the move to [`BrennConfig::presence_turn_pose`].
+    #[serde(default)]
+    pub presence_turn_move_ms: Option<u64>,
+    /// The same for every stow step this scripter emits. Scoped to the
+    /// scripter's own endings only.
+    #[serde(default)]
+    pub presence_stow_move_ms: Option<u64>,
     /// How long a turn waits for the first response message after its utterance
     /// is published. Must be greater than zero.
     #[serde(default = "default_brenn_response_timeout_ms")]
@@ -1035,7 +1059,61 @@ impl BrennConfig {
                 ));
             }
         }
+        // A raise is a pose and a pace, and the step the scripter emits carries
+        // both: the pose the daemon resolves against its deployed library, which
+        // nothing here can do, and the pace as a `move_ms` on the wire. What
+        // this side can say is whether a script may carry the step at all — an
+        // empty name, one past the asset-name bound, the reserved `keep`, a pace
+        // of zero or one past the protocol's ceiling — and it asks the wire's
+        // own door with the step the scripter will build rather than restating
+        // either rule: the copies would sit in two repositories across a
+        // published pin, and a value this side admits but the wire rejects
+        // reaches an `expect` in `Scripter::emit` rather than an operator.
+        let raises = self.script_raises();
+        for (keys, raise) in [
+            (
+                &["presence_wake_pose", "presence_wake_move_ms"][..],
+                &raises.wake,
+            ),
+            (
+                &["presence_turn_pose", "presence_turn_move_ms"][..],
+                &raises.turn,
+            ),
+            (&["presence_stow_move_ms"][..], &raises.stow),
+        ] {
+            if let Err(refusal) = motion_proto::MotionScript::new(
+                "",
+                0,
+                vec![raise.step(0)],
+                motion_proto::MAX_TIMEOUT_MS,
+            ) {
+                let named: Vec<String> = keys.iter().map(|key| format!("brenn.{key}")).collect();
+                return Err(format!(
+                    "{} state a raise to {:?} that no motion script may carry: {refusal}",
+                    named.join(" and "),
+                    raise.pose,
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The three moves the scripter asks for: each pose with its own pace.
+    pub fn script_raises(&self) -> crate::scripter::ScriptRaises {
+        crate::scripter::ScriptRaises {
+            wake: crate::scripter::Raise {
+                pose: self.presence_wake_pose.as_str().into(),
+                move_ms: self.presence_wake_move_ms,
+            },
+            turn: crate::scripter::Raise {
+                pose: self.presence_turn_pose.as_str().into(),
+                move_ms: self.presence_turn_move_ms,
+            },
+            stow: crate::scripter::Raise {
+                pose: motion_proto::STOW_POSE.into(),
+                move_ms: self.presence_stow_move_ms,
+            },
+        }
     }
 
     /// The presence timings as the scripter measures them.
@@ -1481,6 +1559,14 @@ pub(crate) fn default_presence_max_engaged_ms() -> u64 {
 // enough that the stow reads as a response to the speech ending.
 pub(crate) fn default_presence_stow_margin_ms() -> u64 {
     500
+}
+// Both events take the pose every deployment's library holds, so a config that
+// names neither puts the head in one place for every raise.
+pub(crate) fn default_presence_wake_pose() -> String {
+    crate::scripter::DEFAULT_PRESENCE_POSE.to_string()
+}
+pub(crate) fn default_presence_turn_pose() -> String {
+    crate::scripter::DEFAULT_PRESENCE_POSE.to_string()
 }
 // Apologetic, short, and content-free: it is spoken when the bus failed, so it
 // must not imply the request was understood.
@@ -2909,6 +2995,127 @@ max_backoff_ms = 9000
         .expect("parse")
         .validate()
         .expect("the ceiling is a bound, not a limit to stay under");
+    }
+
+    /// A stated pace is a `move_ms` on the wire and takes the same bounds the
+    /// protocol puts on one; absent states nothing and is always lawful.
+    #[test]
+    fn brenn_rejects_a_move_pace_of_zero_or_past_the_protocol_ceiling() {
+        let past = motion_proto::MAX_TIMEOUT_MS + 1;
+        for key in [
+            "presence_wake_move_ms",
+            "presence_turn_move_ms",
+            "presence_stow_move_ms",
+        ] {
+            for value in ["0".to_string(), past.to_string()] {
+                let err = Config::parse(&with_addr(&brenn_table(&format!("{key} = {value}"))))
+                    .expect("parse")
+                    .validate()
+                    .unwrap_err();
+                assert!(err.contains(key), "expected {key} in message: {err}");
+            }
+            // The ceiling itself is a lawful pace, and so is saying nothing.
+            Config::parse(&with_addr(&format!(
+                "{}{}",
+                brenn_mode_tables(),
+                brenn_table(&format!("{key} = {}", motion_proto::MAX_TIMEOUT_MS))
+            )))
+            .expect("parse")
+            .validate()
+            .expect("the ceiling is a bound, not a limit to stay under");
+        }
+        let quiet = Config::parse(&with_addr(&format!(
+            "{}{}",
+            brenn_mode_tables(),
+            brenn_table("")
+        )))
+        .expect("parse")
+        .brenn
+        .expect("a [brenn] table");
+        assert_eq!(quiet.script_raises().wake.move_ms, None);
+        assert_eq!(quiet.script_raises().turn.move_ms, None);
+        assert_eq!(quiet.script_raises().stow.move_ms, None);
+    }
+
+    /// Pose and pace are screened as the one step the scripter emits, so a
+    /// refusal names the pair that produced it and no rule about how the two go
+    /// together can be admitted here and rejected on the wire.
+    #[test]
+    fn brenn_screens_each_raise_as_the_step_the_scripter_emits() {
+        let err = Config::parse(&with_addr(&brenn_table(
+            "presence_wake_pose = \"peek\"\npresence_wake_move_ms = 0",
+        )))
+        .expect("parse")
+        .validate()
+        .unwrap_err();
+        for named in ["presence_wake_pose", "presence_wake_move_ms", "peek"] {
+            assert!(err.contains(named), "expected {named} in message: {err}");
+        }
+    }
+
+    /// A pose name is the daemon's to resolve, but a name no script may carry
+    /// at all is refused here, where the line to fix is still nameable.
+    #[test]
+    fn brenn_rejects_a_pose_name_no_script_could_carry() {
+        let long = "p".repeat(motion_proto::MAX_ASSET_NAME_LEN + 1);
+        // The wire bounds a name in bytes. A name of lawful *character* count
+        // whose encoding runs past the bound is the case a rule restated here
+        // in characters would have admitted.
+        let wide = "é".repeat(motion_proto::MAX_ASSET_NAME_LEN / 2 + 1);
+        assert!(
+            wide.chars().count() <= motion_proto::MAX_ASSET_NAME_LEN
+                && wide.len() > motion_proto::MAX_ASSET_NAME_LEN,
+            "a name lawful by characters and unlawful by bytes"
+        );
+        for key in ["presence_wake_pose", "presence_turn_pose"] {
+            for value in [
+                "".to_string(),
+                long.clone(),
+                wide.clone(),
+                motion_proto::KEEP_BASE.to_string(),
+            ] {
+                let err = Config::parse(&with_addr(&brenn_table(&format!("{key} = {value:?}"))))
+                    .expect("parse")
+                    .validate()
+                    .unwrap_err();
+                assert!(err.contains(key), "expected {key} in message: {err}");
+            }
+            // A name of the greatest lawful length is not itself a refusal; that
+            // no library holds it is the daemon's answer, not this one's.
+            let longest = "p".repeat(motion_proto::MAX_ASSET_NAME_LEN);
+            Config::parse(&with_addr(&format!(
+                "{}{}",
+                brenn_mode_tables(),
+                brenn_table(&format!("{key} = {longest:?}"))
+            )))
+            .expect("parse")
+            .validate()
+            .expect("a name of lawful length is a name this side accepts");
+        }
+    }
+
+    /// The two poses and the three paces reach the scripter as configured.
+    #[test]
+    fn brenn_carries_the_presence_poses_and_paces_to_the_scripter() {
+        let brenn = Config::parse(&with_addr(&format!(
+            "{}{}",
+            brenn_mode_tables(),
+            brenn_table(
+                "presence_wake_pose = \"peek\"\n\
+             presence_turn_pose = \"neutral\"\n\
+             presence_wake_move_ms = 600\n\
+             presence_turn_move_ms = 900\n\
+             presence_stow_move_ms = 1500",
+            )
+        )))
+        .expect("parse")
+        .brenn
+        .expect("a [brenn] table");
+        assert_eq!(brenn.script_raises().wake.pose.as_ref(), "peek");
+        assert_eq!(brenn.script_raises().turn.pose.as_ref(), "neutral");
+        assert_eq!(brenn.script_raises().wake.move_ms, Some(600));
+        assert_eq!(brenn.script_raises().turn.move_ms, Some(900));
+        assert_eq!(brenn.script_raises().stow.move_ms, Some(1_500));
     }
 
     #[test]

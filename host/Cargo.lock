@@ -920,7 +920,7 @@ dependencies = [
 [[package]]
 name = "motion-proto"
 version = "0.1.0"
-source = "git+https://github.com/rnortman/brenn-reachy?rev=fe67c1ff0f0e9215075db787082e8c86bcf8bb59#fe67c1ff0f0e9215075db787082e8c86bcf8bb59"
+source = "git+https://github.com/rnortman/brenn-reachy?rev=3037fa7bc759dcebda947d6bb42935835f49f5c7#3037fa7bc759dcebda947d6bb42935835f49f5c7"
 dependencies = [
  "serde",
  "serde_json",
