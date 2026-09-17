@@ -11,12 +11,9 @@
 
 mod common;
 
-use std::path::Path;
-
 /// The single segment `wav-import` synthesizes for the replayed capture. The
 /// listener wakes on it, so it mints exactly one utterance.
 const SEGMENT_ID: u32 = 1;
-const WAKE_PREROLL_SAMPLES: usize = 16_000;
 
 /// The fake TTS clip length in S16 samples — a non-multiple of the 320-sample
 /// frame, so the writer's ceiling framing and final-frame zero-padding are both
@@ -26,15 +23,6 @@ const TTS_SAMPLES: usize = 700;
 const FRAME_SAMPLES: usize = 320;
 /// Frames the writer emits for the clip: ⌈TTS_SAMPLES / FRAME_SAMPLES⌉.
 const CLIP_FRAMES: u64 = TTS_SAMPLES.div_ceil(FRAME_SAMPLES) as u64;
-
-fn primed_wake_wav(dir: &Path) -> std::path::PathBuf {
-    let wake = common::read_wav_pcm(Path::new(common::WAKE_PHRASE_WAV));
-    let mut pcm = vec![0_i16; WAKE_PREROLL_SAMPLES];
-    pcm.extend_from_slice(&wake);
-    let wav = dir.join("primed-wake.wav");
-    speech_pipeline::write_spine_wav(&wav, &pcm).expect("write spine wav");
-    wav
-}
 
 /// A capture replayed against a listener + `echo`-brain daemon with STT/TTS
 /// pointed at a fake speaches container: the segment mints one utterance, STT
@@ -47,7 +35,7 @@ fn primed_wake_wav(dir: &Path) -> std::path::PathBuf {
 #[test]
 fn echo_brain_reads_back_transcript_end_to_end() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let wav = primed_wake_wav(work.path());
+    let wav = common::primed_wake_wav(work.path());
     let framelog = common::import_wav_to_framelog(work.path(), &wav, SEGMENT_ID);
 
     // One fake speaches container serves both endpoints; the daemon's [stt] and
@@ -154,6 +142,8 @@ fn echo_brain_reads_back_transcript_end_to_end() {
     // segment-and-response cycle stamped and blamed, end to end through a real
     // daemon, real models, and a real (fake-backed) STT and TTS round trip.
     let s = &events[pos("latency_summary")];
+    // As in `playback_integration`: the carve starts at the wake's end, past
+    // any preroll, so its t0 is projected rather than measured.
     assert_eq!(
         s["t0_projected"],
         true,

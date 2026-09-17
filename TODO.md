@@ -670,3 +670,68 @@ whole replies.
 
 See `TODO(pod-playout-position)` at `PLAYBACK_PLAYOUT_HOP_MS` in
 `firmware/crates/audio-pipeline/src/playback.rs`.
+
+## `wake-readiness-preroll-coupling` — DEFERRED as of 2026-09-16 (needs a design decision spanning the device and the host)
+
+The streaming wake core now refuses to score until it has sixteen real embeddings:
+`WAKE_READINESS_SAMPLES` = 16 × 1 280 = 20 480 samples, 1.28 s, in
+`host/crates/speech-pipeline/src/listener/oww_stream.rs`. The device's VAD-onset preroll is
+`PREROLL_SAMPLES` = 16 000 samples, 1 s, in `firmware/crates/audio-pipeline/src/ring.rs`. The
+listener re-enters the readiness window on *every* `SegmentOpened`, not once per process, because
+`reset_stream` runs there.
+
+This is not currently a detection failure: the wake head's score peaks well after the phrase
+begins — on the committed fixture the first threshold crossing is about 0.9 s into the phrase and
+the maximum lands past the phrase's end — so a phrase spoken at the preroll boundary is scored with
+room to spare, and `stream_matches_batch_on_wake_phrase` shows the committed phrase wakes even from
+a completely cold stream with no preroll at all. What is missing is that nothing ties the two
+constants together, or states what relation between them the design actually requires. They live in
+two crates in two halves of the tree, the host one is not derived from the device one, and no test
+compares them. `PREROLL_SAMPLES >= WAKE_READINESS_SAMPLES` is the obvious assertion and is also the
+wrong one — it is stricter than the behaviour needs, and adding it would fail today for a system
+that works.
+
+The narrow case worth measuring is `ring.rs`'s `preroll_cursor` clamp: within the first two seconds
+of a capture run the ring is not yet full, so the very first segment after a device boot ships less
+than a full preroll. A phrase spoken then is scored from a stream with almost no warm-up.
+
+Deferred because the fix is a choice, not an edit: raise the device preroll above the readiness
+window (device RAM and segment-latency cost, firmware change), or prime the host stream from the
+ring's retained history on a segment re-anchor so a re-anchor does not reopen the window at all
+(host change, and it has to decide what "retained history" means across a discontinuity). Either
+way the relation should then be stated once and pinned.
+
+Done = the required relation between the device preroll and the host readiness window is written
+down in one place, a test pins it, and the boot-cold-ring case is measured on hardware rather than
+argued about.
+
+See `TODO(wake-readiness-preroll-coupling)` at `WAKE_READINESS_SAMPLES` in
+`host/crates/speech-pipeline/src/listener/oww_stream.rs`.
+
+## `measured-t0-e2e-coverage` — DEFERRED as of 2026-09-16 (needs a decision about which carve should produce a measured t0)
+
+`t0_projected: false` — an utterance whose first audio the host actually *received* as this
+segment's first audio, rather than projecting its receipt through the device clock — has no
+end-to-end coverage. `playback_integration.rs` and `parrot_integration.rs` both asserted it until
+their fixtures grew a 1 s preroll in front of the wake phrase; both now assert `true`, and only the
+unit tests in `playback_router.rs` exercise the measured branch.
+
+The obvious repair does not work. A second segment on the same connection is not a warm stream —
+`reset_stream` runs on every `SegmentOpened` — so it needs the same priming prefix as the first.
+And the deeper point is that the old assertion was an artifact: it passed because the fixture put
+the phrase at segment sample 0 with a declared preroll of 0, which no device produces. On real
+hardware a wake-gated carve starts at `wake_end_sample - preroll_pad`, roughly a second past the
+segment base, so `t0_for` classifies it projected — the same verdict the tests now record.
+
+So the question is which carve is *supposed* to produce a measured t0 in the field, and that is
+what the coverage should reproduce. The likely answer is a bypass-policy carve, where the utterance
+begins at the speech onset the device VAD fired on and therefore inside the declared preroll; that
+needs a bypass harness config and a `wav-import --preroll-samples` fixture, neither of which exists
+yet.
+
+Done = one integration case carves an utterance whose start lands inside a non-zero declared
+preroll and asserts `t0_projected: false` end to end, and the wake-gated cases say in one line why
+they are projected.
+
+See `TODO(measured-t0-e2e-coverage)` at the `t0_projected` assertion in
+`host/crates/speech-surface/tests/playback_integration.rs`.

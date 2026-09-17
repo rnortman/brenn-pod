@@ -3,13 +3,14 @@
 //!
 //! Segment-batch scoring feeds a fresh [`OwwStream`] chunk-by-chunk and compares
 //! the maximum per-step sigmoid score with the threshold. The gate requires
-//! sixteen real embeddings; short segments return a finite zero rejection.
+//! sixteen real embeddings; a segment too short for one comes back
+//! [`WakeOutcome::Unscored`] rather than carrying an invented score.
 //! Fresh state per call means no bleed across segments or pods.
 //!
 //! `OwwGate` is retired once the pipeline rework routes wake through the listener
 //! thread; until then it keeps the segment-shaped [`WakeGate`] seam working.
 
-use super::{WakeError, WakeOutcome};
+use super::{UnscoredReason, WakeError, WakeOutcome};
 use crate::listener::oww_stream::{OwwModels, ScoredChunk};
 use crate::types::Segment;
 
@@ -37,7 +38,9 @@ impl OwwGate {
     pub fn gate(&mut self, seg: &Segment) -> Result<WakeOutcome, WakeError> {
         // An empty segment has nothing to score.
         if seg.pcm.is_empty() {
-            return Ok(WakeOutcome::Rejected { score: 0.0 });
+            return Ok(WakeOutcome::Unscored {
+                reason: UnscoredReason::Empty,
+            });
         }
 
         // Fresh streaming state per segment: no bleed across segments or pods.
@@ -56,7 +59,9 @@ impl OwwGate {
         }
         // A segment without a complete real embedding history cannot be scored.
         let Some(best) = best else {
-            return Ok(WakeOutcome::Rejected { score: 0.0 });
+            return Ok(WakeOutcome::Unscored {
+                reason: UnscoredReason::ShorterThanReadinessWindow,
+            });
         };
         Ok(if best.score > self.threshold {
             WakeOutcome::Detected {
@@ -125,11 +130,17 @@ mod tests {
     }
 
     #[test]
-    fn sub_chunk_segment_rejects_without_score() {
+    fn sub_chunk_segment_is_unscored_not_a_zero() {
         let mut gate = test_gate();
-        // Fewer than sixteen real embeddings is rejected without invoking wake.
+        // Fewer than sixteen real embeddings never reaches the wake head, and
+        // the verdict says so rather than reporting a score nothing produced.
         let outcome = gate.gate(&seg_with_pcm(seeded_noise(3, 100))).unwrap();
-        assert_eq!(outcome, WakeOutcome::Rejected { score: 0.0 });
+        assert_eq!(
+            outcome,
+            WakeOutcome::Unscored {
+                reason: UnscoredReason::ShorterThanReadinessWindow
+            }
+        );
     }
 
     #[test]
@@ -138,17 +149,21 @@ mod tests {
         let mut gate = test_gate_with_threshold(-1.0);
         assert_eq!(
             gate.gate(&seg_with_pcm(seeded_noise(3, 100))).unwrap(),
-            WakeOutcome::Rejected { score: 0.0 }
+            WakeOutcome::Unscored {
+                reason: UnscoredReason::ShorterThanReadinessWindow
+            }
         );
     }
 
     #[test]
-    fn empty_segment_rejects_without_panic() {
+    fn empty_segment_is_unscored_without_panic() {
         let mut gate = test_gate();
-        match gate.gate(&seg_with_pcm(vec![])).unwrap() {
-            WakeOutcome::Rejected { score } => assert_eq!(score, 0.0),
-            other => panic!("empty segment must reject, got {other:?}"),
-        }
+        assert_eq!(
+            gate.gate(&seg_with_pcm(vec![])).unwrap(),
+            WakeOutcome::Unscored {
+                reason: UnscoredReason::Empty
+            }
+        );
     }
 
     #[test]

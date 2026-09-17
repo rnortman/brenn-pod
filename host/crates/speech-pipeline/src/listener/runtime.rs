@@ -42,7 +42,7 @@ use super::event::{
     BargeCause, CarveTiming, CarvedUtterance, Feed, ListenerEvent, ListenerUtteranceId,
     StatsFlushCause, StatsModel, WakePolicy,
 };
-use super::oww_stream::{OwwModels, OwwStream};
+use super::oww_stream::{CHUNK as OWW_CHUNK, OwwModels, OwwStream};
 use super::ring::PcmRing;
 use super::silero::{SILERO_CHUNK, SileroModel, SileroVad};
 use super::stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreStats};
@@ -678,8 +678,20 @@ impl ListenerState {
 
         // Streaming wake. Each step's score is recorded at the same pod-absolute
         // translation the arm path uses, so "wake fires fine" becomes a number
-        // sitting next to the Silero one rather than an anecdote.
-        for scored in self.oww.push(oww_models, pcm)? {
+        // sitting next to the Silero one rather than an anecdote. Chunks the
+        // stream consumed while still short of its readiness window are counted
+        // too: they are the ones that produce no score, and an OWW line that
+        // reports them is what separates a warming stream from a dead one.
+        let chunks_before = self.oww.chunks_processed();
+        let scored_chunks = self.oww.push(oww_models, pcm)?;
+        // Readiness is monotone, so the unscored chunks are the leading ones of
+        // this push; the last of them ends where the scored run begins.
+        let unscored = self.oww.chunks_processed() - chunks_before - scored_chunks.len() as u64;
+        self.oww_stats.record_unscored(
+            unscored as u32,
+            self.oww_base + (chunks_before + unscored) * OWW_CHUNK as u64,
+        );
+        for scored in scored_chunks {
             self.oww_stats
                 .record(scored.score, self.oww_base + scored.end_sample);
             if let Some(det) = self.oww.arm(&scored) {
@@ -1909,6 +1921,23 @@ mod tests {
         PodId("pod-x".into())
     }
 
+    /// Digital silence a real-audio fixture puts in front of the wake phrase,
+    /// standing in for the device's VAD-onset preroll (`audio-pipeline`'s
+    /// `PREROLL_SAMPLES`, 1 s at 16 kHz). A live pod never opens a segment at
+    /// the first sample of the phrase; it opens one preroll behind, and that is
+    /// the audio the wake stream warms up on.
+    const WAKE_PREROLL_SAMPLES: usize = 16_000;
+
+    /// The committed wake phrase behind [`WAKE_PREROLL_SAMPLES`] of silence —
+    /// the shape a live segment carries.
+    fn primed_wake_phrase() -> Vec<i16> {
+        let phrase = wake_phrase_pcm();
+        let mut audio = Vec::with_capacity(WAKE_PREROLL_SAMPLES + phrase.len());
+        audio.extend(std::iter::repeat_n(0_i16, WAKE_PREROLL_SAMPLES));
+        audio.extend_from_slice(&phrase);
+        audio
+    }
+
     /// Production knobs with the wake-command hold off. The real-audio tests that
     /// use this drive the wake phrase with nothing after it — the exact shape the
     /// hold retains — and their subject is the arm, the segment and the stamps, not
@@ -2162,8 +2191,13 @@ mod tests {
             .expect("close feed")
     }
 
-    /// Silence never wakes and never opens an utterance. The close reports
-    /// Silero's scores; OWW has not reached its 20,480-sample readiness window.
+    /// Silence never wakes and never opens an utterance. It is not *event*-silent:
+    /// the close reports what both models did across it, which is the whole
+    /// point — a quiet room is the case the transition stream cannot describe.
+    /// Here the room is quieter than the wake model's readiness window, so OWW's
+    /// line is a count of chunks it consumed without scoring rather than a
+    /// distribution. Either way there is a line, and "wake never ran" stays
+    /// distinguishable from "wake ran and scored low".
     #[test]
     fn silence_is_inert() {
         let mut oww = oww_models();
@@ -2192,19 +2226,25 @@ mod tests {
         // And the observability that makes a silent room legible rather than
         // indistinguishable from a dead listener.
         let stats = model_stats(&events);
-        assert_eq!(
-            stats.len(),
-            1,
-            "only Silero reports before wake readiness: {stats:?}"
-        );
-        for (model, cause, s) in stats {
-            assert_eq!(cause, StatsFlushCause::SegmentClose, "{model:?}");
-            assert!(
-                s.max < 0.5,
-                "{model:?} must score silence low, got max {}",
-                s.max
-            );
+        assert_eq!(stats.len(), 2, "both models report on the close: {stats:?}");
+        for (model, cause, s) in &stats {
+            assert_eq!(*cause, StatsFlushCause::SegmentClose, "{model:?}");
+            if let Some(max) = s.max {
+                assert!(max < 0.5, "{model:?} must score silence low, got max {max}");
+            }
         }
+        // 20 × 512 = 10 240 samples: eight whole OWW chunks, all of them inside
+        // the readiness window, so the OWW line is pure warm-up.
+        let (_, _, oww_summary) = stats
+            .iter()
+            .find(|(model, _, _)| *model == StatsModel::Oww)
+            .expect("OWW reports even before it can score");
+        assert_eq!(
+            (oww_summary.chunks, oww_summary.unscored_chunks),
+            (0, 8),
+            "the warming stream is counted, not silently absent"
+        );
+        assert_eq!(oww_summary.max, None, "no distribution without a score");
     }
 
     /// The wake phrase arms the pod and emits a `WakeDetected` (absolute index).
@@ -2217,10 +2257,7 @@ mod tests {
         let mut silero = silero_model();
         let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
         open(&mut state, 0, &mut oww, &mut silero);
-        let silence = vec![0_i16; 16_000];
-        let phrase = wake_phrase_pcm();
-        let mut audio = silence;
-        audio.extend_from_slice(&phrase);
+        let audio = primed_wake_phrase();
         let events = feed_audio_chunkwise(&mut state, 0, &audio, &mut oww, &mut silero);
         let detections: Vec<_> = events
             .iter()
@@ -2233,7 +2270,7 @@ mod tests {
             .collect();
         assert!(!detections.is_empty(), "wake phrase must arm a wake");
         assert!(
-            detections[0] > 16_000 && detections[0] <= audio.len() as u64,
+            detections[0] > WAKE_PREROLL_SAMPLES as u64 && detections[0] <= audio.len() as u64,
             "wake end {} within the prefixed phrase",
             detections[0]
         );
@@ -2270,7 +2307,7 @@ mod tests {
         // ~1 s of device preroll, then the phrase, then silence past the hangover —
         // chunk-wise, as the live feed arrives, since the wake gating this asserts
         // turns on the arm landing in the right place relative to the onset.
-        let silence = vec![0_i16; 16_000];
+        let silence = vec![0_i16; WAKE_PREROLL_SAMPLES];
         let phrase = wake_phrase_pcm();
         let mut audio: Vec<i16> = Vec::new();
         audio.extend_from_slice(&silence);
@@ -2805,9 +2842,8 @@ mod tests {
         let mut state = ListenerState::new(config);
         open(&mut state, 0, &mut oww, &mut silero);
 
-        // silence | phrase | pause | phrase | trailing silence past the continuation window.
-        let mut audio: Vec<i16> = vec![0_i16; 16_000];
-        audio.extend_from_slice(&phrase);
+        // preroll | phrase | pause | phrase | trailing silence past the continuation window.
+        let mut audio: Vec<i16> = primed_wake_phrase();
         audio.extend(std::iter::repeat_n(0_i16, pause as usize));
         audio.extend_from_slice(&phrase);
         audio.extend(std::iter::repeat_n(0_i16, tail as usize));
@@ -3944,7 +3980,10 @@ mod tests {
         );
         assert_eq!(s.chunks, 2, "the onset-causing chunk is included");
         assert_eq!((s.first_chunk_end, s.last_chunk_end), (512, 1_024));
-        assert_eq!((s.min, s.max, s.mean, s.median), (0.9, 0.9, 0.9, 0.9));
+        assert_eq!(
+            (s.min, s.max, s.mean, s.median),
+            (Some(0.9), Some(0.9), Some(0.9), Some(0.9))
+        );
         // Ordering: the stats explain the transition, so they precede it.
         let kinds: Vec<&str> = events
             .iter()
@@ -3970,7 +4009,8 @@ mod tests {
             "picks up exactly where the previous flush left off"
         );
         assert_eq!(
-            s.max, 0.1,
+            s.max,
+            Some(0.1),
             "and reports the release chunks, not the onset ones"
         );
     }
@@ -4266,8 +4306,7 @@ mod tests {
         let mut silero = silero_model();
         let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
         let phrase = wake_phrase_pcm();
-        let mut first_audio = vec![0_i16; 16_000];
-        first_audio.extend_from_slice(&phrase);
+        let first_audio = primed_wake_phrase();
         // Segment 1 carries the wake phrase and closes right after it.
         open(&mut state, 0, &mut oww, &mut silero);
         let mut events = feed_audio_chunkwise(&mut state, 0, &first_audio, &mut oww, &mut silero);
@@ -5153,8 +5192,7 @@ mod tests {
         let mut state = ListenerState::new(real_hold_config(WakePolicy::WakeGated));
         open(&mut state, 0, &mut oww, &mut silero);
         let phrase = wake_phrase_pcm();
-        let mut first_audio = vec![0_i16; 16_000];
-        first_audio.extend_from_slice(&phrase);
+        let first_audio = primed_wake_phrase();
 
         let events = feed_audio_chunkwise(&mut state, 0, &first_audio, &mut oww, &mut silero);
         let held = wake_helds(&events);

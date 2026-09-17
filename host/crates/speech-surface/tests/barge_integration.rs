@@ -18,7 +18,6 @@
 
 mod common;
 
-use std::path::Path;
 use std::time::Duration;
 
 /// Segment ids for the two utterances on the one connection.
@@ -57,12 +56,6 @@ const TTS_DELAY: Duration = Duration::from_millis(250);
 /// margin over a decision already taken and not a race against one pending.
 const NO_CUT_WINDOW: Duration = Duration::from_millis(500);
 
-fn wake_pcm_with_preroll() -> Vec<i16> {
-    let mut pcm = vec![0_i16; 16_000];
-    pcm.extend_from_slice(&common::read_wav_pcm(Path::new(common::WAKE_PHRASE_WAV)));
-    pcm
-}
-
 #[test]
 fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
     let speaches_url = common::spawn_fake_speaches_with_tts_delay(TTS_SAMPLES, TTS_DELAY);
@@ -79,7 +72,7 @@ fn barge_in_flushes_playback_and_chains_the_interrupted_turn() {
     // The wake phrase drives both segments: it arms the wake gate and carves
     // utterance 1, and — reused as segment 2 — its speech sustains past the barge
     // guard. The fake STT transcribes both to `FAKE_TRANSCRIPT`.
-    let pcm = wake_pcm_with_preroll();
+    let pcm = common::primed_wake_pcm();
     let seg1 = common::session_frames(&pcm, UTTERANCE_SEGMENT_ID, 0);
     // Segment 2 follows segment 1 on the connection's sample timeline; the device
     // VAD boundary (not a sample gap) separates the two utterances. Its `Hello` is
@@ -271,7 +264,7 @@ fn a_wake_over_the_readback_cuts_it() {
     let jsonl_path = daemon.jsonl_path.clone();
     let addr = daemon.listen_addr();
 
-    let pcm = wake_pcm_with_preroll();
+    let pcm = common::primed_wake_pcm();
     let seg1 = common::session_frames(&pcm, UTTERANCE_SEGMENT_ID, 0);
     let seg2 = common::session_frames(&pcm, BARGE_SEGMENT_ID, pcm.len() as u64);
 
@@ -332,7 +325,7 @@ fn a_reply_that_says_the_wake_phrase_is_not_cut_by_its_own_words() {
     let jsonl_path = daemon.jsonl_path.clone();
     let addr = daemon.listen_addr();
 
-    let pcm = wake_pcm_with_preroll();
+    let pcm = common::primed_wake_pcm();
     let seg1 = common::session_frames(&pcm, UTTERANCE_SEGMENT_ID, 0);
     let seg2 = common::session_frames(&pcm, BARGE_SEGMENT_ID, pcm.len() as u64);
 
