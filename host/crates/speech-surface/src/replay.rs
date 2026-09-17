@@ -414,6 +414,7 @@ mod tests {
             ("", BargeMode::Wake),
             ("[barge]\nmode = \"wake\"\n", BargeMode::Wake),
             ("[barge]\nmode = \"speech\"\n", BargeMode::Speech),
+            ("[barge]\nmode = \"mute\"\n", BargeMode::Mute),
         ] {
             let config = Config::parse(&format!("{}{table}", wake_table_toml(""))).expect("parse");
             let wake = config.wake.as_ref().expect("wake table");

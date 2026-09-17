@@ -2282,7 +2282,7 @@ mod tests {
         let pod = PodId("pod-x".into());
         ledger.record_dispatch(&pod, UtteranceId(1), None);
         ledger.record_cmd(&pod, UtteranceId(1), None);
-        ledger.dispatch_done(&pod, UtteranceId(1));
+        ledger.dispatch_done(&pod, UtteranceId(1), false);
 
         let wiring = give_up_wiring(shape).await;
         run_router_scripted(
@@ -2918,7 +2918,7 @@ mod tests {
             );
             ledger.record_dispatch(&pod, UtteranceId(1), None);
             ledger.record_cmd(&pod, UtteranceId(1), None);
-            ledger.dispatch_done(&pod, UtteranceId(1));
+            ledger.dispatch_done(&pod, UtteranceId(1), false);
 
             let dir = tempfile::tempdir().unwrap();
             let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
@@ -2986,7 +2986,7 @@ mod tests {
         drop(jsonl);
         join.await.unwrap();
 
-        let audio = ledger.dispatch_done(&pod, UtteranceId(2));
+        let audio = ledger.dispatch_done(&pod, UtteranceId(2), false);
         assert_eq!(audio.awaiting_start, 0, "the turn's one clip is playing");
         assert_eq!(
             audio.horizon,

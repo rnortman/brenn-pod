@@ -1423,6 +1423,10 @@ mod tests {
     ) -> TurnAudio {
         TurnAudio {
             dispatch_done,
+            // The scripter's ending does not turn on the capture window; the
+            // `<listen/>` linger it already keeps for an open turn is the
+            // `TurnEnded` disposition's business.
+            listen_open: false,
             cmds_sent,
             awaiting_start,
             horizon,

@@ -40,8 +40,8 @@ use speech_pipeline::{
     ConfidenceGate, DoaTrack, EndpointCause, FlushRejected, GateReject, InterruptProgress,
     ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment, SegmentTelemetry,
     SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError, Transcriber, Transcript,
-    Utterance, UtteranceId, WakeCommandReason, WakeConfirmation, stage_delta_us, tracking_event,
-    transcribe_pcm,
+    TurnEnd, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation, stage_delta_us,
+    tracking_event, transcribe_pcm,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -124,7 +124,10 @@ impl PipelineItem {
                 | WakeHeld { pod, .. }
                 | ArmExpired { pod, .. }
                 | EndpointerTransition { pod, .. }
-                | ModelStats { pod, .. } => pod,
+                | ModelStats { pod, .. }
+                | ListenOpened { pod, .. }
+                | ListenHeard { pod, .. }
+                | ListenExpired { pod, .. } => pod,
             },
         }
     }
@@ -150,6 +153,9 @@ impl PipelineItem {
                 ArmExpired { .. } => "arm_expired",
                 EndpointerTransition { .. } => "endpointer_transition",
                 ModelStats { .. } => "model_stats",
+                ListenOpened { .. } => "listen_opened",
+                ListenHeard { .. } => "listen_heard",
+                ListenExpired { .. } => "listen_expired",
             },
         }
     }
@@ -224,6 +230,9 @@ struct Carve {
     /// This carve's speech was heard over the pod's own playback, whether or not
     /// it cut it. The gate below makes such a carve prove it is speech.
     over_playback: bool,
+    /// This carve was heard inside an open capture window: the person kept talking
+    /// after a reply that asked them to, with no wake word.
+    follow_up: bool,
     /// The listener's host-receipt stamps for this utterance's audio, from t0 to
     /// the carve. Copied onto the minted `Utterance`'s `StageTimings`.
     timing: CarveTiming,
@@ -838,6 +847,22 @@ async fn handle_listener(
                 ),
             );
         }
+        ListenerEvent::ListenOpened {
+            pod,
+            epoch,
+            deadline_sample,
+        } => {
+            jsonl.emit(
+                "listen_opened",
+                &json!({ "pod": pod.0, "epoch": epoch, "deadline_sample": deadline_sample }),
+            );
+        }
+        ListenerEvent::ListenHeard { pod, epoch } => {
+            jsonl.emit("listen_heard", &json!({ "pod": pod.0, "epoch": epoch }));
+        }
+        ListenerEvent::ListenExpired { pod, epoch } => {
+            jsonl.emit("listen_expired", &json!({ "pod": pod.0, "epoch": epoch }));
+        }
         ListenerEvent::Superseded { pod, utterance_id } => {
             // Emitted before the abort so a supersede is correlatable by utterance
             // id; the transition line alone names no utterance.
@@ -994,6 +1019,7 @@ fn spawn_stt(
         cause,
         barge_in,
         over_playback,
+        follow_up,
         timing,
     } = utterance;
     let carve = Carve {
@@ -1006,6 +1032,7 @@ fn spawn_stt(
         // rides through so the mint on the far side can chain the interrupted turns.
         barge_in,
         over_playback,
+        follow_up,
         timing,
         sent_from,
     };
@@ -1177,6 +1204,7 @@ async fn handle_stt_done(
             stt_elapsed_us,
             stt_trim_samples: utterance.wake.map(|w| w.stt_trim_samples),
             stt_sent_from_sample: done.carve.sent_from,
+            follow_up: done.carve.follow_up,
         },
     );
 
@@ -1292,7 +1320,7 @@ async fn handle_stt_done(
                 // that no further command is coming for this turn — which is what
                 // lets its settlement complete, and one of the three facts the
                 // head's ending is scheduled from.
-                let audio = barge.ledger.dispatch_done(&pod, id);
+                let audio = barge.ledger.dispatch_done(&pod, id, end == TurnEnd::Open);
                 if let Some(scripter) = scripter {
                     scripter.send(ScriptInput::Audio {
                         pod: pod.clone(),
@@ -1512,6 +1540,9 @@ struct UtteranceLine<'a> {
     stt_elapsed_us: Option<u64>,
     stt_trim_samples: Option<usize>,
     stt_sent_from_sample: Option<usize>,
+    /// Whether this utterance was heard inside a capture window rather than on a
+    /// wake word: it carries no wake provenance and none was needed.
+    follow_up: bool,
 }
 
 /// The `tracking` JSONL line: the full `TrackingEvent` flattened in, plus the
@@ -1579,6 +1610,7 @@ mod tests {
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
             over_playback: false,
+            follow_up: false,
             timing: CarveTiming::default(),
         }
     }
@@ -2508,6 +2540,7 @@ mod tests {
                 cause: EndpointCause::SoftEndpoint,
                 barge_in: false,
                 over_playback: false,
+                follow_up: false,
                 timing: CarveTiming::default(),
                 sent_from: Some(0),
             },
@@ -2792,6 +2825,7 @@ mod tests {
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
             over_playback: false,
+            follow_up: false,
             timing: CarveTiming::default(),
             sent_from: Some(0),
         };

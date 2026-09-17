@@ -64,6 +64,11 @@ const CONSOLE_INFO: &[&str] = &[
     "utterance_superseded",
     "utterance_closed",
     "arm_expired",
+    // The capture window a `<listen/>` reply opens: when it opened, each time
+    // speech was heard inside it, and its expiry. At most a handful per reply.
+    "listen_opened",
+    "listen_heard",
+    "listen_expired",
     // Bounded by construction: one line per model per ~8 s of audio per pod, plus
     // one per transition. Never per-chunk.
     "model_stats",
@@ -2994,6 +2999,9 @@ mod tests {
         ("listener_absent", Class::Loud),
         ("listener_event_dropped_overflow", Class::Loud),
         ("listener_thread_panicked", Class::Loud),
+        ("listen_expired", Class::Calm),
+        ("listen_heard", Class::Calm),
+        ("listen_opened", Class::Calm),
         ("listening", Class::Calm),
         ("pipeline_fatal", Class::Loud),
         ("playback_aborted", Class::Loud),

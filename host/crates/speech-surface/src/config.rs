@@ -657,6 +657,12 @@ pub enum BargeModeConfig {
     /// machine that second rule fires on the robot's own echo whenever the head
     /// has moved since the reply started, which is most replies.
     Speech,
+    /// Nothing cuts, and nothing said over an audible reply is heard at all: while
+    /// the pod is playing, and for a short tail after, the microphone is scored as
+    /// silence. For a unit whose echo cancellation cannot be trusted — the robot
+    /// never hears itself, at the price of a reply no voice can interrupt, not even
+    /// the wake word.
+    Mute,
 }
 
 /// Barge-in configuration. One key, because it is one decision — what may cut a
@@ -676,6 +682,7 @@ impl BargeConfig {
         match self.mode {
             BargeModeConfig::Wake => BargeMode::Wake,
             BargeModeConfig::Speech => BargeMode::Speech,
+            BargeModeConfig::Mute => BargeMode::Mute,
         }
     }
 }
@@ -2069,6 +2076,10 @@ threshold = 0.7
         let spoken = Config::parse(&with_addr("[barge]\nmode = \"speech\"")).expect("parse");
         assert_eq!(spoken.barge.mode, BargeModeConfig::Speech);
         assert_eq!(spoken.barge.to_listener(), BargeMode::Speech);
+
+        let muted = Config::parse(&with_addr("[barge]\nmode = \"mute\"")).expect("parse");
+        assert_eq!(muted.barge.mode, BargeModeConfig::Mute);
+        assert_eq!(muted.barge.to_listener(), BargeMode::Mute);
 
         assert!(Config::parse(&with_addr("[barge]\nmode = \"off\"")).is_err());
         let err = Config::parse(&with_addr("[barge]\nbogus = 1")).unwrap_err();
