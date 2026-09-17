@@ -835,15 +835,13 @@ pub const WAKE_PHRASE_WAV: &str = concat!(
     "/../../testdata/wake/wake-phrase.wav"
 );
 /// Digital silence prepended to a wake fixture by [`primed_wake_pcm`] and
-/// [`primed_wake_wav`], standing in for the device's VAD-onset preroll
-/// (`audio-pipeline`'s `PREROLL_SAMPLES`, 1 s at 16 kHz). A live pod never
-/// opens a segment at the first sample of the wake phrase; it opens one preroll
-/// behind, and that is the audio the wake model warms up on. A fixture that
-/// starts at the phrase gives the model a cold start no real capture produces.
+/// [`primed_wake_wav`]. A real capture carries at least this much silence
+/// ahead of the phrase (the device's VAD-onset preroll, 1 s at 16 kHz); a
+/// fixture that omits it gives the model a cold start no real segment produces.
 ///
-/// One number, one place: the value belongs to the device's preroll, not to
-/// `WAKE_READINESS_SAMPLES` (1.28 s, longer than this) — the wake still fires
-/// because the head's score peaks well after the phrase begins.
+/// Pinned to the device preroll (1 s), not to `WAKE_READINESS_SAMPLES`
+/// (1.28 s, longer) — the wake still fires because the head's score peaks
+/// well after the phrase begins.
 pub const WAKE_PREROLL_SAMPLES: usize = 16_000;
 
 /// The committed wake phrase behind [`WAKE_PREROLL_SAMPLES`] of silence, as PCM.
