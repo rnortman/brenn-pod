@@ -27,7 +27,6 @@ use serde_json::Value;
 
 /// The single segment `wav-import` synthesizes for the wake-phrase clip.
 const WAKE_SEGMENT_ID: u32 = 1;
-const WAKE_PREROLL_SAMPLES: usize = 16_000;
 
 /// The configured ack clip length in S16 samples — a non-multiple of the
 /// 320-sample frame, so the writer's ceiling framing and final-frame
@@ -37,15 +36,6 @@ const CLIP_SAMPLES: usize = 700;
 const FRAME_SAMPLES: usize = 320;
 /// Frames the writer emits for the clip: ⌈CLIP_SAMPLES / FRAME_SAMPLES⌉.
 const CLIP_FRAMES: u64 = CLIP_SAMPLES.div_ceil(FRAME_SAMPLES) as u64;
-
-fn primed_wake_wav(dir: &Path) -> std::path::PathBuf {
-    let wake = common::read_wav_pcm(Path::new(common::WAKE_PHRASE_WAV));
-    let mut pcm = vec![0_i16; WAKE_PREROLL_SAMPLES];
-    pcm.extend_from_slice(&wake);
-    let wav = dir.join("primed-wake.wav");
-    speech_pipeline::write_spine_wav(&wav, &pcm).expect("write spine wav");
-    wav
-}
 
 /// Write `n` samples of spine-format PCM (16 kHz mono S16) to `path` — the exact
 /// format the clip loader accepts. A recognizable ramp so a mis-sized read is
@@ -74,7 +64,7 @@ fn write_clip_wav(path: &Path, n: usize) {
 #[test]
 fn wav_brain_answers_wake_with_paced_clip_playback() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let wav = primed_wake_wav(work.path());
+    let wav = common::primed_wake_wav(work.path());
     let framelog = common::import_wav_to_framelog(work.path(), &wav, WAKE_SEGMENT_ID);
     let clip = work.path().join("ack.wav");
     write_clip_wav(&clip, CLIP_SAMPLES);
@@ -155,6 +145,11 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
     // daemon. Every stage stamp survived the listener → pipeline → brain → router
     // → writer hops, so every offset and every blame delta is a real measurement.
     let s = &events[summary_at];
+    // The carve starts at the wake's end, a second past the segment base and so
+    // past any preroll a device would declare: its first-audio receipt is
+    // projected through the device clock, not measured.
+    // TODO(measured-t0-e2e-coverage): no integration case covers the measured
+    // branch since this one stopped reaching it.
     assert_eq!(
         s["t0_projected"],
         true,
@@ -283,7 +278,7 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
 #[test]
 fn no_brain_config_mints_utterance_without_any_playback() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let wav = primed_wake_wav(work.path());
+    let wav = common::primed_wake_wav(work.path());
     let framelog = common::import_wav_to_framelog(work.path(), &wav, WAKE_SEGMENT_ID);
 
     // No `[brain]` table: the listener still carves an utterance on the wake

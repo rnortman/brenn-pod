@@ -13,25 +13,32 @@
 //!   once. `run` needs `&mut`, so one owner (the listener thread) drives them
 //!   serially for every pod.
 //! - [`OwwStream`] holds one pod's rolling state: the raw-PCM mel lookback, the
-//!   persistent 76-frame mel window, the 16-embedding window, the frame cursor,
+//!   persistent 76-frame mel window, the 16-embedding window, the chunk cursor,
 //!   and the wake refractory. It borrows the models per step.
 //!
-//! **Mel contiguity — the one hard invariant.** The mel model uses valid framing
-//! (window [`MEL_STFT_WINDOW`], hop [`SAMPLES_PER_MEL_FRAME`], no edge padding),
-//! so `run_mel` over a growing buffer is *prefix-stable*: appending audio only
-//! adds trailing frames, never disturbs earlier ones. The streaming core exploits
-//! that. Each chunk runs the mel session over (raw-PCM lookback + new chunk) and
-//! appends only the frames that are genuinely new — the ones the lookback alone
-//! did not already cover ([`mel_frame_count`]). Because the lookback carries the
-//! window's left context, those frames have the same framing as a whole-segment
-//! pass. Frames then drive one embedding per processed chunk, on the same
-//! cadence as the batch path, so batch scoring — reconstructed by feeding a fresh
-//! `OwwStream` chunk-by-chunk (the [`OwwGate`](crate::wake::OwwGate) wrapper) —
-//! replays the same chunked-stream decisions once its real embedding history is
-//! ready. Streamed mel values can differ slightly from a whole-segment pass. The mel window cold-starts from ones and the embedding
-//! window from zeros, but the wake model never sees placeholder embeddings. The
-//! first chunk yields 5 frames (no left context to fill the window); every chunk
-//! after adds exactly 8, with one embedding produced for each chunk.
+//! **Upstream parity is the governing constraint.** Every geometry choice here
+//! — the 480-sample raw lookback, the ones-filled mel window, one embedding per
+//! 1 280-sample chunk, no wake score until sixteen real embeddings — reproduces
+//! openWakeWord 0.6.0's `Model.predict` step for step. `python_per_step_scores_
+//! regression` in this module's tests is that parity's pin: per-step scores
+//! captured from the Python implementation on the committed models. Change a
+//! constant here and that test is the thing that tells you the front end has
+//! drifted.
+//!
+//! **The framing invariant.** The mel model uses valid framing (window
+//! [`MEL_STFT_WINDOW`], hop [`SAMPLES_PER_MEL_FRAME`], no edge padding), so a
+//! chunk run over (lookback + chunk) emits a predictable frame count: 5 for the
+//! first chunk (empty lookback) and exactly [`EMB_STEP`] = 8 for every chunk
+//! after, over a full [`MEL_LOOKBACK_SAMPLES`] lookback. Those 8 frames per
+//! chunk are what keep one embedding firing per chunk. The lookback is shorter
+//! than the STFT window, so a streamed frame is *not* bit-identical to the same
+//! frame from a whole-segment mel pass — it differs by the left context the
+//! 480-sample lookback does not carry. That is upstream's behaviour too, and it
+//! is why the whole-segment comparison in the tests carries a tolerance.
+//!
+//! The mel window cold-starts from [`MEL_COLD_FILL`] and the embedding window
+//! from zeros, but the wake model never sees a placeholder embedding: scoring
+//! waits for [`WAKE_WINDOW`] real embeddings.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -52,8 +59,9 @@ pub(crate) const EMB_DIM: usize = 96;
 pub(crate) const WAKE_WINDOW: usize = 16;
 /// Samples per processing chunk (80 ms at 16 kHz).
 pub(crate) const CHUNK: usize = 1280;
-/// Mel frames between successive embeddings after the first chunk (one 80 ms
-/// chunk of audio). One embedding is produced per processed chunk.
+/// Mel frames a steady-state chunk appends to the mel window: 8, one per 10 ms
+/// hop across an 80 ms chunk. One embedding is produced per processed chunk, so
+/// this is the window's advance between successive embeddings.
 pub(crate) const EMB_STEP: usize = 8;
 /// Audio samples one mel frame advances (10 ms at 16 kHz): the mel model's STFT
 /// hop.
@@ -64,19 +72,69 @@ pub(crate) const SAMPLES_PER_MEL_FRAME: usize = CHUNK / EMB_STEP;
 /// for `n >= MEL_STFT_WINDOW` and none below. A model change breaks that test.
 pub(crate) const MEL_STFT_WINDOW: usize = 640;
 
-/// Raw-PCM samples of lookback prepended to each chunk before the mel pass. This
-/// carries the preceding 30 ms of audio used by the streaming mel pipeline.
+/// Raw-PCM samples of lookback prepended to each chunk before the mel pass: 3
+/// mel hops, 30 ms. Not a free parameter — openWakeWord 0.6.0 keeps exactly 3
+/// hops of raw lookback across chunks, and matching it is what makes our
+/// per-step scores equal `Model.predict`'s. It is deliberately *shorter* than
+/// [`MEL_STFT_WINDOW`], so the first frames of a chunk see less left context
+/// than a whole-segment pass would give them.
 pub(crate) const MEL_LOOKBACK_SAMPLES: usize = 3 * SAMPLES_PER_MEL_FRAME;
+
+// `step` appends every frame the mel pass returns, which is only correct while
+// the lookback is too short to complete a frame of its own.
+const _: () = assert!(MEL_LOOKBACK_SAMPLES < MEL_STFT_WINDOW);
+
+/// Value the persistent mel window is filled with at cold start. Ones, not
+/// zeros: openWakeWord 0.6.0 initialises its melspectrogram buffer to ones, and
+/// the embedding model is only in distribution for a window shaped like that.
+/// A "tidy-up" back to zeros changes every warm-up embedding and silently
+/// breaks per-step parity with the Python implementation.
+pub(crate) const MEL_COLD_FILL: f32 = 1.0;
 
 /// Samples after a detection during which further detections are suppressed
 /// (~2 s at 16 kHz), so one spoken phrase arms the wake once, not repeatedly.
 pub(crate) const REFRACTORY_SAMPLES: u64 = 32_000;
-/// Samples by which the threshold-crossing cursor leads phrase completion.
+
+/// Samples subtracted from the scoring cursor to place a detection's
+/// `wake_end_sample`.
+///
+/// A step's `end_sample` is the exact end of the last mel frame that step fed:
+/// after `N` chunks the window holds `8N - 3` frames, the last of which ends at
+/// `(8N - 4) * 160 + 640 = N * 1280`. So `end_sample` is where the *audio the
+/// score saw* ends, not where the phrase ends — the wake head goes on climbing
+/// for several chunks after the phrase is over (see the tail of
+/// `python_per_step_scores_regression`, whose maximum lands past the end of the
+/// committed phrase).
+///
+/// The crossing is therefore observed no earlier than the chunk in which it
+/// happened, and one chunk is backed off so the carve cursor names the start of
+/// that chunk rather than its end: the listener never eats the chunk whose
+/// scoring produced the arm. It is "one chunk", not "80 ms" — the quantity
+/// being undone is the step's own granularity, so it tracks `CHUNK`.
+/// `first_arm_lands_inside_the_wake_phrase` pins the resulting cursor against
+/// the committed fixture.
 pub(crate) const WAKE_END_LAG_SAMPLES: u64 = CHUNK as u64;
 
+/// Audio a stream must see after a reset before it can produce any wake score:
+/// [`WAKE_WINDOW`] chunks, 1.28 s at 16 kHz. Public because it is a contract
+/// with whoever supplies the audio — a segment shorter than this is never
+/// scored, and a wake phrase whose head sits inside this window is only
+/// detected because the head's score peaks well after the phrase begins.
+///
+/// TODO(wake-readiness-preroll-coupling): nothing ties this to the device's
+/// VAD-onset preroll (`audio-pipeline`'s `PREROLL_SAMPLES`, 16 000), which is
+/// shorter, and the listener re-enters this window on every `SegmentOpened`.
+pub const WAKE_READINESS_SAMPLES: u64 = (WAKE_WINDOW * CHUNK) as u64;
+
 /// Frames `run_mel` emits for `n` raw samples under the model's valid framing.
-/// The join between "which frames has the lookback already contributed" and
-/// "which are new this chunk".
+/// The analytic form of the geometry `mel_frame_count_matches_model` pins
+/// against the committed model.
+///
+/// Test-only. `step` does not consult it: the lookback is too short to complete
+/// a frame, so every frame a chunk's pass returns is new and there is nothing
+/// to subtract. It exists to state the framing the module depends on in a form
+/// a test can compare against the model itself.
+#[cfg(test)]
 pub(crate) fn mel_frame_count(n: usize) -> usize {
     if n < MEL_STFT_WINDOW {
         0
@@ -243,20 +301,20 @@ impl OwwModels {
     }
 }
 
-/// One pod's rolling openWakeWord state. The mel window cold-starts from ones
-/// and the embedding window from zeros; drive it with
+/// One pod's rolling openWakeWord state. The mel window cold-starts from
+/// [`MEL_COLD_FILL`] and the embedding window from zeros; drive it with
 /// [`push`](OwwStream::push) as audio arrives, [`flush`](OwwStream::flush) at a
 /// segment's trailing partial chunk, and [`reset`](OwwStream::reset) on a
 /// discontinuity. [`arm`](OwwStream::arm) applies the threshold + refractory to a
 /// scored step.
 pub struct OwwStream {
     /// Last `MEL_LOOKBACK_SAMPLES` raw samples, prepended to the next chunk for
-    /// mel left context. Empty at cold-start, so the first chunk matches a
-    /// whole-segment pass with no leading padding.
+    /// mel left context. Empty at cold-start, so the first chunk is framed from
+    /// its own first sample and yields 5 frames instead of 8.
     lookback: Vec<f32>,
     /// Real samples not yet forming a whole chunk.
     pending: VecDeque<f32>,
-    /// Persistent 76-frame mel window (cold-started from ones).
+    /// Persistent 76-frame mel window (cold-started from [`MEL_COLD_FILL`]).
     mel_window: VecDeque<[f32; MEL_BINS]>,
     /// Persistent 16-embedding window (cold-started from zeros).
     emb_window: VecDeque<[f32; EMB_DIM]>,
@@ -277,7 +335,7 @@ impl OwwStream {
         OwwStream {
             lookback: Vec::new(),
             pending: VecDeque::new(),
-            mel_window: VecDeque::from(vec![[1.0; MEL_BINS]; EMB_WINDOW]),
+            mel_window: VecDeque::from(vec![[MEL_COLD_FILL; MEL_BINS]; EMB_WINDOW]),
             emb_window: VecDeque::from(vec![[0.0; EMB_DIM]; WAKE_WINDOW]),
             real_embeddings: 0,
             total_chunks: 0,
@@ -288,20 +346,19 @@ impl OwwStream {
 
     /// Clear all rolling state back to cold-start. Called on a pod reconnect or a
     /// sample-index discontinuity so scoring never runs across a hole.
+    ///
+    /// Re-runs the constructor rather than clearing field by field: a field
+    /// added to `OwwStream` cannot then be initialised in one place and
+    /// forgotten in the other, which would leak state across a re-anchor.
     pub fn reset(&mut self) {
-        self.lookback.clear();
-        self.pending.clear();
-        self.mel_window = VecDeque::from(vec![[1.0; MEL_BINS]; EMB_WINDOW]);
-        self.emb_window = VecDeque::from(vec![[0.0; EMB_DIM]; WAKE_WINDOW]);
-        self.real_embeddings = 0;
-        self.total_chunks = 0;
-        self.refractory_until = 0;
+        *self = OwwStream::new(self.threshold);
     }
 
-    /// Feed real PCM. Processes every whole chunk now available, returning a
-    /// [`ScoredChunk`] for each embedding step that completed (roughly one per
-    /// chunk, with no wake score until the first 15 embeddings). A trailing partial chunk stays buffered
-    /// for the next `push` or a `flush`.
+    /// Feed real PCM. Processes every whole chunk now available, returning one
+    /// [`ScoredChunk`] per processed chunk, starting with the chunk that
+    /// completes [`WAKE_WINDOW`] real embeddings — the first
+    /// [`WAKE_READINESS_SAMPLES`] after a reset yield none. A trailing partial
+    /// chunk stays buffered for the next `push` or a `flush`.
     pub fn push(
         &mut self,
         models: &mut OwwModels,
@@ -314,6 +371,13 @@ impl OwwStream {
             out.extend(self.step(models, &chunk)?);
         }
         Ok(out)
+    }
+
+    /// Whole chunks processed since the last reset. The denominator the listener
+    /// needs to report how much audio the wake model consumed, including the
+    /// chunks consumed before the stream was ready to score.
+    pub fn chunks_processed(&self) -> u64 {
+        self.total_chunks
     }
 
     /// Score a trailing partial chunk, zero-padded up to a whole chunk (the batch
@@ -330,11 +394,13 @@ impl OwwStream {
 
     /// Apply the threshold + refractory to a freshly-scored step. Fires (and
     /// re-arms the refractory) on a threshold crossing outside the refractory
-    /// window; provenance is reported one chunk before the scoring cursor.
+    /// window; provenance is reported [`WAKE_END_LAG_SAMPLES`] before the
+    /// scoring cursor.
+    ///
+    /// Readiness is not re-checked here. [`step`](OwwStream::step) is the single
+    /// gate: no `ScoredChunk` exists at all until the embedding history is real,
+    /// so a second guard on this side could only ever disagree with the first.
     pub fn arm(&mut self, chunk: &ScoredChunk) -> Option<WakeDetected> {
-        if self.real_embeddings < WAKE_WINDOW {
-            return None;
-        }
         if chunk.score > self.threshold && chunk.end_sample >= self.refractory_until {
             self.refractory_until = chunk.end_sample + REFRACTORY_SAMPLES;
             Some(WakeDetected {
@@ -346,27 +412,27 @@ impl OwwStream {
         }
     }
 
-    /// One chunk step: mel over (lookback + chunk), append only the genuinely new
-    /// frames (those the lookback did not already cover), and drive the
-    /// embedding/wake windows once per processed chunk. Updates the rolling
-    /// windows and lookback.
+    /// One chunk step: mel over (lookback + chunk), append every frame the pass
+    /// produced, and drive the embedding/wake windows once per processed chunk.
+    /// Updates the rolling windows and lookback.
+    ///
+    /// Every frame is new: the lookback is shorter than [`MEL_STFT_WINDOW`], so
+    /// it contributes no complete frame of its own and only supplies left
+    /// context. That is what makes the count 5 for the first chunk and
+    /// [`EMB_STEP`] for every chunk after.
     fn step(
         &mut self,
         models: &mut OwwModels,
         chunk: &[f32],
     ) -> Result<Vec<ScoredChunk>, WakeError> {
         debug_assert_eq!(chunk.len(), CHUNK);
-        let prev_lookback = self.lookback.len();
-        let mut input = Vec::with_capacity(prev_lookback + chunk.len());
+        let mut input = Vec::with_capacity(self.lookback.len() + chunk.len());
         input.extend_from_slice(&self.lookback);
         input.extend_from_slice(chunk);
 
         let frames = models.run_mel(&input)?;
-        // Prefix-stable framing: the first `mel_frame_count(prev_lookback)` frames
-        // repeat what the lookback already contributed; the rest are new.
-        let already = mel_frame_count(prev_lookback).min(frames.len());
         let mut scores = Vec::new();
-        for frame in &frames[already..] {
+        for frame in &frames {
             self.mel_window.pop_front();
             self.mel_window.push_back(*frame);
         }
@@ -412,11 +478,18 @@ mod tests {
         oww_model_dir()
     }
 
-    /// Reference batch scorer over a complete real embedding history. Streaming
-    /// must preserve the decision; incomplete histories produce no score.
-    fn batch_reference_max(models: &mut OwwModels, pcm: &[i16]) -> Option<f32> {
+    /// Re-derive the maximum wake score from a single whole-segment mel pass,
+    /// sliding the same windows over the contiguous frames.
+    ///
+    /// **Not an oracle.** It reimplements this module's own choices (the cold
+    /// fill, the 5-then-8 cadence, the sixteen-embedding gate), so it can only
+    /// catch a streaming/batch *self*-consistency break — a chunking bug in
+    /// `push`/`flush` — never a wrong choice made in both places. The external
+    /// ground truth is `python_per_step_scores_regression`, which pins values
+    /// produced by openWakeWord 0.6.0 rather than by this file.
+    fn whole_segment_max(models: &mut OwwModels, pcm: &[i16]) -> Option<f32> {
         let mut mel_window: VecDeque<[f32; MEL_BINS]> =
-            VecDeque::from(vec![[1.0; MEL_BINS]; EMB_WINDOW]);
+            VecDeque::from(vec![[MEL_COLD_FILL; MEL_BINS]; EMB_WINDOW]);
         let mut emb_window: VecDeque<[f32; EMB_DIM]> =
             VecDeque::from(vec![[0.0; EMB_DIM]; WAKE_WINDOW]);
         let mut samples: Vec<f32> = pcm.iter().map(|&s| f32::from(s)).collect();
@@ -424,6 +497,9 @@ mod tests {
         samples.resize(target, 0.0);
 
         let frames = models.run_mel(&samples).unwrap();
+        // The first chunk contributes `mel_frame_count(CHUNK)` frames; every
+        // chunk after contributes `EMB_STEP`. An embedding fires on each.
+        let first = mel_frame_count(CHUNK);
         let mut frame_count = 0usize;
         let mut real_embeddings = 0usize;
         let mut best: Option<f32> = None;
@@ -431,7 +507,9 @@ mod tests {
             mel_window.pop_front();
             mel_window.push_back(frame);
             frame_count += 1;
-            if frame_count == 5 || (frame_count > 5 && (frame_count - 5).is_multiple_of(EMB_STEP)) {
+            if frame_count == first
+                || (frame_count > first && (frame_count - first).is_multiple_of(EMB_STEP))
+            {
                 let emb = models.run_embedding(&mel_window).unwrap();
                 emb_window.pop_front();
                 emb_window.push_back(emb);
@@ -491,13 +569,14 @@ mod tests {
         );
     }
 
-    /// Streaming and batch agree on the wake decision. Streamed mel values can
-    /// differ slightly from whole-segment values near phrase edges.
+    /// Streaming and a whole-segment re-derivation agree on the wake decision
+    /// for the committed phrase, and on the score to within the framing
+    /// difference between them.
     #[test]
     fn stream_matches_batch_on_wake_phrase() {
         let mut models = test_models();
         let pcm = wake_phrase_pcm();
-        let reference = batch_reference_max(&mut models, &pcm).unwrap();
+        let reference = whole_segment_max(&mut models, &pcm).unwrap();
         let streamed = stream_max(&mut models, &pcm).unwrap();
         assert!(
             reference > 0.5,
@@ -508,19 +587,24 @@ mod tests {
             "streaming must detect the wake phrase, got {streamed}"
         );
         assert!(
-            // Streaming mel values may differ near phrase edges; 0.01 preserves
-            // the accept/reject parity check while allowing that model variance.
+            // The bound is the cost of `MEL_LOOKBACK_SAMPLES` (480) being
+            // shorter than `MEL_STFT_WINDOW` (640): the first frames of each
+            // streamed chunk see less left context than the same frames of a
+            // single contiguous pass, so the two mel spectra differ slightly at
+            // every chunk boundary. Tighten this only by lengthening the
+            // lookback — which would break parity with openWakeWord.
             (reference - streamed).abs() < 0.01,
             "streaming score {streamed} diverges materially from batch {reference}"
         );
     }
 
-    /// Streaming reproduces the batch oracle on noise: both reject, scores equal.
+    /// Streaming reproduces the whole-segment pass on noise: both reject, scores
+    /// equal.
     #[test]
     fn stream_matches_batch_on_noise() {
         let mut models = test_models();
         let pcm = seeded_noise(1, 32_000);
-        let reference = batch_reference_max(&mut models, &pcm).unwrap();
+        let reference = whole_segment_max(&mut models, &pcm).unwrap();
         let streamed = stream_max(&mut models, &pcm).unwrap();
         assert!(
             reference <= 0.5,
@@ -613,6 +697,49 @@ mod tests {
         }
     }
 
+    /// What [`WAKE_END_LAG_SAMPLES`] actually buys, measured against the
+    /// committed phrase rather than restated from the constant.
+    ///
+    /// The fixture is 32 000 samples of silence then the 20 507-sample "Hey
+    /// Jarvis" clip, so the phrase occupies 32 000..52 507. The first
+    /// threshold crossing must therefore name a cursor *inside* the phrase —
+    /// past enough of it to be the phrase that scored, and short of its end so
+    /// the command audio after it is never eaten. The head goes on climbing
+    /// past the end of the clip (`python_per_step_scores_regression` peaks at
+    /// 53 760), which is exactly why the cursor is backed off.
+    #[test]
+    fn first_arm_lands_inside_the_wake_phrase() {
+        let mut models = test_models();
+        let mut stream = OwwStream::new(0.5);
+        let lead = 32_000_usize;
+        let phrase = wake_phrase_pcm();
+        let phrase_end = lead + phrase.len();
+        let mut pcm = vec![0_i16; lead];
+        pcm.extend_from_slice(&phrase);
+
+        let mut scored = stream.push(&mut models, &pcm).unwrap();
+        scored.extend(stream.flush(&mut models).unwrap());
+        let first = scored
+            .iter()
+            .find_map(|sc| stream.arm(sc))
+            .expect("the committed phrase arms");
+
+        assert_eq!(
+            first.wake_end_sample, 46_080,
+            "the first crossing's cursor moved; scores: {scored:?}"
+        );
+        assert!(
+            first.wake_end_sample > lead as u64,
+            "cursor {} precedes the phrase at {lead}",
+            first.wake_end_sample
+        );
+        assert!(
+            first.wake_end_sample < phrase_end as u64,
+            "cursor {} runs past the phrase end {phrase_end}",
+            first.wake_end_sample
+        );
+    }
+
     /// A sub-chunk feed computes one embedding on flush but cannot be wake-scored.
     #[test]
     fn sub_chunk_does_not_score() {
@@ -696,16 +823,24 @@ mod tests {
         assert_eq!(scored.len(), 1, "reset requires sixteen fresh embeddings");
     }
 
+    /// The cold-start guarantee, end to end through the public surface: a
+    /// stream fed nothing but digital silence offers `arm` no chunk it can fire
+    /// on, even with the threshold pushed below every possible score. Readiness
+    /// is enforced by there being no `ScoredChunk` to arm, which is why `arm`
+    /// needs no guard of its own.
     #[test]
-    fn arm_rejects_synthetic_chunk_before_ready() {
+    fn a_threshold_below_zero_still_cannot_wake_on_cold_silence() {
+        let mut models = test_models();
         let mut stream = OwwStream::new(-1.0);
+        let scored = stream
+            .push(
+                &mut models,
+                &vec![0_i16; WAKE_READINESS_SAMPLES as usize - 1],
+            )
+            .unwrap();
         assert!(
-            stream
-                .arm(&ScoredChunk {
-                    score: 1.0,
-                    end_sample: 0
-                })
-                .is_none()
+            scored.is_empty(),
+            "under {WAKE_READINESS_SAMPLES} samples cannot be scored: {scored:?}"
         );
     }
 
@@ -728,7 +863,6 @@ mod tests {
     #[test]
     fn arm_enforces_threshold_and_refractory() {
         let mut stream = OwwStream::new(0.5);
-        stream.real_embeddings = WAKE_WINDOW;
         // Below threshold: no arm, refractory untouched.
         assert_eq!(
             stream.arm(&ScoredChunk {

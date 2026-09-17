@@ -24,15 +24,6 @@ use speech_pipeline::{
 };
 use speech_surface::replay::{ReplayListener, StopReason, replay_framelog};
 
-const WAKE_PREROLL_SAMPLES: usize = 16_000;
-
-fn primed_wake_pcm() -> Vec<i16> {
-    let wake = common::read_wav_pcm(Path::new(common::WAKE_PHRASE_WAV));
-    let mut pcm = vec![0_i16; WAKE_PREROLL_SAMPLES];
-    pcm.extend_from_slice(&wake);
-    pcm
-}
-
 /// Load a `ReplayListener` with the wake-command hold off: the plain replays
 /// have no command after the wake phrase, so the hold must be disabled or it
 /// suppresses the carve these tests assert on.
@@ -65,8 +56,7 @@ fn committed_listener_with(config: ListenerConfig) -> ReplayListener {
 #[test]
 fn wake_phrase_framelog_replays_to_wake_and_carve() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let wav = dir.path().join("primed-wake.wav");
-    speech_pipeline::write_spine_wav(&wav, &primed_wake_pcm()).expect("write spine wav");
+    let wav = common::primed_wake_wav(dir.path());
     let framelog = common::import_wav_to_framelog(dir.path(), &wav, 1);
 
     let mut listener = committed_listener();
@@ -156,7 +146,7 @@ fn silence_framelog_replays_to_no_wake_no_utterance() {
 #[test]
 fn overlapping_segment_prerolls_replay_without_killing_the_listener() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pcm = primed_wake_pcm();
+    let pcm = common::primed_wake_pcm();
     // Segment 1 carries the whole phrase from index 0. Segment 2 opens 8 000
     // samples (500 ms) behind segment 1's end, re-sending that tail as its preroll
     // — the close-to-open gap was shorter than the preroll.
@@ -286,14 +276,15 @@ fn cached_clip(cell: &'static OnceLock<Arc<[i16]>>, path: &str) -> Arc<[i16]> {
 fn compose_wake_pause_command(path: &Path, pause_samples: usize) -> usize {
     let wake = cached_clip(&WAKE_CLIP, common::WAKE_PHRASE_WAV);
     let command = cached_clip(&COMMAND_CLIP, common::COMMAND_PHRASE_WAV);
-    let mut pcm =
-        Vec::with_capacity(WAKE_PREROLL_SAMPLES + wake.len() + pause_samples + command.len());
-    pcm.extend(std::iter::repeat_n(0_i16, WAKE_PREROLL_SAMPLES));
+    let mut pcm = Vec::with_capacity(
+        common::WAKE_PREROLL_SAMPLES + wake.len() + pause_samples + command.len(),
+    );
+    pcm.extend(std::iter::repeat_n(0_i16, common::WAKE_PREROLL_SAMPLES));
     pcm.extend_from_slice(&wake);
     pcm.extend(std::iter::repeat_n(0_i16, pause_samples));
     pcm.extend_from_slice(&command);
     speech_pipeline::write_spine_wav(path, &pcm).expect("write spine wav");
-    WAKE_PREROLL_SAMPLES + wake.len()
+    common::WAKE_PREROLL_SAMPLES + wake.len()
 }
 
 /// The frame log for a wake / `pause_samples` of silence / command clip, and the
@@ -647,7 +638,7 @@ fn a_wake_and_a_command_in_two_device_segments_coalesce() {
     // trailing quiet to soft-endpoint it.
     let hangover = 8_000_usize; // 0.5 s
     let hole = 16_000_u64; // 1.0 s
-    let mut segment_a = vec![0_i16; WAKE_PREROLL_SAMPLES];
+    let mut segment_a = vec![0_i16; common::WAKE_PREROLL_SAMPLES];
     segment_a.extend_from_slice(&wake);
     segment_a.extend(std::iter::repeat_n(0_i16, hangover));
     let mut segment_b = command.to_vec();

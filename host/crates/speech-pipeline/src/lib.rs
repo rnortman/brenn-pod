@@ -38,7 +38,7 @@ pub use listener::{
     ListenerConfig, ListenerEvent, ListenerHandle, ListenerState, ListenerStats,
     ListenerStatsSnapshot, ListenerUtteranceId, MODEL_STATS_FLUSH_CHUNKS, OwwModels, OwwStream,
     PcmRing, ScoreStats, ScoreSummary, ScoredChunk, SileroConfig, SileroModel, SileroVad,
-    StatsFlushCause, StatsModel, TransitionCause, WakeDetected, WakePolicy,
+    StatsFlushCause, StatsModel, TransitionCause, WAKE_READINESS_SAMPLES, WakeDetected, WakePolicy,
 };
 pub use playback::{
     AbortReason, AudibleJob, FRAME_MS, FlushRejected, PacerConfig, PlayRejected, PlaybackEvent,
@@ -59,6 +59,6 @@ pub use types::{
     TrackingEvent, Transcript, TranscriptConfidence, Utterance, UtteranceId, WakeConfirmation,
     signed_offset_us, stage_delta_us,
 };
-pub use wake::{OwwConfig, OwwGate, WakeError, WakeOutcome};
+pub use wake::{OwwConfig, OwwGate, UnscoredReason, WakeError, WakeOutcome};
 pub use wav::{SpineFormatViolation, check_spine_format, write_spine_wav};
 pub use wav_brain::WavBrain;

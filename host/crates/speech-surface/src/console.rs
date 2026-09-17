@@ -1003,16 +1003,38 @@ fn narrate_endpointer_transition(fields: &Value) -> String {
 /// The reading a transition line cannot give — an endpointer that never fires says
 /// nothing about what the model returned. Each field degrades to `?` when absent
 /// or mistyped.
+///
+/// Chunks the model consumed without scoring are named separately
+/// (`+3 unscored`), and a line with nothing but those reads
+/// `oww p x0 +8 unscored (segment_close) @10240` — the wake model warming up
+/// after a reset, which is a different reading from a low score and from no
+/// line at all.
 fn narrate_model_stats(fields: &Value) -> String {
     let model = fmt_str(fields.get("model"));
-    let chunks = fmt_u64(fields.get("chunks"));
+    let chunks = fields.get("chunks").and_then(Value::as_u64);
+    let unscored = fields
+        .get("unscored_chunks")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cause = fmt_str(fields.get("cause"));
+    let at = fmt_u64(fields.get("last_chunk_end"));
+    let unscored = if unscored > 0 {
+        format!(" +{unscored} unscored")
+    } else {
+        String::new()
+    };
+    let count = fmt_u64(fields.get("chunks"));
+    if chunks == Some(0) {
+        return format!("{model} p x0{unscored} ({cause}) @{at}");
+    }
     let min = fmt_score(fields.get("min"));
     let max = fmt_score(fields.get("max"));
     let mean = fmt_score(fields.get("mean"));
     let median = fmt_score(fields.get("median"));
-    let cause = fmt_str(fields.get("cause"));
-    let at = fmt_u64(fields.get("last_chunk_end"));
-    format!("{model} p x{chunks}: min {min} max {max} mean {mean} median {median} ({cause}) @{at}")
+    format!(
+        "{model} p x{count}{unscored}: min {min} max {max} mean {mean} median {median} \
+         ({cause}) @{at}"
+    )
 }
 
 /// A superseded utterance as prose: `utterance seq 4 superseded — speech
@@ -2089,6 +2111,70 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("!!!"), "stats are calm: {line}");
+    }
+
+    /// A warming wake stream narrates as a count with no distribution. Reading
+    /// this line, an operator can tell OWW ran and could not yet score from OWW
+    /// having scored low — and both from OWW never having run, which emits no
+    /// line at all.
+    #[test]
+    fn model_stats_narrate_unscored_warmup_chunks() {
+        let mut r = Renderer::new(false);
+        let line = r
+            .render(
+                0,
+                "model_stats",
+                &json!({
+                    "pod": "pod-fbe2f8",
+                    "epoch": 1,
+                    "model": "oww",
+                    "cause": "segment_close",
+                    "first_chunk_end": 1_280_u64,
+                    "last_chunk_end": 10_240_u64,
+                    "chunks": 0,
+                    "unscored_chunks": 8,
+                }),
+            )
+            .unwrap();
+        assert!(
+            line.contains("[pod-fbe2f8] oww p x0 +8 unscored (segment_close) @10240"),
+            "{line}"
+        );
+        assert!(!line.contains("min"), "no distribution to report: {line}");
+    }
+
+    /// A flush that spans the readiness boundary carries both readings on one
+    /// line: what could not be scored, and the distribution of what could.
+    #[test]
+    fn model_stats_narrate_a_partly_scored_flush() {
+        let mut r = Renderer::new(false);
+        let line = r
+            .render(
+                0,
+                "model_stats",
+                &json!({
+                    "pod": "pod-fbe2f8",
+                    "epoch": 1,
+                    "model": "oww",
+                    "cause": "segment_close",
+                    "first_chunk_end": 1_280_u64,
+                    "last_chunk_end": 25_600_u64,
+                    "chunks": 4,
+                    "unscored_chunks": 16,
+                    "min": 0.001,
+                    "max": 0.004,
+                    "mean": 0.002,
+                    "median": 0.002,
+                }),
+            )
+            .unwrap();
+        assert!(
+            line.contains(
+                "oww p x4 +16 unscored: min 0.001 max 0.004 mean 0.002 median 0.002 \
+                 (segment_close) @25600"
+            ),
+            "{line}"
+        );
     }
 
     /// The rest of the lifecycle: a wake detection (JSONL-only until now), a

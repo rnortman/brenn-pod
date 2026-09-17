@@ -834,6 +834,35 @@ pub const WAKE_PHRASE_WAV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../testdata/wake/wake-phrase.wav"
 );
+/// Digital silence prepended to a wake fixture by [`primed_wake_pcm`] and
+/// [`primed_wake_wav`], standing in for the device's VAD-onset preroll
+/// (`audio-pipeline`'s `PREROLL_SAMPLES`, 1 s at 16 kHz). A live pod never
+/// opens a segment at the first sample of the wake phrase; it opens one preroll
+/// behind, and that is the audio the wake model warms up on. A fixture that
+/// starts at the phrase gives the model a cold start no real capture produces.
+///
+/// One number, one place: the value belongs to the device's preroll, not to
+/// `WAKE_READINESS_SAMPLES` (1.28 s, longer than this) — the wake still fires
+/// because the head's score peaks well after the phrase begins.
+pub const WAKE_PREROLL_SAMPLES: usize = 16_000;
+
+/// The committed wake phrase behind [`WAKE_PREROLL_SAMPLES`] of silence, as PCM.
+pub fn primed_wake_pcm() -> Vec<i16> {
+    let wake = read_wav_pcm(Path::new(WAKE_PHRASE_WAV));
+    let mut pcm = Vec::with_capacity(WAKE_PREROLL_SAMPLES + wake.len());
+    pcm.extend(std::iter::repeat_n(0_i16, WAKE_PREROLL_SAMPLES));
+    pcm.extend_from_slice(&wake);
+    pcm
+}
+
+/// [`primed_wake_pcm`] written as a spine `.wav` inside `dir`, for the cases
+/// that feed `wav-import` rather than raw PCM.
+pub fn primed_wake_wav(dir: &Path) -> PathBuf {
+    let wav = dir.join("primed-wake.wav");
+    speech_pipeline::write_spine_wav(&wav, &primed_wake_pcm()).expect("write primed wake wav");
+    wav
+}
+
 /// The committed TTS command clip — "this is a test one two three", not the wake
 /// phrase, so it arms nothing.
 pub const COMMAND_PHRASE_WAV: &str = concat!(
