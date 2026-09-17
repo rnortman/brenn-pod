@@ -4,35 +4,6 @@
 
 This is a placeholder entry. Leave it here so the file is never empty. It is not a real TODO. You would reference it in code with `// TODO(example-placeholder)` comments. This is the basic TODO system design: An entry here with a slug used to join to code comments. Add real TODOs below this one in this format.
 
-## `brenn-brain-listen` — BLOCKED as of 2026-08-03 (needs a hold-open capability in the listener)
-
-The pub/sub response vocabulary carries a `<listen/>` marker: "hold the microphone open after this
-reply, the person is expected to keep talking without saying the wake word again". `BrennBrain`
-recognizes it, strips it out of the speech, and reports `LinkListenUnsupported` — the behavior
-behind it does not exist. Capture is wake-word-gated, and the only playback-time capture trigger
-today is the barge latch (`OwwStream`'s barge path, `host/crates/speech-pipeline/src/listener/
-runtime.rs`). Without the marker a conversational exchange costs a wake word per turn, which is
-exactly the interaction an LLM on the other end is best at.
-
-The marker is in the wire vocabulary now precisely so this lands without a schema change: the peer
-already emits it, the codec already parses it, and the help document already tells the peer it is
-accepted-but-inert. So this is listener + pipeline work only — a way to arm capture for a bounded
-window after a reply finishes playing, without the wake gate, and a way for the brain to request it
-that survives the pipeline's inline dispatch (the marker is known when the segment is spoken, but
-the window opens when playback of that segment *ends*).
-
-Deferred rather than dismissed: it is a listener state-machine change with its own failure modes
-(what closes the window, what happens when the user says nothing, what happens when the held-open
-capture picks up the pod's own playback tail), not a line in the brain.
-
-Done = a `<listen/>`-marked reply holds capture open for a bounded window after its playback ends,
-speech in that window dispatches as an ordinary utterance with no wake word, the window closes on
-timeout or on the next dispatch, and `LinkListenUnsupported` is retired along with its stat and
-console name.
-
-See `TODO(brenn-brain-listen)` at the `Tag::Listen` arm of `BrennBrain::deliver` in
-`host/crates/speech-pipeline/src/brenn_brain.rs`.
-
 ## `bridge-upgrade-rejection-terminal` — BLOCKED as of 2026-08-02 (needs a change in the brenn repo first)
 
 A bearer token the brenn server does not accept — stale, rotated, mistyped, or pointed at the

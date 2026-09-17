@@ -26,6 +26,7 @@ use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use serde::Serialize;
 
+use crate::brenn_brain::Cue;
 use crate::types::{
     InterruptProgress, PodId, SPINE_FORMAT, SpeakCmd, Transcript, TranscriptConfidence, Utterance,
     UtteranceId,
@@ -111,24 +112,62 @@ pub enum SinkSendError {
 /// takes a lock and returns.
 pub type SinkTap = Arc<dyn Fn(&SpeakCmd) + Send + Sync>;
 
+/// Observes the movements a response asked for, in the order the markers
+/// appeared in it. Synchronous and on the brain's own thread, like [`SinkTap`],
+/// so an implementation must stay cheap — the surface's tap resolves names
+/// against its library and sends one message.
+pub type CueTap = Arc<dyn Fn(Vec<Cue>) + Send + Sync>;
+
 /// The channel a `Brain` writes its responses into. Wraps the sender half of the
 /// response path; the pipeline holds the receiver. Bounded, so a slow playback
 /// path back-pressures the brain rather than growing unboundedly.
+///
+/// Cues do not ride the response queue. A cue is not speech: a reply that is
+/// nothing but a cue queues no command at all, and the movement still has to
+/// reach the head.
 pub struct ResponseSink {
     tx: mpsc::Sender<SpeakCmd>,
     tap: Option<SinkTap>,
+    cues: Option<CueTap>,
 }
 
 impl ResponseSink {
     pub fn new(tx: mpsc::Sender<SpeakCmd>) -> Self {
-        Self { tx, tap: None }
+        Self {
+            tx,
+            tap: None,
+            cues: None,
+        }
     }
 
     /// A sink that hands each accepted command to `tap` before returning. The tap
     /// is the surface's seam for counting a turn's responses and capturing their
     /// text; the brain is unaware of it.
     pub fn with_tap(tx: mpsc::Sender<SpeakCmd>, tap: SinkTap) -> Self {
-        Self { tx, tap: Some(tap) }
+        Self {
+            tx,
+            tap: Some(tap),
+            cues: None,
+        }
+    }
+
+    /// A sink with both taps, either of which may be absent: a deployment that
+    /// wires no head has no use for the cue tap, and a cue it drops is a
+    /// movement nobody could have made.
+    pub fn with_taps(
+        tx: mpsc::Sender<SpeakCmd>,
+        tap: Option<SinkTap>,
+        cues: Option<CueTap>,
+    ) -> Self {
+        Self { tx, tap, cues }
+    }
+
+    /// Hand the movements one response message asked for to the cue tap. A no-op
+    /// when none is wired.
+    pub fn cue(&self, cues: Vec<Cue>) {
+        if let Some(tap) = self.cues.as_ref() {
+            tap(cues);
+        }
     }
 
     /// Queue a response command. Errors if the queue is full or the pipeline's

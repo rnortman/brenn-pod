@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use audio_pipeline::playback::{
@@ -958,12 +959,28 @@ pub struct BrennConfig {
     /// is published. Must be greater than zero.
     #[serde(default = "default_brenn_response_timeout_ms")]
     pub response_timeout_ms: u64,
-    /// How long a turn waits for a *promised* continuation segment. Shorter than
-    /// the initial budget by default and deliberately so: once the harness has
-    /// started answering, a long silent gap is evidence of a lost continuation
-    /// rather than of a slow think. Must be greater than zero.
+    /// How long a turn waits for a *promised* continuation segment. The same
+    /// budget as the first message by default: a continuation is another cloud
+    /// round-trip, not a local one.
+    ///
+    /// What keeps it from being larger still: the pipeline awaits the turn
+    /// inline, and nothing is playing during a continuation wait, so a wake word
+    /// said in the window is not answered until the window ends. A
+    /// `<continued/>` the peer never follows up therefore costs a pod that is
+    /// deaf to its wake word for this long. Must be greater than zero.
     #[serde(default = "default_brenn_continuation_timeout_ms")]
     pub continuation_timeout_ms: u64,
+    /// A copy of the deployed motion library's name sidecar
+    /// (`library.names.json`), relative to `host/` like the model paths. Names
+    /// the poses and motions a response may cue and the pace of each, which is
+    /// what lets a cue be refused here rather than at the daemon, where an
+    /// unknown name costs the whole script it rides in.
+    ///
+    /// Absent means no cue vocabulary at all: every `<pose/>` and `<motion/>` is
+    /// stripped as an unknown marker. Content cannot move the head until the
+    /// operator has said what it may be moved to.
+    #[serde(default)]
+    pub library_names: Option<PathBuf>,
     /// Sub-identity put on every publish, for the peer to attribute the message
     /// to. Omitted from the request when absent.
     #[serde(default)]
@@ -1536,8 +1553,10 @@ fn default_no_speech_max() -> f32 {
 fn default_brenn_response_timeout_ms() -> u64 {
     30_000
 }
+// The same budget as the first message: a continuation is another cloud
+// round-trip, and a peer that chunks a long answer pays that latency per chunk.
 fn default_brenn_continuation_timeout_ms() -> u64 {
-    10_000
+    30_000
 }
 // Well inside any plausible consumer lease, so two lost refreshes in a row still
 // leave the head up.
@@ -1572,6 +1591,135 @@ pub(crate) fn default_presence_turn_pose() -> String {
 // must not imply the request was understood.
 fn default_brenn_failure_message() -> String {
     "Sorry, something's not working right now.".to_string()
+}
+
+// --- the cue vocabulary -------------------------------------------------------
+
+/// How long a motion runs and how long it takes to blend back out, as the
+/// deployed library recorded it. Both are needed to know when the motion is
+/// over: the player is inert only once the blend has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionSpan {
+    pub duration_ms: u64,
+    pub blend_out_ms: u64,
+}
+
+/// The poses and motions a response may cue, with the pace of each.
+///
+/// A copy of the daemon's own name sidecar, read once at startup. It answers, in
+/// one file, which names may be cued and how long each takes — the second being
+/// what lets a speed factor become the absolute `move_ms` the wire carries. It is
+/// a copy, so it can drift from the deployed library; the daemon's per-script
+/// refusal is the detector, and refreshing the copy is the repair.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CueLibrary {
+    poses: HashMap<Arc<str>, u64>,
+    motions: HashMap<Arc<str>, MotionSpan>,
+}
+
+/// The sidecar's shape, as much of it as this side reads. Ids and the `clips`
+/// array are ignored, and so is any field added later: the daemon owns this
+/// format, and a reader that refused an unknown key would break on the next
+/// field it grows.
+#[derive(Deserialize)]
+struct SidecarNames {
+    #[serde(default)]
+    poses: Vec<SidecarPose>,
+    #[serde(default)]
+    motions: Vec<SidecarMotion>,
+}
+
+#[derive(Deserialize)]
+struct SidecarPose {
+    name: String,
+    duration_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct SidecarMotion {
+    name: String,
+    duration_ms: u64,
+    blend_out_ms: u64,
+}
+
+impl CueLibrary {
+    /// Read a copy of the sidecar. Unreadable or malformed is an error rather
+    /// than an empty vocabulary: a deployment that named the file expects the
+    /// head to move, and silently cueing nothing would look like a model that
+    /// forgot to ask.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Parse the sidecar's JSON.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let names: SidecarNames =
+            serde_json::from_str(text).map_err(|e| format!("not a library name sidecar: {e}"))?;
+        let mut poses = HashMap::new();
+        for pose in names.poses {
+            // The daemon's own rule: a pose with no pace names no move, and a
+            // `move_ms` computed from it would be zero at every speed.
+            if pose.duration_ms == 0 {
+                return Err(format!("pose {:?} has no duration", pose.name));
+            }
+            poses.insert(Arc::from(pose.name.as_str()), pose.duration_ms);
+        }
+        let mut motions = HashMap::new();
+        for motion in names.motions {
+            if motion.duration_ms == 0 {
+                return Err(format!("motion {:?} has no duration", motion.name));
+            }
+            motions.insert(
+                Arc::from(motion.name.as_str()),
+                MotionSpan {
+                    duration_ms: motion.duration_ms,
+                    blend_out_ms: motion.blend_out_ms,
+                },
+            );
+        }
+        Ok(Self { poses, motions })
+    }
+
+    /// The library's name for `name` and that pose's own pace, or `None` when
+    /// the library does not hold it. The returned name is the library's copy, so
+    /// a resolved cue carries no allocation of the peer's text.
+    pub fn pose(&self, name: &str) -> Option<(Arc<str>, u64)> {
+        self.poses
+            .get_key_value(name)
+            .map(|(name, duration_ms)| (Arc::clone(name), *duration_ms))
+    }
+
+    /// The same for a motion, with the span the daemon recorded for it.
+    pub fn motion(&self, name: &str) -> Option<(Arc<str>, MotionSpan)> {
+        self.motions
+            .get_key_value(name)
+            .map(|(name, span)| (Arc::clone(name), *span))
+    }
+
+    /// The pose names a response may cue: every pose but the stow.
+    ///
+    /// The stow is excluded because rest is not a pose a reply gets to command —
+    /// it is the ending the fault ladder and the script compiler both treat
+    /// structurally. Sorted, so two runs of one deployment render one document.
+    pub fn help_poses(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .poses
+            .keys()
+            .filter(|name| name.as_ref() != motion_proto::STOW_POSE)
+            .map(|name| name.to_string())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// The motion names a response may cue: every motion in the library.
+    pub fn help_motions(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.motions.keys().map(|name| name.to_string()).collect();
+        names.sort_unstable();
+        names
+    }
 }
 
 /// A config text whose `[wake]` table is in the streaming listener's required
@@ -2784,7 +2932,8 @@ model = "m"
         assert_eq!(brenn.presence_max_engaged_ms, 30_000);
         assert_eq!(brenn.presence_stow_margin_ms, 500);
         assert_eq!(brenn.response_timeout_ms, 30_000);
-        assert_eq!(brenn.continuation_timeout_ms, 10_000);
+        assert_eq!(brenn.continuation_timeout_ms, 30_000);
+        assert_eq!(brenn.library_names, None);
         assert_eq!(brenn.attribution, None);
         assert_eq!(
             brenn.failure_message,
@@ -2821,6 +2970,7 @@ presence_max_engaged_ms = 20000
 presence_stow_margin_ms = 750
 response_timeout_ms = 45000
 continuation_timeout_ms = 5000
+library_names = "cogs/library.names.json"
 attribution = "voice"
 failure_message = "The bus is down."
 [brenn.bridge]
@@ -2849,6 +2999,10 @@ max_backoff_ms = 9000
         );
         assert_eq!(brenn.response_timeout_ms, 45_000);
         assert_eq!(brenn.continuation_timeout_ms, 5_000);
+        assert_eq!(
+            brenn.library_names,
+            Some(PathBuf::from("cogs/library.names.json"))
+        );
         assert_eq!(brenn.attribution.as_deref(), Some("voice"));
         assert_eq!(brenn.failure_message, "The bus is down.");
         assert_eq!(brenn.bridge.ident, "pod-host");
@@ -3311,5 +3465,81 @@ max_backoff_ms = 9000
     fn psk_table_load_reports_a_missing_file() {
         let err = PskTable::load(Path::new("/nonexistent/psk.toml")).unwrap_err();
         assert!(err.to_string().contains("/nonexistent/psk.toml"), "{err}");
+    }
+
+    // --- the cue vocabulary ---
+
+    /// The sidecar's real shape: ids and a `clips` array this side ignores, and
+    /// the `stow` pose no reply may command.
+    const SIDECAR: &str = r#"{
+      "clips": [{ "clip_id": 0, "name": "bench/nod" }],
+      "poses": [
+        { "pose_id": 0, "name": "peek", "duration_ms": 800 },
+        { "pose_id": 2, "name": "stow", "duration_ms": 2000 }
+      ],
+      "motions": [
+        { "motion_id": 0, "name": "bench/nod", "duration_ms": 800, "blend_out_ms": 200 },
+        { "motion_id": 1, "name": "a/b", "duration_ms": 1860, "blend_out_ms": 150 }
+      ]
+    }"#;
+
+    #[test]
+    fn the_cue_library_reads_the_sidecar_and_ignores_what_it_does_not_own() {
+        let library = CueLibrary::parse(SIDECAR).expect("sidecar parses");
+        assert_eq!(library.pose("peek").map(|(_, ms)| ms), Some(800));
+        assert_eq!(library.pose("stow").map(|(_, ms)| ms), Some(2_000));
+        assert_eq!(library.pose("nowhere"), None);
+        assert_eq!(
+            library.motion("a/b").map(|(_, span)| span),
+            Some(MotionSpan {
+                duration_ms: 1_860,
+                blend_out_ms: 150
+            })
+        );
+        assert_eq!(library.motion("bench/perk"), None);
+    }
+
+    #[test]
+    fn the_help_vocabulary_omits_the_stow_and_nothing_else() {
+        // Rest is not a pose a reply commands; every motion is fair game.
+        let library = CueLibrary::parse(SIDECAR).expect("sidecar parses");
+        assert_eq!(library.help_poses(), vec!["peek".to_string()]);
+        assert_eq!(
+            library.help_motions(),
+            vec!["a/b".to_string(), "bench/nod".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_paceless_entry_is_refused() {
+        // A zero duration is the daemon's own refusal, and a `move_ms` derived
+        // from it would be zero at every speed.
+        let refusal = CueLibrary::parse(
+            r#"{ "poses": [{ "name": "peek", "duration_ms": 0 }], "motions": [] }"#,
+        )
+        .expect_err("a paceless pose is refused");
+        assert!(refusal.contains("peek"), "{refusal}");
+        assert!(
+            CueLibrary::parse(
+                r#"{ "poses": [], "motions": [{ "name": "a/b", "duration_ms": 0, "blend_out_ms": 20 }] }"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_missing_sidecar_is_refused_rather_than_read_as_empty() {
+        assert!(CueLibrary::parse("{ not json").is_err());
+        assert!(CueLibrary::parse(r#"{ "poses": [{ "name": "peek" }] }"#).is_err());
+        let missing = CueLibrary::load(Path::new("/nonexistent/library.names.json"))
+            .expect_err("an unreadable file is refused");
+        assert!(missing.contains("library.names.json"), "{missing}");
+    }
+
+    #[test]
+    fn an_empty_sidecar_holds_no_vocabulary() {
+        let library = CueLibrary::parse("{}").expect("an empty sidecar parses");
+        assert!(library.help_poses().is_empty());
+        assert!(library.help_motions().is_empty());
     }
 }

@@ -91,9 +91,6 @@ pub enum BrainEvent {
     /// pending turn anyway. Benign — with a single pending slot there is only one
     /// turn it could belong to — but worth seeing.
     LinkReplyAssumed { utterance: UtteranceId },
-    /// A response asked to hold the mic open, which is in the wire vocabulary but
-    /// not implemented; the tag was stripped and the request ignored.
-    LinkListenUnsupported { utterance: UtteranceId },
     /// A response chain kept promising continuations past the safety bound. The
     /// capping segment was spoken and the turn ended as if it were terminal.
     LinkContinuationCapped {
@@ -162,7 +159,6 @@ pub struct BrainStats {
     link_response_timeouts: AtomicU64,
     link_tags_stripped: AtomicU64,
     link_replies_assumed: AtomicU64,
-    link_listen_unsupported: AtomicU64,
     link_continuations_capped: AtomicU64,
 }
 
@@ -196,9 +192,6 @@ pub struct BrainStatsSnapshot {
     /// Responses accepted for the pending turn despite carrying no correlation
     /// marker. Not a failure counter — the reply policy is deliberately optimistic.
     pub link_replies_assumed: u64,
-    /// Responses that asked to hold the mic open, a wire-vocabulary tag with no
-    /// implementation behind it yet.
-    pub link_listen_unsupported: u64,
     /// Response chains cut off at the continuation safety bound.
     pub link_continuations_capped: u64,
 }
@@ -249,11 +242,6 @@ impl BrainStats {
         self.link_replies_assumed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a response that asked for the unimplemented hold-open behavior.
-    pub fn record_link_listen_unsupported(&self) {
-        self.link_listen_unsupported.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Count a response chain cut off at the continuation safety bound.
     pub fn record_link_continuation_capped(&self) {
         self.link_continuations_capped
@@ -272,7 +260,6 @@ impl BrainStats {
             link_response_timeouts: self.link_response_timeouts.load(Ordering::Relaxed),
             link_tags_stripped: self.link_tags_stripped.load(Ordering::Relaxed),
             link_replies_assumed: self.link_replies_assumed.load(Ordering::Relaxed),
-            link_listen_unsupported: self.link_listen_unsupported.load(Ordering::Relaxed),
             link_continuations_capped: self.link_continuations_capped.load(Ordering::Relaxed),
         }
     }

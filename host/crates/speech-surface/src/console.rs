@@ -50,6 +50,9 @@ const CONSOLE_INFO: &[&str] = &[
     "brenn_attached",
     "brenn_subscribed",
     "brenn_help_published",
+    // The cue vocabulary this run resolved: said once at startup, and the one
+    // place an operator sees which library copy the head is being cued against.
+    "cue_library_loaded",
     // The head's timeline changing. One line per change, never per re-emission
     // of the standing script. `presence_absent` is its startup sibling: a
     // bus-brain pod whose head will never move, said once at startup.
@@ -169,9 +172,9 @@ const HEALTH_COUNTER_LEAVES: &[&str] = &[
     "speak_send_failures",
     "send_failures",
     "no_transcript",
-    // The bus brain's failure counters. `link_replies_assumed` and
-    // `link_listen_unsupported` are deliberately absent: both are documented
-    // non-failures, and a mover line for either would cry wolf.
+    // The bus brain's failure counters. `link_replies_assumed` is deliberately
+    // absent: it is a documented non-failure, and a mover line for it would cry
+    // wolf.
     "link_publish_failures",
     "link_response_timeouts",
     "link_tags_stripped",
@@ -2718,7 +2721,6 @@ mod tests {
                         "link_tags_stripped": 3,
                         "link_continuations_capped": 1,
                         "link_replies_assumed": 9,
-                        "link_listen_unsupported": 4,
                     }
                 }),
             )
@@ -2953,7 +2955,6 @@ mod tests {
         ("brain_dispatched", Class::Calm),
         ("brain_echo", Class::Calm),
         ("brain_link_continuation_capped", Class::Loud),
-        ("brain_link_listen_unsupported", Class::Loud),
         ("brain_link_publish_failed", Class::Loud),
         ("brain_link_reply_assumed", Class::Calm),
         ("brain_link_response_timeout", Class::Loud),
@@ -2983,6 +2984,7 @@ mod tests {
         ("conn_rejected", Class::Loud),
         ("conn_superseded", Class::Calm),
         ("console_sink_failed", Class::Loud),
+        ("cue_library_loaded", Class::Calm),
         ("daemon_start", Class::Calm),
         ("echo_declined", Class::Calm),
         ("endpointer_transition", Class::Calm),

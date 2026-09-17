@@ -55,7 +55,7 @@ use crate::barge::TurnLedger;
 use crate::brenn::BridgeLink;
 use crate::brenn::driver::{BridgeDriver, DriverIo, IntentSink};
 use crate::clip::{ClipError, load_clip};
-use crate::config::{BrainMode, Config, PskTable, SttBackend, SttConfig, TtsBackend};
+use crate::config::{BrainMode, Config, CueLibrary, PskTable, SttBackend, SttConfig, TtsBackend};
 use crate::iso8601_ms;
 use crate::jsonl::JsonlHandle;
 use crate::pipeline::{BargeWiring, BrainWiring, PipelineFatal};
@@ -690,6 +690,26 @@ impl Server {
         // utterance).
         let turn_ledger = Arc::new(TurnLedger::new());
 
+        // The cue vocabulary, read once. A configured file that will not parse is
+        // fatal here rather than an empty vocabulary later: the deployment said
+        // the head may be cued, and a run that silently refused every cue would
+        // look like a peer that never asked.
+        let cue_library = match config.brenn.as_ref().and_then(|b| b.library_names.as_ref()) {
+            Some(path) => {
+                let library = CueLibrary::load(path).map_err(std::io::Error::other)?;
+                jsonl.emit(
+                    "cue_library_loaded",
+                    &json!({
+                        "path": path,
+                        "poses": library.help_poses(),
+                        "motions": library.help_motions().len(),
+                    }),
+                );
+                Some(Arc::new(library))
+            }
+            None => None,
+        };
+
         let scripter = build_scripter(&config, &jsonl, sinks.scripts.clone());
         let script_handle = scripter.as_ref().map(|scripter| scripter.handle.clone());
 
@@ -921,6 +941,7 @@ impl Server {
                 }
                 let driver = BridgeDriver::new(
                     parts.config,
+                    cue_library.as_deref(),
                     parts.bridge.handle,
                     brain,
                     bridge_teardown.clone(),
@@ -1870,12 +1891,6 @@ fn brain_event_adapter(jsonl: JsonlHandle) -> BrainEventFn {
         BrainEvent::LinkReplyAssumed { utterance } => {
             jsonl.emit(
                 "brain_link_reply_assumed",
-                &json!({ "utterance": utterance }),
-            );
-        }
-        BrainEvent::LinkListenUnsupported { utterance } => {
-            jsonl.emit(
-                "brain_link_listen_unsupported",
                 &json!({ "utterance": utterance }),
             );
         }
@@ -3923,27 +3938,9 @@ mod tests {
         }])
         .await;
 
-        // Structurally identical to `LinkListenUnsupported`, so the name is the
-        // only thing separating the two arms: assert the other one is absent.
-        assert!(events_named(&lines, "brain_link_listen_unsupported").is_empty());
         let assumed = events_named(&lines, "brain_link_reply_assumed");
         assert_eq!(assumed.len(), 1);
         assert_eq!(assumed[0]["utterance"], 25);
-    }
-
-    #[tokio::test]
-    async fn brain_event_adapter_maps_link_listen_unsupported() {
-        use speech_pipeline::UtteranceId;
-
-        let lines = adapter_lines(vec![BrainEvent::LinkListenUnsupported {
-            utterance: UtteranceId(26),
-        }])
-        .await;
-
-        assert!(events_named(&lines, "brain_link_reply_assumed").is_empty());
-        let unsupported = events_named(&lines, "brain_link_listen_unsupported");
-        assert_eq!(unsupported.len(), 1);
-        assert_eq!(unsupported[0]["utterance"], 26);
     }
 
     #[tokio::test]
