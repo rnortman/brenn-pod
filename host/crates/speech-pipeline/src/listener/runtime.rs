@@ -2100,11 +2100,10 @@ mod tests {
         PodId("pod-x".into())
     }
 
-    /// Digital silence a real-audio fixture puts in front of the wake phrase,
-    /// standing in for the device's VAD-onset preroll (`audio-pipeline`'s
-    /// `PREROLL_SAMPLES`, 1 s at 16 kHz). A live pod never opens a segment at
-    /// the first sample of the phrase; it opens one preroll behind, and that is
-    /// the audio the wake stream warms up on.
+    /// Digital silence a real-audio fixture puts in front of the wake phrase.
+    /// A real capture carries at least this much silence ahead of the phrase
+    /// (the device's VAD-onset preroll, 1 s at 16 kHz); a fixture that omits
+    /// it gives the wake stream a cold start no real segment produces.
     const WAKE_PREROLL_SAMPLES: usize = 16_000;
 
     /// The committed wake phrase behind [`WAKE_PREROLL_SAMPLES`] of silence —
