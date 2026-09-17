@@ -326,6 +326,9 @@ impl RecentSegment {
 /// Per-pod pipeline state.
 #[derive(Default)]
 struct PodState {
+    /// Original sample-domain deadline of the current capture window, retained
+    /// while its one-shot candidate is being transcribed and gated.
+    listen_deadline: Option<u64>,
     recent_segments: VecDeque<RecentSegment>,
     recent_wakes: VecDeque<u64>,
     in_flight: Option<InFlight>,
@@ -374,6 +377,7 @@ impl PodState {
             return false;
         }
         if epoch > self.epoch {
+            self.listen_deadline = None;
             self.recent_segments.clear();
             self.recent_wakes.clear();
             // The room and the log belonged to the connection that just went, and
@@ -874,12 +878,20 @@ async fn handle_listener(
             epoch,
             deadline_sample,
         } => {
+            let state = pods.entry(pod.clone()).or_default();
+            if !state.adopt_epoch(epoch) {
+                return;
+            }
+            state.listen_deadline = Some(deadline_sample);
             jsonl.emit(
                 "listen_opened",
                 &json!({ "pod": pod.0, "epoch": epoch, "deadline_sample": deadline_sample }),
             );
         }
         ListenerEvent::ListenHeard { pod, epoch } => {
+            if !pods.entry(pod.clone()).or_default().adopt_epoch(epoch) {
+                return;
+            }
             jsonl.emit("listen_heard", &json!({ "pod": pod.0, "epoch": epoch }));
             // The head's ending was dated from the reply that opened the window,
             // and nothing between here and the follow-up's dispatch moves it:
@@ -890,7 +902,15 @@ async fn handle_listener(
             }
         }
         ListenerEvent::ListenExpired { pod, epoch } => {
+            let state = pods.entry(pod.clone()).or_default();
+            if !state.adopt_epoch(epoch) {
+                return;
+            }
+            state.listen_deadline = None;
             jsonl.emit("listen_expired", &json!({ "pod": pod.0, "epoch": epoch }));
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::HeardExpired(pod));
+            }
         }
         ListenerEvent::Superseded { pod, utterance_id } => {
             // Emitted before the abort so a supersede is correlatable by utterance
@@ -1277,31 +1297,63 @@ async fn handle_stt_done(
         .and_then(|t| t.confidence.as_ref())
         .and_then(|conf| confidence_gate.evaluate(conf));
     let gate = match (utterance.wake, confidence_reject) {
+        _ if !wiring.brain.accepts_utterance(&utterance) => GateOutcome::DeclineNoTranscript,
         (Some(wake), Some(reject)) => GateOutcome::DeclineWake(wake, reject),
         (None, Some(reject)) if done.carve.follow_up => GateOutcome::DeclineFollowUp(reject),
         (None, Some(reject)) if done.carve.barge_in => GateOutcome::DeclineBarge(reject),
         (None, Some(reject)) if done.carve.over_playback => GateOutcome::DeclineEcho(reject),
         _ => GateOutcome::Dispatch,
     };
-    // A wake or barge decline is a raise that produced no turn: the head is up and
-    // nothing will follow, so the settle starts here rather than waiting for the
-    // engagement's ceiling. A declined follow-up is the same shape — the head has
-    // been waiting out the capture window and no turn is coming of what it heard,
-    // so it folds a linger from the decline. An echo decline is not a raise —
-    // nobody raised, and
-    // `Unanswered` clears the pod's current turn, which would cut short the script
-    // of the very reply the echo came from.
+    // A declined candidate never becomes a turn. Restore a consumed capture
+    // window at its original deadline so the peer's open <listen/> remains true.
+    if state.listen_deadline.is_some() {
+        if matches!(gate, GateOutcome::Dispatch) {
+            state.listen_deadline = None;
+        } else if let (Some(listen), Some(deadline_sample)) = (listen, state.listen_deadline) {
+            (listen.feed)(
+                utterance.pod.clone(),
+                Feed::ResumeListen {
+                    epoch: done.carve.id.epoch,
+                    deadline_sample,
+                },
+            )
+            .await;
+        }
+    }
+    // A rejected wake or barge settles a raise that had no turn; a follow-up
+    // or other discarded text candidate only restores a provisional script.
     if let Some(scripter) = scripter
         && matches!(
             gate,
-            GateOutcome::DeclineWake(..)
-                | GateOutcome::DeclineBarge(..)
-                | GateOutcome::DeclineFollowUp(..)
+            GateOutcome::DeclineWake(..) | GateOutcome::DeclineBarge(..)
         )
     {
         scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
     }
+    if let Some(scripter) = scripter
+        && (matches!(gate, GateOutcome::DeclineFollowUp(..))
+            || matches!(gate, GateOutcome::DeclineNoTranscript)
+                && utterance.wake.is_none()
+                && !done.carve.barge_in)
+    {
+        scripter.send(ScriptInput::Discarded(utterance.pod.clone()));
+    }
+    if let Some(scripter) = scripter
+        && matches!(gate, GateOutcome::DeclineNoTranscript)
+        && (utterance.wake.is_some() || done.carve.barge_in)
+    {
+        scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
+    }
     match gate {
+        GateOutcome::DeclineNoTranscript => {
+            (wiring.events)(BrainEvent::NoTranscript {
+                utterance: utterance.id,
+            });
+            wiring.stats.record_no_transcript();
+            if done.carve.barge_in {
+                wiring.brain.barge_declined(&utterance);
+            }
+        }
         GateOutcome::DeclineWake(wake, reject) => {
             decline_low_confidence(&utterance, &wake, reject, wiring)
         }
@@ -1631,6 +1683,7 @@ fn push_bounded<T>(dq: &mut VecDeque<T>, item: T) {
 /// nothing.
 enum GateOutcome {
     Dispatch,
+    DeclineNoTranscript,
     DeclineWake(WakeConfirmation, GateReject),
     DeclineBarge(GateReject),
     /// Speech carved inside a `<listen/>` window that transcribed to likely
@@ -1955,6 +2008,7 @@ mod tests {
     /// assert what the pipeline nudged without a real link, and the disposition it
     /// answers every turn with.
     struct RecordingBrain {
+        text_only: bool,
         log: Arc<Mutex<NudgeLog>>,
         end: TurnEnd,
         /// When set, the turn's one cmd is started and settled clean against
@@ -1967,6 +2021,12 @@ mod tests {
     }
 
     impl Brain for RecordingBrain {
+        fn accepts_utterance(&self, u: &Utterance) -> bool {
+            !self.text_only
+                || u.transcript
+                    .as_ref()
+                    .is_some_and(|t| !t.text.trim().is_empty())
+        }
         fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
             let (pod, id) = (u.pod.clone(), u.id);
             if !self.cues.is_empty() {
@@ -2053,6 +2113,7 @@ mod tests {
     }
 
     struct Harness {
+        text_only: bool,
         record_dir: Option<PathBuf>,
         transcriber: Option<Arc<dyn Transcriber>>,
         brain: bool,
@@ -2074,6 +2135,7 @@ mod tests {
     impl Harness {
         fn new() -> Harness {
             Harness {
+                text_only: false,
                 record_dir: None,
                 transcriber: None,
                 brain: false,
@@ -2154,6 +2216,10 @@ mod tests {
             self.brain = true;
             self
         }
+        fn text_only(mut self) -> Harness {
+            self.text_only = true;
+            self
+        }
         /// How every turn this harness's brain takes ends.
         fn turn_end(mut self, end: TurnEnd) -> Harness {
             self.turn_end = end;
@@ -2191,6 +2257,7 @@ mod tests {
                 let events: BrainEventFn = Arc::new(move |e| sink.lock().unwrap().push(e));
                 Some(BrainWiring {
                     brain: Arc::new(RecordingBrain {
+                        text_only: self.text_only,
                         log: self.nudges.clone(),
                         end: self.turn_end,
                         settle_first: self.settle_first.clone(),
@@ -4688,10 +4755,7 @@ mod tests {
         writer.await.unwrap();
     }
 
-    /// The window is wake-less, so the confidence gate is all that stands
-    /// between an open room and the brain. A follow-up that transcribes to
-    /// hallucination is declined and the head is told the raise produced no
-    /// turn — but nothing was interrupted, so the brain hears no cut.
+    /// A declined follow-up consumes no turn and restores the original window.
     #[tokio::test]
     async fn a_gated_follow_up_declines_without_telling_the_brain_it_was_cut() {
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
@@ -4700,9 +4764,11 @@ mod tests {
             follow_up: true,
             ..carved(1, 0, 16, None)
         };
+        let (feed, fed) = spy_listen_feed();
         let h = Harness::new()
             .brain()
             .scripter(handle.clone())
+            .listen(feed, TEST_LISTEN_WINDOW)
             .transcriber(FakeTranscriber(Some((
                 "phantom".into(),
                 Some(conf(0.37, -0.99)),
@@ -4713,21 +4779,118 @@ mod tests {
             });
         let nudges = h.nudges.clone();
         let stats = h.stats.clone();
-        let (_lines, cmds) = h.run(vec![soft_endpoint(follow_up)]).await;
+        let (_lines, cmds) = h
+            .run(vec![
+                PipelineItem::Listener(ListenerEvent::ListenOpened {
+                    pod: pod(),
+                    epoch: 1,
+                    deadline_sample: 24_000,
+                }),
+                soft_endpoint(follow_up),
+            ])
+            .await;
 
         assert!(cmds.is_empty(), "the phantom never reached the brain");
         assert_eq!(stats.snapshot().barge_command_absent, 1);
+        assert!(matches!(
+            fed.lock().unwrap().as_slice(),
+            [Feed::ResumeListen {
+                epoch: 1,
+                deadline_sample: 24_000
+            }]
+        ));
         assert!(
             nudges.lock().unwrap().barge_declined.is_empty(),
             "no reply was cut by a follow-up",
         );
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Unanswered(pod())],
-            "the head folds a linger from the decline",
+            vec![ScriptInput::Discarded(pod())],
+            "the provisional head state is resolved without a turn",
         );
         drop(jsonl);
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_follow_up_never_starts_a_text_brain_turn() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (feed, fed) = spy_listen_feed();
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .brain()
+            .text_only()
+            .scripter(handle.clone())
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .transcriber(FakeTranscriber(Some(("".into(), None))));
+        let (lines, cmds) = h
+            .run(vec![
+                PipelineItem::Listener(ListenerEvent::ListenOpened {
+                    pod: pod(),
+                    epoch: 1,
+                    deadline_sample: 24_000,
+                }),
+                soft_endpoint(follow_up),
+            ])
+            .await;
+        assert!(cmds.is_empty());
+        assert!(!lines.iter().any(|line| line["event"] == "brain_dispatched"));
+        assert!(matches!(
+            fed.lock().unwrap().as_slice(),
+            [Feed::ResumeListen {
+                epoch: 1,
+                deadline_sample: 24_000
+            }]
+        ));
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Discarded(pod())]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_wake_inside_a_listen_window_restores_that_window() {
+        let (feed, fed) = spy_listen_feed();
+        let wake = WakeConfirmation {
+            score: 0.8,
+            wake_end_sample: 0,
+            stt_trim_samples: 0,
+        };
+        let h = Harness::new()
+            .brain()
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .transcriber(FakeTranscriber(Some((
+                "phantom".into(),
+                Some(conf(0.37, -0.99)),
+            ))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let (_, cmds) = h
+            .run(vec![
+                PipelineItem::Listener(ListenerEvent::ListenOpened {
+                    pod: pod(),
+                    epoch: 1,
+                    deadline_sample: 24_000,
+                }),
+                soft_endpoint(carved(1, 0, 16, Some(wake))),
+            ])
+            .await;
+        assert!(cmds.is_empty());
+        assert!(matches!(
+            fed.lock().unwrap().as_slice(),
+            [Feed::ResumeListen {
+                epoch: 1,
+                deadline_sample: 24_000
+            }]
+        ));
     }
 
     /// The same follow-up, transcribing to something: it dispatches like any

@@ -301,9 +301,14 @@ pub enum ScriptInput {
     /// A raise produced no turn: the wake arm expired with no command, or the
     /// confidence gate declined what was said.
     Unanswered(PodId),
-    /// Speech was heard inside an open `<listen/>` window. The head keeps
-    /// waiting where it stands, a linger from now.
+    /// A candidate was discarded without becoming a brain turn. Restore any
+    /// provisional interaction; with none, leave the current script alone.
+    Discarded(PodId),
+    /// Speech was heard inside an open `<listen/>` window. Hold provisionally
+    /// until transcription either starts a turn or rejects the candidate.
     Heard(PodId),
+    /// An uncarved onset's window expired; discard its provisional hold.
+    HeardExpired(PodId),
     /// A reply asked the head to move. The movements of one response message,
     /// in the order the reply named them; the last pose and the last motion in
     /// the batch are the ones that take effect.
@@ -340,7 +345,9 @@ impl ScriptInput {
             | ScriptInput::TurnStarted { pod, .. }
             | ScriptInput::TurnEnded { pod, .. }
             | ScriptInput::Unanswered(pod)
+            | ScriptInput::Discarded(pod)
             | ScriptInput::Heard(pod)
+            | ScriptInput::HeardExpired(pod)
             | ScriptInput::Cues { pod, .. }
             | ScriptInput::Audio { pod, .. } => pod,
         }
@@ -496,6 +503,9 @@ struct Running {
 /// One pod's script state.
 #[derive(Debug, Default)]
 struct PodScript {
+    /// State before a provisional wake, barge, or listen-window onset. A gate
+    /// rejection restores it; only a real brain dispatch commits the new turn.
+    prior: Option<Box<PriorScript>>,
     /// The turn in flight. Every fact naming another turn is stale — the turn
     /// was barged, or a new interaction started over it — and is ignored.
     turn: Option<UtteranceId>,
@@ -513,7 +523,27 @@ struct PodScript {
     refresh: Option<Instant>,
 }
 
+#[derive(Debug)]
+struct PriorScript {
+    turn: Option<UtteranceId>,
+    end: Option<TurnEnd>,
+    audio: Option<TurnAudio>,
+    want: Want,
+    running: Option<Running>,
+}
+
 impl PodScript {
+    fn save_prior(&mut self) {
+        if self.prior.is_none() && !matches!(self.want, Want::Quiet | Want::Stowing) {
+            self.prior = Some(Box::new(PriorScript {
+                turn: self.turn,
+                end: self.end,
+                audio: self.audio,
+                want: self.want.clone(),
+                running: self.running.clone(),
+            }));
+        }
+    }
     /// Forget the turn in flight and everything said about it. A new
     /// interaction, or one abandoned, starts the facts over — and a fact left
     /// behind by the previous turn would close the new one early.
@@ -568,7 +598,9 @@ impl Scripter {
             ScriptInput::TurnStarted { turn, .. } => {
                 let publish = self.raise(&pod, now, Cause::Turn);
                 // After the raise, which cleared the previous turn's facts.
-                self.pods.entry(pod.clone()).or_default().turn = Some(turn);
+                let p = self.pods.entry(pod.clone()).or_default();
+                p.prior = None;
+                p.turn = Some(turn);
                 publish
             }
             ScriptInput::TurnEnded { turn, end, .. } => {
@@ -580,8 +612,10 @@ impl Scripter {
                     self.reconsider(&pod, now)
                 }
             }
-            ScriptInput::Unanswered(_) => self.wait_out_linger(&pod, now, Cause::Unanswered),
-            ScriptInput::Heard(_) => self.wait_out_linger(&pod, now, Cause::Heard),
+            ScriptInput::Unanswered(_) => self.restore_or_linger(&pod, now),
+            ScriptInput::Discarded(_) => self.restore_prior(&pod, now),
+            ScriptInput::Heard(_) => self.heard(&pod, now),
+            ScriptInput::HeardExpired(_) => self.restore_prior(&pod, now),
             ScriptInput::Cues { cues, .. } => self.cue(&pod, now, cues),
             ScriptInput::Audio { turn, audio, .. } => {
                 let p = self.pods.entry(pod.clone()).or_default();
@@ -739,6 +773,9 @@ impl Scripter {
         // out names the raise alone.
         let cut = {
             let p = self.pods.entry(pod.clone()).or_default();
+            if cause != Cause::Turn {
+                p.save_prior();
+            }
             p.clear_turn();
             p.running.take().is_some()
         };
@@ -818,10 +855,7 @@ impl Scripter {
         )
     }
 
-    /// Keep the head where it stands and re-date its ending to a linger from
-    /// now. The answer to both facts that say "the interaction is not over, and
-    /// nothing new is coming through the brain": a raise that produced no turn,
-    /// and speech heard inside an open capture window.
+    /// Keep an unanswered raise up for one linger before stowing it.
     ///
     /// The turn's facts are dropped first. A `TurnEnded` or `Audio` about the
     /// turn that just finished, arriving after this, would otherwise reconsider
@@ -833,13 +867,7 @@ impl Scripter {
     fn wait_out_linger(&mut self, pod: &PodId, now: Now, cause: Cause) -> Option<ScriptPublish> {
         let p = self.pods.entry(pod.clone()).or_default();
         p.clear_turn();
-        // An unanswered raise ends what the last reply was doing; speech heard
-        // inside the window does not — a cued nod plays on while the person
-        // talks, and cutting it would be the head reacting to being listened
-        // to.
-        if cause == Cause::Unanswered {
-            p.running = None;
-        }
+        p.running = None;
         let at = p
             .want
             .at()
@@ -847,6 +875,38 @@ impl Scripter {
             .expect("the caller's guard refused every want that holds the head nowhere");
         let (want, clamped) = self.closing(pod, now, at, now.at + self.timing.linger);
         self.set(pod, now, want, cause, clamped)
+    }
+
+    fn heard(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
+        let p = self.pods.entry(pod.clone()).or_default();
+        p.save_prior();
+        p.clear_turn();
+        let at = p.want.at()?.clone();
+        self.set(pod, now, Want::Hold { at }, Cause::Heard, None)
+    }
+
+    fn restore_or_linger(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
+        if self.pods.get(pod).is_some_and(|p| p.prior.is_some()) {
+            self.restore_prior(pod, now)
+        } else {
+            self.wait_out_linger(pod, now, Cause::Unanswered)
+        }
+    }
+
+    fn restore_prior(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
+        let p = self.pods.get_mut(pod)?;
+        let prior = p.prior.take()?;
+        let changed = p.want != prior.want || p.running != prior.running;
+        p.turn = prior.turn;
+        p.end = prior.end;
+        p.audio = prior.audio;
+        p.want = prior.want;
+        p.running = prior.running;
+        if changed {
+            self.emit(pod, now, Cause::Unanswered, true, None)
+        } else {
+            None
+        }
     }
 
     /// Decide whether the turn in flight can be scheduled to its end yet, and
@@ -2086,12 +2146,9 @@ mod tests {
         assert!(publish.change);
     }
 
-    /// Speech heard inside the capture window keeps the head where the reply
-    /// left it and moves its ending out to a linger from the moment it was
-    /// heard. Nothing is raised and nothing retargets: the person is still
-    /// talking to the same head.
+    /// Speech inside the capture window provisionally holds the reply's pose.
     #[test]
-    fn speech_inside_the_window_re_dates_the_stow_from_now() {
+    fn speech_inside_the_window_suspends_the_stow() {
         let mut fx = two_pose_fixture();
         fx.publish(ScriptInput::Wake(pod()), ZERO);
         fx.apply(
@@ -2126,18 +2183,16 @@ mod tests {
         let heard = fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(3));
         assert_eq!(
             steps(&heard),
-            vec![(0, NEUTRAL), (8_000, STOW_POSE)],
-            "a linger from the instant the speech was heard, off the same pose",
+            vec![(0, NEUTRAL)],
+            "the candidate cannot stow the head while transcription is pending",
         );
         assert_eq!(heard.cause, Cause::Heard);
         assert!(heard.change);
     }
 
-    /// The window's speech clears the finished turn, so a fact about that turn
-    /// still in flight behind it cannot pull the ending back to the turn's own
-    /// horizon.
+    /// A late fact about the suspended turn cannot close the provisional hold.
     #[test]
-    fn a_late_fact_about_the_cleared_turn_does_not_move_the_heard_stow() {
+    fn a_late_fact_about_the_cleared_turn_does_not_move_the_heard_hold() {
         let mut fx = fixture();
         fx.wake_and_dispatch(ZERO);
         fx.apply(
@@ -2148,7 +2203,7 @@ mod tests {
             },
             ZERO,
         );
-        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(1));
+        fx.apply(ScriptInput::Heard(pod()), Duration::from_secs(1));
         let want = fx.want();
         assert!(
             fx.apply(
@@ -2162,31 +2217,67 @@ mod tests {
             .is_none(),
             "the turn was cleared with the speech that was heard",
         );
-        assert_eq!(
-            fx.want(),
-            want,
-            "and the ending stands where `Heard` put it"
-        );
+        assert_eq!(fx.want(), want, "and the provisional hold remains");
     }
 
-    /// Two facts that mean the same thing about the same instant say it once.
-    /// A declined follow-up is both — heard, then unanswered — and the head is
-    /// not re-instructed for the second.
+    /// A rejected candidate restores the reply's original open-window ending.
     #[test]
-    fn heard_then_unanswered_at_one_instant_publishes_once() {
+    fn rejected_follow_up_restores_the_original_stow() {
         let mut fx = fixture();
         fx.wake_and_dispatch(ZERO);
-        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(2));
-        assert!(
-            fx.apply(ScriptInput::Unanswered(pod()), Duration::from_secs(2))
-                .is_none(),
-            "the same closing, already standing",
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
         );
+        let original = fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0)),
+            },
+            ZERO,
+        );
+        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(2));
         let later = fx.publish(ScriptInput::Unanswered(pod()), Duration::from_secs(4));
         assert_eq!(
             steps(&later),
-            vec![(0, NEUTRAL), (8_000, STOW_POSE)],
-            "a decline that lands later does move the ending out",
+            vec![(0, NEUTRAL), (4_000, STOW_POSE)],
+            "the original deadline stands, rather than a fresh linger",
+        );
+        assert_eq!(steps(&original), vec![(0, NEUTRAL), (8_000, STOW_POSE)]);
+    }
+
+    #[test]
+    fn rejected_wake_during_a_pending_turn_restores_its_hold() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(ScriptInput::Wake(pod()), Duration::from_secs(1));
+        fx.apply(ScriptInput::Unanswered(pod()), Duration::from_secs(2));
+        assert_eq!(
+            fx.want(),
+            Want::Hold {
+                at: Raise::to(NEUTRAL)
+            }
+        );
+    }
+
+    #[test]
+    fn discarded_noise_without_a_provisional_raise_cannot_close_a_continuation() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        assert!(
+            fx.apply(ScriptInput::Discarded(pod()), Duration::from_secs(2))
+                .is_none()
+        );
+        assert_eq!(
+            fx.want(),
+            Want::Hold {
+                at: Raise::to(NEUTRAL)
+            }
         );
     }
 
@@ -4431,8 +4522,7 @@ mod tests {
         );
     }
 
-    /// Speech inside the capture window re-dates the ending and leaves the nod
-    /// alone: the head does not react to being listened to.
+    /// Speech inside the capture window leaves the running nod alone.
     #[test]
     fn heard_keeps_a_running_motion() {
         let mut fx = fixture();
@@ -4446,13 +4536,11 @@ mod tests {
             },
             ZERO,
         );
-        let publish = fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(1));
-        assert_eq!(publish.cause, Cause::Heard);
-        assert_eq!(
-            timeline(&publish),
-            vec![(0, NEUTRAL.to_string()), (1, "play nod".to_string())],
-            "the play stands; the re-dated ending is not said until the lift"
+        assert!(
+            fx.apply(ScriptInput::Heard(pod()), Duration::from_secs(1))
+                .is_none()
         );
+        assert!(fx.scripter.pods.get(&pod()).unwrap().running.is_some());
     }
 
     /// An unanswered raise ends what the reply was doing: nothing is coming of

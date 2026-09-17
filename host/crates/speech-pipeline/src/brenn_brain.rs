@@ -806,6 +806,11 @@ fn speak(
 }
 
 impl Brain for BrennBrain {
+    fn accepts_utterance(&self, u: &Utterance) -> bool {
+        u.transcript
+            .as_ref()
+            .is_some_and(|t| !t.text.trim().is_empty())
+    }
     /// Publish the turn, then speak each response segment as it arrives, returning
     /// only when the peer stops promising more.
     ///

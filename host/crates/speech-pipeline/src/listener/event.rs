@@ -81,6 +81,9 @@ pub enum Feed {
     /// One-shot. The window closes on the first utterance minted under it, whatever
     /// its provenance, and on the deadline passing with the endpointer idle.
     Listen { window_samples: u64 },
+    /// Restore a consumed window after its candidate was declined. The original
+    /// sample-domain deadline is retained; rejection does not grant a new window.
+    ResumeListen { epoch: u64, deadline_sample: u64 },
     /// The transport segment closed (the authoritative outer boundary). Finalizes
     /// any in-progress utterance and clears the wake arm.
     SegmentClosed {
@@ -323,8 +326,8 @@ pub enum ListenerEvent {
         summary: ScoreSummary,
     },
     /// A capture window opened: speech beginning at or before `deadline_sample`
-    /// carves with no wake word. Accounting only — the window is the listener's own
-    /// state and nothing downstream acts on this.
+    /// carves with no wake word. The pipeline retains this deadline so a rejected
+    /// one-shot candidate can restore the same window.
     ListenOpened {
         pod: PodId,
         epoch: u64,

@@ -599,6 +599,17 @@ impl ListenerState {
                     deadline_sample,
                 }])
             }
+            Feed::ResumeListen {
+                epoch,
+                deadline_sample,
+            } => {
+                let mut events = Vec::new();
+                if epoch == self.epoch && self.listen.is_none() {
+                    self.listen = Some(ListenWindow { deadline_sample });
+                    self.check_listen_expiry(pod, self.silero_cursor, &mut events);
+                }
+                Ok(events)
+            }
             Feed::SegmentClosed { host_rx, .. } => self.handle_close(pod, host_rx),
         }
     }
@@ -3583,6 +3594,51 @@ mod tests {
             .count()
     }
 
+    #[test]
+    fn rejected_candidate_restores_only_its_original_window() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        let opened = open_listen(&mut state, 1_000, 4_096, &mut oww, &mut silero);
+        let deadline = match opened.as_slice() {
+            [
+                ListenerEvent::ListenOpened {
+                    deadline_sample, ..
+                },
+            ] => *deadline_sample,
+            _ => panic!("one window opened"),
+        };
+        state.listen = None; // The candidate consumed this one-shot window.
+        state
+            .handle(
+                &pod(),
+                Feed::ResumeListen {
+                    epoch: state.epoch,
+                    deadline_sample: deadline,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .unwrap();
+        assert_eq!(state.listen.unwrap().deadline_sample, deadline);
+        state.listen = None;
+        state
+            .handle(
+                &pod(),
+                Feed::ResumeListen {
+                    epoch: state.epoch + 1,
+                    deadline_sample: deadline,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .unwrap();
+        assert!(
+            state.listen.is_none(),
+            "a stale connection cannot reopen it"
+        );
+    }
+
     /// The window carries speech past the wake gate: a person answering a reply
     /// that asked them to keep talking says nothing to arm with. The carve has no
     /// wake provenance, says it is a follow-up, and the window closes on it.
@@ -3849,7 +3905,7 @@ mod tests {
         // this deployment still needs the mute.
         assert_eq!(
             state.silero_stats.flush().map(|s| s.max),
-            Some(0.9),
+            Some(Some(0.9)),
             "the model's own score is what the summary carries"
         );
 

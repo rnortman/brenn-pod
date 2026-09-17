@@ -247,6 +247,11 @@ pub enum TurnEnd {
 
 /// Utterance in → speak/act out; interruptible.
 pub trait Brain: Send + Sync {
+    /// Whether this utterance can become a turn. A brain that needs text can
+    /// decline an empty transcription before the pipeline changes turn state.
+    fn accepts_utterance(&self, _u: &Utterance) -> bool {
+        true
+    }
     /// Answer one utterance, queueing every response through `out`, and report how the
     /// turn ended. The return is a statement about the conversation, not about
     /// delivery: a turn whose replies were all refused by a full queue still ends
