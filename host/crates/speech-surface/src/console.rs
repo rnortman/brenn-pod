@@ -53,6 +53,13 @@ const CONSOLE_INFO: &[&str] = &[
     // The cue vocabulary this run resolved: said once at startup, and the one
     // place an operator sees which library copy the head is being cued against.
     "cue_library_loaded",
+    // A movement a reply asked for that the head never made: a name the
+    // configured library does not hold or a speed outside the wire's range, and
+    // a cue that arrived with the head already at rest. Loud for the refusal —
+    // it is a peer asking for something this deployment cannot do, and the
+    // operator's repair is either the model's prompt or a stale library copy.
+    "cue_refused",
+    "cue_ignored",
     // The head's timeline changing. One line per change, never per re-emission
     // of the standing script. `presence_absent` is its startup sibling: a
     // bus-brain pod whose head will never move, said once at startup.
@@ -147,11 +154,15 @@ const CALM_DESPITE_TOKEN: &[&str] = &[
 ///   it left cleanly or not.
 /// - `brenn_delivery_gap`: responses were lost on the bus before reaching this
 ///   pod, so a turn was answered with part of its speech missing.
+/// - `cue_refused`: a reply asked the head for a movement this deployment
+///   cannot make — an invented name, a stale library copy, or a speed outside
+///   the wire's range — and the head did nothing.
 const LOUD_WITHOUT_TOKEN: &[&str] = &[
     "listener_absent",
     "brenn_detached",
     "brenn_bridge_exit",
     "brenn_delivery_gap",
+    "cue_refused",
 ];
 
 /// Long string fields (transcript, error detail) truncate here; the file keeps
@@ -2989,7 +3000,9 @@ mod tests {
         ("conn_rejected", Class::Loud),
         ("conn_superseded", Class::Calm),
         ("console_sink_failed", Class::Loud),
+        ("cue_ignored", Class::Calm),
         ("cue_library_loaded", Class::Calm),
+        ("cue_refused", Class::Loud),
         ("daemon_start", Class::Calm),
         ("echo_declined", Class::Calm),
         ("endpointer_transition", Class::Calm),

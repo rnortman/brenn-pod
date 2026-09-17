@@ -32,28 +32,30 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use futures::channel::mpsc as fmpsc;
+use motion_proto::{MAX_SPEED, MAX_TIMEOUT_MS, MIN_SPEED, Play, PlayWindow, STOW_POSE};
 use pod_ingest::{HostMicros, SegmentRef};
 use serde::Serialize;
 use serde_json::json;
+use speech_pipeline::brenn_brain::Cue;
 use speech_pipeline::{
     AudioSpan, Brain, BrainEvent, BrainEventFn, BrainStats, CarveTiming, CarvedUtterance,
-    ConfidenceGate, DoaTrack, EndpointCause, Feed, FlushRejected, GateReject, InterruptProgress,
-    ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment, SegmentTelemetry,
-    SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError, Transcriber, Transcript,
-    TurnEnd, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation, stage_delta_us,
-    tracking_event, transcribe_pcm,
+    ConfidenceGate, CueTap, DoaTrack, EndpointCause, Feed, FlushRejected, GateReject,
+    InterruptProgress, ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment,
+    SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError,
+    Transcriber, Transcript, TurnEnd, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation,
+    stage_delta_us, tracking_event, transcribe_pcm,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::barge::TurnLedger;
-use crate::config::WakeWordInStt;
+use crate::config::{CueLibrary, WakeWordInStt};
 use crate::jsonl::JsonlHandle;
 use crate::playback_router::FeedFn;
 use crate::recorder::{
     WakeClass, WakeClassUpdate, sanitize_filename, set_wake_class, sidecar_path,
 };
-use crate::scripter::{ScriptHandle, ScriptInput};
+use crate::scripter::{MotionCue, Raise, ScriptHandle, ScriptInput};
 
 /// The pipeline exited on an unrecoverable fault. The server renders this to a
 /// `pipeline_fatal` JSONL line and a nonzero exit.
@@ -227,6 +229,10 @@ pub struct PipelineCtx {
     /// `None` when no presence channel is configured. Every tap is a
     /// non-blocking send; nothing in this task waits on it.
     pub(crate) scripter: Option<ScriptHandle>,
+    /// The poses and motions a reply may name, or `None` when the deployment
+    /// configured no library — in which case no reply can move the head, since
+    /// nothing here could tell an offered name from an invented one.
+    pub(crate) cues: Option<Arc<CueLibrary>>,
 }
 
 /// How many recent segments and wake detections to retain per pod for sidecar
@@ -401,6 +407,7 @@ pub async fn run(
         barge,
         listen,
         scripter,
+        cues,
     } = ctx;
 
     let mut pods: HashMap<PodId, PodState> = HashMap::new();
@@ -470,6 +477,7 @@ pub async fn run(
                     barge.as_ref(),
                     listen.as_ref(),
                     scripter.as_ref(),
+                    cues.as_ref(),
                     &jsonl,
                 )
                 .await;
@@ -1124,6 +1132,7 @@ async fn handle_stt_done(
     barge: Option<&BargeWiring>,
     listen: Option<&ListenWiring>,
     scripter: Option<&ScriptHandle>,
+    cues: Option<&Arc<CueLibrary>>,
     jsonl: &JsonlHandle,
 ) {
     let Some(state) = pods.get_mut(&done.pod) else {
@@ -1312,6 +1321,20 @@ async fn handle_stt_done(
                 &json!({ "pod": utterance.pod.0, "utterance": utterance.id }),
             );
             let (pod, id) = (utterance.pod.clone(), utterance.id);
+            // The movements this turn's reply may ask for. Wired exactly when a
+            // head is scripted and a vocabulary is configured: with either
+            // missing there is nothing a movement could reach, and the codec
+            // keeps stripping the markers as the unknown ones they are.
+            let cue_tap = match (cues, scripter) {
+                (Some(library), Some(scripter)) => Some(cue_tap(
+                    Arc::clone(library),
+                    scripter.clone(),
+                    jsonl.clone(),
+                    pod.clone(),
+                    id,
+                )),
+                _ => None,
+            };
             // Recorded at every dispatch, barge or not: this turn is what the *next*
             // interrupt would chain.
             let sink = match barge {
@@ -1323,9 +1346,9 @@ async fn handle_stt_done(
                     );
                     let ledger = Arc::clone(&barge.ledger);
                     let (tap_pod, tap_id) = (pod.clone(), id);
-                    ResponseSink::with_tap(
+                    ResponseSink::with_taps(
                         wiring.speak_tx.clone(),
-                        Arc::new(move |cmd: &SpeakCmd| {
+                        Some(Arc::new(move |cmd: &SpeakCmd| {
                             ledger.record_cmd(
                                 &tap_pod,
                                 tap_id,
@@ -1336,10 +1359,11 @@ async fn handle_stt_done(
                                     SpeakBody::Pcm(_) => None,
                                 },
                             );
-                        }),
+                        })),
+                        cue_tap,
                     )
                 }
-                None => ResponseSink::new(wiring.speak_tx.clone()),
+                None => ResponseSink::with_taps(wiring.speak_tx.clone(), None, cue_tap),
             };
             // Around the await, not inside the barge arm below: a turn is in
             // flight for as long as the brain has it, and that is what keeps
@@ -1391,6 +1415,126 @@ async fn handle_stt_done(
             }
         }
     }
+}
+
+/// Resolve one movement a reply named against the deployed library, or say why
+/// it cannot be made.
+///
+/// This is where an invented name stops. An unresolvable pose or motion makes
+/// the daemon refuse the *whole* script it rides in, so a name that reached the
+/// wire would cost every other movement in the same script as well as its own —
+/// and the head would hold its last instruction with nothing on the pod saying
+/// which reply was responsible. The speed range is checked here too, for the
+/// same reason and because this is where the number is turned into the absolute
+/// pace the wire carries.
+///
+/// The returned reason is what the refusal line reports: short, stable, and
+/// about the cue rather than about the reply.
+fn resolve_cue(library: &CueLibrary, cue: &Cue) -> Result<MotionCue, &'static str> {
+    let (name, speed) = match cue {
+        Cue::Pose { name, speed } | Cue::Motion { name, speed } => (name.as_str(), *speed),
+    };
+    if let Some(speed) = speed
+        && !(speed.is_finite() && (MIN_SPEED..=MAX_SPEED).contains(&speed))
+    {
+        return Err("speed_out_of_range");
+    }
+    match cue {
+        Cue::Pose { .. } => {
+            // Rest is not a pose a reply gets to command: the stow is the
+            // ending the fault ladder and the script compiler both treat
+            // structurally, and a reply that wants the head down simply stops
+            // asking it to stay up.
+            if name == STOW_POSE {
+                return Err("stow_not_cueable");
+            }
+            let (pose, duration_ms) = library.pose(name).ok_or("unknown_pose")?;
+            // Silence is the library's own pace, so a cue at unit speed states
+            // no pace at all — the same thing a presence raise does.
+            let move_ms = match speed {
+                None => None,
+                Some(speed) if (speed - 1.0).abs() < f64::EPSILON => None,
+                Some(speed) => {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "a duration in milliseconds, divided by a speed in 0.25..=2.0"
+                    )]
+                    let move_ms = (duration_ms as f64 / speed).ceil() as u64;
+                    // The wire's own ceiling, checked where the number is made.
+                    // Refused rather than clamped: a pace nobody asked for is
+                    // not a repair.
+                    if move_ms > MAX_TIMEOUT_MS {
+                        return Err("move_too_long");
+                    }
+                    Some(move_ms)
+                }
+            };
+            Ok(MotionCue::Pose(Raise { pose, move_ms }))
+        }
+        Cue::Motion { .. } => {
+            let (motion, span) = library.motion(name).ok_or("unknown_motion")?;
+            let play = match speed {
+                Some(speed) => Play::at_speed(motion.as_ref(), speed),
+                None => Play::new(motion.as_ref()),
+            };
+            let span_ms = PlayWindow {
+                duration_ms: span.duration_ms,
+                blend_out_ms: span.blend_out_ms,
+            }
+            .span_ms(play.speed);
+            Ok(MotionCue::Motion { play, span_ms })
+        }
+    }
+}
+
+/// The tap the brain hands each response message's movements to: resolve them,
+/// say which were refused, and send the rest to the head as one input.
+///
+/// One input per message and not one per cue, because the movements of one
+/// reply are one decision — the last pose and the last motion in it are what
+/// the head ends up doing, and splitting them would make the head act out an
+/// ordering the reply never meant.
+fn cue_tap(
+    library: Arc<CueLibrary>,
+    scripter: ScriptHandle,
+    jsonl: JsonlHandle,
+    pod: PodId,
+    turn: UtteranceId,
+) -> CueTap {
+    Arc::new(move |cues: Vec<Cue>| {
+        let mut resolved = Vec::with_capacity(cues.len());
+        for cue in cues {
+            let (kind, name) = match &cue {
+                Cue::Pose { name, .. } => ("pose", name.clone()),
+                Cue::Motion { name, .. } => ("motion", name.clone()),
+            };
+            match resolve_cue(&library, &cue) {
+                Ok(cue) => resolved.push(cue),
+                // Dropped, not corrected: the movement the reply asked for
+                // cannot be made, and the nearest one it did not ask for is
+                // not an improvement. The rest of the message's cues stand.
+                Err(reason) => jsonl.emit(
+                    "cue_refused",
+                    &json!({
+                        "pod": pod.0,
+                        "utterance": turn,
+                        "kind": kind,
+                        "name": name,
+                        "reason": reason,
+                    }),
+                ),
+            }
+        }
+        if !resolved.is_empty() {
+            scripter.send(ScriptInput::Cues {
+                pod: pod.clone(),
+                turn,
+                cues: resolved,
+            });
+        }
+    })
 }
 
 /// Build an `AudioSpan` for `[start_sample, end_sample)` from the pod's recent
@@ -1801,11 +1945,17 @@ mod tests {
         /// this ledger before `handle` returns — the chain whose last segment
         /// carries no speech, where playback is over before the brain is.
         settle_first: Option<Arc<TurnLedger>>,
+        /// The movements this brain's reply asks for, handed to the cue tap
+        /// ahead of the speech as a real reply's are.
+        cues: Vec<Cue>,
     }
 
     impl Brain for RecordingBrain {
         fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
             let (pod, id) = (u.pod.clone(), u.id);
+            if !self.cues.is_empty() {
+                out.cue(self.cues.clone());
+            }
             let spoken = EchoTestBrain.handle(u, out);
             let end = self.end;
             let settle_first = self.settle_first.clone();
@@ -1899,6 +2049,8 @@ mod tests {
         wake_word: WakeWordInStt,
         nudges: Arc<Mutex<NudgeLog>>,
         scripter: Option<ScriptHandle>,
+        cues: Option<Arc<CueLibrary>>,
+        reply_cues: Vec<Cue>,
         turn_end: TurnEnd,
         queue_depth: usize,
     }
@@ -1919,6 +2071,8 @@ mod tests {
                 nudges: Arc::new(Mutex::new(NudgeLog::default())),
                 turn_end: TurnEnd::Closed,
                 scripter: None,
+                cues: None,
+                reply_cues: Vec::new(),
                 queue_depth: 32,
             }
         }
@@ -1947,6 +2101,17 @@ mod tests {
         /// interaction lifecycle as the scripter receives it.
         fn scripter(mut self, handle: ScriptHandle) -> Harness {
             self.scripter = Some(handle);
+            self
+        }
+        /// Give the run a cue vocabulary, so a reply's movements resolve into
+        /// the inputs the head receives.
+        fn cues(mut self, library: CueLibrary) -> Harness {
+            self.cues = Some(Arc::new(library));
+            self
+        }
+        /// What this harness's brain asks the head to do in its reply.
+        fn reply_cues(mut self, cues: Vec<Cue>) -> Harness {
+            self.reply_cues = cues;
             self
         }
         /// Wire barge-in against `ledger` and a flush entry point that returns
@@ -2013,6 +2178,7 @@ mod tests {
                         log: self.nudges.clone(),
                         end: self.turn_end,
                         settle_first: self.settle_first.clone(),
+                        cues: self.reply_cues.clone(),
                     }),
                     speak_tx,
                     events,
@@ -2030,6 +2196,7 @@ mod tests {
             }
 
             let ctx = PipelineCtx {
+                cues: self.cues.clone(),
                 record_dir: self.record_dir.clone(),
                 clock_step_clamps: Arc::new(AtomicU64::new(0)),
                 transcriber: self.transcriber.clone(),
@@ -2651,6 +2818,7 @@ mod tests {
             &mut pods,
             &mut next_id,
             &ConfidenceGate::OFF,
+            None,
             None,
             None,
             None,
@@ -4633,5 +4801,242 @@ mod tests {
             }
             assert!(nudges.lock().unwrap().barge_declined.is_empty());
         }
+    }
+
+    // --- the cue tap ------------------------------------------------------
+
+    /// The vocabulary the cue cases resolve against: one cueable pose at 800 ms,
+    /// the stow no reply may command, and a motion with its own blend-out.
+    fn cue_library() -> CueLibrary {
+        CueLibrary::parse(
+            r#"{
+              "poses": [
+                { "name": "peek", "duration_ms": 800 },
+                { "name": "stow", "duration_ms": 2000 }
+              ],
+              "motions": [
+                { "name": "bench/nod", "duration_ms": 1000, "blend_out_ms": 200 }
+              ]
+            }"#,
+        )
+        .expect("the fixture sidecar parses")
+    }
+
+    /// A speed factor becomes the absolute pace the wire carries, and unit speed
+    /// says nothing at all — the library's own pace, which is what a presence
+    /// raise states too.
+    #[test]
+    fn a_cued_poses_speed_becomes_the_pace_the_wire_carries() {
+        let library = cue_library();
+        let paced = |speed: Option<f64>| match resolve_cue(
+            &library,
+            &Cue::Pose {
+                name: "peek".into(),
+                speed,
+            },
+        ) {
+            Ok(MotionCue::Pose(raise)) => raise.move_ms,
+            other => panic!("a pose resolves to a pose: {other:?}"),
+        };
+        assert_eq!(paced(Some(2.0)), Some(400), "twice as fast is half as long");
+        assert_eq!(paced(Some(0.25)), Some(3_200));
+        assert_eq!(paced(Some(1.0)), None, "unit speed states no pace");
+        assert_eq!(paced(None), None);
+    }
+
+    /// The blend-out is the overlay's own exit ramp and runs on the wall clock:
+    /// speeding a motion up must not shorten the fade that ends it.
+    #[test]
+    fn a_cued_motions_span_is_the_library_duration_at_speed_plus_its_blend_out() {
+        let library = cue_library();
+        let span = |speed: Option<f64>| match resolve_cue(
+            &library,
+            &Cue::Motion {
+                name: "bench/nod".into(),
+                speed,
+            },
+        ) {
+            Ok(MotionCue::Motion { play, span_ms }) => (play.speed, span_ms),
+            other => panic!("a motion resolves to a motion: {other:?}"),
+        };
+        assert_eq!(span(Some(0.5)), (0.5, 2_200));
+        assert_eq!(span(None), (1.0, 1_200));
+        assert_eq!(span(Some(2.0)), (2.0, 700));
+    }
+
+    /// Every way a cue can fail to resolve, and the reason each reports. A
+    /// refused cue is dropped rather than corrected: the nearest movement the
+    /// reply did not ask for is not an improvement.
+    #[test]
+    fn a_cue_this_deployment_cannot_make_is_refused_with_its_reason() {
+        let library = cue_library();
+        let pose = |name: &str, speed: Option<f64>| {
+            resolve_cue(
+                &library,
+                &Cue::Pose {
+                    name: name.into(),
+                    speed,
+                },
+            )
+            .expect_err("refused")
+        };
+        assert_eq!(pose("stow", None), "stow_not_cueable");
+        assert_eq!(pose("nowhere", None), "unknown_pose");
+        assert_eq!(pose("peek", Some(0.1)), "speed_out_of_range");
+        assert_eq!(pose("peek", Some(2.5)), "speed_out_of_range");
+        assert_eq!(pose("peek", Some(f64::NAN)), "speed_out_of_range");
+        assert_eq!(pose("peek", Some(f64::INFINITY)), "speed_out_of_range");
+        assert_eq!(
+            resolve_cue(
+                &library,
+                &Cue::Motion {
+                    name: "bench/perk".into(),
+                    speed: None,
+                },
+            )
+            .expect_err("refused"),
+            "unknown_motion",
+        );
+    }
+
+    /// A reply's movements reach the head as one input, resolved: the name
+    /// checked against the library and the speed already turned into the
+    /// numbers the scripter puts on the wire.
+    #[tokio::test]
+    async fn a_replys_cues_reach_the_head_resolved() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .scripter(handle.clone())
+            .cues(cue_library())
+            .reply_cues(vec![
+                Cue::Pose {
+                    name: "peek".into(),
+                    speed: Some(2.0),
+                },
+                Cue::Motion {
+                    name: "bench/nod".into(),
+                    speed: None,
+                },
+            ])
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let cues = script_inputs(handle, rx)
+            .await
+            .into_iter()
+            .find_map(|input| match input {
+                ScriptInput::Cues { cues, .. } => Some(cues),
+                _ => None,
+            })
+            .expect("the reply's movements reached the head");
+        assert_eq!(
+            cues,
+            vec![
+                MotionCue::Pose(Raise {
+                    pose: "peek".into(),
+                    move_ms: Some(400),
+                }),
+                MotionCue::Motion {
+                    play: Play::new("bench/nod"),
+                    span_ms: 1_200,
+                },
+            ],
+            "in the order the reply named them",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A name this deployment does not hold never reaches the wire: an
+    /// unresolvable name makes the daemon refuse the whole script it rides in,
+    /// so the other movements in the same reply would go with it.
+    #[tokio::test]
+    async fn an_invented_name_is_refused_at_the_tap_and_the_rest_still_moves() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .scripter(handle.clone())
+            .cues(cue_library())
+            .reply_cues(vec![
+                Cue::Motion {
+                    name: "invented/flourish".into(),
+                    speed: None,
+                },
+                Cue::Pose {
+                    name: "peek".into(),
+                    speed: None,
+                },
+            ])
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let refused = lines
+            .iter()
+            .find(|v| v["event"] == "cue_refused")
+            .expect("the refusal is narrated");
+        assert_eq!(refused["name"], "invented/flourish");
+        assert_eq!(refused["kind"], "motion");
+        assert_eq!(refused["reason"], "unknown_motion");
+        assert_eq!(refused["utterance"], 1);
+
+        let cues = script_inputs(handle, rx)
+            .await
+            .into_iter()
+            .find_map(|input| match input {
+                ScriptInput::Cues { cues, .. } => Some(cues),
+                _ => None,
+            })
+            .expect("what did resolve still reached the head");
+        assert_eq!(
+            cues,
+            vec![MotionCue::Pose(Raise {
+                pose: "peek".into(),
+                move_ms: None,
+            })],
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// With no vocabulary configured nothing can move the head: content moves it
+    /// only where the operator has said what it may be moved to.
+    #[tokio::test]
+    async fn a_reply_cues_nothing_when_no_library_is_configured() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .scripter(handle.clone())
+            .reply_cues(vec![Cue::Pose {
+                name: "peek".into(),
+                speed: None,
+            }])
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        assert!(
+            !script_inputs(handle, rx)
+                .await
+                .iter()
+                .any(|input| matches!(input, ScriptInput::Cues { .. })),
+            "no library, no movement",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
     }
 }

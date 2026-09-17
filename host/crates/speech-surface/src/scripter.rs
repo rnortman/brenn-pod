@@ -79,7 +79,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use brenn_bridge::{BridgeHandle, PublishRequest, Urgency};
-use motion_proto::{MAX_TIMEOUT_MS, MotionScript, STOW_POSE, SeqSource, Step, unix_millis};
+use motion_proto::{MAX_TIMEOUT_MS, MotionScript, Play, STOW_POSE, SeqSource, Step, unix_millis};
 use serde_json::json;
 use speech_pipeline::{PodId, TurnEnd, UtteranceId};
 use tokio::sync::{Notify, mpsc};
@@ -170,6 +170,28 @@ impl Default for ScriptRaises {
     }
 }
 
+/// One movement a response asked for, resolved against the deployed library.
+///
+/// Resolved, not named: the name has been checked against the library and the
+/// pace it asked for has become the absolute number the wire carries, because
+/// an unresolvable name in a script makes the daemon refuse the *whole* script
+/// it rides in — every other movement in it with it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MotionCue {
+    /// Put the head at this pose and leave it there. The same value a presence
+    /// event's raise carries, because a cued pose is a raise the reply chose.
+    Pose(Raise),
+    /// Play this motion once over whatever pose is standing.
+    Motion {
+        /// The overlay to start, at the speed the reply asked for.
+        play: Play,
+        /// How long the overlay occupies the timeline at that speed, blend-out
+        /// included: the library's own duration, not a guess. What tells the
+        /// scripter when the motion is over and the head's ending may proceed.
+        span_ms: u64,
+    },
+}
+
 /// The four intervals a script is measured in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScriptTiming {
@@ -250,7 +272,8 @@ impl Now {
 /// Deliberately not the pipeline's own vocabulary: the tap sites are spread
 /// across several modules and event enums, and naming the *effect on the head*
 /// rather than the cause is what keeps this from growing a branch per call site.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: a cue carries a speed, which is a float.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ScriptInput {
     /// A confirmed wake word. The head goes up.
     Wake(PodId),
@@ -281,6 +304,20 @@ pub enum ScriptInput {
     /// Speech was heard inside an open `<listen/>` window. The head keeps
     /// waiting where it stands, a linger from now.
     Heard(PodId),
+    /// A reply asked the head to move. The movements of one response message,
+    /// in the order the reply named them; the last pose and the last motion in
+    /// the batch are the ones that take effect.
+    ///
+    /// Content, not a person: a cue never raises a head that is at rest.
+    Cues {
+        /// Whose head.
+        pod: PodId,
+        /// The turn whose reply asked. Reported, not matched — the cue arrives
+        /// through the brain's own sink for the turn in flight.
+        turn: UtteranceId,
+        /// What to do, already resolved against the library.
+        cues: Vec<MotionCue>,
+    },
     /// The turn's cmd accounting moved: dispatch returned, a clip started
     /// playing, or a cmd resolved.
     Audio {
@@ -304,6 +341,7 @@ impl ScriptInput {
             | ScriptInput::TurnEnded { pod, .. }
             | ScriptInput::Unanswered(pod)
             | ScriptInput::Heard(pod)
+            | ScriptInput::Cues { pod, .. }
             | ScriptInput::Audio { pod, .. } => pod,
         }
     }
@@ -323,6 +361,11 @@ pub enum Cause {
     Unanswered,
     /// Speech inside an open capture window.
     Heard,
+    /// A reply asked the head to move.
+    Cue,
+    /// A cued motion's own span ran out, so the standing want is said plainly
+    /// again — with its ending back in it.
+    MotionEnded,
     /// The turn's speech is accounted for, so its ending can be scheduled.
     Closing,
     /// The standing script said again; not a change.
@@ -339,6 +382,8 @@ impl Cause {
             Cause::Turn => "turn",
             Cause::Unanswered => "unanswered",
             Cause::Heard => "heard",
+            Cause::Cue => "cue",
+            Cause::MotionEnded => "motion_ended",
             Cause::Closing => "closing",
             Cause::Refresh => "refresh",
         }
@@ -428,6 +473,26 @@ impl Want {
     }
 }
 
+/// A cued motion the head is in the middle of.
+///
+/// The span is the library's own, so this is not a guess about when the motion
+/// is over: it is when the daemon's player goes inert. Every script emitted
+/// while this stands restates the play, because a script wholly replaces its
+/// predecessor at the daemon and an overlay the replacement does not name is
+/// cut on the next tick. One at a time — a second cue replaces this one.
+#[derive(Debug, Clone, PartialEq)]
+struct Running {
+    /// The overlay to restate, at the speed it was cued with. A row the daemon
+    /// picks up keeps the speed it joined at, so restating it is inert.
+    play: Play,
+    /// How long the window is, measured from each script's own arrival. The
+    /// edge refuses a play window reaching past its script's horizon, so this
+    /// is also what the emitted timeout has to cover.
+    span_ms: u64,
+    /// When the motion is over and the standing want may be said plainly again.
+    ends_at: Instant,
+}
+
 /// One pod's script state.
 #[derive(Debug, Default)]
 struct PodScript {
@@ -440,6 +505,10 @@ struct PodScript {
     audio: Option<TurnAudio>,
     /// What this pod's head is being asked to do.
     want: Want,
+    /// A cued motion still playing over that want, if any. Not part of the
+    /// want: it does not decide where the head ends up, only what every script
+    /// says while it lasts.
+    running: Option<Running>,
     /// When the standing script is said again.
     refresh: Option<Instant>,
 }
@@ -507,19 +576,20 @@ impl Scripter {
                     self.reconsider(&pod, now)
                 }
             }
-            ScriptInput::Unanswered(_) | ScriptInput::Heard(_)
-                if matches!(self.want(&pod), Want::Quiet | Want::Stowing) =>
+            ScriptInput::Unanswered(_) | ScriptInput::Heard(_) | ScriptInput::Cues { .. }
+                if !self.engaged(&pod) =>
             {
                 // The head is down or on its way: this pod's script has run, or
                 // it never had one. Both tap sites can fire twice about the same
                 // raise — the confidence gate declines and the arm then expires
                 // — and raising the head to lower it again is not what either
-                // means. A `Heard` is refused for the same reason and one more:
-                // content never raises a head that is at rest.
+                // means. A `Heard` and a `Cues` are refused for the same reason
+                // and one more: content never raises a head that is at rest.
                 None
             }
             ScriptInput::Unanswered(_) => self.wait_out_linger(&pod, now, Cause::Unanswered),
             ScriptInput::Heard(_) => self.wait_out_linger(&pod, now, Cause::Heard),
+            ScriptInput::Cues { cues, .. } => self.cue(&pod, now, cues),
             ScriptInput::Audio { turn, audio, .. } => {
                 let p = self.pods.entry(pod.clone()).or_default();
                 if p.turn != Some(turn) {
@@ -534,22 +604,46 @@ impl Scripter {
         publish
     }
 
-    /// Fire every re-emission due at `now`.
+    /// Whether this pod's head is up: a want that holds it somewhere, which is
+    /// the precondition for every input that is content rather than a person.
+    #[must_use]
+    pub fn engaged(&self, pod: &PodId) -> bool {
+        !matches!(self.want(pod), Want::Quiet | Want::Stowing)
+    }
+
+    /// Fire every re-emission due at `now`, and lift every cued motion whose
+    /// span has run out.
     ///
     /// A closing script whose stow instant has arrived gets one last emission —
     /// the stow, immediately — and then the scripter goes quiet. See
     /// [`Scripter::emit`] for why that confirming re-send is what makes the
     /// refresh cadence's repair promise true for short turns.
+    ///
+    /// A motion's lift is its own cause: what goes out is the standing want
+    /// said plainly, which is the first script since the cue to carry the
+    /// head's ending again. The stow a cued motion held back is taken here
+    /// rather than cutting the motion for it.
     pub fn tick(&mut self, now: Now) -> Vec<ScriptPublish> {
-        let due: Vec<PodId> = self
+        let due: Vec<(PodId, bool)> = self
             .pods
             .iter()
-            .filter(|(_, p)| p.refresh.is_some_and(|at| at <= now.at))
-            .map(|(pod, _)| pod.clone())
+            .filter_map(|(pod, p)| {
+                let lift = p.running.as_ref().is_some_and(|r| r.ends_at <= now.at);
+                let refresh = p.refresh.is_some_and(|at| at <= now.at);
+                (lift || refresh).then(|| (pod.clone(), lift))
+            })
             .collect();
         let mut out = Vec::new();
-        for pod in due {
-            if let Some(publish) = self.emit(&pod, now, Cause::Refresh, false, None) {
+        for (pod, lift) in due {
+            let cause = if lift {
+                if let Some(p) = self.pods.get_mut(&pod) {
+                    p.running = None;
+                }
+                Cause::MotionEnded
+            } else {
+                Cause::Refresh
+            };
+            if let Some(publish) = self.emit(&pod, now, cause, lift, None) {
                 out.push(publish);
             }
             self.tidy(&pod);
@@ -559,9 +653,54 @@ impl Scripter {
 
     /// The earliest instant [`Scripter::tick`] has anything to do, or `None`
     /// when no pod has a script standing.
+    ///
+    /// A running motion's end is one of those instants: the standing want has
+    /// an ending in it that is not being said while the motion plays, so the
+    /// lift cannot wait for the next refresh.
     #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
-        self.pods.values().filter_map(|p| p.refresh).min()
+        self.pods
+            .values()
+            .flat_map(|p| [p.refresh, p.running.as_ref().map(|r| r.ends_at)])
+            .flatten()
+            .min()
+    }
+
+    /// Apply one response message's movements and say so at once.
+    ///
+    /// Last of each kind wins: a reply naming two poses means the second, and a
+    /// second motion replaces one still playing rather than queueing behind it.
+    /// A pose does not disturb a running motion — the motion plays over
+    /// whatever base is standing — and a motion does not move the pose the head
+    /// returns to when it ends.
+    ///
+    /// Callers must have refused every want that holds the head nowhere: a cue
+    /// never raises a head that is at rest.
+    fn cue(&mut self, pod: &PodId, now: Now, cues: Vec<MotionCue>) -> Option<ScriptPublish> {
+        {
+            let p = self.pods.get_mut(pod)?;
+            for cue in cues {
+                match cue {
+                    MotionCue::Pose(raise) => match &mut p.want {
+                        Want::Hold { at } | Want::Closing { at, .. } => *at = raise,
+                        // Refused by the caller's guard; a want holding the head
+                        // nowhere has no base for a cued pose to replace.
+                        Want::Quiet | Want::Stowing => {}
+                    },
+                    MotionCue::Motion { play, span_ms } => {
+                        p.running = Some(Running {
+                            play,
+                            span_ms,
+                            ends_at: now.at + Duration::from_millis(span_ms),
+                        });
+                    }
+                }
+            }
+        }
+        // Not `set`: the want may be unchanged — a motion over the standing
+        // pose — and the script still has to go out, because the play is only
+        // in front of the daemon once a script names it.
+        self.emit(pod, now, Cause::Cue, true, None)
     }
 
     /// Put the head at the pose this cause means and start the turn's facts
@@ -575,7 +714,23 @@ impl Scripter {
             Cause::Turn => self.turn.clone(),
             _ => self.wake.clone(),
         };
-        self.pods.entry(pod.clone()).or_default().clear_turn();
+        // A raise is a person. Whatever the last reply asked the head to do,
+        // this outranks it: the cued motion is dropped and the script that goes
+        // out names the raise alone.
+        let cut = {
+            let p = self.pods.entry(pod.clone()).or_default();
+            p.clear_turn();
+            p.running.take().is_some()
+        };
+        if cut {
+            // The want may be exactly what it was — a raise to the pose already
+            // held — and the script still has to go out: it is the one that
+            // stops naming the play, and an overlay a replacement does not
+            // restate is what ends it.
+            let p = self.pods.get_mut(pod)?;
+            p.want = Want::Hold { at };
+            return self.emit(pod, now, cause, true, None);
+        }
         self.set(pod, now, Want::Hold { at }, cause, None)
     }
 
@@ -658,6 +813,13 @@ impl Scripter {
     fn wait_out_linger(&mut self, pod: &PodId, now: Now, cause: Cause) -> Option<ScriptPublish> {
         let p = self.pods.entry(pod.clone()).or_default();
         p.clear_turn();
+        // An unanswered raise ends what the last reply was doing; speech heard
+        // inside the window does not — a cued nod plays on while the person
+        // talks, and cutting it would be the head reacting to being listened
+        // to.
+        if cause == Cause::Unanswered {
+            p.running = None;
+        }
         let at = p
             .want
             .at()
@@ -780,6 +942,35 @@ impl Scripter {
         // Whether the timeline this publish carries ends at the stow, which is
         // what decides how much room the timeout keeps past it.
         let mut stow_terminal = matches!(p.want, Want::Closing { .. });
+        // While a cued motion plays, every script says the same two things: the
+        // pose the want stands at, and the play. Not the want's stow — each
+        // restatement's window runs the motion's full span from *that* script's
+        // arrival, because the edge cannot know the player is part-way through,
+        // so a stow dated inside it would have the window reaching past the
+        // script's own horizon and the script would be refused whole. The head
+        // is covered by the timeout below until the lift puts the ending back.
+        //
+        // The base is the pose restated rather than a keep: a replacement
+        // re-dispatches it from the composed setpoint, which is a no-op when
+        // the head is already there and a re-plan from where it is when it is
+        // not, and it is lawful from any phase the daemon might be in.
+        if let (Some(running), Some(at)) = (p.running.clone(), p.want.at().cloned()) {
+            p.refresh = Some(now.at + refresh);
+            let steps = vec![at.step(0), Step::play(1, running.play)];
+            // The window's own end is the last thing this timeline reaches, so
+            // that is what the timeout has to cover — otherwise the edge
+            // refuses a play running past the horizon.
+            let timeout_ms = floor_ms.max((1 + running.span_ms).saturating_add(refresh_ms));
+            return Some(self.rendered(
+                pod,
+                now,
+                cause,
+                change,
+                clamped_from_ms,
+                steps,
+                timeout_ms,
+            ));
+        }
         let steps = match p.want.steps(now.at, &stow) {
             Some(steps) => {
                 p.refresh = Some(now.at + refresh);
@@ -830,6 +1021,21 @@ impl Scripter {
         };
         let last_step_ms = steps.last().map_or(0, |step| step.after_ms);
         let timeout_ms = floor_ms.max(last_step_ms.saturating_add(headroom_ms));
+        Some(self.rendered(pod, now, cause, change, clamped_from_ms, steps, timeout_ms))
+    }
+
+    /// Number one decided timeline and wrap it as the publish it goes out as.
+    #[allow(clippy::too_many_arguments)]
+    fn rendered(
+        &mut self,
+        pod: &PodId,
+        now: Now,
+        cause: Cause,
+        change: bool,
+        clamped_from_ms: Option<u64>,
+        steps: Vec<Step>,
+        timeout_ms: u64,
+    ) -> ScriptPublish {
         let seq = self.seq.next(now.unix_ms);
         // Every refusal is unreachable by construction: the steps ascend from
         // zero; the timeout exceeds the last step by the headroom, which is a
@@ -844,17 +1050,21 @@ impl Scripter {
         // here. The two refusals a step
         // carries are screened at the same door: every pose name here is either
         // `STOW_POSE` or one config validation has already offered to this same
-        // constructor, and every stated pace is one it has bounded. The expect
+        // constructor, and every stated pace is one it has bounded. A cued pose
+        // or play is screened at the same door one step earlier — its name
+        // against the library and its speed against the wire's own range —
+        // before it ever reaches a want, and a play always follows the base
+        // step the render puts in front of it. The expect
         // states that rather than pushing an impossible error onto every caller.
         let script = MotionScript::new(pod.0.clone(), seq, steps, timeout_ms)
             .expect("the scripter's timelines ascend inside a timeout sized to cover them");
-        Some(ScriptPublish {
+        ScriptPublish {
             pod: pod.clone(),
             script,
             cause,
             change,
             clamped_from_ms,
-        })
+        }
     }
 
     /// Forget a pod with nothing standing. Its next raise starts from the same
@@ -1267,6 +1477,24 @@ impl ScriptTask {
                 () = teardown.cancelled() => break,
                 input = self.rx.recv() => match input {
                     Some(input) => {
+                        // A cue that arrives with the head already at rest is
+                        // dropped, and that is worth a line: the reply asked
+                        // for a movement nobody saw. Every other input's
+                        // outcome is legible from the scripts that follow it,
+                        // so only this one is narrated here.
+                        if let ScriptInput::Cues { pod, turn, cues } = &input
+                            && !self.core.engaged(pod)
+                        {
+                            self.jsonl.emit(
+                                "cue_ignored",
+                                &json!({
+                                    "pod": pod.0,
+                                    "utterance": turn,
+                                    "cues": cues.len(),
+                                    "reason": "head_at_rest",
+                                }),
+                            );
+                        }
                         if let Some(publish) = self.core.apply(input, Now::read()) {
                             self.publish(publish);
                         }
@@ -1417,6 +1645,16 @@ mod tests {
             at: Raise {
                 pose: pose.into(),
                 move_ms: None,
+            },
+        }
+    }
+
+    /// The same, at a pace the raise states rather than the library's.
+    fn holding_at(pose: &str, move_ms: Option<u64>) -> Want {
+        Want::Hold {
+            at: Raise {
+                pose: pose.into(),
+                move_ms,
             },
         }
     }
@@ -3850,6 +4088,351 @@ mod tests {
             sink.closed.load(Ordering::Relaxed),
             1,
             "a stopped task tells its sink no more are coming"
+        );
+    }
+
+    // --- cued poses and motions -------------------------------------------
+
+    /// A pose a reply asked for, at the pace the tap computed for it.
+    fn pose_cue(pose: &str, move_ms: Option<u64>) -> MotionCue {
+        MotionCue::Pose(Raise {
+            pose: pose.into(),
+            move_ms,
+        })
+    }
+
+    /// A motion a reply asked for, with the span the library gave it.
+    fn motion_cue(name: &str, span_ms: u64) -> MotionCue {
+        MotionCue::Motion {
+            play: Play::new(name),
+            span_ms,
+        }
+    }
+
+    fn cued(cues: Vec<MotionCue>) -> ScriptInput {
+        ScriptInput::Cues {
+            pod: pod(),
+            turn: TURN,
+            cues,
+        }
+    }
+
+    /// The steps of a script including its plays, which `steps` cannot render:
+    /// a base step reads as its pose, a play as `play <name>`.
+    fn timeline(publish: &ScriptPublish) -> Vec<(u64, String)> {
+        publish
+            .script
+            .steps()
+            .iter()
+            .map(|step| {
+                let label = match &step.action {
+                    motion_proto::Action::Base(base) => base.pose().unwrap_or("keep").to_string(),
+                    motion_proto::Action::Play(play) => format!("play {}", play.name),
+                };
+                (step.after_ms, label)
+            })
+            .collect()
+    }
+
+    /// A pose the reply named is the pose the hold is standing at, at the pace
+    /// the cue states — and it goes out the moment it arrives, because a reply's
+    /// movement is not something to hold until the next refresh.
+    #[test]
+    fn a_cued_pose_retargets_the_hold_and_is_said_at_once() {
+        let mut fx = two_pose_fixture();
+        fx.wake_and_dispatch(ZERO);
+        let publish = fx.publish(
+            cued(vec![pose_cue(PEEK, Some(400))]),
+            Duration::from_secs(1),
+        );
+        assert_eq!(publish.cause, Cause::Cue);
+        assert!(publish.change, "a movement the head makes is a change");
+        assert_eq!(
+            paced(&publish),
+            vec![(0, PEEK, Some(400))],
+            "the cued pose, at the pace the cue asked for"
+        );
+        assert_eq!(fx.want(), holding_at(PEEK, Some(400)));
+    }
+
+    /// A motion plays over the standing pose, and the script that carries it
+    /// restates that pose as the base a play needs in front of it.
+    #[test]
+    fn a_cued_motion_plays_over_the_standing_pose() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        let publish = fx.publish(cued(vec![motion_cue("nod", 2_000)]), ZERO);
+        assert_eq!(publish.cause, Cause::Cue);
+        assert_eq!(
+            timeline(&publish),
+            vec![(0, NEUTRAL.to_string()), (1, "play nod".to_string())],
+            "the pose restated as the base, then the play"
+        );
+        assert_eq!(
+            fx.want(),
+            holding(NEUTRAL),
+            "a motion does not change where the head ends up"
+        );
+    }
+
+    /// The timeout has to cover the play window, which is measured from the
+    /// script's own arrival: a window reaching past the script's horizon is
+    /// refused at the edge, and the whole script with it.
+    #[test]
+    fn a_long_motions_timeout_covers_its_whole_window() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        let short = fx.publish(cued(vec![motion_cue("nod", 2_000)]), ZERO);
+        assert_eq!(
+            short.script.timeout_ms(),
+            millis(CEILING),
+            "a window inside the engagement ceiling leaves the bound alone"
+        );
+
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        let long = fx.publish(cued(vec![motion_cue("long/one", 40_000)]), ZERO);
+        assert_eq!(
+            long.script.timeout_ms(),
+            1 + 40_000 + millis(REFRESH),
+            "the window's end plus a refresh, when that outruns the ceiling"
+        );
+    }
+
+    /// Both kinds in one message: the pose the reply named becomes the base the
+    /// motion plays over.
+    #[test]
+    fn a_pose_cued_while_a_motion_runs_becomes_the_plays_base() {
+        let mut fx = two_pose_fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 4_000)]), ZERO);
+        let publish = fx.publish(cued(vec![pose_cue(PEEK, None)]), Duration::from_millis(500));
+        assert_eq!(
+            timeline(&publish),
+            vec![(0, PEEK.to_string()), (1, "play nod".to_string())],
+            "the new base under the motion that is still running"
+        );
+    }
+
+    /// The last of each kind wins: the user does not want a queue, and a reply
+    /// that names two motions means the second.
+    #[test]
+    fn a_second_motion_replaces_the_first() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 10_000)]), ZERO);
+        let publish = fx.publish(
+            cued(vec![motion_cue("shake", 2_000)]),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            timeline(&publish),
+            vec![(0, NEUTRAL.to_string()), (1, "play shake".to_string())],
+            "the replacement, alone: the daemon cuts a row nothing restates"
+        );
+        assert_eq!(
+            fx.scripter.deadline(),
+            Some(fx.t0 + Duration::from_secs(3)),
+            "the second motion's own end, not the first's"
+        );
+    }
+
+    /// Every script while a motion runs restates it, because a script wholly
+    /// replaces its predecessor and an overlay the replacement does not name is
+    /// cut on the daemon's next tick.
+    #[test]
+    fn a_refresh_while_a_motion_runs_restates_the_same_play() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 20_000)]), ZERO);
+        let ticked = fx.tick(REFRESH);
+        assert_eq!(
+            ticked.len(),
+            1,
+            "the refresh says the standing script again"
+        );
+        assert_eq!(
+            timeline(&ticked[0]),
+            vec![(0, NEUTRAL.to_string()), (1, "play nod".to_string())],
+            "the same play, so the daemon picks the row up where it stands"
+        );
+        assert_eq!(ticked[0].cause, Cause::Refresh);
+        assert!(!ticked[0].change, "a re-emission is not a change");
+    }
+
+    /// The turn ends while the motion is still going: the ending is *not* in the
+    /// script, because the window is measured from each script's arrival and a
+    /// stow dated inside it would have the edge refuse the whole thing. The stow
+    /// arrives at the lift instead — the motion is never cut for it.
+    #[test]
+    fn a_turn_ending_under_a_motion_waits_for_the_lift() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 3_000)]), ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        let closing = fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0 + Duration::from_secs(10))),
+            },
+            ZERO,
+        );
+        assert_eq!(
+            timeline(&closing),
+            vec![(0, NEUTRAL.to_string()), (1, "play nod".to_string())],
+            "the ending is decided but not said while the motion runs"
+        );
+
+        let lifted = fx.tick(Duration::from_secs(3));
+        assert_eq!(lifted.len(), 1, "the lift says the standing want plainly");
+        assert_eq!(lifted[0].cause, Cause::MotionEnded);
+        assert_eq!(
+            steps(&lifted[0]),
+            vec![(0, NEUTRAL), (7_500, STOW_POSE)],
+            "the stow the motion held back, still dated from the audio"
+        );
+    }
+
+    /// A stow that came due while the motion was playing is taken at the lift:
+    /// the head waits for the motion and then comes down, rather than the stow
+    /// cutting the motion short.
+    #[test]
+    fn a_stow_that_fell_due_under_a_motion_is_taken_at_the_lift() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 3_000)]), ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        fx.apply(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0 + Duration::from_secs(1))),
+            },
+            ZERO,
+        );
+        let lifted = fx.tick(Duration::from_secs(3));
+        assert_eq!(lifted.len(), 1);
+        assert_eq!(
+            steps(&lifted[0]),
+            vec![(0, STOW_POSE)],
+            "the confirming stow, immediately: its instant is behind the lift"
+        );
+        assert_eq!(fx.want(), Want::Stowing);
+    }
+
+    /// A raise is a person, and cutting a nod for a person is right.
+    #[test]
+    fn a_wake_cuts_a_running_motion() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 20_000)]), ZERO);
+        let publish = fx.publish(ScriptInput::Wake(pod()), Duration::from_secs(1));
+        assert_eq!(
+            timeline(&publish),
+            vec![(0, NEUTRAL.to_string())],
+            "the raise alone: nothing restates the play, so the daemon cuts it"
+        );
+        assert_eq!(
+            fx.scripter.deadline(),
+            Some(fx.t0 + Duration::from_secs(1) + REFRESH),
+            "no motion is left to lift"
+        );
+    }
+
+    /// Speech inside the capture window re-dates the ending and leaves the nod
+    /// alone: the head does not react to being listened to.
+    #[test]
+    fn heard_keeps_a_running_motion() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 20_000)]), ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
+        );
+        let publish = fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(1));
+        assert_eq!(publish.cause, Cause::Heard);
+        assert_eq!(
+            timeline(&publish),
+            vec![(0, NEUTRAL.to_string()), (1, "play nod".to_string())],
+            "the play stands; the re-dated ending is not said until the lift"
+        );
+    }
+
+    /// An unanswered raise ends what the reply was doing: nothing is coming of
+    /// it, so the head settles rather than finishing a gesture at nobody.
+    #[test]
+    fn an_unanswered_raise_cuts_a_running_motion() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 20_000)]), ZERO);
+        let publish = fx.publish(ScriptInput::Unanswered(pod()), Duration::from_secs(1));
+        assert_eq!(
+            steps(&publish),
+            vec![(0, NEUTRAL), (millis(LINGER), STOW_POSE)],
+            "a linger from now, with no play left in the script"
+        );
+    }
+
+    /// Content never raises a head that is at rest: a cue that lost the race
+    /// with the ending moves nothing.
+    #[test]
+    fn a_cue_with_no_head_up_moves_nothing() {
+        let mut fx = fixture();
+        assert!(
+            fx.apply(cued(vec![motion_cue("nod", 2_000)]), ZERO)
+                .is_none(),
+            "a cue for a pod with nothing standing"
+        );
+        assert_eq!(fx.want(), Want::Quiet);
+        assert!(
+            !fx.scripter.engaged(&pod()),
+            "and the pod is still one nobody has heard from"
+        );
+    }
+
+    /// The lift cannot wait for the next refresh: the standing want has an
+    /// ending in it that is not being said while the motion plays.
+    #[test]
+    fn a_running_motion_owns_the_deadline_when_it_ends_first() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 2_000)]), ZERO);
+        assert_eq!(
+            fx.scripter.deadline(),
+            Some(fx.t0 + Duration::from_secs(2)),
+            "the motion's end, which is sooner than the refresh"
+        );
+        let lifted = fx.tick(Duration::from_secs(2));
+        assert_eq!(lifted.len(), 1);
+        assert_eq!(
+            timeline(&lifted[0]),
+            vec![(0, NEUTRAL.to_string())],
+            "the hold, plainly, with the motion gone"
+        );
+        assert_eq!(
+            fx.scripter.deadline(),
+            Some(fx.t0 + Duration::from_secs(2) + REFRESH),
+            "and the refresh cadence carries it from there"
         );
     }
 }

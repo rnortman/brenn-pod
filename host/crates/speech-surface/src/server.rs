@@ -1059,6 +1059,7 @@ impl Server {
                     },
                 }),
                 scripter: script_handle.clone(),
+                cues: cue_library.clone(),
             },
             jsonl.clone(),
         ));
