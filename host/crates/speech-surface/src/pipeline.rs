@@ -37,7 +37,7 @@ use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
     AudioSpan, Brain, BrainEvent, BrainEventFn, BrainStats, CarveTiming, CarvedUtterance,
-    ConfidenceGate, DoaTrack, EndpointCause, FlushRejected, GateReject, InterruptProgress,
+    ConfidenceGate, DoaTrack, EndpointCause, Feed, FlushRejected, GateReject, InterruptProgress,
     ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment, SegmentTelemetry,
     SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError, Transcriber, Transcript,
     TurnEnd, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation, stage_delta_us,
@@ -49,6 +49,7 @@ use tokio::task::AbortHandle;
 use crate::barge::TurnLedger;
 use crate::config::WakeWordInStt;
 use crate::jsonl::JsonlHandle;
+use crate::playback_router::FeedFn;
 use crate::recorder::{
     WakeClass, WakeClassUpdate, sanitize_filename, set_wake_class, sidecar_path,
 };
@@ -187,6 +188,19 @@ pub(crate) struct BargeWiring {
     pub(crate) flush: FlushFn,
 }
 
+/// How this task opens a capture window: the listener feed and how long the
+/// window runs, in samples.
+///
+/// One struct and not two fields because a window length with nothing to feed is
+/// not a configuration — the two are wired together or not at all.
+pub(crate) struct ListenWiring {
+    /// The same listener feed the playback fan-out drives the floor with.
+    pub(crate) feed: FeedFn,
+    /// How long the window stays open, in samples at the capture rate. Dated by
+    /// the listener from its own cursor, so nothing here is a wall clock.
+    pub(crate) window_samples: u64,
+}
+
 /// Pass-through configuration and shared counters for [`run`].
 pub struct PipelineCtx {
     /// The record-store directory, or `None` when recording is disabled.
@@ -204,6 +218,11 @@ pub struct PipelineCtx {
     /// Barge-in wiring, or `None` in a pipeline with no playback path (the replay
     /// rigs), where a detected barge-in is a log line and nothing more.
     pub(crate) barge: Option<BargeWiring>,
+    /// How a `<listen/>` reply opens its capture window, or `None` with no
+    /// listener wired. One of the two openers lives here; the other is the
+    /// playback fan-out, and whichever of the brain's return and the last clip's
+    /// settle comes second is the one that fires.
+    pub(crate) listen: Option<ListenWiring>,
     /// Where the interaction's lifecycle points are reported for the head, or
     /// `None` when no presence channel is configured. Every tap is a
     /// non-blocking send; nothing in this task waits on it.
@@ -380,6 +399,7 @@ pub async fn run(
         confidence_gate,
         wake_word,
         barge,
+        listen,
         scripter,
     } = ctx;
 
@@ -448,6 +468,7 @@ pub async fn run(
                     &confidence_gate,
                     brain.as_ref(),
                     barge.as_ref(),
+                    listen.as_ref(),
                     scripter.as_ref(),
                     &jsonl,
                 )
@@ -859,6 +880,13 @@ async fn handle_listener(
         }
         ListenerEvent::ListenHeard { pod, epoch } => {
             jsonl.emit("listen_heard", &json!({ "pod": pod.0, "epoch": epoch }));
+            // The head's ending was dated from the reply that opened the window,
+            // and nothing between here and the follow-up's dispatch moves it:
+            // `TurnStarted` comes after the endpoint, STT and the gate. Without
+            // this the head starts down mid-follow-up and jerks back up.
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::Heard(pod.clone()));
+            }
         }
         ListenerEvent::ListenExpired { pod, epoch } => {
             jsonl.emit("listen_expired", &json!({ "pod": pod.0, "epoch": epoch }));
@@ -1094,6 +1122,7 @@ async fn handle_stt_done(
     confidence_gate: &ConfidenceGate,
     brain: Option<&BrainWiring>,
     barge: Option<&BargeWiring>,
+    listen: Option<&ListenWiring>,
     scripter: Option<&ScriptHandle>,
     jsonl: &JsonlHandle,
 ) {
@@ -1217,7 +1246,10 @@ async fn handle_stt_done(
     // pod's own voice, or an empty transcript is never gated. A scored wake accept
     // is gated through its wake provenance; a barge-in utterance has no wake word,
     // so a second arm keyed on the barge mark declines the barging speech that
-    // transcribed to nothing — the playback is already cut. A third arm catches
+    // transcribed to nothing — the playback is already cut. A third declines
+    // speech carved inside an open capture window, which is wake-less by
+    // construction and would otherwise reach the brain on nothing but the room's
+    // noise for the whole window. A fourth catches
     // the case the guard let past: audio over the robot's own playback that never
     // sustained enough to cut it, which under a bypassed wake gate would otherwise
     // reach the brain on the strength of the reply's own echo.
@@ -1229,19 +1261,25 @@ async fn handle_stt_done(
         .and_then(|conf| confidence_gate.evaluate(conf));
     let gate = match (utterance.wake, confidence_reject) {
         (Some(wake), Some(reject)) => GateOutcome::DeclineWake(wake, reject),
+        (None, Some(reject)) if done.carve.follow_up => GateOutcome::DeclineFollowUp(reject),
         (None, Some(reject)) if done.carve.barge_in => GateOutcome::DeclineBarge(reject),
         (None, Some(reject)) if done.carve.over_playback => GateOutcome::DeclineEcho(reject),
         _ => GateOutcome::Dispatch,
     };
     // A wake or barge decline is a raise that produced no turn: the head is up and
     // nothing will follow, so the settle starts here rather than waiting for the
-    // engagement's ceiling. An echo decline is not a raise — nobody raised, and
+    // engagement's ceiling. A declined follow-up is the same shape — the head has
+    // been waiting out the capture window and no turn is coming of what it heard,
+    // so it folds a linger from the decline. An echo decline is not a raise —
+    // nobody raised, and
     // `Unanswered` clears the pod's current turn, which would cut short the script
     // of the very reply the echo came from.
     if let Some(scripter) = scripter
         && matches!(
             gate,
-            GateOutcome::DeclineWake(..) | GateOutcome::DeclineBarge(..)
+            GateOutcome::DeclineWake(..)
+                | GateOutcome::DeclineBarge(..)
+                | GateOutcome::DeclineFollowUp(..)
         )
     {
         scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
@@ -1257,6 +1295,12 @@ async fn handle_stt_done(
             // was interrupted with nothing usable said in its place. Non-blocking by
             // contract, like `interrupt`.
             wiring.brain.barge_declined(&utterance);
+        }
+        GateOutcome::DeclineFollowUp(reject) => {
+            // No `barge_declined`: nothing was interrupted. The reply that opened
+            // the window played out in full and the turn behind it has already
+            // ended; what tripped the gate is the room, not an interruption.
+            decline_barge_low_confidence(&utterance, reject, wiring);
         }
         GateOutcome::DeclineEcho(reject) => decline_echo(&utterance, reject, wiring),
         GateOutcome::Dispatch => {
@@ -1327,6 +1371,22 @@ async fn handle_stt_done(
                         turn: id,
                         audio,
                     });
+                }
+                // The opener for a reply whose last clip was already heard out
+                // when the brain returned — a chain whose final segment carries
+                // no speech at all settles before this call. The fan-out is the
+                // opener for the ordinary case; `listen_open` is true on exactly
+                // one of the two, so the window opens once.
+                if let Some(listen) = listen
+                    && audio.listen_open
+                {
+                    (listen.feed)(
+                        pod.clone(),
+                        Feed::Listen {
+                            window_samples: listen.window_samples,
+                        },
+                    )
+                    .await;
                 }
             }
         }
@@ -1405,13 +1465,18 @@ fn push_bounded<T>(dq: &mut VecDeque<T>, item: T) {
 
 /// What the STT-confidence gate decided for a minted utterance: dispatch it, or
 /// decline it as a likely hallucination — through the wake provenance for a scored
-/// wake accept, through the barge mark for a barge-in utterance with no wake, or
+/// wake accept, through the barge mark for a barge-in utterance with no wake,
+/// through the follow-up mark for one carved inside an open capture window, or
 /// through the overlap mark for one carved over the pod's own voice that cut
 /// nothing.
 enum GateOutcome {
     Dispatch,
     DeclineWake(WakeConfirmation, GateReject),
     DeclineBarge(GateReject),
+    /// Speech carved inside a `<listen/>` window that transcribed to likely
+    /// hallucination. The window is wake-less by construction, so without this
+    /// an open room's noise would reach the brain ungated for the whole window.
+    DeclineFollowUp(GateReject),
     DeclineEcho(GateReject),
 }
 
@@ -1732,14 +1797,24 @@ mod tests {
     struct RecordingBrain {
         log: Arc<Mutex<NudgeLog>>,
         end: TurnEnd,
+        /// When set, the turn's one cmd is started and settled clean against
+        /// this ledger before `handle` returns — the chain whose last segment
+        /// carries no speech, where playback is over before the brain is.
+        settle_first: Option<Arc<TurnLedger>>,
     }
 
     impl Brain for RecordingBrain {
         fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
+            let (pod, id) = (u.pod.clone(), u.id);
             let spoken = EchoTestBrain.handle(u, out);
             let end = self.end;
+            let settle_first = self.settle_first.clone();
             async move {
                 spoken.await;
+                if let Some(ledger) = settle_first {
+                    ledger.record_started(&pod, Some(id), 960, tokio::time::Instant::now());
+                    ledger.settle_job(&pod, Some(id), true);
+                }
                 end
             }
             .boxed()
@@ -1819,6 +1894,8 @@ mod tests {
         events: Arc<Mutex<Vec<BrainEvent>>>,
         stats: Arc<BrainStats>,
         barge: Option<(Arc<TurnLedger>, FlushFn)>,
+        listen: Option<ListenWiring>,
+        settle_first: Option<Arc<TurnLedger>>,
         wake_word: WakeWordInStt,
         nudges: Arc<Mutex<NudgeLog>>,
         scripter: Option<ScriptHandle>,
@@ -1837,6 +1914,8 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 stats: Arc::new(BrainStats::default()),
                 barge: None,
+                listen: None,
+                settle_first: None,
                 nudges: Arc::new(Mutex::new(NudgeLog::default())),
                 turn_end: TurnEnd::Closed,
                 scripter: None,
@@ -1847,6 +1926,21 @@ mod tests {
         /// than the burst it pre-loads.
         fn queue_depth(mut self, depth: usize) -> Harness {
             self.queue_depth = depth;
+            self
+        }
+        /// Settle the turn's playback against `ledger` before the brain returns,
+        /// so `dispatch_done` is the last of the two facts rather than the first.
+        fn settle_first(mut self, ledger: Arc<TurnLedger>) -> Harness {
+            self.settle_first = Some(ledger);
+            self
+        }
+        /// Wire the `<listen/>` opener to `feed`, with a window of
+        /// `window_samples`, so a test can read what the listener is told.
+        fn listen(mut self, feed: FeedFn, window_samples: u64) -> Harness {
+            self.listen = Some(ListenWiring {
+                feed,
+                window_samples,
+            });
             self
         }
         /// Wire the head's taps to `handle`, so a test can read the
@@ -1918,6 +2012,7 @@ mod tests {
                     brain: Arc::new(RecordingBrain {
                         log: self.nudges.clone(),
                         end: self.turn_end,
+                        settle_first: self.settle_first.clone(),
                     }),
                     speak_tx,
                     events,
@@ -1944,6 +2039,7 @@ mod tests {
                 barge: self
                     .barge
                     .map(|(ledger, flush)| BargeWiring { ledger, flush }),
+                listen: self.listen,
                 scripter: self.scripter.clone(),
             };
             let loop_jsonl = jsonl.clone();
@@ -2555,6 +2651,7 @@ mod tests {
             &mut pods,
             &mut next_id,
             &ConfidenceGate::OFF,
+            None,
             None,
             None,
             None,
@@ -4300,6 +4397,172 @@ mod tests {
         );
         drop(jsonl);
         writer.await.unwrap();
+    }
+
+    /// A listener feed that records what it was handed, in place of the real
+    /// listener (which owns an inference thread).
+    fn spy_listen_feed() -> (FeedFn, Arc<Mutex<Vec<Feed>>>) {
+        let log: Arc<Mutex<Vec<Feed>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let feed: FeedFn = Arc::new(move |_pod, f| {
+            sink.lock().unwrap().push(f);
+            Box::pin(std::future::ready(()))
+        });
+        (feed, log)
+    }
+
+    /// How long a test's capture window runs. Any number, as long as it is the
+    /// one that comes out the other end.
+    const TEST_LISTEN_WINDOW: u64 = 96_000;
+
+    /// The pipeline-side opener. A reply whose last clip was heard out before
+    /// the brain returned leaves `dispatch_done` the call that completes the
+    /// turn, so the window is this task's to open — the fan-out already saw its
+    /// settle and had nothing to open on.
+    #[tokio::test]
+    async fn a_reply_settled_before_dispatch_returns_opens_the_window_here() {
+        let ledger = Arc::new(TurnLedger::new());
+        let (feed, fed) = spy_listen_feed();
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .turn_end(TurnEnd::Open)
+            .barge(Arc::clone(&ledger), Err(FlushRejected::NotPlaying))
+            .settle_first(Arc::clone(&ledger))
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let fed = fed.lock().unwrap();
+        assert!(
+            matches!(
+                fed.as_slice(),
+                [Feed::Listen {
+                    window_samples: TEST_LISTEN_WINDOW
+                }]
+            ),
+            "one window, as long as the configuration says: {fed:?}",
+        );
+    }
+
+    /// The same reply, with nothing asking to keep listening: no window. The
+    /// disposition is the whole difference.
+    #[tokio::test]
+    async fn a_closed_turn_opens_no_window_at_dispatch() {
+        let ledger = Arc::new(TurnLedger::new());
+        let (feed, fed) = spy_listen_feed();
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .turn_end(TurnEnd::Closed)
+            .barge(Arc::clone(&ledger), Err(FlushRejected::NotPlaying))
+            .settle_first(Arc::clone(&ledger))
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        assert!(fed.lock().unwrap().is_empty(), "the reply said nothing");
+    }
+
+    /// Speech heard inside the window reaches the head, so its ending is moved
+    /// out past the follow-up that is still being spoken and transcribed.
+    #[tokio::test]
+    async fn speech_inside_the_window_reaches_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _) = Harness::new()
+            .scripter(handle.clone())
+            .run(vec![PipelineItem::Listener(ListenerEvent::ListenHeard {
+                pod: pod(),
+                epoch: 1,
+            })])
+            .await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Heard(pod())]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l["event"] == "listen_heard")
+                .count(),
+            1,
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The window is wake-less, so the confidence gate is all that stands
+    /// between an open room and the brain. A follow-up that transcribes to
+    /// hallucination is declined and the head is told the raise produced no
+    /// turn — but nothing was interrupted, so the brain hears no cut.
+    #[tokio::test]
+    async fn a_gated_follow_up_declines_without_telling_the_brain_it_was_cut() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .brain()
+            .scripter(handle.clone())
+            .transcriber(FakeTranscriber(Some((
+                "phantom".into(),
+                Some(conf(0.37, -0.99)),
+            ))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let nudges = h.nudges.clone();
+        let stats = h.stats.clone();
+        let (_lines, cmds) = h.run(vec![soft_endpoint(follow_up)]).await;
+
+        assert!(cmds.is_empty(), "the phantom never reached the brain");
+        assert_eq!(stats.snapshot().barge_command_absent, 1);
+        assert!(
+            nudges.lock().unwrap().barge_declined.is_empty(),
+            "no reply was cut by a follow-up",
+        );
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Unanswered(pod())],
+            "the head folds a linger from the decline",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The same follow-up, transcribing to something: it dispatches like any
+    /// other utterance. The gate declines hallucinations, not follow-ups.
+    #[tokio::test]
+    async fn a_clean_follow_up_dispatches() {
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            ..carved(1, 0, 16, None)
+        };
+        let (_lines, cmds) = Harness::new()
+            .brain()
+            .transcriber(FakeTranscriber(Some((
+                "and another thing".into(),
+                Some(conf(0.01, -0.2)),
+            ))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            })
+            .run(vec![soft_endpoint(follow_up)])
+            .await;
+
+        assert_eq!(cmds.len(), 1, "the follow-up is answered");
     }
 
     #[tokio::test]

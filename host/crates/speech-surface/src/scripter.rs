@@ -278,6 +278,9 @@ pub enum ScriptInput {
     /// A raise produced no turn: the wake arm expired with no command, or the
     /// confidence gate declined what was said.
     Unanswered(PodId),
+    /// Speech was heard inside an open `<listen/>` window. The head keeps
+    /// waiting where it stands, a linger from now.
+    Heard(PodId),
     /// The turn's cmd accounting moved: dispatch returned, a clip started
     /// playing, or a cmd resolved.
     Audio {
@@ -300,6 +303,7 @@ impl ScriptInput {
             | ScriptInput::TurnStarted { pod, .. }
             | ScriptInput::TurnEnded { pod, .. }
             | ScriptInput::Unanswered(pod)
+            | ScriptInput::Heard(pod)
             | ScriptInput::Audio { pod, .. } => pod,
         }
     }
@@ -317,6 +321,8 @@ pub enum Cause {
     Turn,
     /// A raise that produced no turn.
     Unanswered,
+    /// Speech inside an open capture window.
+    Heard,
     /// The turn's speech is accounted for, so its ending can be scheduled.
     Closing,
     /// The standing script said again; not a change.
@@ -332,6 +338,7 @@ impl Cause {
             Cause::Barge => "barge",
             Cause::Turn => "turn",
             Cause::Unanswered => "unanswered",
+            Cause::Heard => "heard",
             Cause::Closing => "closing",
             Cause::Refresh => "refresh",
         }
@@ -500,31 +507,19 @@ impl Scripter {
                     self.reconsider(&pod, now)
                 }
             }
-            ScriptInput::Unanswered(_)
+            ScriptInput::Unanswered(_) | ScriptInput::Heard(_)
                 if matches!(self.want(&pod), Want::Quiet | Want::Stowing) =>
             {
                 // The head is down or on its way: this pod's script has run, or
                 // it never had one. Both tap sites can fire twice about the same
                 // raise — the confidence gate declines and the arm then expires
                 // — and raising the head to lower it again is not what either
-                // means.
+                // means. A `Heard` is refused for the same reason and one more:
+                // content never raises a head that is at rest.
                 None
             }
-            ScriptInput::Unanswered(_) => {
-                // The head stays where the raise put it and folds after the
-                // linger, so the closing carries the standing raise. The branch
-                // above has already refused every want that holds the head
-                // nowhere, so there is one to carry.
-                let p = self.pods.entry(pod.clone()).or_default();
-                p.clear_turn();
-                let at = p
-                    .want
-                    .at()
-                    .cloned()
-                    .expect("a want the branch above did not refuse holds the head somewhere");
-                let (want, clamped) = self.closing(&pod, now, at, now.at + self.timing.linger);
-                self.set(&pod, now, want, Cause::Unanswered, clamped)
-            }
+            ScriptInput::Unanswered(_) => self.wait_out_linger(&pod, now, Cause::Unanswered),
+            ScriptInput::Heard(_) => self.wait_out_linger(&pod, now, Cause::Heard),
             ScriptInput::Audio { turn, audio, .. } => {
                 let p = self.pods.entry(pod.clone()).or_default();
                 if p.turn != Some(turn) {
@@ -646,6 +641,30 @@ impl Scripter {
             },
             Some(millis_between(now.at, stow_at)),
         )
+    }
+
+    /// Keep the head where it stands and re-date its ending to a linger from
+    /// now. The answer to both facts that say "the interaction is not over, and
+    /// nothing new is coming through the brain": a raise that produced no turn,
+    /// and speech heard inside an open capture window.
+    ///
+    /// The turn's facts are dropped first. A `TurnEnded` or `Audio` about the
+    /// turn that just finished, arriving after this, would otherwise reconsider
+    /// the ending back to that turn's own horizon; with no turn standing it is
+    /// refused.
+    ///
+    /// Callers must have refused every want that holds the head nowhere — the
+    /// closing carries the standing raise, so there has to be one.
+    fn wait_out_linger(&mut self, pod: &PodId, now: Now, cause: Cause) -> Option<ScriptPublish> {
+        let p = self.pods.entry(pod.clone()).or_default();
+        p.clear_turn();
+        let at = p
+            .want
+            .at()
+            .cloned()
+            .expect("the caller's guard refused every want that holds the head nowhere");
+        let (want, clamped) = self.closing(pod, now, at, now.at + self.timing.linger);
+        self.set(pod, now, want, cause, clamped)
     }
 
     /// Decide whether the turn in flight can be scheduled to its end yet, and
@@ -1795,6 +1814,150 @@ mod tests {
         assert_eq!(steps(&publish), vec![(0, NEUTRAL), (8_000, STOW_POSE)]);
         assert_eq!(publish.cause, Cause::Unanswered);
         assert!(publish.change);
+    }
+
+    /// Speech heard inside the capture window keeps the head where the reply
+    /// left it and moves its ending out to a linger from the moment it was
+    /// heard. Nothing is raised and nothing retargets: the person is still
+    /// talking to the same head.
+    #[test]
+    fn speech_inside_the_window_re_dates_the_stow_from_now() {
+        let mut fx = two_pose_fixture();
+        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.apply(
+            ScriptInput::TurnStarted {
+                pod: pod(),
+                turn: TURN,
+            },
+            ZERO,
+        );
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
+        );
+        let closing = fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0 + Duration::from_secs(2))),
+            },
+            ZERO,
+        );
+        assert_eq!(
+            steps(&closing),
+            vec![(0, NEUTRAL), (10_000, STOW_POSE)],
+            "the open turn's own linger, past its audio",
+        );
+
+        let heard = fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(3));
+        assert_eq!(
+            steps(&heard),
+            vec![(0, NEUTRAL), (8_000, STOW_POSE)],
+            "a linger from the instant the speech was heard, off the same pose",
+        );
+        assert_eq!(heard.cause, Cause::Heard);
+        assert!(heard.change);
+    }
+
+    /// The window's speech clears the finished turn, so a fact about that turn
+    /// still in flight behind it cannot pull the ending back to the turn's own
+    /// horizon.
+    #[test]
+    fn a_late_fact_about_the_cleared_turn_does_not_move_the_heard_stow() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
+        );
+        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(1));
+        let want = fx.want();
+        assert!(
+            fx.apply(
+                ScriptInput::Audio {
+                    pod: pod(),
+                    turn: TURN,
+                    audio: audio(true, 1, 0, Some(fx.t0 + Duration::from_millis(1_500))),
+                },
+                Duration::from_secs(1),
+            )
+            .is_none(),
+            "the turn was cleared with the speech that was heard",
+        );
+        assert_eq!(
+            fx.want(),
+            want,
+            "and the ending stands where `Heard` put it"
+        );
+    }
+
+    /// Two facts that mean the same thing about the same instant say it once.
+    /// A declined follow-up is both — heard, then unanswered — and the head is
+    /// not re-instructed for the second.
+    #[test]
+    fn heard_then_unanswered_at_one_instant_publishes_once() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(2));
+        assert!(
+            fx.apply(ScriptInput::Unanswered(pod()), Duration::from_secs(2))
+                .is_none(),
+            "the same closing, already standing",
+        );
+        let later = fx.publish(ScriptInput::Unanswered(pod()), Duration::from_secs(4));
+        assert_eq!(
+            steps(&later),
+            vec![(0, NEUTRAL), (8_000, STOW_POSE)],
+            "a decline that lands later does move the ending out",
+        );
+    }
+
+    /// Content never raises a head that is down or on its way down: a window's
+    /// speech arriving after the stow was decided is refused, exactly as an
+    /// unanswered raise is.
+    #[test]
+    fn heard_for_a_head_at_rest_is_refused() {
+        let mut fx = fixture();
+        assert!(
+            fx.apply(ScriptInput::Heard(pod()), ZERO).is_none(),
+            "no head is up",
+        );
+
+        let mut stowing = fixture();
+        stowing.wake_and_dispatch(ZERO);
+        stowing.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        // A turn whose stow was already due when its facts settled: the want is
+        // armed for one confirming re-send and nothing else.
+        stowing.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(stowing.t0)),
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(stowing.want(), Want::Stowing);
+        assert!(
+            stowing
+                .apply(ScriptInput::Heard(pod()), Duration::from_secs(2))
+                .is_none(),
+            "a stow in front of the daemon is not reopened by content",
+        );
     }
 
     /// The nominal turn: 6.24 s of speech starts, and one message carries the

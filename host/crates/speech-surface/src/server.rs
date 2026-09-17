@@ -55,10 +55,12 @@ use crate::barge::TurnLedger;
 use crate::brenn::BridgeLink;
 use crate::brenn::driver::{BridgeDriver, DriverIo, IntentSink};
 use crate::clip::{ClipError, load_clip};
-use crate::config::{BrainMode, Config, CueLibrary, PskTable, SttBackend, SttConfig, TtsBackend};
+use crate::config::{
+    BrainMode, Config, CueLibrary, PskTable, SAMPLES_PER_MS, SttBackend, SttConfig, TtsBackend,
+};
 use crate::iso8601_ms;
 use crate::jsonl::JsonlHandle;
-use crate::pipeline::{BargeWiring, BrainWiring, PipelineFatal};
+use crate::pipeline::{BargeWiring, BrainWiring, ListenWiring, PipelineFatal};
 use crate::playback_router::{
     self, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
 };
@@ -721,6 +723,16 @@ impl Server {
         // step in a latency line is corroborated by the `stage_health` count. With
         // no listener wired there is no floor to drive and no barge-in path, so the
         // adapter is lines-only.
+        // The capture window a `<listen/>` reply opens is exactly as long as the
+        // head lingers after one, so the microphone's deadline and the head's stow
+        // are dated the same instant from one key. In samples, because the
+        // listener dates it from its own audio cursor and knows nothing of
+        // `[brenn]`.
+        let listen_window = config
+            .brenn
+            .as_ref()
+            .map_or(0, |brenn| brenn.presence_linger_ms * SAMPLES_PER_MS);
+
         let playback_events = playback_event_adapter(
             jsonl.clone(),
             clock_step_clamps.clone(),
@@ -734,6 +746,7 @@ impl Server {
                 },
                 ledger: turn_ledger.clone(),
                 scripter: script_handle.clone(),
+                listen_window,
             }),
         );
 
@@ -1025,6 +1038,19 @@ impl Server {
                 // Barge-in needs a listener to detect it and a writer to cut, so it
                 // is wired exactly when detection is: the same condition the
                 // playback fan-out above uses.
+                // The pipeline-side opener for a `<listen/>` window, wired with
+                // the same weak feed the fan-out uses: whichever of the brain's
+                // return and the last clip's settle comes second opens it.
+                listen: listener_handle.as_ref().map(|listener| ListenWiring {
+                    feed: {
+                        let sender = weak_feed_sender(listener);
+                        Arc::new(move |pod, feed| match sender() {
+                            Some(sender) => Box::pin(async move { sender.feed(pod, feed).await }),
+                            None => Box::pin(std::future::ready(())),
+                        })
+                    },
+                    window_samples: listen_window,
+                }),
                 barge: listener_handle.as_ref().map(|_| BargeWiring {
                     ledger: turn_ledger.clone(),
                     flush: {
