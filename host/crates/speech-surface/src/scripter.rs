@@ -559,6 +559,10 @@ impl Scripter {
     pub fn apply(&mut self, input: ScriptInput, now: Now) -> Option<ScriptPublish> {
         let pod = input.pod().clone();
         let publish = match input {
+            // Refused before it reaches a want, for the reason `refusal` gives —
+            // which is also the reason the task's line carries, so the drop and
+            // the narration are one decision.
+            ref refused if self.refusal(refused).is_some() => None,
             ScriptInput::Wake(_) => self.raise(&pod, now, Cause::Wake),
             ScriptInput::Barge(_) => self.raise(&pod, now, Cause::Barge),
             ScriptInput::TurnStarted { turn, .. } => {
@@ -575,17 +579,6 @@ impl Scripter {
                     p.end = Some(end);
                     self.reconsider(&pod, now)
                 }
-            }
-            ScriptInput::Unanswered(_) | ScriptInput::Heard(_) | ScriptInput::Cues { .. }
-                if !self.engaged(&pod) =>
-            {
-                // The head is down or on its way: this pod's script has run, or
-                // it never had one. Both tap sites can fire twice about the same
-                // raise — the confidence gate declines and the arm then expires
-                // — and raising the head to lower it again is not what either
-                // means. A `Heard` and a `Cues` are refused for the same reason
-                // and one more: content never raises a head that is at rest.
-                None
             }
             ScriptInput::Unanswered(_) => self.wait_out_linger(&pod, now, Cause::Unanswered),
             ScriptInput::Heard(_) => self.wait_out_linger(&pod, now, Cause::Heard),
@@ -607,8 +600,35 @@ impl Scripter {
     /// Whether this pod's head is up: a want that holds it somewhere, which is
     /// the precondition for every input that is content rather than a person.
     #[must_use]
-    pub fn engaged(&self, pod: &PodId) -> bool {
+    fn engaged(&self, pod: &PodId) -> bool {
         !matches!(self.want(pod), Want::Quiet | Want::Stowing)
+    }
+
+    /// Why this input changes nothing, or `None` when it is acted on.
+    ///
+    /// The one place a refusal is decided. [`Scripter::apply`] guards on it and
+    /// the task narrates the reason it returns, so a clause added here reaches
+    /// both the drop and the line that reports it — and a reason this scripter
+    /// never gives cannot be logged.
+    ///
+    /// The head being down or on its way is such a reason: this pod's script has
+    /// run, or it never had one. Both tap sites can fire twice about the same
+    /// raise — the confidence gate declines and the arm then expires — and
+    /// raising the head to lower it again is not what either means. A `Heard`
+    /// and a `Cues` are refused for the same reason and one more: content never
+    /// raises a head that is at rest.
+    #[must_use]
+    pub fn refusal(&self, input: &ScriptInput) -> Option<&'static str> {
+        match input {
+            ScriptInput::Unanswered(pod)
+            | ScriptInput::Heard(pod)
+            | ScriptInput::Cues { pod, .. }
+                if !self.engaged(pod) =>
+            {
+                Some("head_at_rest")
+            }
+            _ => None,
+        }
     }
 
     /// Fire every re-emission due at `now`, and lift every cued motion whose
@@ -959,8 +979,14 @@ impl Scripter {
             let steps = vec![at.step(0), Step::play(1, running.play)];
             // The window's own end is the last thing this timeline reaches, so
             // that is what the timeout has to cover — otherwise the edge
-            // refuses a play running past the horizon.
-            let timeout_ms = floor_ms.max((1 + running.span_ms).saturating_add(refresh_ms));
+            // refuses a play running past the horizon. The window itself is
+            // bounded by the wire's ceiling where the span is made, so the
+            // ceiling here only ever trims the refresh headroom on top of it:
+            // a re-emission that lands late finds no script standing, which is
+            // the same grace every other timeline gives up at the bound.
+            let timeout_ms = floor_ms
+                .max((1 + running.span_ms).saturating_add(refresh_ms))
+                .min(MAX_TIMEOUT_MS);
             return Some(self.rendered(
                 pod,
                 now,
@@ -1047,14 +1073,19 @@ impl Scripter {
         // stow pace is also what keeps the daemon's own room check for a
         // stow-terminal timeline — its last step plus the pace that step
         // states, against this timeout — satisfied for every script emitted
-        // here. The two refusals a step
+        // here. A timeline carrying a play is bounded the other way round: its
+        // window is refused above `MAX_TIMEOUT_MS` where the span is made, and
+        // the timeout is capped at that same ceiling, so the timeout covers the
+        // window and neither reaches past the wire's bound. The two refusals a
+        // step
         // carries are screened at the same door: every pose name here is either
         // `STOW_POSE` or one config validation has already offered to this same
         // constructor, and every stated pace is one it has bounded. A cued pose
         // or play is screened at the same door one step earlier — its name
-        // against the library and its speed against the wire's own range —
-        // before it ever reaches a want, and a play always follows the base
-        // step the render puts in front of it. The expect
+        // against the library, its speed against the wire's own range and its
+        // span against the wire's ceiling — before it ever reaches a want, and
+        // a play always follows the base step the render puts in front of it.
+        // The expect
         // states that rather than pushing an impossible error onto every caller.
         let script = MotionScript::new(pod.0.clone(), seq, steps, timeout_ms)
             .expect("the scripter's timelines ascend inside a timeout sized to cover them");
@@ -1477,13 +1508,14 @@ impl ScriptTask {
                 () = teardown.cancelled() => break,
                 input = self.rx.recv() => match input {
                     Some(input) => {
-                        // A cue that arrives with the head already at rest is
-                        // dropped, and that is worth a line: the reply asked
-                        // for a movement nobody saw. Every other input's
-                        // outcome is legible from the scripts that follow it,
-                        // so only this one is narrated here.
+                        // A cue the scripter refuses is worth a line: the reply
+                        // asked for a movement nobody saw. The reason is the
+                        // scripter's own, so the line cannot claim a drop that
+                        // did not happen or miss one that did. Every other
+                        // input's outcome is legible from the scripts that
+                        // follow it, so only this one is narrated here.
                         if let ScriptInput::Cues { pod, turn, cues } = &input
-                            && !self.core.engaged(pod)
+                            && let Some(reason) = self.core.refusal(&input)
                         {
                             self.jsonl.emit(
                                 "cue_ignored",
@@ -1491,7 +1523,7 @@ impl ScriptTask {
                                     "pod": pod.0,
                                     "utterance": turn,
                                     "cues": cues.len(),
-                                    "reason": "head_at_rest",
+                                    "reason": reason,
                                 }),
                             );
                         }
@@ -3954,6 +3986,51 @@ mod tests {
             .map(|line| line["reason"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(reasons, vec!["queue_full", "scripter_gone"]);
+    }
+
+    /// A cue the scripter refuses is said out loud: the reply asked for a
+    /// movement nobody saw, and with no script to show for it the line is the
+    /// only record. The reason is the scripter's own, so the line cannot claim a
+    /// drop the core did not make.
+    #[tokio::test]
+    async fn a_cue_the_scripter_refuses_is_narrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::File(path.clone()))
+            .await
+            .unwrap();
+        let sink = Arc::new(Recorder::default());
+        let config = brenn_config();
+        let (handle, inbox) = channel(jsonl.clone());
+        let task = ScriptTask::with_sink(&config, sink.clone(), inbox, jsonl.clone());
+        let teardown = CancellationToken::new();
+        let join = tokio::spawn(task.run(teardown.clone()));
+
+        // Nothing has raised this pod, so its head is at rest.
+        handle.send(cued(vec![motion_cue("nod", 2_000)]));
+        expect_lines(&path, "cue_ignored", 1).await;
+
+        teardown.cancel();
+        tokio::time::timeout(WAIT, join)
+            .await
+            .expect("the task stops when told to")
+            .expect("the task does not panic");
+        drop(handle);
+        drop(jsonl);
+        writer.await.unwrap();
+
+        let line = lines(&path)
+            .into_iter()
+            .find(|line| line["event"] == "cue_ignored")
+            .expect("the refusal is narrated");
+        assert_eq!(line["pod"], "pod-kitchen");
+        assert_eq!(line["cues"], 1);
+        assert_eq!(line["reason"], "head_at_rest");
+        assert!(
+            sink.taken().is_empty(),
+            "and nothing went to the head: {:?}",
+            sink.taken()
+        );
     }
 
     /// A sink that keeps what it was handed, so a test can read the emissions

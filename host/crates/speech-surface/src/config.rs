@@ -1654,10 +1654,19 @@ impl CueLibrary {
     /// than an empty vocabulary: a deployment that named the file expects the
     /// head to move, and silently cueing nothing would look like a model that
     /// forgot to ask.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    /// Reports through [`ConfigError`], like every other startup file this
+    /// module reads: the path is carried structurally and the read failure keeps
+    /// its `io::Error`, so a caller can tell which file failed and how without
+    /// parsing a sentence.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::parse(&text).map_err(|message| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message,
+        })
     }
 
     /// Parse the sidecar's JSON.
@@ -3542,9 +3551,15 @@ max_backoff_ms = 9000
     fn a_malformed_or_missing_sidecar_is_refused_rather_than_read_as_empty() {
         assert!(CueLibrary::parse("{ not json").is_err());
         assert!(CueLibrary::parse(r#"{ "poses": [{ "name": "peek" }] }"#).is_err());
+        // Through `ConfigError`, like every other startup file: the path is the
+        // error's own field, not a sentence it was formatted into.
         let missing = CueLibrary::load(Path::new("/nonexistent/library.names.json"))
             .expect_err("an unreadable file is refused");
-        assert!(missing.contains("library.names.json"), "{missing}");
+        assert!(
+            matches!(&missing, ConfigError::Read { path, .. }
+                if path == Path::new("/nonexistent/library.names.json")),
+            "{missing}"
+        );
     }
 
     #[test]

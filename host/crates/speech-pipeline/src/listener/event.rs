@@ -215,6 +215,22 @@ pub enum ListenerEvent {
         score: f32,
         wake_end_sample: u64,
     },
+    /// A wake phrase crossed threshold and was discarded unheard, because the pod
+    /// was muted — its own playback was sounding, or its tail had not yet passed.
+    /// Nothing was armed, reported as a detection, or cut.
+    ///
+    /// A reader is entitled to conclude that the wake word did fire in this
+    /// stretch and that the mute is why nothing came of it: with `Mute`
+    /// configured, this line is the difference between "the detector never
+    /// scored the phrase" and "it did, on the robot's own voice or over it". It
+    /// says nothing about whose voice — only that the machine was talking.
+    WakeMuted {
+        pod: PodId,
+        epoch: u64,
+        score: f32,
+        /// Absolute index one past the last sample of the discarded phrase.
+        wake_end_sample: u64,
+    },
     /// An interruption crossed the barge-in guard while interruptible playback was
     /// active for this pod: cut the response. Fires at most once per playback
     /// session (the latch re-arms when playback next starts). The speech that

@@ -822,13 +822,17 @@ impl ListenerState {
     ) {
         // A muted chunk is silence to everything past the model: the endpointer
         // releases an utterance the robot began talking over, the barge guard's
-        // sustain run never builds, and no onset opens on the echo. The stats
-        // cadence is unchanged, and what they record is what the endpointer was
-        // driven with.
-        let p = if self.muted(chunk_end_sample) { 0.0 } else { p };
+        // sustain run never builds, and no onset opens on the echo.
+        //
+        // The stats keep the model's own score, not the substitute. They are the
+        // one reading of what the microphone actually heard while the robot was
+        // talking — which is how loud the echo is, and so whether this
+        // deployment still needs the mute — and a summary of zeros over every
+        // reply would answer that question with the mute's own assumption.
+        let driven = if self.muted(chunk_end_sample) { 0.0 } else { p };
         self.silero_stats.record(p, chunk_end_sample);
-        self.drive_barge_guard(pod, p, chunk_end_sample, host_rx, events);
-        let ev = self.endpointer.push(p, chunk_end_sample);
+        self.drive_barge_guard(pod, driven, chunk_end_sample, host_rx, events);
+        let ev = self.endpointer.push(driven, chunk_end_sample);
         // Flushes (inside the drain) before the transition events, so a transition
         // line arrives with the stats of the chunks that led to it — this one
         // included. The drain is also where an `Onset` gets its receipt stamp:
@@ -1054,10 +1058,20 @@ impl ListenerState {
         events: &mut Vec<ListenerEvent>,
     ) {
         // A muted detection is discarded whole: nothing is armed, nothing is
-        // reported, nothing is cut. The model is stateful, so the frames were
-        // pushed and scored regardless — what the mute takes away is the phrase
-        // being believed, and while the robot is talking the phrase is the robot's.
+        // cut, and no `WakeDetected` claims a wake this listener acted on. The
+        // model is stateful, so the frames were pushed and scored regardless —
+        // what the mute takes away is the phrase being believed, and while the
+        // robot is talking the phrase is the robot's. The discard is reported,
+        // because "the wake word did nothing during the reply" has to be
+        // tellable from "it never fired", and how often the machine trips
+        // itself is the reading that says whether the mute can be turned off.
         if self.muted(wake_end_sample) {
+            events.push(ListenerEvent::WakeMuted {
+                pod: pod.clone(),
+                epoch: self.epoch,
+                score,
+                wake_end_sample,
+            });
             return;
         }
         // A prior unconsumed arm is superseded by this fresh wake — it fired with
@@ -1815,6 +1829,10 @@ impl ListenerStats {
                 // `PlaybackStats::jobs_flushed`, and the speech that caused it is
                 // counted by the `SoftEndpoint` it carves like any other utterance.
                 ListenerEvent::BargeIn { .. } => {}
+                // Not a wake this listener acted on, so it is not counted as
+                // one: `wakes` is the tally of arms, and a muted detection
+                // armed nothing. Its own line carries it.
+                ListenerEvent::WakeMuted { .. } => {}
                 // Pure observability, no stage-health counter. A capture window's
                 // consequence is the utterance it carves, counted as any other is.
                 ListenerEvent::EndpointerTransition { .. }
@@ -3718,14 +3736,35 @@ mod tests {
         play(&mut state, true, true);
 
         let over = state.detect_wake_for_test(&pod(), 0.9, 4_096);
-        assert!(over.is_empty(), "not even reported: {over:?}");
+        assert!(
+            !over
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::WakeDetected { .. })),
+            "not reported as a wake this listener acted on: {over:?}"
+        );
         assert!(state.wake.is_none(), "and nothing is armed");
         assert!(!state.barge_pending, "and nothing is cut");
+        // But the discard is on the record: the phrase did fire, and an
+        // operator asking whether the mute can come off reads it here.
+        assert!(
+            matches!(
+                over.as_slice(),
+                [ListenerEvent::WakeMuted {
+                    score,
+                    wake_end_sample: 4_096,
+                    ..
+                }] if (*score - 0.9).abs() < f32::EPSILON
+            ),
+            "the muted detection is reported as such: {over:?}"
+        );
 
         // The pacer says the audio is heard out at 4096; the tail runs to 5120.
         stop_playback_at(&mut state, 4_096);
         let tail = state.detect_wake_for_test(&pod(), 0.9, 5_120);
-        assert!(tail.is_empty(), "the tail is still the robot: {tail:?}");
+        assert!(
+            matches!(tail.as_slice(), [ListenerEvent::WakeMuted { .. }]),
+            "the tail is still the robot: {tail:?}"
+        );
         assert!(state.wake.is_none());
 
         let after = state.detect_wake_for_test(&pod(), 0.9, 5_121);
@@ -3763,6 +3802,14 @@ mod tests {
         assert!(
             transitions(&over).is_empty(),
             "the endpointer saw silence: {over:?}"
+        );
+        // The stats are not silenced with it: they are the one record of how
+        // loud the room was while the robot talked, which is what says whether
+        // this deployment still needs the mute.
+        assert_eq!(
+            state.silero_stats.flush().map(|s| s.max),
+            Some(0.9),
+            "the model's own score is what the summary carries"
         );
 
         stop_playback_at(&mut state, cursor);

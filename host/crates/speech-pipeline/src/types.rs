@@ -207,6 +207,21 @@ pub struct SpeakCmd {
     pub timings: StageTimings,
 }
 
+/// A movement a response asked for, in the order the markers appeared in it.
+///
+/// A spine value type beside [`SpeakCmd`], for the same reason: it is what a
+/// brain's answer can contain, and the seam that carries it is brain-agnostic.
+/// The names are the peer's own text — nothing here knows the deployed library,
+/// so a name that resolves to nothing is refused further down, at the seam that
+/// holds the library.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cue {
+    /// Take this pose for the rest of the reply.
+    Pose { name: String, speed: Option<f64> },
+    /// Play this motion once over the standing pose.
+    Motion { name: String, speed: Option<f64> },
+}
+
 /// The payload of a `SpeakCmd`: text to synthesize, or ready PCM to play.
 #[derive(Debug, Clone, Serialize)]
 pub enum SpeakBody {

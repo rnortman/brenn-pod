@@ -62,7 +62,7 @@ use crate::iso8601_ms;
 use crate::jsonl::JsonlHandle;
 use crate::pipeline::{BargeWiring, BrainWiring, ListenWiring, PipelineFatal};
 use crate::playback_router::{
-    self, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
+    self, FeedFn, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
 };
 use crate::prune::{PruneOutcome, PruneRequest, prune};
 use crate::recorder::{OpenLogs, Recorder, RecorderShared};
@@ -703,8 +703,13 @@ impl Server {
                     "cue_library_loaded",
                     &json!({
                         "path": path,
+                        // Both name lists, not a count of either: this line is
+                        // what an operator compares a refused name against, and
+                        // the motion names are the half that is regenerated and
+                        // path-shaped — the half that drifts. Bounded by the
+                        // library, and said once per run.
                         "poses": library.help_poses(),
-                        "motions": library.help_motions().len(),
+                        "motions": library.help_motions(),
                     }),
                 );
                 Some(Arc::new(library))
@@ -737,13 +742,7 @@ impl Server {
             jsonl.clone(),
             clock_step_clamps.clone(),
             listener_handle.as_ref().map(|listener| PlaybackFanout {
-                feed: {
-                    let sender = weak_feed_sender(listener);
-                    Arc::new(move |pod, feed| match sender() {
-                        Some(sender) => Box::pin(async move { sender.feed(pod, feed).await }),
-                        None => Box::pin(std::future::ready(())),
-                    })
-                },
+                feed: feed_fn(listener),
                 ledger: turn_ledger.clone(),
                 scripter: script_handle.clone(),
                 listen_window,
@@ -1042,13 +1041,7 @@ impl Server {
                 // the same weak feed the fan-out uses: whichever of the brain's
                 // return and the last clip's settle comes second opens it.
                 listen: listener_handle.as_ref().map(|listener| ListenWiring {
-                    feed: {
-                        let sender = weak_feed_sender(listener);
-                        Arc::new(move |pod, feed| match sender() {
-                            Some(sender) => Box::pin(async move { sender.feed(pod, feed).await }),
-                            None => Box::pin(std::future::ready(())),
-                        })
-                    },
+                    feed: feed_fn(listener),
                     window_samples: listen_window,
                 }),
                 barge: listener_handle.as_ref().map(|_| BargeWiring {
@@ -1515,6 +1508,21 @@ fn presence_channel(config: &Config) -> Option<&str> {
 fn weak_feed_sender(listener: &Arc<ListenerHandle>) -> impl Fn() -> Option<FeedSender> + use<> {
     let listener = Arc::downgrade(listener);
     move || listener.upgrade().map(|l| l.feed_sender())
+}
+
+/// The feed entry point every non-listener task drives the listener through: the
+/// playback fan-out's floor and the pipeline's capture window alike.
+///
+/// One function and not one closure per caller, because what happens when the
+/// listener is already gone — the feed is dropped, silently, on the reasoning in
+/// [`weak_feed_sender`] — is one policy, and a second copy of it would be the
+/// one that kept the old behaviour when the policy changed.
+fn feed_fn(listener: &Arc<ListenerHandle>) -> FeedFn {
+    let sender = weak_feed_sender(listener);
+    Arc::new(move |pod, feed| match sender() {
+        Some(sender) => Box::pin(async move { sender.feed(pod, feed).await }) as _,
+        None => Box::pin(std::future::ready(())),
+    })
 }
 
 /// Forward one session event to the listener as a [`Feed`], when a listener is

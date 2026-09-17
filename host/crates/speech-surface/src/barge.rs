@@ -93,7 +93,7 @@ impl TurnSettlement {
     fn audio(&self) -> TurnAudio {
         TurnAudio {
             dispatch_done: self.dispatch_done,
-            listen_open: self.listen && self.completed_clean() && self.playing == 0,
+            listen_open: self.listen && self.completed_clean(),
             cmds_sent: self.cmds_sent,
             awaiting_start: self
                 .cmds_sent
@@ -115,8 +115,10 @@ pub struct TurnAudio {
     /// `brain.handle()` has returned: no further cmds are coming.
     pub dispatch_done: bool,
     /// The instant a capture window should open: a turn whose reply asked to keep
-    /// listening has now said everything it had to say, every cmd of it settled
-    /// cleanly, and nothing is still sounding in the speaker.
+    /// listening has now said everything it had to say and every cmd of it
+    /// settled cleanly — which is also the instant nothing of it is still
+    /// sounding, since a started cmd settles exactly once and the count of
+    /// settles has reached the count sent.
     ///
     /// True on exactly one call per turn — the last of `dispatch_done` and the
     /// final settle, whichever the pod reaches second — because the clean

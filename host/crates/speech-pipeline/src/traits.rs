@@ -26,10 +26,9 @@ use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use serde::Serialize;
 
-use crate::brenn_brain::Cue;
 use crate::types::{
-    InterruptProgress, PodId, SPINE_FORMAT, SpeakCmd, Transcript, TranscriptConfidence, Utterance,
-    UtteranceId,
+    Cue, InterruptProgress, PodId, SPINE_FORMAT, SpeakCmd, Transcript, TranscriptConfidence,
+    Utterance, UtteranceId,
 };
 
 /// The PCM handed to a `Transcriber`: the segment's samples plus their rate.
@@ -140,20 +139,12 @@ impl ResponseSink {
         }
     }
 
-    /// A sink that hands each accepted command to `tap` before returning. The tap
-    /// is the surface's seam for counting a turn's responses and capturing their
-    /// text; the brain is unaware of it.
-    pub fn with_tap(tx: mpsc::Sender<SpeakCmd>, tap: SinkTap) -> Self {
-        Self {
-            tx,
-            tap: Some(tap),
-            cues: None,
-        }
-    }
-
-    /// A sink with both taps, either of which may be absent: a deployment that
-    /// wires no head has no use for the cue tap, and a cue it drops is a
-    /// movement nobody could have made.
+    /// A sink with both taps, either of which may be absent. The command tap is
+    /// the surface's seam for counting a turn's responses and capturing their
+    /// text; the cue tap is where a movement the reply named reaches the head. A
+    /// deployment that wires no head has no use for the second, and a cue it
+    /// drops is a movement nobody could have made. The brain is unaware of
+    /// either.
     pub fn with_taps(
         tx: mpsc::Sender<SpeakCmd>,
         tap: Option<SinkTap>,
@@ -454,13 +445,14 @@ mod tests {
         // Zero buffer: `futures::mpsc` still guarantees one slot per sender, so
         // this is the smallest channel that refuses a second un-drained send.
         let (tx, _rx) = mpsc::channel::<SpeakCmd>(0);
-        let mut sink = ResponseSink::with_tap(
+        let mut sink = ResponseSink::with_taps(
             tx,
-            Arc::new(move |cmd: &SpeakCmd| {
+            Some(Arc::new(move |cmd: &SpeakCmd| {
                 if let SpeakBody::Text(text) = &cmd.body {
                     sink_seen.lock().unwrap().push(text.clone());
                 }
-            }),
+            })),
+            None,
         );
 
         sink.try_send(cmd("first")).unwrap();

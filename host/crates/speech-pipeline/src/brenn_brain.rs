@@ -24,6 +24,9 @@ use tokio::sync::mpsc;
 
 use crate::brain::{BrainEvent, BrainEventFn, BrainStats, send_or_report};
 use crate::traits::{Brain, ResponseSink, TurnEnd};
+/// The movement a `<pose/>` or `<motion/>` marker asks for: a spine value type,
+/// re-exported here because this codec is where one is read off the wire.
+pub use crate::types::Cue;
 use crate::types::{
     ContextSegment, InterruptProgress, PodId, RoomId, SpeakBody, SpeakCmd, Utterance, UtteranceId,
 };
@@ -191,26 +194,13 @@ pub enum Tag {
     Continued,
     /// Hold the microphone open after this reply.
     Listen,
-    /// Move the head to a named pose and leave it there. `speed` is a multiplier
-    /// on the pose's own pace, absent when the marker named none.
-    Pose { name: String, speed: Option<f64> },
-    /// Play a named motion over whatever pose the head holds. `speed` as above.
-    Motion { name: String, speed: Option<f64> },
+    /// Move the head: a named pose to take for the rest of the reply, or a named
+    /// motion to play over the standing one. Carries the [`Cue`] the response
+    /// delivers verbatim, so the marker and the movement cannot drift apart.
+    Cue(Cue),
     /// A tag-shaped island the vocabulary does not cover, or one mangled past
     /// parsing. Stripped from the speech and reported loudly, never spoken.
     Unknown { raw: String },
-}
-
-/// A movement the response asked for, in the order the markers appeared. The
-/// names are the peer's own text: nothing here knows the deployed library, so a
-/// name that resolves to nothing is refused further down, at the seam that holds
-/// the library.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Cue {
-    /// Take this pose for the rest of the reply.
-    Pose { name: String, speed: Option<f64> },
-    /// Play this motion once over the standing pose.
-    Motion { name: String, speed: Option<f64> },
 }
 
 /// Tag-shaped islands in a response body. Deliberately not an XML grammar: the
@@ -349,11 +339,11 @@ fn parse_cue(attrs: &str, raw: &str, motion: bool) -> Tag {
         None => None,
     };
     let name = name.to_owned();
-    if motion {
-        Tag::Motion { name, speed }
+    Tag::Cue(if motion {
+        Cue::Motion { name, speed }
     } else {
-        Tag::Pose { name, speed }
-    }
+        Cue::Pose { name, speed }
+    })
 }
 
 /// The reply marker's turn id: absent (the model forgot it), present and readable,
@@ -708,14 +698,7 @@ impl BrennBrain {
             cues: tags
                 .iter()
                 .filter_map(|(tag, _)| match tag {
-                    Tag::Pose { name, speed } => Some(Cue::Pose {
-                        name: name.clone(),
-                        speed: *speed,
-                    }),
-                    Tag::Motion { name, speed } => Some(Cue::Motion {
-                        name: name.clone(),
-                        speed: *speed,
-                    }),
+                    Tag::Cue(cue) => Some(cue.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -749,11 +732,7 @@ impl BrennBrain {
                         reported += 1;
                     }
                 }
-                Tag::Reply { .. }
-                | Tag::Continued
-                | Tag::Listen
-                | Tag::Pose { .. }
-                | Tag::Motion { .. } => {}
+                Tag::Reply { .. } | Tag::Continued | Tag::Listen | Tag::Cue(_) => {}
             }
         }
         DeliverOutcome::Delivered
@@ -1357,24 +1336,24 @@ mod tests {
     fn a_pose_marker_carries_its_name_and_optional_speed() {
         assert_eq!(
             tags("<pose name=\"peek\"/>"),
-            vec![Tag::Pose {
+            vec![Tag::Cue(Cue::Pose {
                 name: "peek".into(),
                 speed: None
-            }]
+            })]
         );
         assert_eq!(
             tags("<pose name='peek' speed=1.5/>"),
-            vec![Tag::Pose {
+            vec![Tag::Cue(Cue::Pose {
                 name: "peek".into(),
                 speed: Some(1.5)
-            }]
+            })]
         );
         assert_eq!(
             tags("<motion name=\"a/b\" speed=\"0.5\"/>"),
-            vec![Tag::Motion {
+            vec![Tag::Cue(Cue::Motion {
                 name: "a/b".into(),
                 speed: Some(0.5)
-            }]
+            })]
         );
     }
 
@@ -1418,14 +1397,14 @@ mod tests {
         assert_eq!(
             tags.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>(),
             vec![
-                Tag::Motion {
+                Tag::Cue(Cue::Motion {
                     name: "a/b".into(),
                     speed: None
-                },
-                Tag::Pose {
+                }),
+                Tag::Cue(Cue::Pose {
                     name: "peek".into(),
                     speed: None
-                },
+                }),
             ]
         );
     }

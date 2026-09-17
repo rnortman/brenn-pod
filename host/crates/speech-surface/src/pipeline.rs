@@ -120,6 +120,7 @@ impl PipelineItem {
             PipelineItem::Connected { pod, .. } => pod,
             PipelineItem::Listener(ev) => match ev {
                 WakeDetected { pod, .. }
+                | WakeMuted { pod, .. }
                 | BargeIn { pod, .. }
                 | SoftEndpoint { pod, .. }
                 | Superseded { pod, .. }
@@ -148,6 +149,7 @@ impl PipelineItem {
             PipelineItem::Connected { .. } => "connected",
             PipelineItem::Listener(ev) => match ev {
                 WakeDetected { .. } => "wake_detected",
+                WakeMuted { .. } => "wake_muted",
                 BargeIn { .. } => "barge_in",
                 SoftEndpoint { .. } => "soft_endpoint",
                 Superseded { .. } => "superseded",
@@ -397,19 +399,6 @@ pub async fn run(
     ctx: PipelineCtx,
     jsonl: JsonlHandle,
 ) -> Result<(), PipelineFatal> {
-    let PipelineCtx {
-        record_dir,
-        clock_step_clamps,
-        transcriber,
-        brain,
-        confidence_gate,
-        wake_word,
-        barge,
-        listen,
-        scripter,
-        cues,
-    } = ctx;
-
     let mut pods: HashMap<PodId, PodState> = HashMap::new();
     // One `Utterance` id per dispatched utterance; unique within this loop (the
     // single minter), scoped locally so concurrent pipelines never interleave.
@@ -432,7 +421,7 @@ pub async fn run(
             .min();
         tokio::select! {
             () = sleep_until_opt(next_release), if !queue_closed => {
-                release_due_holds(&mut pods, scripter.as_ref(), &jsonl);
+                release_due_holds(&mut pods, ctx.scripter.as_ref(), &jsonl);
             }
             item = rx.recv(), if !queue_closed => match item {
                 None => {
@@ -444,7 +433,7 @@ pub async fn run(
                     }
                 }
                 Some(PipelineItem::Segment { seg, epoch }) => {
-                    handle_segment(*seg, epoch, &mut pods, record_dir.as_deref(), &clock_step_clamps, &jsonl)
+                    handle_segment(*seg, epoch, &mut pods, ctx.record_dir.as_deref(), &ctx.clock_step_clamps, &jsonl)
                         .await;
                 }
                 Some(PipelineItem::Connected { pod, epoch, room, log }) => {
@@ -454,33 +443,21 @@ pub async fn run(
                     handle_listener(
                         ev,
                         &mut pods,
-                        record_dir.as_deref(),
-                        transcriber.as_ref(),
-                        wake_word,
+                        ctx.record_dir.as_deref(),
+                        ctx.transcriber.as_ref(),
+                        ctx.wake_word,
                         &done_tx,
                         &mut next_utterance_id,
-                        brain.as_ref(),
-                        barge.as_ref(),
-                        scripter.as_ref(),
+                        ctx.brain.as_ref(),
+                        ctx.barge.as_ref(),
+                        ctx.scripter.as_ref(),
                         &jsonl,
                     )
                     .await;
                 }
             },
             Some(done) = done_rx.recv() => {
-                handle_stt_done(
-                    done,
-                    &mut pods,
-                    &mut next_utterance_id,
-                    &confidence_gate,
-                    brain.as_ref(),
-                    barge.as_ref(),
-                    listen.as_ref(),
-                    scripter.as_ref(),
-                    cues.as_ref(),
-                    &jsonl,
-                )
-                .await;
+                handle_stt_done(done, &mut pods, &mut next_utterance_id, &ctx, &jsonl).await;
             }
         }
     }
@@ -658,6 +635,22 @@ async fn handle_listener(
     jsonl: &JsonlHandle,
 ) {
     match ev {
+        ListenerEvent::WakeMuted {
+            pod,
+            epoch,
+            score,
+            wake_end_sample,
+        } => {
+            // A line and nothing else: the detection was discarded in the
+            // listener, so nothing here has an arm, a turn or a head to move.
+            // It is the record that the phrase did fire while the pod was
+            // muted — the reading behind both "the wake word did not work
+            // during the reply" and "the echo still trips the detector".
+            jsonl.emit(
+                "wake_muted",
+                &json!({ "pod": pod.0, "epoch": epoch, "score": score, "wake_end_sample": wake_end_sample }),
+            );
+        }
         ListenerEvent::WakeDetected {
             pod,
             epoch,
@@ -1127,14 +1120,29 @@ async fn handle_stt_done(
     done: SttDone,
     pods: &mut HashMap<PodId, PodState>,
     next_utterance_id: &mut u64,
-    confidence_gate: &ConfidenceGate,
-    brain: Option<&BrainWiring>,
-    barge: Option<&BargeWiring>,
-    listen: Option<&ListenWiring>,
-    scripter: Option<&ScriptHandle>,
-    cues: Option<&Arc<CueLibrary>>,
+    ctx: &PipelineCtx,
     jsonl: &JsonlHandle,
 ) {
+    // The wiring this dispatch reaches for, named once: five of the ctx's
+    // optional handles are used here, and threading them in one by one is how a
+    // call site becomes a row of bare `None`s that an argument-order mistake
+    // typechecks straight through.
+    let PipelineCtx {
+        confidence_gate,
+        brain,
+        barge,
+        listen,
+        scripter,
+        cues,
+        ..
+    } = ctx;
+    let (brain, barge, listen, scripter, cues) = (
+        brain.as_ref(),
+        barge.as_ref(),
+        listen.as_ref(),
+        scripter.as_ref(),
+        cues.as_ref(),
+    );
     let Some(state) = pods.get_mut(&done.pod) else {
         return;
     };
@@ -1484,6 +1492,14 @@ fn resolve_cue(library: &CueLibrary, cue: &Cue) -> Result<MotionCue, &'static st
                 blend_out_ms: span.blend_out_ms,
             }
             .span_ms(play.speed);
+            // The wire's own ceiling again, for the same reason as the pose's
+            // pace: the span becomes the timeout of every script that restates
+            // this play, and a timeout past the bound is a script the wire
+            // refuses to build at all. Checked where the number is made, and
+            // with the one millisecond the render puts the play's step at.
+            if span_ms.saturating_add(1) > MAX_TIMEOUT_MS {
+                return Err("motion_too_long");
+            }
             Ok(MotionCue::Motion { play, span_ms })
         }
     }
@@ -2813,19 +2829,21 @@ mod tests {
             })),
             elapsed_us: 0,
         };
-        handle_stt_done(
-            done,
-            &mut pods,
-            &mut next_id,
-            &ConfidenceGate::OFF,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &jsonl,
-        )
-        .await;
+        // Nothing wired: a stale completion is dropped before any of it is
+        // reached.
+        let ctx = PipelineCtx {
+            record_dir: None,
+            clock_step_clamps: Arc::new(AtomicU64::new(0)),
+            transcriber: None,
+            brain: None,
+            confidence_gate: ConfidenceGate::OFF,
+            wake_word: WakeWordInStt::default(),
+            barge: None,
+            listen: None,
+            scripter: None,
+            cues: None,
+        };
+        handle_stt_done(done, &mut pods, &mut next_id, &ctx, &jsonl).await;
 
         assert_eq!(next_id, 1, "no utterance minted for a stale completion");
         let slot = &pods[&pod()].in_flight;
@@ -4896,6 +4914,57 @@ mod tests {
             )
             .expect_err("refused"),
             "unknown_motion",
+        );
+    }
+
+    /// The wire's ceiling, on both derived numbers. A library copy is edited by
+    /// hand and can name a duration this deployment has never played; the pose's
+    /// pace and the motion's span are both made here, and a number past the
+    /// wire's bound is refused here rather than reaching a script the wire
+    /// cannot build.
+    #[test]
+    fn a_cue_whose_derived_span_or_pace_passes_the_wires_ceiling_is_refused() {
+        let library = CueLibrary::parse(
+            r#"{
+              "poses": [{ "name": "slow", "duration_ms": 400000 }],
+              "motions": [{ "name": "bench/epic", "duration_ms": 400000,
+                            "blend_out_ms": 200 }]
+            }"#,
+        )
+        .expect("the fixture sidecar parses");
+        assert_eq!(
+            resolve_cue(
+                &library,
+                &Cue::Pose {
+                    name: "slow".into(),
+                    speed: Some(0.25),
+                },
+            )
+            .expect_err("refused"),
+            "move_too_long",
+        );
+        assert_eq!(
+            resolve_cue(
+                &library,
+                &Cue::Motion {
+                    name: "bench/epic".into(),
+                    speed: Some(0.25),
+                },
+            )
+            .expect_err("refused"),
+            "motion_too_long",
+        );
+        // And the same library at unit speed is ordinary: the bound is on the
+        // number, not on the entry.
+        assert!(
+            resolve_cue(
+                &library,
+                &Cue::Motion {
+                    name: "bench/epic".into(),
+                    speed: None,
+                },
+            )
+            .is_ok()
         );
     }
 

@@ -52,7 +52,7 @@ pub use traits::{
     TranscribeError, Transcriber, TranscriptEvent, TurnEnd, transcribe_pcm,
 };
 pub use types::{
-    AudioSpan, BargeInContext, Codec, ConfidenceGate, ContextSegment, DoaTrack, EndpointCause,
+    AudioSpan, BargeInContext, Codec, ConfidenceGate, ContextSegment, Cue, DoaTrack, EndpointCause,
     GateReject, InterruptProgress, MAX_CONTEXT_SEGMENTS, MAX_RESOLVE_SAMPLES, PodId,
     ResolvedSpanAudio, RoomId, SPINE_FORMAT, Segment, SegmentEndCause, SegmentEndInfo,
     SegmentTelemetry, SpanResolveError, SpeakBody, SpeakCmd, SpeakerId, StageTimings,

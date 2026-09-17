@@ -246,6 +246,9 @@ fn replay_log(path: &Path, listener: &mut ReplayListener) -> Result<LogCounts, R
                     ),
                 );
             }
+            // A framelog carries no playback either, so nothing is ever muted
+            // and no detection is discarded for it.
+            ListenerEvent::WakeMuted { .. } => {}
             // A framelog carries no capture window: nothing in a replay feeds one,
             // so a window never opens and these never fire.
             ListenerEvent::ListenOpened { .. }

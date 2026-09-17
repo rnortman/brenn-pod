@@ -35,6 +35,11 @@ const CONSOLE_INFO: &[&str] = &[
     "segment_closed",
     "wake_decision",
     "wake_detected",
+    // A wake phrase the mute discarded: it fired while the pod's own reply was
+    // sounding, or inside the tail after it, and nothing was armed or cut. The
+    // reading behind "the wake word does nothing while it talks" and behind
+    // whether the echo still trips the detector at all.
+    "wake_muted",
     "wake_command_absent",
     // The other two ways the confidence gate declines a raise. Rate-bounded the
     // same way: at most one per utterance.
@@ -3065,6 +3070,7 @@ mod tests {
         ("wake_command_absent", Class::Calm),
         ("wake_decision", Class::Loud),
         ("wake_detected", Class::Calm),
+        ("wake_muted", Class::Calm),
         ("wake_sidecar_error", Class::Loud),
         ("wake_sidecar_skipped", Class::Loud),
         ("wake_stage_panicked", Class::Loud),
