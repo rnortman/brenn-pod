@@ -64,6 +64,10 @@ tempfile = "3"
 heapless = "0.9"
 # Shared frame-log/wire-frame test fixtures (`test_fixtures`).
 pod-ingest = { path = "../pod-ingest", features = ["test-util"] }
+# `test_support`: the committed wake audio and the device-shaped primed wake
+# fixture, so the preroll shape has one definition across both crates.
+# Feature-unified with the normal dep in test builds only.
+speech-pipeline = { path = "../speech-pipeline", features = ["test-util"] }
 # The shared streamer engine — test-only; the daemon never runs a streamer.
 pod-streamer = { path = "../../../firmware/crates/pod-streamer" }
 # Test-only too: `client-transport` is the Linux pod's transport (the integration

@@ -2,18 +2,16 @@
 //! `Segment`, derived from the streaming listener core (`listener::oww_stream`).
 //!
 //! `OwwGate` (`wake::oww`) drives a fresh streaming pass over a whole segment and
-//! takes the max-score verdict, so batch behaviour is derived-from-streaming and
-//! parity holds by construction. Live wake detection runs in the continuous
-//! listener; this gate survives only as the replay/parity tool the framelog corpus
-//! is scored through.
+//! takes the max-score verdict over the steps past the stream's warm-up. A
+//! segment too short to reach that point produces no score at all. Live wake
+//! detection runs in the continuous listener; this gate survives as a replay tool.
 
 pub mod oww;
 
 pub use oww::{OwwConfig, OwwGate};
 
-/// Verdict for one batch-scored segment: a scored accept (`positive`) or a scored
-/// reject (`negative`). The batch gate is a replay/parity oracle, so it always
-/// scores — there is no bypass verdict.
+/// Verdict for one batch-scored segment. Three cases, three variants: the model
+/// accepted, the model rejected, or the model never ran.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WakeOutcome {
     /// The gate passed on a score above threshold. Sidecar class `positive`.
@@ -28,8 +26,25 @@ pub enum WakeOutcome {
         wake_end_sample: usize,
     },
     /// The gate dropped the segment on a score below threshold. Sidecar
-    /// class `negative`.
+    /// class `negative`. `score` is a real model output.
     Rejected { score: f32 },
+    /// The wake head never ran on this segment, so there is no score to report.
+    /// The segment did not wake, but it is not evidence that the audio scores
+    /// low: anything reading these verdicts as a score distribution — corpus
+    /// scoring, threshold tuning — must exclude this case rather than fold a
+    /// stand-in zero into it.
+    Unscored { reason: UnscoredReason },
+}
+
+/// Why a segment carries no wake score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnscoredReason {
+    /// The segment carried no audio.
+    Empty,
+    /// The segment was shorter than the wake model's readiness window
+    /// ([`WAKE_READINESS_SAMPLES`](crate::listener::oww_stream::WAKE_READINESS_SAMPLES)),
+    /// so every chunk in it fell inside the stream's suppressed warm-up.
+    ShorterThanReadinessWindow,
 }
 
 /// A wake-gate failure: model/session load, runtime inference, or a non-finite

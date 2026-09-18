@@ -795,3 +795,56 @@ longer than `presence_linger_ms` with the head never starting down.
 
 See `TODO(listen-window-owns-the-stow)` at `wait_out_linger` in
 `host/crates/speech-surface/src/scripter.rs`.
+
+## `measured-t0-e2e-coverage` — DEFERRED as of 2026-09-16 (needs a decision about which carve should produce a measured t0)
+
+`t0_projected: false` — an utterance whose first audio the host actually *received* as this
+segment's first audio, rather than projecting its receipt through the device clock — has no
+end-to-end coverage. `playback_integration.rs` and `parrot_integration.rs` both asserted it until
+their fixtures grew a 1 s preroll in front of the wake phrase; both now assert `true`, and only the
+unit tests in `playback_router.rs` exercise the measured branch.
+
+The obvious repair does not work. A second segment on the same connection is not a warm stream —
+`reset_stream` runs on every `SegmentOpened` — so it needs the same priming prefix as the first.
+And the deeper point is that the old assertion was an artifact: it passed because the fixture put
+the phrase at segment sample 0 with a declared preroll of 0, which no device produces. On real
+hardware a wake-gated carve starts at `wake_end_sample - preroll_pad`, roughly a second past the
+segment base, so `t0_for` classifies it projected — the same verdict the tests now record.
+
+So the question is which carve is *supposed* to produce a measured t0 in the field, and that is
+what the coverage should reproduce. The likely answer is a bypass-policy carve, where the utterance
+begins at the speech onset the device VAD fired on and therefore inside the declared preroll; that
+needs a bypass harness config and a `wav-import --preroll-samples` fixture, neither of which exists
+yet.
+
+Done = one integration case carves an utterance whose start lands inside a non-zero declared
+preroll and asserts `t0_projected: false` end to end, and the wake-gated cases say in one line why
+they are projected.
+
+See `TODO(measured-t0-e2e-coverage)` at the `t0_projected` assertion in
+`host/crates/speech-surface/tests/playback_integration.rs`.
+
+## `batch-wake-gate-fate` — DEFERRED as of 2026-09-18 (needs a decision the pipeline rework owns)
+
+`wake::oww::OwwGate` and the `WakeOutcome` / `UnscoredReason` verdict types it returns have no
+consumer. A grep across `host/` finds the module's own tests and the `pub use` in `lib.rs`, nothing
+else: live wake detection runs in the listener thread, and the sidecar's wake class comes from a
+score comparison in `pipeline.rs` rather than from a `WakeOutcome`. The module header says as much
+— "`OwwGate` is retired once the pipeline rework routes wake through the listener thread".
+
+That makes it public API nothing exercises, and it grew this cycle: the readiness work added an
+`Unscored` variant, a new public enum, a new export, and four tests. The `Unscored` variant's doc
+makes a promise — anything reading these verdicts as a score distribution must exclude this case
+rather than fold in a stand-in zero — that no code today is in a position to keep or break.
+
+It is kept rather than deleted because the replay/parity path is the one place a whole recorded
+segment can be scored in one call, and the corpus-scoring work that would use it is not designed
+yet. Deleting it now would mean rebuilding it there; keeping it means carrying an unexercised
+surface until that decision lands.
+
+Done = either a named consumer reads `WakeOutcome` (and the `Unscored` promise becomes testable
+against it), or `wake::oww` and its three re-exports are deleted and the batch pass becomes a
+`#[cfg(test)]` helper over `OwwStream`.
+
+See `TODO(batch-wake-gate-fate)` at the module header in
+`host/crates/speech-pipeline/src/wake/oww.rs`.

@@ -834,6 +834,21 @@ pub const WAKE_PHRASE_WAV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../testdata/wake/wake-phrase.wav"
 );
+/// The primed wake fixture — the committed wake phrase behind the device's
+/// VAD-onset preroll — from the crate that owns the preroll's safety argument
+/// (`WAKE_READINESS_SAMPLES <= PREROLL_SAMPLES`, a compile-time pin in
+/// `speech-pipeline`). Re-exported rather than restated: one definition of "a
+/// fixture shaped like what a device sends".
+pub use speech_pipeline::test_support::primed_wake_pcm;
+
+/// [`primed_wake_pcm`] written as a spine `.wav` inside `dir`, for the cases
+/// that feed `wav-import` rather than raw PCM.
+pub fn primed_wake_wav(dir: &Path) -> PathBuf {
+    let wav = dir.join("primed-wake.wav");
+    speech_pipeline::write_spine_wav(&wav, &primed_wake_pcm()).expect("write primed wake wav");
+    wav
+}
+
 /// The committed TTS command clip — "this is a test one two three", not the wake
 /// phrase, so it arms nothing.
 pub const COMMAND_PHRASE_WAV: &str = concat!(

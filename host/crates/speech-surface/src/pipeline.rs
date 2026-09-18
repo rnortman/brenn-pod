@@ -1828,9 +1828,9 @@ mod tests {
     use serde_json::Value;
     use speech_pipeline::{
         BargeCause, CarveTiming, DropOldestQueue, EndpointState, EndpointTransition,
-        InterruptProgress, ScoreSummary, SegmentAudio, SegmentEndCause, SegmentEndInfo, SpeakBody,
-        StatsFlushCause, StatsModel, TranscriptConfidence, TranscriptEvent, TransitionCause,
-        TurnEnd, WakeConfirmation,
+        InterruptProgress, ScoreDistribution, ScoreSummary, SegmentAudio, SegmentEndCause,
+        SegmentEndInfo, SpeakBody, StatsFlushCause, StatsModel, TranscriptConfidence,
+        TranscriptEvent, TransitionCause, TurnEnd, WakeConfirmation,
     };
     use std::sync::Mutex;
 
@@ -3104,10 +3104,13 @@ mod tests {
                         first_chunk_end: 0,
                         last_chunk_end: 16,
                         chunks: 1,
-                        min: 0.0,
-                        max: 1.0,
-                        mean: 0.5,
-                        median: 0.5,
+                        unscored_chunks: 0,
+                        distribution: Some(ScoreDistribution {
+                            min: 0.0,
+                            max: 1.0,
+                            mean: 0.5,
+                            median: 0.5,
+                        }),
                     },
                 }),
                 "model_stats",
@@ -3371,10 +3374,13 @@ mod tests {
                     first_chunk_end: 2_560,
                     last_chunk_end: 19_456,
                     chunks: 4,
-                    min: 0.007,
-                    max: 0.999,
-                    mean: 0.7,
-                    median: 0.9,
+                    unscored_chunks: 0,
+                    distribution: Some(ScoreDistribution {
+                        min: 0.007,
+                        max: 0.999,
+                        mean: 0.7,
+                        median: 0.9,
+                    }),
                 },
             })
         };
@@ -3969,10 +3975,13 @@ mod tests {
                     first_chunk_end: 52_125_568,
                     last_chunk_end: 52_256_640,
                     chunks: 256,
-                    min: 0.001,
-                    max: 0.031,
-                    mean: 0.004,
-                    median: 0.002,
+                    unscored_chunks: 0,
+                    distribution: Some(ScoreDistribution {
+                        min: 0.001,
+                        max: 0.031,
+                        mean: 0.004,
+                        median: 0.002,
+                    }),
                 },
             })])
             .await;

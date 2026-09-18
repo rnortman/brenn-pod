@@ -56,8 +56,8 @@ fn committed_listener_with(config: ListenerConfig) -> ReplayListener {
 #[test]
 fn wake_phrase_framelog_replays_to_wake_and_carve() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let framelog =
-        common::import_wav_to_framelog(dir.path(), Path::new(common::WAKE_PHRASE_WAV), 1);
+    let wav = common::primed_wake_wav(dir.path());
+    let framelog = common::import_wav_to_framelog(dir.path(), &wav, 1);
 
     let mut listener = committed_listener();
     let summary = replay_framelog(&framelog, &mut listener, 1).expect("replay");
@@ -146,7 +146,7 @@ fn silence_framelog_replays_to_no_wake_no_utterance() {
 #[test]
 fn overlapping_segment_prerolls_replay_without_killing_the_listener() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let pcm = read_wav(Path::new(common::WAKE_PHRASE_WAV));
+    let pcm = common::primed_wake_pcm();
     // Segment 1 carries the whole phrase from index 0. Segment 2 opens 8 000
     // samples (500 ms) behind segment 1's end, re-sending that tail as its preroll
     // — the close-to-open gap was shorter than the preroll.
@@ -252,17 +252,7 @@ fn write_two_segment_framelog(
     out
 }
 
-/// Read a 16 kHz mono S16 `.wav` into PCM.
-fn read_wav(path: &Path) -> Vec<i16> {
-    let mut reader = hound::WavReader::open(path).expect("open wav");
-    reader
-        .samples::<i16>()
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read wav samples")
-}
-
-/// The two committed TTS clips, each loaded once per test binary.
-static WAKE_CLIP: OnceLock<Arc<[i16]>> = OnceLock::new();
+/// The committed TTS command clip, loaded once per test binary.
 static COMMAND_CLIP: OnceLock<Arc<[i16]>> = OnceLock::new();
 
 /// The committed TTS clip at `path`, loaded once per test binary and shared by
@@ -271,9 +261,10 @@ fn cached_clip(cell: &'static OnceLock<Arc<[i16]>>, path: &str) -> Arc<[i16]> {
     Arc::clone(cell.get_or_init(|| speech_surface::load_clip(Path::new(path)).expect("load clip")))
 }
 
-/// Splice the two committed TTS clips into one 16 kHz mono S16 `.wav` at `path`:
-/// the wake phrase, `pause_samples` of digital silence, then the command phrase.
-/// Returns the wake clip's length — the boundary the hold cases measure a carve
+/// Splice the primed wake and the two committed clips into one 16 kHz mono S16
+/// `.wav` at `path`: silence, the wake phrase, `pause_samples` of digital
+/// silence, then the command phrase.
+/// Returns the primed wake length — the boundary the hold cases measure a carve
 /// against, together with the pause length the caller passed in.
 ///
 /// This is the shape the wake-command hold exists for — a speaker who says "Hey
@@ -282,18 +273,18 @@ fn cached_clip(cell: &'static OnceLock<Arc<[i16]>>, path: &str) -> Arc<[i16]> {
 /// the shape where the device VAD releases in the pause is
 /// [`a_wake_and_a_command_in_two_device_segments_coalesce`].
 fn compose_wake_pause_command(path: &Path, pause_samples: usize) -> usize {
-    let wake = cached_clip(&WAKE_CLIP, common::WAKE_PHRASE_WAV);
     let command = cached_clip(&COMMAND_CLIP, common::COMMAND_PHRASE_WAV);
-    let mut pcm = Vec::with_capacity(wake.len() + pause_samples + command.len());
-    pcm.extend_from_slice(&wake);
+    let mut pcm = common::primed_wake_pcm();
+    let primed_len = pcm.len();
+    pcm.reserve(pause_samples + command.len());
     pcm.extend(std::iter::repeat_n(0_i16, pause_samples));
     pcm.extend_from_slice(&command);
     speech_pipeline::write_spine_wav(path, &pcm).expect("write spine wav");
-    wake.len()
+    primed_len
 }
 
 /// The frame log for a wake / `pause_samples` of silence / command clip, and the
-/// wake clip's length. Composed and `wav-import`ed once per distinct pause and
+/// primed wake length. Composed and `wav-import`ed once per distinct pause and
 /// then shared: cases that differ only in `ListenerConfig` replay byte-identical
 /// audio, and composing plus importing it again is a subprocess per case for no
 /// added signal.
@@ -334,7 +325,7 @@ fn wake_pause_command_framelog(pause_samples: usize) -> (PathBuf, usize) {
 }
 
 /// Replay the wake / pause / command fixture through a listener configured as
-/// given, returning the summary and the wake clip's length.
+/// given, returning the summary and the primed wake length.
 fn replay_wake_pause_command(
     pause_samples: usize,
     config: ListenerConfig,
@@ -634,7 +625,6 @@ fn a_pause_past_the_wait_expires_the_arm_and_loses_the_command() {
 #[test]
 fn a_wake_and_a_command_in_two_device_segments_coalesce() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let wake = cached_clip(&WAKE_CLIP, common::WAKE_PHRASE_WAV);
     let command = cached_clip(&COMMAND_CLIP, common::COMMAND_PHRASE_WAV);
 
     // Segment A: the wake phrase and the half second of quiet the device VAD held
@@ -643,7 +633,7 @@ fn a_wake_and_a_command_in_two_device_segments_coalesce() {
     // trailing quiet to soft-endpoint it.
     let hangover = 8_000_usize; // 0.5 s
     let hole = 16_000_u64; // 1.0 s
-    let mut segment_a = wake.to_vec();
+    let mut segment_a = common::primed_wake_pcm();
     segment_a.extend(std::iter::repeat_n(0_i16, hangover));
     let mut segment_b = command.to_vec();
     segment_b.extend(std::iter::repeat_n(0_i16, 32_000));

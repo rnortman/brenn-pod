@@ -11,8 +11,6 @@
 
 mod common;
 
-use std::path::Path;
-
 /// The single segment `wav-import` synthesizes for the replayed capture. The
 /// listener wakes on it, so it mints exactly one utterance.
 const SEGMENT_ID: u32 = 1;
@@ -37,8 +35,8 @@ const CLIP_FRAMES: u64 = TTS_SAMPLES.div_ceil(FRAME_SAMPLES) as u64;
 #[test]
 fn echo_brain_reads_back_transcript_end_to_end() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let framelog =
-        common::import_wav_to_framelog(work.path(), Path::new(common::WAKE_PHRASE_WAV), SEGMENT_ID);
+    let wav = common::primed_wake_wav(work.path());
+    let framelog = common::import_wav_to_framelog(work.path(), &wav, SEGMENT_ID);
 
     // One fake speaches container serves both endpoints; the daemon's [stt] and
     // [tts] tables point at its single URL.
@@ -144,10 +142,12 @@ fn echo_brain_reads_back_transcript_end_to_end() {
     // segment-and-response cycle stamped and blamed, end to end through a real
     // daemon, real models, and a real (fake-backed) STT and TTS round trip.
     let s = &events[pos("latency_summary")];
+    // As in `playback_integration`: the carve starts at the wake's end, past
+    // any preroll, so its t0 is projected rather than measured.
     assert_eq!(
         s["t0_projected"],
-        false,
-        "the wake opened the segment, so t0 is measured\n{}",
+        true,
+        "the wake follows the priming silence, so t0 is projected\n{}",
         daemon.diagnostics()
     );
     for field in [

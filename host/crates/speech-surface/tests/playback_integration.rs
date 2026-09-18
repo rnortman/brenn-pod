@@ -64,11 +64,8 @@ fn write_clip_wav(path: &Path, n: usize) {
 #[test]
 fn wav_brain_answers_wake_with_paced_clip_playback() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let framelog = common::import_wav_to_framelog(
-        work.path(),
-        Path::new(common::WAKE_PHRASE_WAV),
-        WAKE_SEGMENT_ID,
-    );
+    let wav = common::primed_wake_wav(work.path());
+    let framelog = common::import_wav_to_framelog(work.path(), &wav, WAKE_SEGMENT_ID);
     let clip = work.path().join("ack.wav");
     write_clip_wav(&clip, CLIP_SAMPLES);
 
@@ -148,10 +145,15 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
     // daemon. Every stage stamp survived the listener → pipeline → brain → router
     // → writer hops, so every offset and every blame delta is a real measurement.
     let s = &events[summary_at];
+    // The carve starts at the wake's end, a second past the segment base and so
+    // past any preroll a device would declare: its first-audio receipt is
+    // projected through the device clock, not measured.
+    // TODO(measured-t0-e2e-coverage): no integration case covers the measured
+    // branch since this one stopped reaching it.
     assert_eq!(
         s["t0_projected"],
-        false,
-        "the wake opened the segment, so t0 is measured\n{}",
+        true,
+        "the wake follows the priming silence, so t0 is projected\n{}",
         daemon.diagnostics()
     );
     for field in [
@@ -276,11 +278,8 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
 #[test]
 fn no_brain_config_mints_utterance_without_any_playback() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let framelog = common::import_wav_to_framelog(
-        work.path(),
-        Path::new(common::WAKE_PHRASE_WAV),
-        WAKE_SEGMENT_ID,
-    );
+    let wav = common::primed_wake_wav(work.path());
+    let framelog = common::import_wav_to_framelog(work.path(), &wav, WAKE_SEGMENT_ID);
 
     // No `[brain]` table: the listener still carves an utterance on the wake
     // phrase, but nothing answers it — no playback is ever queued.

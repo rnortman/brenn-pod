@@ -11,8 +11,11 @@ pub mod listener;
 pub mod playback;
 pub mod queue;
 mod stats;
-#[cfg(test)]
-mod test_support;
+// Fixtures for this crate's tests, and — behind `test-util` — for the
+// integration tests of the crates above it, which need the same device-shaped
+// wake audio.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support;
 pub mod tracking;
 pub mod traits;
 pub mod types;
@@ -37,8 +40,9 @@ pub use listener::{
     EndpointState, EndpointTransition, Endpointer, EndpointerConfig, Feed, FeedSender, Listener,
     ListenerConfig, ListenerEvent, ListenerHandle, ListenerState, ListenerStats,
     ListenerStatsSnapshot, ListenerUtteranceId, MODEL_STATS_FLUSH_CHUNKS, OwwModels, OwwStream,
-    PcmRing, ScoreStats, ScoreSummary, ScoredChunk, SileroConfig, SileroModel, SileroVad,
-    StatsFlushCause, StatsModel, TransitionCause, WakeDetected, WakePolicy,
+    PcmRing, PushReport, ScoreDistribution, ScoreStats, ScoreSummary, ScoredChunk, SileroConfig,
+    SileroModel, SileroVad, StatsFlushCause, StatsModel, TransitionCause, UnscoredRun,
+    WAKE_READINESS_SAMPLES, WakeDetected, WakePolicy,
 };
 pub use playback::{
     AbortReason, AudibleJob, FRAME_MS, FlushRejected, PacerConfig, PlayRejected, PlaybackEvent,
@@ -59,6 +63,6 @@ pub use types::{
     TrackingEvent, Transcript, TranscriptConfidence, Utterance, UtteranceId, WakeConfirmation,
     signed_offset_us, stage_delta_us,
 };
-pub use wake::{OwwConfig, OwwGate, WakeError, WakeOutcome};
+pub use wake::{OwwConfig, OwwGate, UnscoredReason, WakeError, WakeOutcome};
 pub use wav::{SpineFormatViolation, check_spine_format, write_spine_wav};
 pub use wav_brain::WavBrain;

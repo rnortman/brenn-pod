@@ -1,19 +1,18 @@
 //! `OwwGate`: the batch openWakeWord wake gate, now a thin wrapper over the
 //! streaming core ([`crate::listener::oww_stream`]).
 //!
-//! Segment-batch scoring is derived from streaming, not a separate code path: a
-//! fresh [`OwwStream`] is fed the segment chunk-by-chunk and the maximum
-//! per-step sigmoid score is compared to the threshold. Because the streaming
-//! core's raw-PCM mel lookback makes its frame stream prefix-identical to a
-//! whole-segment mel pass and it scores on the same 8-frame cadence, the
-//! reconstructed batch score matches the retired whole-segment result exactly —
-//! so this wrapper is a parity oracle and replay tool while the listener is
-//! stood up. Fresh state per call means no bleed across segments or pods.
+//! Segment-batch scoring feeds a fresh [`OwwStream`] chunk-by-chunk and compares
+//! the maximum per-step sigmoid score with the threshold. The stream suppresses
+//! its warm-up chunks, so a segment shorter than the readiness window comes back
+//! [`WakeOutcome::Unscored`] rather than carrying an invented score.
+//! Fresh state per call means no bleed across segments or pods.
 //!
 //! `OwwGate` is retired once the pipeline rework routes wake through the listener
 //! thread; until then it keeps the segment-shaped [`WakeGate`] seam working.
+//! Nothing outside this module reads its verdicts today:
+//! TODO(batch-wake-gate-fate) — name the consumer or delete the gate.
 
-use super::{WakeError, WakeOutcome};
+use super::{UnscoredReason, WakeError, WakeOutcome};
 use crate::listener::oww_stream::{OwwModels, ScoredChunk};
 use crate::types::Segment;
 
@@ -41,7 +40,9 @@ impl OwwGate {
     pub fn gate(&mut self, seg: &Segment) -> Result<WakeOutcome, WakeError> {
         // An empty segment has nothing to score.
         if seg.pcm.is_empty() {
-            return Ok(WakeOutcome::Rejected { score: 0.0 });
+            return Ok(WakeOutcome::Unscored {
+                reason: UnscoredReason::Empty,
+            });
         }
 
         // Fresh streaming state per segment: no bleed across segments or pods.
@@ -52,18 +53,18 @@ impl OwwGate {
                 *best = Some(sc);
             }
         };
-        for sc in stream.push(&mut self.models, &seg.pcm)? {
+        for sc in stream.push(&mut self.models, &seg.pcm)?.scored {
             keep_best(&mut best, sc);
         }
-        for sc in stream.flush(&mut self.models)? {
+        for sc in stream.flush(&mut self.models)?.scored {
             keep_best(&mut best, sc);
         }
-        // A segment too short for one embedding step still scores (batch fallback).
-        if best.is_none() {
-            keep_best(&mut best, stream.force_score(&mut self.models)?);
-        }
-
-        let best = best.expect("a non-empty segment produces at least one score");
+        // A segment too short to outlast the stream's warm-up cannot be scored.
+        let Some(best) = best else {
+            return Ok(WakeOutcome::Unscored {
+                reason: UnscoredReason::ShorterThanReadinessWindow,
+            });
+        };
         Ok(if best.score > self.threshold {
             WakeOutcome::Detected {
                 score: best.score,
@@ -131,44 +132,68 @@ mod tests {
     }
 
     #[test]
-    fn sub_chunk_segment_is_padded_and_scored() {
+    fn sub_chunk_segment_is_unscored_not_a_zero() {
         let mut gate = test_gate();
-        // Fewer than one chunk: flushed with zero-padding and scored, no panic.
+        // A segment inside the warm-up never reaches the wake head, and the
+        // verdict says so rather than reporting a score nothing produced.
         let outcome = gate.gate(&seg_with_pcm(seeded_noise(3, 100))).unwrap();
-        let score = match outcome {
-            WakeOutcome::Detected { score, .. } | WakeOutcome::Rejected { score } => score,
-        };
-        assert!(
-            score.is_finite(),
-            "sub-chunk score must be finite, got {score}"
+        assert_eq!(
+            outcome,
+            WakeOutcome::Unscored {
+                reason: UnscoredReason::ShorterThanReadinessWindow
+            }
         );
     }
 
     #[test]
-    fn sub_chunk_detected_clamps_window_end_to_real_pcm() {
-        // A threshold below the sigmoid range forces detection on the flushed
-        // sub-chunk remainder; its window end clamps to the 100 real samples.
+    fn sub_chunk_does_not_detect_with_negative_threshold() {
+        // A negative threshold cannot bypass the warm-up.
         let mut gate = test_gate_with_threshold(-1.0);
-        let pcm = seeded_noise(3, 100);
-        match gate.gate(&seg_with_pcm(pcm.clone())).unwrap() {
-            WakeOutcome::Detected {
-                wake_end_sample, ..
-            } => assert_eq!(
-                wake_end_sample,
-                pcm.len(),
-                "sub-chunk detection clamps the window end to real PCM"
+        assert_eq!(
+            gate.gate(&seg_with_pcm(seeded_noise(3, 100))).unwrap(),
+            WakeOutcome::Unscored {
+                reason: UnscoredReason::ShorterThanReadinessWindow
+            }
+        );
+    }
+
+    /// The readiness boundary through the batch surface: a segment exactly as
+    /// long as the warm-up carries no score, and one chunk more carries a real
+    /// one.
+    #[test]
+    fn the_warmup_boundary_decides_scored_from_unscored() {
+        use crate::listener::oww_stream::{CHUNK, WARMUP_CHUNKS};
+
+        let warmup = WARMUP_CHUNKS as usize;
+        let mut gate = test_gate();
+        assert_eq!(
+            gate.gate(&seg_with_pcm(seeded_noise(4, warmup * CHUNK)))
+                .unwrap(),
+            WakeOutcome::Unscored {
+                reason: UnscoredReason::ShorterThanReadinessWindow
+            }
+        );
+        match gate
+            .gate(&seg_with_pcm(seeded_noise(4, (warmup + 1) * CHUNK)))
+            .unwrap()
+        {
+            WakeOutcome::Rejected { score } => assert!(
+                score.is_finite() && score <= 0.5,
+                "noise past the warm-up scores, low: {score}"
             ),
-            other => panic!("threshold -1.0 must detect, got {other:?}"),
+            other => panic!("one chunk past the warm-up must be scored, got {other:?}"),
         }
     }
 
     #[test]
-    fn empty_segment_rejects_without_panic() {
+    fn empty_segment_is_unscored_without_panic() {
         let mut gate = test_gate();
-        match gate.gate(&seg_with_pcm(vec![])).unwrap() {
-            WakeOutcome::Rejected { score } => assert_eq!(score, 0.0),
-            other => panic!("empty segment must reject, got {other:?}"),
-        }
+        assert_eq!(
+            gate.gate(&seg_with_pcm(vec![])).unwrap(),
+            WakeOutcome::Unscored {
+                reason: UnscoredReason::Empty
+            }
+        );
     }
 
     #[test]

@@ -30,11 +30,8 @@ const NOISE_SEGMENT_ID: u32 = 1;
 #[test]
 fn wake_phrase_arms_detection_carves_utterance_and_labels_sidecar() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let framelog = common::import_wav_to_framelog(
-        work.path(),
-        Path::new(common::WAKE_PHRASE_WAV),
-        WAKE_SEGMENT_ID,
-    );
+    let wav = common::primed_wake_wav(work.path());
+    let framelog = common::import_wav_to_framelog(work.path(), &wav, WAKE_SEGMENT_ID);
 
     let record_dir = tempfile::tempdir().expect("record tempdir");
     let mut daemon = common::spawn_daemon(&common::listener_daemon_config(Some(record_dir.path())));
@@ -97,11 +94,8 @@ fn wake_phrase_arms_detection_carves_utterance_and_labels_sidecar() {
 #[test]
 fn no_listener_config_mints_no_utterance_and_labels_negative() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let framelog = common::import_wav_to_framelog(
-        work.path(),
-        Path::new(common::WAKE_PHRASE_WAV),
-        WAKE_SEGMENT_ID,
-    );
+    let wav = common::primed_wake_wav(work.path());
+    let framelog = common::import_wav_to_framelog(work.path(), &wav, WAKE_SEGMENT_ID);
 
     let record_dir = tempfile::tempdir().expect("record tempdir");
     // `daemon_config` carries listen_addr + [record] only — no listener tables.
@@ -146,11 +140,8 @@ fn no_listener_config_mints_no_utterance_and_labels_negative() {
 #[test]
 fn recording_off_listener_scores_without_sidecar_noise() {
     let work = tempfile::tempdir().expect("work tempdir");
-    let framelog = common::import_wav_to_framelog(
-        work.path(),
-        Path::new(common::WAKE_PHRASE_WAV),
-        WAKE_SEGMENT_ID,
-    );
+    let wav = common::primed_wake_wav(work.path());
+    let framelog = common::import_wav_to_framelog(work.path(), &wav, WAKE_SEGMENT_ID);
 
     // Recording off: `listener_daemon_config(None)` emits `[record] enabled = false`
     // alongside the real listener tables.

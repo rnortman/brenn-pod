@@ -149,6 +149,11 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   details.
 - **`wsub=` on the `StreamRealtimeDuplex` report**, counting TLS poll-direction
   substitutions.
+- **Wake-detection oracle script** (`host/tools/oww-oracle/capture_scores.py`).
+  Drives upstream openWakeWord's Python API with the same deterministic seed
+  noise the Rust stream uses, producing per-step scores that the Rust regression
+  tests pin against. A model change invalidates the pins; re-running the script
+  regenerates them.
 
 ### Changed
 
@@ -200,6 +205,17 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Fixed
 
+- **The wake-word detector no longer false-fires on silence after a stream
+  reset.** Certain wake heads scored near 1.0 on the first chunk of every
+  segment because the embedding window cold-started from zeros, an
+  out-of-distribution input upstream openWakeWord never produces. The embedding
+  history is now seeded from the models with low-amplitude noise embeddings
+  (matching upstream's own initialisation), and the warm-up suppresses five
+  predictions instead of waiting for sixteen real embeddings. Wake detection
+  begins 0.48 s into each segment instead of 1.28 s, so every chunk that
+  touches the phrase the device VAD opened on is now scored. A compile-time
+  assertion ties the readiness window to the device preroll so the relationship
+  cannot regress silently.
 - **Doorbell rings arriving during WiFi backoff are no longer dropped**, so the wake one
   asks for actually happens.
 - **First HIL attempt after a cold boot could fail (AC9).** The host now retries Identify,

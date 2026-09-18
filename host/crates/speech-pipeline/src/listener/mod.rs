@@ -23,11 +23,14 @@ pub use event::{
     BargeCause, CarveTiming, CarvedUtterance, Feed, ListenerEvent, ListenerUtteranceId,
     StatsFlushCause, StatsModel, WakePolicy,
 };
-pub use oww_stream::{OwwConfig, OwwModels, OwwStream, ScoredChunk, WakeDetected};
+pub use oww_stream::{
+    OwwConfig, OwwModels, OwwStream, PushReport, ScoredChunk, UnscoredRun, WAKE_READINESS_SAMPLES,
+    WakeDetected,
+};
 pub use ring::PcmRing;
 pub use runtime::{
     BargeInConfig, BargeMode, FeedSender, Listener, ListenerConfig, ListenerHandle, ListenerState,
     ListenerStats, ListenerStatsSnapshot,
 };
 pub use silero::{SileroConfig, SileroModel, SileroVad};
-pub use stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreStats, ScoreSummary};
+pub use stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreDistribution, ScoreStats, ScoreSummary};
