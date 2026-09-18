@@ -34,7 +34,7 @@ use brenn_bridge::{
     SubscriptionDepths, Urgency,
 };
 use serde_json::json;
-use speech_pipeline::brenn_brain::{HelpChannels, response_contract_help};
+use speech_pipeline::brenn_brain::{HelpChannels, HelpCues, response_contract_help};
 use speech_pipeline::{BrennBrain, DeliverOutcome};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -42,7 +42,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{Notice, publish_once};
-use crate::config::BrennConfig;
+use crate::config::{BrennConfig, CueLibrary};
 use crate::jsonl::JsonlHandle;
 use crate::time::due;
 
@@ -196,6 +196,7 @@ impl BridgeDriver {
     /// lifetime.
     pub fn new(
         config: &BrennConfig,
+        library: Option<&CueLibrary>,
         handle: BridgeHandle,
         brain: Arc<BrennBrain>,
         teardown: CancellationToken,
@@ -203,11 +204,18 @@ impl BridgeDriver {
     ) -> Self {
         let help = config.help_channel.as_ref().map(|channel| HelpDoc {
             channel: channel.clone(),
-            body: response_contract_help(&HelpChannels {
-                publish: config.publish_channel.clone(),
-                response: config.response_channel.clone(),
-                wake: config.wake_channel.clone(),
-            }),
+            body: response_contract_help(
+                &HelpChannels {
+                    publish: config.publish_channel.clone(),
+                    response: config.response_channel.clone(),
+                    wake: config.wake_channel.clone(),
+                },
+                &HelpCues {
+                    poses: library.map(CueLibrary::help_poses).unwrap_or_default(),
+                    motions: library.map(CueLibrary::help_motions).unwrap_or_default(),
+                    continued_ms: config.continuation_timeout_ms,
+                },
+            ),
             published: Arc::new(AtomicBool::new(false)),
             task: None,
         });
@@ -708,6 +716,7 @@ mod tests {
         let teardown = CancellationToken::new();
         let driver = BridgeDriver::new(
             &config,
+            None,
             handle,
             brain.clone(),
             teardown.clone(),

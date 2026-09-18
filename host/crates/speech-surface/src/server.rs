@@ -55,12 +55,12 @@ use crate::barge::TurnLedger;
 use crate::brenn::BridgeLink;
 use crate::brenn::driver::{BridgeDriver, DriverIo, IntentSink};
 use crate::clip::{ClipError, load_clip};
-use crate::config::{BrainMode, Config, PskTable, SttBackend, SttConfig, TtsBackend};
+use crate::config::{BrainMode, Config, CueLibrary, PskTable, SttBackend, SttConfig, TtsBackend};
 use crate::iso8601_ms;
 use crate::jsonl::JsonlHandle;
-use crate::pipeline::{BargeWiring, BrainWiring, PipelineFatal};
+use crate::pipeline::{BargeWiring, BrainWiring, ListenWiring, PipelineFatal};
 use crate::playback_router::{
-    self, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
+    self, FeedFn, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
 };
 use crate::prune::{PruneOutcome, PruneRequest, prune};
 use crate::recorder::{OpenLogs, Recorder, RecorderShared};
@@ -690,8 +690,47 @@ impl Server {
         // utterance).
         let turn_ledger = Arc::new(TurnLedger::new());
 
+        // The cue vocabulary, read once. A configured file that will not parse is
+        // fatal here rather than an empty vocabulary later: the deployment said
+        // the head may be cued, and a run that silently refused every cue would
+        // look like a peer that never asked.
+        let cue_library = match config.brenn.as_ref().and_then(|b| b.library_names.as_ref()) {
+            Some(path) => {
+                let library = CueLibrary::load(path).map_err(std::io::Error::other)?;
+                jsonl.emit(
+                    "cue_library_loaded",
+                    &json!({
+                        "path": path,
+                        // Both name lists, not a count of either: this line is
+                        // what an operator compares a refused name against, and
+                        // the motion names are the half that is regenerated and
+                        // path-shaped — the half that drifts. Bounded by the
+                        // library, and said once per run.
+                        "poses": library.help_poses(),
+                        "motions": library.help_motions(),
+                    }),
+                );
+                Some(Arc::new(library))
+            }
+            None => None,
+        };
+
         let scripter = build_scripter(&config, &jsonl, sinks.scripts.clone());
         let script_handle = scripter.as_ref().map(|scripter| scripter.handle.clone());
+
+        // How both openers open a `<listen/>` reply's capture window: built once
+        // and shared, so the window's length cannot depend on which of them
+        // fired. No `[brenn]` table means no turn can end open, so the length is
+        // never read; the wiring exists because the feed does.
+        let listen = listener_handle.as_ref().map(|listener| {
+            Arc::new(ListenWiring {
+                feed: feed_fn(listener),
+                window_samples: config
+                    .brenn
+                    .as_ref()
+                    .map_or(0, |brenn| brenn.listen_window_samples()),
+            })
+        });
 
         // Turns each writer's `PlaybackEvent`s into JSONL lines, and fans the same
         // events out to the listener's playback floor and the ledger. Built once
@@ -700,20 +739,16 @@ impl Server {
         // critical path. Shares `clock_step_clamps` so a clamped backward clock
         // step in a latency line is corroborated by the `stage_health` count. With
         // no listener wired there is no floor to drive and no barge-in path, so the
-        // adapter is lines-only.
+        // adapter is lines-only. The floor feed is the listen wiring's own: one
+        // feed closure per listener, whatever it is fed.
         let playback_events = playback_event_adapter(
             jsonl.clone(),
             clock_step_clamps.clone(),
-            listener_handle.as_ref().map(|listener| PlaybackFanout {
-                feed: {
-                    let sender = weak_feed_sender(listener);
-                    Arc::new(move |pod, feed| match sender() {
-                        Some(sender) => Box::pin(async move { sender.feed(pod, feed).await }),
-                        None => Box::pin(std::future::ready(())),
-                    })
-                },
+            listen.as_ref().map(|listen| PlaybackFanout {
+                feed: Arc::clone(&listen.feed),
                 ledger: turn_ledger.clone(),
                 scripter: script_handle.clone(),
+                listen: Arc::clone(listen),
             }),
         );
 
@@ -921,6 +956,7 @@ impl Server {
                 }
                 let driver = BridgeDriver::new(
                     parts.config,
+                    cue_library.as_deref(),
                     parts.bridge.handle,
                     brain,
                     bridge_teardown.clone(),
@@ -1004,6 +1040,10 @@ impl Server {
                 // Barge-in needs a listener to detect it and a writer to cut, so it
                 // is wired exactly when detection is: the same condition the
                 // playback fan-out above uses.
+                // The pipeline-side opener for a `<listen/>` window, wired with
+                // the same weak feed the fan-out uses: whichever of the brain's
+                // return and the last clip's settle comes second opens it.
+                listen: listen.clone(),
                 barge: listener_handle.as_ref().map(|_| BargeWiring {
                     ledger: turn_ledger.clone(),
                     flush: {
@@ -1012,6 +1052,7 @@ impl Server {
                     },
                 }),
                 scripter: script_handle.clone(),
+                cues: cue_library.clone(),
             },
             jsonl.clone(),
         ));
@@ -1469,6 +1510,21 @@ fn weak_feed_sender(listener: &Arc<ListenerHandle>) -> impl Fn() -> Option<FeedS
     move || listener.upgrade().map(|l| l.feed_sender())
 }
 
+/// The feed entry point every non-listener task drives the listener through: the
+/// playback fan-out's floor and the pipeline's capture window alike.
+///
+/// One function and not one closure per caller, because what happens when the
+/// listener is already gone — the feed is dropped, silently, on the reasoning in
+/// [`weak_feed_sender`] — is one policy, and a second copy of it would be the
+/// one that kept the old behaviour when the policy changed.
+fn feed_fn(listener: &Arc<ListenerHandle>) -> FeedFn {
+    let sender = weak_feed_sender(listener);
+    Arc::new(move |pod, feed| match sender() {
+        Some(sender) => Box::pin(async move { sender.feed(pod, feed).await }) as _,
+        None => Box::pin(std::future::ready(())),
+    })
+}
+
 /// Forward one session event to the listener as a [`Feed`], when a listener is
 /// wired. The listener taps the live pre-assembly stream: `HelloAccepted` opens a
 /// fresh per-pod epoch (the connection sequence, unique across reconnects), audio
@@ -1806,6 +1862,7 @@ fn brain_event_adapter(jsonl: JsonlHandle) -> BrainEventFn {
             audio_ref,
             no_speech_prob,
             avg_logprob,
+            follow_up,
         } => {
             jsonl.emit(
                 "barge_command_absent",
@@ -1818,6 +1875,7 @@ fn brain_event_adapter(jsonl: JsonlHandle) -> BrainEventFn {
                     "reason": "low_confidence",
                     "no_speech": no_speech_prob,
                     "logprob": avg_logprob,
+                    "follow_up": follow_up,
                 }),
             );
         }
@@ -1870,12 +1928,6 @@ fn brain_event_adapter(jsonl: JsonlHandle) -> BrainEventFn {
         BrainEvent::LinkReplyAssumed { utterance } => {
             jsonl.emit(
                 "brain_link_reply_assumed",
-                &json!({ "utterance": utterance }),
-            );
-        }
-        BrainEvent::LinkListenUnsupported { utterance } => {
-            jsonl.emit(
-                "brain_link_listen_unsupported",
                 &json!({ "utterance": utterance }),
             );
         }
@@ -3793,6 +3845,7 @@ mod tests {
             },
             no_speech_prob: 0.42,
             avg_logprob: -1.10,
+            follow_up: false,
         }])
         .await;
 
@@ -3810,6 +3863,8 @@ mod tests {
         assert!((absent[0]["no_speech"].as_f64().unwrap() - 0.42).abs() < 1e-6);
         assert!((absent[0]["logprob"].as_f64().unwrap() - -1.10).abs() < 1e-6);
         assert!(absent[0].get("score").is_none());
+        // The provenance the reader tunes on: this one cut a reply.
+        assert_eq!(absent[0]["follow_up"], false);
     }
 
     #[tokio::test]
@@ -3923,27 +3978,9 @@ mod tests {
         }])
         .await;
 
-        // Structurally identical to `LinkListenUnsupported`, so the name is the
-        // only thing separating the two arms: assert the other one is absent.
-        assert!(events_named(&lines, "brain_link_listen_unsupported").is_empty());
         let assumed = events_named(&lines, "brain_link_reply_assumed");
         assert_eq!(assumed.len(), 1);
         assert_eq!(assumed[0]["utterance"], 25);
-    }
-
-    #[tokio::test]
-    async fn brain_event_adapter_maps_link_listen_unsupported() {
-        use speech_pipeline::UtteranceId;
-
-        let lines = adapter_lines(vec![BrainEvent::LinkListenUnsupported {
-            utterance: UtteranceId(26),
-        }])
-        .await;
-
-        assert!(events_named(&lines, "brain_link_reply_assumed").is_empty());
-        let unsupported = events_named(&lines, "brain_link_listen_unsupported");
-        assert_eq!(unsupported.len(), 1);
-        assert_eq!(unsupported[0]["utterance"], 26);
     }
 
     #[tokio::test]

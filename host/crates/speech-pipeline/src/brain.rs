@@ -42,18 +42,24 @@ pub enum BrainEvent {
         stt_trim_samples: usize,
         reason: WakeCommandReason,
     },
-    /// A barge-in utterance whose STT confidence tripped the gate: the sustained
-    /// speech that cut playback transcribed to likely hallucination, so it is
-    /// declined rather than echoed. The barge already cut the audio, so declining
-    /// the phantom text is the honest outcome of speech that said nothing. No wake
-    /// provenance — a barge carries no wake word — so this carries the barge mark
-    /// in its place, plus the audio span for retro-transcription and the offending
-    /// confidence signals for the log line.
+    /// A wake-less utterance whose STT confidence tripped the gate: speech heard
+    /// without a wake word transcribed to likely hallucination, so it is declined
+    /// rather than echoed. No wake provenance — neither provenance carries a wake
+    /// word — so this carries the audio span for retro-transcription and the
+    /// offending confidence signals in its place.
+    ///
+    /// `follow_up` says which wake-less provenance it was, and a reader is
+    /// entitled to act on that distinction: `false` is a barge, speech that cut an
+    /// audible reply, and the repair is the barge thresholds or the echo path;
+    /// `true` is speech inside a `<listen/>` capture window, nothing was
+    /// interrupted, and the repair is the confidence gate or the room. A
+    /// deployment where nothing can barge reads every one of these as `true`.
     BargeCommandAbsent {
         utterance: UtteranceId,
         audio_ref: AudioSpan,
         no_speech_prob: f32,
         avg_logprob: f32,
+        follow_up: bool,
     },
     /// An utterance carved over the pod's own playback without cutting it, whose
     /// STT confidence tripped the gate: the residual of a reply leaking back
@@ -91,9 +97,6 @@ pub enum BrainEvent {
     /// pending turn anyway. Benign — with a single pending slot there is only one
     /// turn it could belong to — but worth seeing.
     LinkReplyAssumed { utterance: UtteranceId },
-    /// A response asked to hold the mic open, which is in the wire vocabulary but
-    /// not implemented; the tag was stripped and the request ignored.
-    LinkListenUnsupported { utterance: UtteranceId },
     /// A response chain kept promising continuations past the safety bound. The
     /// capping segment was spoken and the turn ended as if it were terminal.
     LinkContinuationCapped {
@@ -162,7 +165,6 @@ pub struct BrainStats {
     link_response_timeouts: AtomicU64,
     link_tags_stripped: AtomicU64,
     link_replies_assumed: AtomicU64,
-    link_listen_unsupported: AtomicU64,
     link_continuations_capped: AtomicU64,
 }
 
@@ -177,9 +179,11 @@ pub struct BrainStatsSnapshot {
     /// with no follow-on command. Deliberately not a failure counter: a follow-up
     /// tool goes back for these segments; it is not an error rate to alarm on.
     pub wake_command_absent: u64,
-    /// Barge-in utterances declined because STT confidence flagged the barging
-    /// speech as likely hallucination. Not a failure: the playback was already
-    /// cut, and declining the phantom text is the honest outcome.
+    /// Wake-less utterances — barges, and follow-ups inside a `<listen/>` window
+    /// — declined because STT confidence flagged the speech as likely
+    /// hallucination. Not a failure: nothing usable was said, and declining the
+    /// phantom text is the honest outcome. Which provenance a given decline had
+    /// is on its event's `follow_up`, not in this total.
     pub barge_command_absent: u64,
     /// Utterances carved over the pod's own playback and declined because STT
     /// confidence flagged them as likely hallucination — the residual of a reply
@@ -196,9 +200,6 @@ pub struct BrainStatsSnapshot {
     /// Responses accepted for the pending turn despite carrying no correlation
     /// marker. Not a failure counter — the reply policy is deliberately optimistic.
     pub link_replies_assumed: u64,
-    /// Responses that asked to hold the mic open, a wire-vocabulary tag with no
-    /// implementation behind it yet.
-    pub link_listen_unsupported: u64,
     /// Response chains cut off at the continuation safety bound.
     pub link_continuations_capped: u64,
 }
@@ -219,7 +220,8 @@ impl BrainStats {
         self.wake_command_absent.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a barge-in utterance declined for tripping the confidence gate.
+    /// Count a wake-less utterance — a barge or a follow-up — declined for
+    /// tripping the confidence gate.
     pub fn record_barge_command_absent(&self) {
         self.barge_command_absent.fetch_add(1, Ordering::Relaxed);
     }
@@ -249,11 +251,6 @@ impl BrainStats {
         self.link_replies_assumed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a response that asked for the unimplemented hold-open behavior.
-    pub fn record_link_listen_unsupported(&self) {
-        self.link_listen_unsupported.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Count a response chain cut off at the continuation safety bound.
     pub fn record_link_continuation_capped(&self) {
         self.link_continuations_capped
@@ -272,7 +269,6 @@ impl BrainStats {
             link_response_timeouts: self.link_response_timeouts.load(Ordering::Relaxed),
             link_tags_stripped: self.link_tags_stripped.load(Ordering::Relaxed),
             link_replies_assumed: self.link_replies_assumed.load(Ordering::Relaxed),
-            link_listen_unsupported: self.link_listen_unsupported.load(Ordering::Relaxed),
             link_continuations_capped: self.link_continuations_capped.load(Ordering::Relaxed),
         }
     }

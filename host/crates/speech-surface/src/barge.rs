@@ -36,8 +36,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use speech_pipeline::{
-    BargeInContext, ContextSegment, InterruptProgress, MAX_CONTEXT_SEGMENTS, PodId, UtteranceId,
-    audio_ms,
+    BargeInContext, ContextSegment, InterruptProgress, MAX_CONTEXT_SEGMENTS, PodId, TurnEnd,
+    UtteranceId, audio_ms,
 };
 use tokio::time::{Duration, Instant};
 
@@ -55,6 +55,9 @@ struct TurnSettlement {
     all_clean: bool,
     /// `brain.handle()` has returned, so no further cmds are coming.
     dispatch_done: bool,
+    /// The turn's reply asked to keep listening (`<listen/>`), so the turn ended
+    /// open. Set with `dispatch_done`, which is where the brain's answer is known.
+    listen: bool,
     /// Cmds whose playback began (a `PlaybackEvent::Started`).
     cmds_started: u64,
     /// Started and not yet settled — the cmds whose audio is in the speaker.
@@ -90,6 +93,7 @@ impl TurnSettlement {
     fn audio(&self) -> TurnAudio {
         TurnAudio {
             dispatch_done: self.dispatch_done,
+            listen_open: self.listen && self.completed_clean(),
             cmds_sent: self.cmds_sent,
             awaiting_start: self
                 .cmds_sent
@@ -110,6 +114,17 @@ impl TurnSettlement {
 pub struct TurnAudio {
     /// `brain.handle()` has returned: no further cmds are coming.
     pub dispatch_done: bool,
+    /// The instant a capture window should open: a turn whose reply asked to keep
+    /// listening has now said everything it had to say and every cmd of it
+    /// settled cleanly — which is also the instant nothing of it is still
+    /// sounding, since a started cmd settles exactly once and the count of
+    /// settles has reached the count sent.
+    ///
+    /// True on exactly one call per turn — the last of `dispatch_done` and the
+    /// final settle, whichever the pod reaches second — because the clean
+    /// completion underneath it flips on exactly one call. A turn that was cut, or
+    /// that never spoke, never reports it.
+    pub listen_open: bool,
     /// `SpeakCmd`s the tap saw for the turn. Zero at `dispatch_done` is a silent
     /// turn — the brain answered with nothing to say.
     pub cmds_sent: u64,
@@ -232,10 +247,15 @@ impl TurnLedger {
     /// so settlement can complete. Dispatch awaits the brain inline, which is what
     /// makes this a sound "that's all of them" signal. Answers the turn's cmd
     /// accounting as it stands with that fact in.
-    pub(crate) fn dispatch_done(&self, pod: &PodId, id: UtteranceId) -> TurnAudio {
+    ///
+    /// `end` is the brain's own answer about the turn: an `Open` turn asked to
+    /// keep the microphone on. It is known here and nowhere earlier — the
+    /// brain's return is what it is read from.
+    pub(crate) fn dispatch_done(&self, pod: &PodId, id: UtteranceId, end: TurnEnd) -> TurnAudio {
         self.with_pod(pod, |p| {
             let s = p.settlement.entry(id).or_insert_with(TurnSettlement::new);
             s.dispatch_done = true;
+            s.listen = end == TurnEnd::Open;
             let audio = s.audio();
             // Playback can outrun the brain's return, leaving this the last piece.
             settle_check(p, id);
@@ -392,7 +412,7 @@ mod tests {
         let id = UtteranceId(id);
         ledger.record_dispatch(p, id, Some(transcript.into()));
         ledger.record_cmd(p, id, Some(response.into()));
-        ledger.dispatch_done(p, id);
+        ledger.dispatch_done(p, id, TurnEnd::Closed);
         ledger.settle_job(p, Some(id), true);
     }
 
@@ -503,7 +523,7 @@ mod tests {
         ledger.interrupt(&p, UtteranceId(1), progress(200));
 
         ledger.record_dispatch(&p, UtteranceId(2), Some("hmm".into()));
-        ledger.dispatch_done(&p, UtteranceId(2));
+        ledger.dispatch_done(&p, UtteranceId(2), TurnEnd::Closed);
 
         assert!(
             ledger.chain(&p).is_some(),
@@ -521,7 +541,7 @@ mod tests {
         // the user never heard a response through.
         ledger.record_dispatch(&p, UtteranceId(2), Some("again".into()));
         ledger.record_cmd(&p, UtteranceId(2), Some("raining".into()));
-        ledger.dispatch_done(&p, UtteranceId(2));
+        ledger.dispatch_done(&p, UtteranceId(2), TurnEnd::Closed);
         ledger.settle_job(&p, Some(UtteranceId(2)), false);
 
         assert!(ledger.chain(&p).is_some());
@@ -538,7 +558,7 @@ mod tests {
         ledger.record_dispatch(&p, id, Some("hi".into()));
         ledger.record_cmd(&p, id, Some("one".into()));
         ledger.record_cmd(&p, id, Some("two".into()));
-        ledger.dispatch_done(&p, id);
+        ledger.dispatch_done(&p, id, TurnEnd::Closed);
         ledger.settle_job(&p, Some(id), true);
 
         ledger.interrupt(&p, id, progress(30));
@@ -566,7 +586,7 @@ mod tests {
         );
 
         ledger.record_cmd(&p, id, Some("the end".into()));
-        ledger.dispatch_done(&p, id);
+        ledger.dispatch_done(&p, id, TurnEnd::Closed);
         assert!(
             ledger.chain(&p).is_some(),
             "clip 2 is dispatched but has not settled"
@@ -592,7 +612,7 @@ mod tests {
         ledger.settle_job(&p, Some(id), true);
         assert!(ledger.chain(&p).is_some());
 
-        ledger.dispatch_done(&p, id);
+        ledger.dispatch_done(&p, id, TurnEnd::Closed);
         assert!(ledger.chain(&p).is_none());
     }
 
@@ -607,7 +627,7 @@ mod tests {
         ledger.interrupt(&p, UtteranceId(1), progress(20));
 
         ledger.settle_job(&p, Some(UtteranceId(1)), false);
-        ledger.dispatch_done(&p, UtteranceId(1));
+        ledger.dispatch_done(&p, UtteranceId(1), TurnEnd::Closed);
         ledger.settle_job(&p, Some(UtteranceId(1)), true);
 
         assert!(ledger.chain(&p).is_some());
@@ -672,7 +692,7 @@ mod tests {
         ledger.interrupt(&p, UtteranceId(1), progress(200));
         ledger.record_dispatch(&p, UtteranceId(2), Some("hi".into()));
         ledger.record_cmd(&p, UtteranceId(2), Some("hello".into()));
-        ledger.dispatch_done(&p, UtteranceId(2));
+        ledger.dispatch_done(&p, UtteranceId(2), TurnEnd::Closed);
 
         ledger.record_dispatch(&p, UtteranceId(3), Some("again".into()));
 
@@ -756,7 +776,7 @@ mod tests {
         dispatched_turn(&ledger, &p, id, 2);
         let t0 = Instant::now();
 
-        let audio = ledger.dispatch_done(&p, id);
+        let audio = ledger.dispatch_done(&p, id, TurnEnd::Closed);
         assert_eq!(audio.awaiting_start, 2, "neither clip has started");
         assert!(audio.dispatch_done);
         assert_eq!(audio.cmds_sent, 2);
@@ -781,7 +801,7 @@ mod tests {
         let t0 = Instant::now();
 
         ledger.record_started(&p, Some(id), ONE_SECOND, t0);
-        ledger.dispatch_done(&p, id);
+        ledger.dispatch_done(&p, id, TurnEnd::Closed);
         ledger.settle_job(&p, Some(id), true);
         let audio = ledger
             .settle_job(&p, Some(id), false)
@@ -808,7 +828,7 @@ mod tests {
         let t0 = Instant::now();
 
         ledger.record_started(&p, Some(id), 6 * ONE_SECOND, t0);
-        ledger.dispatch_done(&p, id);
+        ledger.dispatch_done(&p, id, TurnEnd::Closed);
         let audio = ledger.settle_job(&p, Some(id), false).unwrap();
         assert_eq!(audio.awaiting_start, 1, "read as the playing clip's ending");
 
@@ -824,7 +844,7 @@ mod tests {
         let id = UtteranceId(1);
         ledger.record_dispatch(&p, id, Some("never mind".into()));
 
-        let audio = ledger.dispatch_done(&p, id);
+        let audio = ledger.dispatch_done(&p, id, TurnEnd::Closed);
 
         assert_eq!(audio.cmds_sent, 0);
         assert_eq!(audio.awaiting_start, 0);
@@ -859,7 +879,7 @@ mod tests {
         dispatched_turn(&ledger, &p, id, 1);
         let t0 = Instant::now();
         ledger.record_started(&p, Some(id), ONE_SECOND, t0);
-        ledger.dispatch_done(&p, id);
+        ledger.dispatch_done(&p, id, TurnEnd::Closed);
 
         let audio = ledger
             .settle_job(&p, Some(id), true)
@@ -872,6 +892,83 @@ mod tests {
                 .record_started(&p, Some(id), ONE_SECOND, t0)
                 .is_none(),
             "and the records are gone by the time it returns"
+        );
+    }
+
+    /// The window opens once, on whichever of the two openers the turn reaches
+    /// second. The usual order: the brain returns while the last clip is still in
+    /// the speaker, so the settle is what opens it.
+    #[tokio::test(start_paused = true)]
+    async fn a_listening_turn_opens_its_window_on_the_settle_that_completes_it() {
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 2);
+        ledger.record_started(&p, Some(id), ONE_SECOND, Instant::now());
+
+        let audio = ledger.dispatch_done(&p, id, TurnEnd::Open);
+        assert!(
+            !audio.listen_open,
+            "a clip is still sounding: {audio:?}, and a second has yet to settle"
+        );
+
+        let audio = ledger.settle_job(&p, Some(id), true).unwrap();
+        assert!(!audio.listen_open, "one cmd of the two: {audio:?}");
+
+        let audio = ledger
+            .settle_job(&p, Some(id), true)
+            .expect("the settle that completed the turn answers for it");
+        assert!(audio.listen_open, "the reply is out of the speaker");
+    }
+
+    /// The other order: a reply whose last segment carried no speech settles every
+    /// clip before the brain returns, so `dispatch_done` is the second opener — and
+    /// it is where the turn's `<listen/>` is learned at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_listening_turn_settled_before_dispatch_returns_opens_at_dispatch_done() {
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+        let id = UtteranceId(1);
+        dispatched_turn(&ledger, &p, id, 1);
+        ledger.record_started(&p, Some(id), ONE_SECOND, Instant::now());
+        let audio = ledger.settle_job(&p, Some(id), true).unwrap();
+        assert!(!audio.listen_open, "the brain has not returned: {audio:?}");
+
+        let audio = ledger.dispatch_done(&p, id, TurnEnd::Open);
+        assert!(audio.listen_open, "and it is open on the call that did");
+    }
+
+    /// Everything that keeps the microphone shut: a reply that did not ask, one
+    /// that was cut, and a turn that said nothing at all. The last two are the
+    /// dangerous pair — a window opened on a barge would carve the speech that
+    /// caused it a second time, and one opened on silence would listen with the
+    /// person having heard nothing to answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_a_cut_and_a_silent_turn_open_no_window() {
+        let ledger = TurnLedger::new();
+        let p = pod("pod-x");
+
+        let closed = UtteranceId(1);
+        dispatched_turn(&ledger, &p, closed, 1);
+        ledger.dispatch_done(&p, closed, TurnEnd::Closed);
+        let audio = ledger.settle_job(&p, Some(closed), true).unwrap();
+        assert!(!audio.listen_open, "the reply never asked: {audio:?}");
+
+        let cut = UtteranceId(2);
+        dispatched_turn(&ledger, &p, cut, 1);
+        ledger.dispatch_done(&p, cut, TurnEnd::Open);
+        let audio = ledger.settle_job(&p, Some(cut), false).unwrap();
+        assert!(
+            !audio.listen_open,
+            "an unclean settle is a reply that was interrupted: {audio:?}"
+        );
+
+        let silent = UtteranceId(3);
+        ledger.record_dispatch(&p, silent, Some("nothing to say".into()));
+        let audio = ledger.dispatch_done(&p, silent, TurnEnd::Open);
+        assert!(
+            !audio.listen_open,
+            "a `<listen/>` with no speech under it opens nothing: {audio:?}"
         );
     }
 

@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::barge::{TurnAudio, TurnLedger};
 use crate::jsonl::JsonlHandle;
+use crate::pipeline::ListenWiring;
 use crate::scripter::{ScriptHandle, ScriptInput};
 use crate::server::{PlaybackRegistry, playback_try_play};
 
@@ -526,6 +527,10 @@ pub(crate) struct PlaybackFanout {
     /// same accounting the ledger keeps: when a turn's speech started and how
     /// long it is, which is what schedules the head's ending.
     pub(crate) scripter: Option<ScriptHandle>,
+    /// How a `<listen/>` capture window is opened, shared with the pipeline's
+    /// own opener: this one fires when a turn that asked to keep listening has
+    /// nothing left sounding.
+    pub(crate) listen: Arc<ListenWiring>,
 }
 
 /// Build the `PlaybackEventFn` handed to every `PlaybackWriter` at spawn: the
@@ -648,6 +653,15 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout) 
             // here is the `Audible` behind this event's business, not this arm's.
             let audio = fanout.ledger.settle_job(pod, *in_reply_to, true);
             tell_scripter(fanout.scripter.as_ref(), pod, *in_reply_to, audio);
+            // The ordinary opener for a reply that asked to keep listening: its
+            // last clip has just been heard out. The pipeline's own `dispatch_done`
+            // is the other one, for the chain whose final segment says nothing;
+            // `listen_open` is true on exactly one call per turn, so between them
+            // the window opens once. Only here, never on a cut: the speech that
+            // interrupted a reply is itself the follow-up.
+            if audio.is_some_and(|a| a.listen_open) {
+                fanout.listen.open(pod.clone()).await;
+            }
         }
         PlaybackEvent::Aborted {
             pod, in_reply_to, ..
@@ -884,7 +898,7 @@ mod tests {
     use serde_json::Value;
     use speech_pipeline::{
         AbortReason, AudibleJob, InterruptProgress, PacerConfig, PcmChunk, PlaybackEventFn,
-        PlaybackStats, PlaybackWriter, StageTimings,
+        PlaybackStats, PlaybackWriter, StageTimings, TurnEnd,
     };
 
     use crate::config::JsonlSink;
@@ -2282,7 +2296,7 @@ mod tests {
         let pod = PodId("pod-x".into());
         ledger.record_dispatch(&pod, UtteranceId(1), None);
         ledger.record_cmd(&pod, UtteranceId(1), None);
-        ledger.dispatch_done(&pod, UtteranceId(1));
+        ledger.dispatch_done(&pod, UtteranceId(1), TurnEnd::Closed);
 
         let wiring = give_up_wiring(shape).await;
         run_router_scripted(
@@ -2393,8 +2407,20 @@ mod tests {
         }
     }
 
-    /// A feed sink recording the `PlaybackState` changes the adapter drives, in
-    /// place of the real listener (which owns an inference thread).
+    /// A capture window long enough to be unmistakable in a fed `Feed::Listen`.
+    const TEST_LISTEN_WINDOW: u64 = 128_000;
+
+    /// The listen wiring the fan-out opens through, over the same spy feed the
+    /// floor is driven with — which is how production wires it.
+    fn test_listen_wiring(feed: &FeedFn) -> Arc<ListenWiring> {
+        Arc::new(ListenWiring {
+            feed: Arc::clone(feed),
+            window_samples: TEST_LISTEN_WINDOW,
+        })
+    }
+
+    /// A feed sink recording the feeds the adapter drives, in place of the real
+    /// listener (which owns an inference thread).
     fn spy_feed() -> (FeedFn, tokio::sync::mpsc::UnboundedReceiver<Feed>) {
         // A real bounded feed channel, so the permit path under test is the one
         // production takes; a forwarder republishes onto an unbounded receiver so
@@ -2431,9 +2457,10 @@ mod tests {
             jsonl.clone(),
             Arc::new(AtomicU64::new(0)),
             Some(PlaybackFanout {
-                feed,
+                feed: Arc::clone(&feed),
                 ledger: Arc::clone(&ledger),
                 scripter: None,
+                listen: test_listen_wiring(&feed),
             }),
         );
         for e in events {
@@ -2470,9 +2497,10 @@ mod tests {
             jsonl.clone(),
             Arc::new(AtomicU64::new(0)),
             Some(PlaybackFanout {
-                feed,
+                feed: Arc::clone(&feed),
                 ledger,
                 scripter: Some(handle.clone()),
+                listen: test_listen_wiring(&feed),
             }),
         );
         for e in events {
@@ -2488,6 +2516,90 @@ mod tests {
             seen.push(input);
         }
         seen
+    }
+
+    /// Drive one turn that asked to keep listening through the fan-out and hand
+    /// back every feed it produced. `terminal` is how the turn's one clip ends,
+    /// which is the whole question: only a clip heard to its end opens a window.
+    async fn feeds_for_listening_turn(terminal: PlaybackEvent) -> Vec<Feed> {
+        let pod = PodId("pod-x".into());
+        let dir = tempfile::tempdir().unwrap();
+        let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
+            .await
+            .unwrap();
+        let (feed, mut rx) = spy_feed();
+        let ledger = Arc::new(TurnLedger::new());
+        ledger.record_dispatch(&pod, UtteranceId(1), None);
+        ledger.record_cmd(&pod, UtteranceId(1), None);
+        let adapter = playback_event_adapter(
+            jsonl.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Some(PlaybackFanout {
+                feed: Arc::clone(&feed),
+                ledger: Arc::clone(&ledger),
+                scripter: None,
+                listen: test_listen_wiring(&feed),
+            }),
+        );
+        adapter(started_for(1)).await;
+        // The brain returned first, which is the ordinary order: the reply is
+        // still coming out of the speaker when `handle` answers.
+        ledger.dispatch_done(&pod, UtteranceId(1), TurnEnd::Open);
+        adapter(terminal).await;
+        drop(adapter);
+        drop(jsonl);
+        join.await.unwrap();
+
+        let mut seen = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            seen.push(f);
+        }
+        seen
+    }
+
+    /// The fan-out opener: the last clip of a reply that asked to keep listening
+    /// is heard out, and the microphone is opened for the configured window.
+    #[tokio::test]
+    async fn the_last_clip_of_a_listening_reply_opens_the_capture_window() {
+        let seen = feeds_for_listening_turn(finished(1, true)).await;
+        assert!(
+            matches!(
+                seen.as_slice(),
+                [Feed::Listen {
+                    window_samples: TEST_LISTEN_WINDOW
+                }]
+            ),
+            "one window, as long as the configuration says: {seen:?}",
+        );
+    }
+
+    /// A reply that was cut opens nothing: the speech that cut it is the
+    /// follow-up, and it is already through the wake-less barge path.
+    #[tokio::test]
+    async fn a_cut_reply_opens_no_capture_window() {
+        for terminal in [
+            PlaybackEvent::Aborted {
+                pod: PodId("pod-x".into()),
+                in_reply_to: Some(UtteranceId(1)),
+                reason: AbortReason::WriteError,
+            },
+            PlaybackEvent::Flushed {
+                pod: PodId("pod-x".into()),
+                in_reply_to: Some(UtteranceId(1)),
+                was_playing: true,
+                frames_written: 4,
+                progress: InterruptProgress {
+                    heard_ms: 80,
+                    total_ms: 900,
+                },
+            },
+        ] {
+            let label = format!("{terminal:?}");
+            assert!(
+                feeds_for_listening_turn(terminal).await.is_empty(),
+                "{label} settles unclean",
+            );
+        }
     }
 
     /// The fixture's `Started`, re-addressed to the turn the scripter tests
@@ -2918,7 +3030,7 @@ mod tests {
             );
             ledger.record_dispatch(&pod, UtteranceId(1), None);
             ledger.record_cmd(&pod, UtteranceId(1), None);
-            ledger.dispatch_done(&pod, UtteranceId(1));
+            ledger.dispatch_done(&pod, UtteranceId(1), TurnEnd::Closed);
 
             let dir = tempfile::tempdir().unwrap();
             let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::File(dir.path().join("e")))
@@ -2929,9 +3041,10 @@ mod tests {
                 jsonl.clone(),
                 Arc::new(AtomicU64::new(0)),
                 Some(PlaybackFanout {
-                    feed,
+                    feed: Arc::clone(&feed),
                     ledger: Arc::clone(&ledger),
                     scripter: None,
+                    listen: test_listen_wiring(&feed),
                 }),
             );
             adapter(event).await;
@@ -2966,9 +3079,10 @@ mod tests {
             jsonl.clone(),
             Arc::new(AtomicU64::new(0)),
             Some(PlaybackFanout {
-                feed,
+                feed: Arc::clone(&feed),
                 ledger: Arc::clone(&ledger),
                 scripter: None,
+                listen: test_listen_wiring(&feed),
             }),
         );
         adapter(PlaybackEvent::Started {
@@ -2986,7 +3100,7 @@ mod tests {
         drop(jsonl);
         join.await.unwrap();
 
-        let audio = ledger.dispatch_done(&pod, UtteranceId(2));
+        let audio = ledger.dispatch_done(&pod, UtteranceId(2), TurnEnd::Closed);
         assert_eq!(audio.awaiting_start, 0, "the turn's one clip is playing");
         assert_eq!(
             audio.horizon,

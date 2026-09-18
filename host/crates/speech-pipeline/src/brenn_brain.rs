@@ -25,7 +25,8 @@ use tokio::sync::mpsc;
 use crate::brain::{BrainEvent, BrainEventFn, BrainStats, send_or_report};
 use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{
-    ContextSegment, InterruptProgress, PodId, RoomId, SpeakBody, SpeakCmd, Utterance, UtteranceId,
+    ContextSegment, Cue, InterruptProgress, PodId, RoomId, SpeakBody, SpeakCmd, Utterance,
+    UtteranceId,
 };
 
 /// The transport seam a brenn-side brain publishes through.
@@ -182,16 +183,19 @@ pub fn interruption_body(pod: &PodId, room: &RoomId, interrupted: InterruptedBod
 // --- inbound codec -----------------------------------------------------------
 
 /// One control marker lifted out of a response body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Tag {
     /// Turn correlation. `to` is `None` when the marker carried no id — accepted
     /// optimistically for the pending turn by the delivery policy.
     Reply { to: Option<u64> },
     /// Flush what came with this message and expect a follow-up message.
     Continued,
-    /// Hold the microphone open after this reply. In the wire vocabulary, not yet
-    /// implemented.
+    /// Hold the microphone open after this reply.
     Listen,
+    /// Move the head: a named pose to take for the rest of the reply, or a named
+    /// motion to play over the standing one. Carries the [`Cue`] the response
+    /// delivers verbatim, so the marker and the movement cannot drift apart.
+    Cue(Cue),
     /// A tag-shaped island the vocabulary does not cover, or one mangled past
     /// parsing. Stripped from the speech and reported loudly, never spoken.
     Unknown { raw: String },
@@ -211,16 +215,44 @@ pub enum Tag {
 static TAG_ISLAND: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"</?[A-Za-z][^<>]*>|</?[A-Za-z][^<>]*").expect("valid regex"));
 
-/// The `to` attribute of a reply marker, permissively: double-quoted,
-/// single-quoted, or bare, with whitespace anywhere around the `=`.
-static REPLY_TO: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:^|\s)to\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'/>]+))"#).expect("valid regex")
-});
+/// One named attribute, permissively: double-quoted, single-quoted, or bare,
+/// with whitespace anywhere around the `=`. One pattern per key, built once.
+fn attr_pattern(key: &str) -> Regex {
+    Regex::new(&format!(
+        r#"(?:^|\s){key}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'/>]+))"#
+    ))
+    .expect("valid regex")
+}
 
-/// Whether an attribute list mentions `to` at all, so a marker whose id is present
-/// but unreadable reads as mangled rather than as a marker without an id.
-static REPLY_TO_KEY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|\s)to\s*=").expect("valid regex"));
+/// Whether an attribute list mentions `key` at all, so a marker whose value is
+/// present but unreadable reads as mangled rather than as one without the
+/// attribute.
+fn attr_key_pattern(key: &str) -> Regex {
+    Regex::new(&format!(r"(?:^|\s){key}\s*=")).expect("valid regex")
+}
+
+/// The value of an attribute, whichever quoting the peer used.
+fn attr_value<'a>(pattern: &Regex, attrs: &'a str) -> Option<&'a str> {
+    pattern
+        .captures(attrs)
+        .and_then(|caps| (1..=3).find_map(|i| caps.get(i)))
+        .map(|m| m.as_str())
+}
+
+/// The `to` attribute of a reply marker.
+static REPLY_TO: LazyLock<Regex> = LazyLock::new(|| attr_pattern("to"));
+
+/// Whether an attribute list mentions `to` at all.
+static REPLY_TO_KEY: LazyLock<Regex> = LazyLock::new(|| attr_key_pattern("to"));
+
+/// The `name` attribute of a pose or motion marker.
+static CUE_NAME: LazyLock<Regex> = LazyLock::new(|| attr_pattern("name"));
+
+/// The `speed` attribute of a pose or motion marker.
+static CUE_SPEED: LazyLock<Regex> = LazyLock::new(|| attr_pattern("speed"));
+
+/// Whether a cue marker mentions `speed` at all.
+static CUE_SPEED_KEY: LazyLock<Regex> = LazyLock::new(|| attr_key_pattern("speed"));
 
 /// Split a response body into the text to speak and the markers it carried, each
 /// with its offset into that text. Known markers are lifted out and acted on by
@@ -275,8 +307,40 @@ fn parse_island(raw: &str) -> Tag {
         "reply" => parse_reply(attrs, raw),
         "continued" => Tag::Continued,
         "listen" => Tag::Listen,
+        "pose" => parse_cue(attrs, raw, false),
+        "motion" => parse_cue(attrs, raw, true),
         _ => unknown(),
     }
+}
+
+/// A pose or motion marker: a required `name` and an optional `speed`.
+///
+/// Neither attribute is defaulted when it is there but unreadable. A cue is a
+/// command to move a machine, and the only honest reading of a mangled one is
+/// that the peer meant something this side cannot recover — so it is stripped
+/// and reported like any other marker the codec cannot read, and the head does
+/// not move. The speed's range is not checked here; this crate does not link
+/// the motion protocol.
+fn parse_cue(attrs: &str, raw: &str, motion: bool) -> Tag {
+    let unknown = || Tag::Unknown { raw: raw.into() };
+    let name = attr_value(&CUE_NAME, attrs).map(str::trim).unwrap_or("");
+    if name.is_empty() {
+        return unknown();
+    }
+    let speed = match attr_value(&CUE_SPEED, attrs) {
+        Some(value) => match value.trim().parse::<f64>() {
+            Ok(speed) if speed.is_finite() => Some(speed),
+            _ => return unknown(),
+        },
+        None if CUE_SPEED_KEY.is_match(attrs) => return unknown(),
+        None => None,
+    };
+    let name = name.to_owned();
+    Tag::Cue(if motion {
+        Cue::Motion { name, speed }
+    } else {
+        Cue::Pose { name, speed }
+    })
 }
 
 /// The reply marker's turn id: absent (the model forgot it), present and readable,
@@ -288,11 +352,7 @@ fn parse_island(raw: &str) -> Tag {
 /// turn's marker, not a stale echo from the peer's context — so a partial read must
 /// not reach the correlation check.
 fn parse_reply(attrs: &str, raw: &str) -> Tag {
-    let value = REPLY_TO
-        .captures(attrs)
-        .and_then(|caps| (1..=3).find_map(|i| caps.get(i)))
-        .map(|m| m.as_str());
-    match value {
+    match attr_value(&REPLY_TO, attrs) {
         Some(value) => match value.trim().parse::<u64>() {
             Ok(to) => Tag::Reply { to: Some(to) },
             Err(_) => Tag::Unknown { raw: raw.into() },
@@ -316,14 +376,29 @@ pub struct HelpChannels {
     pub wake: Option<String>,
 }
 
+/// What the instruction document may tell its reader to ask the head for: the
+/// movement vocabulary the deployment resolved, and the window a `<continued/>`
+/// buys. Both are deployment facts, so the document states the ones this run
+/// actually holds rather than an example of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpCues {
+    /// Pose names the reader may name, already filtered to the ones it is
+    /// allowed to command. Empty renders as `(none)`.
+    pub poses: Vec<String>,
+    /// Motion names the reader may name. Empty renders as `(none)`.
+    pub motions: Vec<String>,
+    /// How long the pod waits for a promised continuation, as configured.
+    pub continued_ms: u64,
+}
+
 /// The contract document, written at the language model that answers on the bus —
 /// not at a human reading reference documentation. It is prompt-style: direct
-/// imperatives, the exact markers to emit, and a worked example. The channel names
-/// are its only dynamic content.
+/// imperatives, the exact markers to emit, and a worked example. The channel names,
+/// the movement vocabulary and the continuation window are its dynamic content.
 ///
 /// It lives next to the codec on purpose. The instructions and the parser can only
 /// diverge if someone edits one of them alone, and here that is one file.
-pub fn response_contract_help(channels: &HelpChannels) -> String {
+pub fn response_contract_help(channels: &HelpChannels, cues: &HelpCues) -> String {
     let wake_section = match &channels.wake {
         Some(wake) => format!(
             "\n\
@@ -333,14 +408,53 @@ pub fn response_contract_help(channels: &HelpChannels) -> String {
         ),
         None => String::new(),
     };
+    // Rounded to whole seconds: the document is spoken-language instruction, and
+    // a millisecond figure invites the reader to treat a scheduling budget as a
+    // promise.
+    let continued_s = cues.continued_ms.div_ceil(1_000);
+    let markers = format!(
+        "\
+# The markers
+
+  <reply to=\"N\"/>        first thing in a reply; N is the utterance id you answer.
+  <continued/>           at the end of a partial reply when another message
+                         follows. The pod waits about {continued_s} seconds for it and
+                         the robot stays attentive; a continuation you never send
+                         simply ends the turn.
+  <listen/>              at the end of a reply, to keep the microphone open so the
+                         person can keep talking without the wake word.
+  <pose name=\"P\" speed=\"S\"/>      move the head to pose P and stay there for the
+                                  rest of the reply. S is optional, 1.0 is the
+                                  pose's own pace, 0.25–2.0.
+  <motion name=\"M\" speed=\"S\"/>    play motion M over the current pose, once. A
+                                  second motion replaces one still playing. S as
+                                  above.
+
+Poses you may name: {poses}.
+Motions you may name: {motions}.
+",
+        poses = name_list(&cues.poses),
+        motions = name_list(&cues.motions),
+    );
     format!(
         "{HELP_INTRO}\n\
          Utterances from the pods arrive on the channel `{publish}`.\n\
          Publish every reply on the channel `{response}`.\n\
-         {wake_section}{HELP_BODY}",
+         {wake_section}{HELP_BODY}\n{markers}{HELP_TAIL}",
         publish = channels.publish,
         response = channels.response,
     )
+}
+
+/// A vocabulary line's names, or `(none)` when the deployment configured no
+/// library: the reader is told the list is empty rather than left to guess that
+/// a missing line means anything goes.
+fn name_list(names: &[String]) -> String {
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    }
 }
 
 const HELP_INTRO: &str = "\
@@ -422,15 +536,9 @@ tokens.
 
 The last message of a turn must NOT carry `<continued/>`: that marker is a promise
 of another message, and the pod waits for it before the turn is over.
+";
 
-# The markers
-
-  <reply to=\"N\"/>   first thing in a reply; N is the utterance id you answer.
-  <continued/>      at the end of a partial reply; another message follows.
-  <listen/>         at the end of a reply, to keep the microphone open so the
-                    person can keep talking without the wake word. Accepted, but
-                    not implemented yet — it is stripped and ignored today.
-
+const HELP_TAIL: &str = "\
 One reply per turn, plus its continuations. Anything else tag-shaped is stripped
 out of the speech and reported as an error, so do not invent markers and do not
 wrap your reply in XML or markdown.
@@ -475,7 +583,7 @@ struct PendingTurn {
 }
 
 /// One response message with its markers already lifted out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ParsedResponse {
     /// The speech, verbatim but for the stripped markers.
     text: String,
@@ -484,6 +592,8 @@ struct ParsedResponse {
     /// The message asked for the microphone to stay open. Read only as the turn's
     /// disposition; nothing here holds the floor open.
     listen: bool,
+    /// The movements the message asked for, in the order they appeared.
+    cues: Vec<Cue>,
 }
 
 /// What [`BrennBrain::deliver`] did with a response message. Everything but
@@ -582,6 +692,13 @@ impl BrennBrain {
             text,
             continued: tags.iter().any(|(tag, _)| *tag == Tag::Continued),
             listen: tags.iter().any(|(tag, _)| *tag == Tag::Listen),
+            cues: tags
+                .iter()
+                .filter_map(|(tag, _)| match tag {
+                    Tag::Cue(cue) => Some(cue.clone()),
+                    _ => None,
+                })
+                .collect(),
         };
         // The queue push comes before the per-marker events on purpose. A message the
         // turn never receives has had none of its markers acted on, and events saying
@@ -612,16 +729,7 @@ impl BrennBrain {
                         reported += 1;
                     }
                 }
-                Tag::Listen => {
-                    // TODO(brenn-brain-listen): hold the mic open for a follow-up
-                    // instead of reporting the request unsupported.
-                    self.stats.record_link_listen_unsupported();
-                    if reported < MAX_MARKER_REPORTS {
-                        (self.events)(BrainEvent::LinkListenUnsupported { utterance });
-                        reported += 1;
-                    }
-                }
-                Tag::Reply { .. } | Tag::Continued => {}
+                Tag::Reply { .. } | Tag::Continued | Tag::Listen | Tag::Cue(_) => {}
             }
         }
         DeliverOutcome::Delivered
@@ -783,6 +891,17 @@ impl Brain for BrennBrain {
                         // `<listen/>` on a segment that promised a follow-up is
                         // superseded by whatever ends the chain.
                         let listen = parsed.listen;
+                        // Before the speech, because the cue is what the reply
+                        // is delivered *with*: a head that starts moving as the
+                        // words are queued is as close to "while speaking" as a
+                        // delivery-time cue gets.
+                        // TODO(cue-timing-delivery-not-playback): the head moves
+                        // a whole TTS round-trip ahead of the words the cue sits
+                        // beside; `scan`'s marker offsets are the way to the
+                        // spoken instant.
+                        if !parsed.cues.is_empty() {
+                            out.cue(parsed.cues);
+                        }
                         speak(&mut out, &u, parsed.text, &events, &stats);
                         if !promised {
                             return if listen {
@@ -1212,6 +1331,85 @@ mod tests {
         assert!(tags.is_empty());
     }
 
+    // --- cue markers ---
+
+    #[test]
+    fn a_pose_marker_carries_its_name_and_optional_speed() {
+        assert_eq!(
+            tags("<pose name=\"peek\"/>"),
+            vec![Tag::Cue(Cue::Pose {
+                name: "peek".into(),
+                speed: None
+            })]
+        );
+        assert_eq!(
+            tags("<pose name='peek' speed=1.5/>"),
+            vec![Tag::Cue(Cue::Pose {
+                name: "peek".into(),
+                speed: Some(1.5)
+            })]
+        );
+        assert_eq!(
+            tags("<motion name=\"a/b\" speed=\"0.5\"/>"),
+            vec![Tag::Cue(Cue::Motion {
+                name: "a/b".into(),
+                speed: Some(0.5)
+            })]
+        );
+    }
+
+    #[test]
+    fn a_cue_marker_the_codec_cannot_read_is_stripped_like_any_other() {
+        // Nothing is defaulted: a cue moves a machine, and a marker whose name or
+        // pace is unreadable has not said where to move it.
+        for body in [
+            "<pose/>",
+            "<pose name=\"\"/>",
+            "<motion speed=\"1.0\"/>",
+            "<pose name=\"peek\" speed=\"fast\"/>",
+            "<motion name=\"a/b\" speed=\"\"/>",
+            "<pose name=\"peek\" speed=\"inf\"/>",
+        ] {
+            assert_eq!(
+                tags(body),
+                vec![Tag::Unknown { raw: body.into() }],
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hold_marker_is_not_in_the_vocabulary() {
+        // `<hold/>` was never a marker; `<continued/>` is what keeps the head up.
+        // Pin that it stays unknown, so a peer using it is told rather than
+        // silently obeyed.
+        assert_eq!(
+            tags("<hold/>"),
+            vec![Tag::Unknown {
+                raw: "<hold/>".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn cue_markers_are_stripped_from_the_speech_in_order() {
+        let (text, tags) = scan("<motion name=\"a/b\"/>Hello!<pose name=\"peek\"/> Bye.");
+        assert_eq!(text, "Hello! Bye.");
+        assert_eq!(
+            tags.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>(),
+            vec![
+                Tag::Cue(Cue::Motion {
+                    name: "a/b".into(),
+                    speed: None
+                }),
+                Tag::Cue(Cue::Pose {
+                    name: "peek".into(),
+                    speed: None
+                }),
+            ]
+        );
+    }
+
     // --- the instruction document ---
 
     fn help_channels() -> HelpChannels {
@@ -1222,17 +1420,27 @@ mod tests {
         }
     }
 
+    fn help_cues() -> HelpCues {
+        HelpCues {
+            poses: vec!["neutral".into(), "peek".into()],
+            motions: vec!["bench/nod".into()],
+            continued_ms: 30_000,
+        }
+    }
+
     #[test]
     fn the_help_document_names_every_marker_type_and_channel() {
         // The document and the codec live in one file so they cannot diverge
         // silently; this is the assertion that makes "cannot" true. Every marker the
         // codec knows, every outbound message type, and every configured channel has
         // to appear verbatim.
-        let help = response_contract_help(&help_channels());
+        let help = response_contract_help(&help_channels(), &help_cues());
         for needle in [
             "<reply to=\"N\"/>",
             "<continued/>",
             "<listen/>",
+            "<pose name=\"P\" speed=\"S\"/>",
+            "<motion name=\"M\" speed=\"S\"/>",
             "\"type\": \"wake\"",
             "\"type\": \"utterance\"",
             "\"type\": \"interruption\"",
@@ -1246,13 +1454,65 @@ mod tests {
 
     #[test]
     fn the_help_document_draws_the_two_interruption_cases_apart() {
-        let help = response_contract_help(&help_channels());
+        let help = response_contract_help(&help_channels(), &help_cues());
         assert!(help.contains("Never reply to this message."));
         assert!(help.contains("cut you off AND then said this"));
         // It must also say what each field of the estimate means.
         for field in ["heard_ms", "total_ms", "heard_text"] {
             assert!(help.contains(field), "help text is missing {field:?}");
         }
+    }
+
+    #[test]
+    fn the_help_document_names_the_vocabulary_this_deployment_resolved() {
+        let help = response_contract_help(&help_channels(), &help_cues());
+        assert!(help.contains("Poses you may name: neutral, peek."));
+        assert!(help.contains("Motions you may name: bench/nod."));
+    }
+
+    #[test]
+    fn an_empty_vocabulary_says_so_rather_than_saying_nothing() {
+        // A missing line would read as "name anything"; `(none)` is the honest
+        // rendering of a deployment that configured no library.
+        let help = response_contract_help(
+            &help_channels(),
+            &HelpCues {
+                poses: Vec::new(),
+                motions: Vec::new(),
+                ..help_cues()
+            },
+        );
+        assert!(help.contains("Poses you may name: (none)."));
+        assert!(help.contains("Motions you may name: (none)."));
+    }
+
+    #[test]
+    fn the_continuation_row_states_the_configured_window() {
+        // The document cannot contradict the configuration, so the number is
+        // rendered from it rather than written into the prose.
+        let help = response_contract_help(
+            &help_channels(),
+            &HelpCues {
+                continued_ms: 12_000,
+                ..help_cues()
+            },
+        );
+        assert!(help.contains("waits about 12 seconds for it"));
+        assert!(!help.contains("not implemented yet"));
+
+        // Rounded up, never down: the document must not promise the peer a
+        // shorter window than the pod will actually wait.
+        let help = response_contract_help(
+            &help_channels(),
+            &HelpCues {
+                continued_ms: 1_500,
+                ..help_cues()
+            },
+        );
+        assert!(
+            help.contains("waits about 2 seconds for it"),
+            "1500 ms is two seconds' worth of promise: {help}"
+        );
     }
 
     // --- the brain ---
@@ -1296,6 +1556,8 @@ mod tests {
         stats: Arc<BrainStats>,
         speak_tx: futures::channel::mpsc::Sender<SpeakCmd>,
         speak_rx: futures::channel::mpsc::Receiver<SpeakCmd>,
+        /// Every batch of cues the sink's cue tap was handed, in order.
+        cued: Arc<Mutex<Vec<Vec<Cue>>>>,
     }
 
     impl Fixture {
@@ -1331,14 +1593,24 @@ mod tests {
                 stats,
                 speak_tx,
                 speak_rx,
+                cued: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         /// Dispatch `u` the way the pipeline does — awaited concurrently, so the test
         /// can play the peer while the turn is parked.
         fn dispatch(&self, u: Utterance) -> tokio::task::JoinHandle<TurnEnd> {
-            let sink = ResponseSink::new(self.speak_tx.clone());
+            let cued = Arc::clone(&self.cued);
+            let sink = ResponseSink::with_taps(
+                self.speak_tx.clone(),
+                None,
+                Some(Arc::new(move |cues| cued.lock().unwrap().push(cues))),
+            );
             tokio::spawn(self.brain.handle(u, sink))
+        }
+
+        fn cued(&self) -> Vec<Vec<Cue>> {
+            self.cued.lock().unwrap().clone()
         }
 
         /// Deliver `body` once the turn has armed its slot. The turn has to reach its
@@ -1641,7 +1913,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_and_listen_markers_are_reported_and_the_speech_survives() {
+    async fn an_unknown_marker_is_reported_and_the_speech_survives() {
+        // A marker the vocabulary knows is acted on silently, whatever it asks
+        // for; only the one nobody can read earns a line.
         let mut f = Fixture::new();
         let turn = f.dispatch(test_utterance());
         f.deliver_armed("<reply to=\"42\"/>Go on.<emote:happy/><listen/>")
@@ -1651,18 +1925,91 @@ mod tests {
         assert_eq!(f.spoken(), ["Go on."]);
         assert_eq!(
             f.events(),
-            vec![
-                BrainEvent::LinkTagStripped {
-                    utterance: UtteranceId(42),
-                    tag: "<emote:happy/>".into(),
-                },
-                BrainEvent::LinkListenUnsupported {
-                    utterance: UtteranceId(42)
-                },
-            ]
+            vec![BrainEvent::LinkTagStripped {
+                utterance: UtteranceId(42),
+                tag: "<emote:happy/>".into(),
+            }]
         );
         assert_eq!(f.stats.snapshot().link_tags_stripped, 1);
-        assert_eq!(f.stats.snapshot().link_listen_unsupported, 1);
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_cues_hands_them_over_before_its_speech() {
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/><motion name=\"a/b\" speed=\"0.5\"/>Hello!")
+            .await;
+        turn.await.unwrap();
+
+        assert_eq!(
+            f.cued(),
+            vec![vec![Cue::Motion {
+                name: "a/b".into(),
+                speed: Some(0.5)
+            }]]
+        );
+        assert_eq!(f.spoken(), ["Hello!"]);
+    }
+
+    #[tokio::test]
+    async fn a_cue_only_message_moves_the_head_and_queues_no_speech() {
+        // A movement is not speech, so it does not ride the response queue: a
+        // whitespace-only reply queues nothing, and the head still moves.
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/><pose name=\"peek\"/>")
+            .await;
+        turn.await.unwrap();
+
+        assert_eq!(
+            f.cued(),
+            vec![vec![Cue::Pose {
+                name: "peek".into(),
+                speed: None
+            }]]
+        );
+        assert!(f.spoken().is_empty());
+    }
+
+    /// A chain's cues are handed over one batch per message, as they arrive. The
+    /// head is meant to move with the chunk that asked for it, and the scripter's
+    /// "last of each kind wins" rule is per batch: collecting a chain into one
+    /// batch would drop the first pose and start the second motion at the end.
+    #[tokio::test]
+    async fn a_continuation_chain_hands_over_one_batch_per_message() {
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/><pose name=\"peek\"/>part one<continued/>")
+            .await;
+        f.deliver_armed("<reply to=\"42\" continued=\"true\"/><motion name=\"a/b\"/>part two")
+            .await;
+        turn.await.unwrap();
+
+        assert_eq!(
+            f.cued(),
+            vec![
+                vec![Cue::Pose {
+                    name: "peek".into(),
+                    speed: None
+                }],
+                vec![Cue::Motion {
+                    name: "a/b".into(),
+                    speed: None
+                }]
+            ]
+        );
+        assert_eq!(f.spoken(), ["part one", "part two"]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_no_cues_never_calls_the_cue_tap() {
+        let f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/>Sixty-eight and clear.")
+            .await;
+        turn.await.unwrap();
+
+        assert!(f.cued().is_empty());
     }
 
     // --- how the turn ended ---
@@ -1679,9 +2026,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_final_response_that_asks_to_listen_leaves_the_turn_open() {
-        // The marker still holds no microphone open — `TODO(brenn-brain-listen)` —
-        // but the turn's disposition is read off it, which is what tells a head
-        // that the exchange is expected to continue.
+        // The turn's disposition is read off the marker, which is what tells the
+        // head that the exchange is expected to continue and the listener that a
+        // capture window is owed.
         let mut f = Fixture::new();
         let turn = f.dispatch(test_utterance());
         f.deliver_armed("<reply to=\"42\"/>Which one did you mean?<listen/>")
@@ -1853,7 +2200,6 @@ mod tests {
             f.events()
         );
         assert_eq!(f.stats.snapshot().link_tags_stripped, 0);
-        assert_eq!(f.stats.snapshot().link_listen_unsupported, 0);
     }
 
     #[tokio::test]
@@ -1960,10 +2306,13 @@ mod tests {
     fn an_unconfigured_wake_channel_is_absent_from_the_help_document() {
         // No wake channel means no wake notices, so the document must not promise
         // them.
-        let help = response_contract_help(&HelpChannels {
-            wake: None,
-            ..help_channels()
-        });
+        let help = response_contract_help(
+            &HelpChannels {
+                wake: None,
+                ..help_channels()
+            },
+            &help_cues(),
+        );
         assert!(!help.contains("brenn:pod.wake"));
         assert!(!help.contains("\"type\": \"wake\""));
         assert!(help.contains("brenn:pod.utterance"));

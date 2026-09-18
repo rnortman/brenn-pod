@@ -48,11 +48,11 @@ pub use playback::{
 pub use queue::{DropOldestQueue, QueueStats, Receiver, Sender, StatsHandle};
 pub use tracking::tracking_event;
 pub use traits::{
-    Brain, PcmChunk, ResponseSink, SegmentAudio, SynthesisError, Synthesizer, TranscribeError,
-    Transcriber, TranscriptEvent, TurnEnd, transcribe_pcm,
+    Brain, CueTap, PcmChunk, ResponseSink, SegmentAudio, SynthesisError, Synthesizer,
+    TranscribeError, Transcriber, TranscriptEvent, TurnEnd, transcribe_pcm,
 };
 pub use types::{
-    AudioSpan, BargeInContext, Codec, ConfidenceGate, ContextSegment, DoaTrack, EndpointCause,
+    AudioSpan, BargeInContext, Codec, ConfidenceGate, ContextSegment, Cue, DoaTrack, EndpointCause,
     GateReject, InterruptProgress, MAX_CONTEXT_SEGMENTS, MAX_RESOLVE_SAMPLES, PodId,
     ResolvedSpanAudio, RoomId, SPINE_FORMAT, Segment, SegmentEndCause, SegmentEndInfo,
     SegmentTelemetry, SpanResolveError, SpeakBody, SpeakCmd, SpeakerId, StageTimings,

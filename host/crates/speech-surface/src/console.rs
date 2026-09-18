@@ -35,6 +35,11 @@ const CONSOLE_INFO: &[&str] = &[
     "segment_closed",
     "wake_decision",
     "wake_detected",
+    // A wake phrase the mute discarded: it fired while the pod's own reply was
+    // sounding, or inside the tail after it, and nothing was armed or cut. The
+    // reading behind "the wake word does nothing while it talks" and behind
+    // whether the echo still trips the detector at all.
+    "wake_muted",
     "wake_command_absent",
     // The other two ways the confidence gate declines a raise. Rate-bounded the
     // same way: at most one per utterance.
@@ -50,6 +55,16 @@ const CONSOLE_INFO: &[&str] = &[
     "brenn_attached",
     "brenn_subscribed",
     "brenn_help_published",
+    // The cue vocabulary this run resolved: said once at startup, and the one
+    // place an operator sees which library copy the head is being cued against.
+    "cue_library_loaded",
+    // A movement a reply asked for that the head never made: a name the
+    // configured library does not hold or a speed outside the wire's range, and
+    // a cue that arrived with the head already at rest. Loud for the refusal —
+    // it is a peer asking for something this deployment cannot do, and the
+    // operator's repair is either the model's prompt or a stale library copy.
+    "cue_refused",
+    "cue_ignored",
     // The head's timeline changing. One line per change, never per re-emission
     // of the standing script. `presence_absent` is its startup sibling: a
     // bus-brain pod whose head will never move, said once at startup.
@@ -61,6 +76,11 @@ const CONSOLE_INFO: &[&str] = &[
     "utterance_superseded",
     "utterance_closed",
     "arm_expired",
+    // The capture window a `<listen/>` reply opens: when it opened, each time
+    // speech was heard inside it, and its expiry. At most a handful per reply.
+    "listen_opened",
+    "listen_heard",
+    "listen_expired",
     // Bounded by construction: one line per model per ~8 s of audio per pod, plus
     // one per transition. Never per-chunk.
     "model_stats",
@@ -139,11 +159,16 @@ const CALM_DESPITE_TOKEN: &[&str] = &[
 ///   it left cleanly or not.
 /// - `brenn_delivery_gap`: responses were lost on the bus before reaching this
 ///   pod, so a turn was answered with part of its speech missing.
+/// - `cue_refused`: a reply asked the head for a movement this deployment
+///   cannot make — an invented name, a stale library copy, a speed outside the
+///   wire's range, or no configured vocabulary or head at all — and the head
+///   did nothing.
 const LOUD_WITHOUT_TOKEN: &[&str] = &[
     "listener_absent",
     "brenn_detached",
     "brenn_bridge_exit",
     "brenn_delivery_gap",
+    "cue_refused",
 ];
 
 /// Long string fields (transcript, error detail) truncate here; the file keeps
@@ -169,9 +194,9 @@ const HEALTH_COUNTER_LEAVES: &[&str] = &[
     "speak_send_failures",
     "send_failures",
     "no_transcript",
-    // The bus brain's failure counters. `link_replies_assumed` and
-    // `link_listen_unsupported` are deliberately absent: both are documented
-    // non-failures, and a mover line for either would cry wolf.
+    // The bus brain's failure counters. `link_replies_assumed` is deliberately
+    // absent: it is a documented non-failure, and a mover line for it would cry
+    // wolf.
     "link_publish_failures",
     "link_response_timeouts",
     "link_tags_stripped",
@@ -890,13 +915,18 @@ fn narrate_wake_command_absent(fields: &Value) -> String {
     format!("utterance #{id} — wake, no command{cause} (score {score})")
 }
 
-/// A barge that cut the reply and then failed the confidence gate:
-/// `utterance #4 — barge, no command, low confidence no_speech=0.44
-/// logprob=-1.20`.
+/// Wake-less speech that failed the confidence gate: `utterance #4 — barge, no
+/// command, low confidence no_speech=0.44 logprob=-1.20`, or `utterance #4 —
+/// follow-up, no command, …` for speech inside a capture window, which cut
+/// nothing.
 fn narrate_barge_command_absent(fields: &Value) -> String {
     let id = fmt_u64(fields.get("utterance"));
+    let what = match fields.get("follow_up").and_then(Value::as_bool) {
+        Some(true) => "follow-up",
+        _ => "barge",
+    };
     format!(
-        "utterance #{id} — barge, no command{}",
+        "utterance #{id} — {what}, no command{}",
         decline_cause(fields)
     )
 }
@@ -1695,6 +1725,26 @@ mod tests {
                  logprob=-1.20"
             ),
             "{barge}"
+        );
+
+        // The same decline of speech inside a capture window, which cut nothing:
+        // the operator reading the console must not chase a barge that never was.
+        let follow_up = r
+            .render(
+                0,
+                "barge_command_absent",
+                &json!({
+                    "utterance": 5, "follow_up": true,
+                    "reason": "low_confidence", "no_speech": 0.44, "logprob": -1.2
+                }),
+            )
+            .unwrap();
+        assert!(
+            follow_up.ends_with(
+                "utterance #5 — follow-up, no command, low confidence no_speech=0.44 \
+                 logprob=-1.20"
+            ),
+            "{follow_up}"
         );
     }
 
@@ -2718,7 +2768,6 @@ mod tests {
                         "link_tags_stripped": 3,
                         "link_continuations_capped": 1,
                         "link_replies_assumed": 9,
-                        "link_listen_unsupported": 4,
                     }
                 }),
             )
@@ -2953,7 +3002,6 @@ mod tests {
         ("brain_dispatched", Class::Calm),
         ("brain_echo", Class::Calm),
         ("brain_link_continuation_capped", Class::Loud),
-        ("brain_link_listen_unsupported", Class::Loud),
         ("brain_link_publish_failed", Class::Loud),
         ("brain_link_reply_assumed", Class::Calm),
         ("brain_link_response_timeout", Class::Loud),
@@ -2983,6 +3031,9 @@ mod tests {
         ("conn_rejected", Class::Loud),
         ("conn_superseded", Class::Calm),
         ("console_sink_failed", Class::Loud),
+        ("cue_ignored", Class::Calm),
+        ("cue_library_loaded", Class::Calm),
+        ("cue_refused", Class::Loud),
         ("daemon_start", Class::Calm),
         ("echo_declined", Class::Calm),
         ("endpointer_transition", Class::Calm),
@@ -2992,6 +3043,9 @@ mod tests {
         ("listener_absent", Class::Loud),
         ("listener_event_dropped_overflow", Class::Loud),
         ("listener_thread_panicked", Class::Loud),
+        ("listen_expired", Class::Calm),
+        ("listen_heard", Class::Calm),
+        ("listen_opened", Class::Calm),
         ("listening", Class::Calm),
         ("pipeline_fatal", Class::Loud),
         ("playback_aborted", Class::Loud),
@@ -3042,6 +3096,7 @@ mod tests {
         ("wake_command_absent", Class::Calm),
         ("wake_decision", Class::Loud),
         ("wake_detected", Class::Calm),
+        ("wake_muted", Class::Calm),
         ("wake_sidecar_error", Class::Loud),
         ("wake_sidecar_skipped", Class::Loud),
         ("wake_stage_panicked", Class::Loud),

@@ -74,6 +74,13 @@ pub enum Feed {
         /// the latch alone, while a different turn is a new reply to cut.
         turn: Option<UtteranceId>,
     },
+    /// Open a capture window: for the next `window_samples` of audio, speech may be
+    /// carved with no wake word. Fed by the surface when a reply that asked to keep
+    /// listening has finished sounding.
+    ///
+    /// One-shot. The window closes on the first utterance minted under it, whatever
+    /// its provenance, and on the deadline passing with the endpointer idle.
+    Listen { window_samples: u64 },
     /// The transport segment closed (the authoritative outer boundary). Finalizes
     /// any in-progress utterance and clears the wake arm.
     SegmentClosed {
@@ -171,6 +178,11 @@ pub struct CarvedUtterance {
     /// point in its life: the floor was open on a chunk between its onset and its
     /// endpoint. `barge_in` implies this.
     pub over_playback: bool,
+    /// This utterance was carved inside an open capture window — the person kept
+    /// talking after a reply that asked them to. It passed the wake gate on the
+    /// window rather than on a wake arm, so `wake` is `None` and nothing is
+    /// trimmed (there is no wake word to trim).
+    pub follow_up: bool,
     /// Host-receipt stamps for this utterance's audio, from t0 to the carve.
     pub timing: CarveTiming,
 }
@@ -201,6 +213,22 @@ pub enum ListenerEvent {
         pod: PodId,
         epoch: u64,
         score: f32,
+        wake_end_sample: u64,
+    },
+    /// A wake phrase crossed threshold and was discarded unheard, because the pod
+    /// was muted — its own playback was sounding, or its tail had not yet passed.
+    /// Nothing was armed, reported as a detection, or cut.
+    ///
+    /// A reader is entitled to conclude that the wake word did fire in this
+    /// stretch and that the mute is why nothing came of it: with `Mute`
+    /// configured, this line is the difference between "the detector never
+    /// scored the phrase" and "it did, on the robot's own voice or over it". It
+    /// says nothing about whose voice — only that the machine was talking.
+    WakeMuted {
+        pod: PodId,
+        epoch: u64,
+        score: f32,
+        /// Absolute index one past the last sample of the discarded phrase.
         wake_end_sample: u64,
     },
     /// An interruption crossed the barge-in guard while interruptible playback was
@@ -294,6 +322,29 @@ pub enum ListenerEvent {
         cause: StatsFlushCause,
         summary: ScoreSummary,
     },
+    /// A capture window opened: speech beginning at or before `deadline_sample`
+    /// carves with no wake word. Accounting only — the window is the listener's own
+    /// state and nothing downstream acts on this.
+    ListenOpened {
+        pod: PodId,
+        epoch: u64,
+        /// The last absolute sample index at which speech may still begin inside
+        /// the window.
+        deadline_sample: u64,
+    },
+    /// Speech was heard inside an open capture window — at its onset, and again at
+    /// the carve that closes the window. A reader is entitled to conclude that a
+    /// person is talking to this pod right now and to hold off anything that would
+    /// end the interaction; it says nothing about what was said, which only the
+    /// utterance that follows can.
+    ListenHeard { pod: PodId, epoch: u64 },
+    /// A capture window ended with nothing carved under it: the wake word gates
+    /// the microphone again. Its deadline passed with the endpointer idle, or the
+    /// window outlived its reason — a new reply began over it, the stream
+    /// re-anchored past its deadline, or the connection went. One of these follows
+    /// every `ListenOpened` that no utterance closed, so a reader may balance the
+    /// two. Accounting only.
+    ListenExpired { pod: PodId, epoch: u64 },
 }
 
 /// Which model a [`ListenerEvent::ModelStats`] summarizes.

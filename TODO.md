@@ -4,35 +4,6 @@
 
 This is a placeholder entry. Leave it here so the file is never empty. It is not a real TODO. You would reference it in code with `// TODO(example-placeholder)` comments. This is the basic TODO system design: An entry here with a slug used to join to code comments. Add real TODOs below this one in this format.
 
-## `brenn-brain-listen` — BLOCKED as of 2026-08-03 (needs a hold-open capability in the listener)
-
-The pub/sub response vocabulary carries a `<listen/>` marker: "hold the microphone open after this
-reply, the person is expected to keep talking without saying the wake word again". `BrennBrain`
-recognizes it, strips it out of the speech, and reports `LinkListenUnsupported` — the behavior
-behind it does not exist. Capture is wake-word-gated, and the only playback-time capture trigger
-today is the barge latch (`OwwStream`'s barge path, `host/crates/speech-pipeline/src/listener/
-runtime.rs`). Without the marker a conversational exchange costs a wake word per turn, which is
-exactly the interaction an LLM on the other end is best at.
-
-The marker is in the wire vocabulary now precisely so this lands without a schema change: the peer
-already emits it, the codec already parses it, and the help document already tells the peer it is
-accepted-but-inert. So this is listener + pipeline work only — a way to arm capture for a bounded
-window after a reply finishes playing, without the wake gate, and a way for the brain to request it
-that survives the pipeline's inline dispatch (the marker is known when the segment is spoken, but
-the window opens when playback of that segment *ends*).
-
-Deferred rather than dismissed: it is a listener state-machine change with its own failure modes
-(what closes the window, what happens when the user says nothing, what happens when the held-open
-capture picks up the pod's own playback tail), not a line in the brain.
-
-Done = a `<listen/>`-marked reply holds capture open for a bounded window after its playback ends,
-speech in that window dispatches as an ordinary utterance with no wake word, the window closes on
-timeout or on the next dispatch, and `LinkListenUnsupported` is retired along with its stat and
-console name.
-
-See `TODO(brenn-brain-listen)` at the `Tag::Listen` arm of `BrennBrain::deliver` in
-`host/crates/speech-pipeline/src/brenn_brain.rs`.
-
 ## `bridge-upgrade-rejection-terminal` — BLOCKED as of 2026-08-02 (needs a change in the brenn repo first)
 
 A bearer token the brenn server does not accept — stale, rotated, mistyped, or pointed at the
@@ -670,3 +641,157 @@ whole replies.
 
 See `TODO(pod-playout-position)` at `PLAYBACK_PLAYOUT_HOP_MS` in
 `firmware/crates/audio-pipeline/src/playback.rs`.
+
+## `cue-library-hand-copied` — DEFERRED as of 2026-09-18 (needs the daemon to publish its library)
+
+`[brenn] library_names` points the speech server at a **copy** of the motion daemon's
+`cogs/library.names.json`, hand-placed on the host and refreshed by whoever remembers to refresh
+it. That file is what decides which pose and motion names a reply may cue and what each one's
+pace is, so a copy that has fallen behind the unit's real library refuses names that exist and
+admits names that do not — and the admitted ones are caught only at the daemon, which refuses the
+*whole* script an unknown name rides in, losing every cue beside it.
+
+The drift is detectable but not prevented: the daemon's per-script refusal is the detector, with a
+JSONL line on both sides. A pace the unit has re-recorded is worse, because nothing refuses it at
+all — the cued `move_ms` is simply computed against a stale duration and the head moves at the
+wrong speed with no line anywhere.
+
+Deferred because the fix is not in this repo: it is the daemon publishing its library (names,
+paces, blend-outs) to the speech server over the link they already share, which is a wire addition
+with a brenn-reachy side, and the copy is honest enough for a single hand-deployed unit.
+
+Done = the speech server learns the cue vocabulary from the deployed daemon rather than from a
+file an operator placed, `library_names` is retired or demoted to an offline/test override, and a
+test pins that a vocabulary the daemon never published cues nothing.
+
+See `TODO(cue-library-hand-copied)` at `library_names` in
+`host/crates/speech-surface/src/config.rs`.
+
+## `cue-timing-delivery-not-playback` — DEFERRED as of 2026-09-18 (needs a design decision: cues on the playback timeline)
+
+A `<pose/>` or `<motion/>` in a reply fires when the *message is delivered*, not when the words it
+sits beside are spoken. The brain hands the cue to the head in `handle` before it queues the
+speech, so the head moves a whole TTS round-trip — synthesis plus the pacer's preroll — ahead of
+the audio. On a short reply the gesture is over before the robot says anything; on a long one, a
+motion cued mid-sentence still plays at the start.
+
+Nothing is lost in the codec: `scan` already computes each marker's byte offset into the reply
+text, and `deliver` discards it. What is missing is the mapping from a text offset to an instant on
+the playback timeline, which needs the synthesizer to say where in the audio a character landed (or
+a good enough estimate), and a scripter that can hold a cue until then — neither of which exists,
+and both of which are design work rather than a patch.
+
+Done = a cue fires at the instant its marker's text is heard, within the tolerance the design that
+takes this on states, and a test pins a motion cued at the end of a long reply starting near the
+end of its audio rather than at its head.
+
+See `TODO(cue-timing-delivery-not-playback)` at the cue hand-off in `handle` in
+`host/crates/speech-pipeline/src/brenn_brain.rs`.
+
+## `cue-play-base-keep` — DEFERRED as of 2026-09-18 (needs the scripter to know the head is not at rest)
+
+Every script emitted while a cued motion runs renders `[pose@0, play@1]`, where the base step is the
+standing pose **restated** rather than a `keep`. `keep` is the step designed for exactly this — hold
+whatever the head is at and put an overlay over it — and restating costs a base re-plan from the
+composed setpoint on every one of those emissions (the refresh cadence, every `Audio` fact, every
+`TurnEnded`). It is harmless today because the re-plan targets where the head already is, so it is a
+no-op in practice, but it is a re-plan the daemon runs and a target the scripter asserts rather than
+the "stay put" it means.
+
+The reason it is not `keep` already: `keep` is unlawful from a daemon phase where the head is at
+rest, and the scripter cannot currently be sure it is not — a cue can arrive against a want whose
+script the daemon has timed out from under it, and the restated pose is lawful from any phase.
+Fixing it means the scripter tracking the daemon's phase, or the wire admitting a `keep` that
+degrades to a pose when there is nothing to keep.
+
+Done = the base under a running play is `keep`, with the "is the head up" question answered by
+something the scripter actually knows, and a test pins that a cue arriving against a lapsed script
+still lands the head somewhere definite.
+
+See `TODO(cue-play-base-keep)` at the running-motion render in `emit` in
+`host/crates/speech-surface/src/scripter.rs`.
+
+## `barge-mute-costs-every-interruption` — DEFERRED as of 2026-09-18 (needs working echo cancellation or a playback-subtracting listener)
+
+`[barge] mode = "mute"` scores every captured chunk as silence while the pod's playback floor is
+active and for `mute_tail_samples` after it drops. That is the only rule on this unit that reliably
+stops the robot hearing its own reply — the wake model fires on the machine's own voice and the
+sustain rule fires on it too — but it is blunt in exactly one direction: an audible reply cannot be
+interrupted by voice **at all**, not even by the wake word. A person who talks across the robot is
+not heard and has to say it again once it has stopped, and a runaway reply can only be stopped by
+waiting it out.
+
+The mode is a deliberate trade, not a bug, and the other two modes are untouched for a deployment
+whose AEC can be trusted. What makes it a limit rather than a choice is that on this hardware there
+is no third option: the unit's echo cancellation is unreliable enough that `Wake` and `Speech` both
+mishear the reply.
+
+Done = the barge rules can tell the robot's own voice from a person's over live playback — through
+AEC that holds up on this unit, or a listener that subtracts the playback stream it is itself
+feeding — and the wake word cuts a reply again without the echo arming it.
+
+See `TODO(barge-mute-costs-every-interruption)` at `BargeMode::Mute` in
+`host/crates/speech-pipeline/src/listener/runtime.rs`.
+
+## `listen-window-single-utterance` — DEFERRED as of 2026-09-18 (needs a decision about what closes a window)
+
+A `<listen/>` capture window is one-shot: it closes at the first utterance minted inside it,
+whatever that utterance's provenance, and nothing reopens it before the next reply that asks to
+listen. So a follow-up the confidence gate then **declines** — a cough, a television, a mumbled
+half-word — has spent the window. The person is answered with nothing, the head waits out one
+linger, and to be heard again they have to say the wake word.
+
+One utterance per window is what keeps the window's lifetime obviously bounded: it cannot outlive
+the dispatch it produced, so there is no accounting for a window that opened three replies ago.
+Reopening on a decline needs an answer to how many declines a window survives and how its deadline
+is re-dated, which is the open-microphone policy question the one-shot rule deliberately does not
+ask.
+
+Done = a follow-up the gate declines does not cost the window, under a stated bound on how long a
+window may stay open and how many declines it absorbs, and a listener test drives a declined carve
+inside a window and carves a second utterance in the same one.
+
+See `TODO(listen-window-single-utterance)` at the window's close in `carve_utterance` in
+`host/crates/speech-pipeline/src/listener/runtime.rs`.
+
+## `cue-motion-one-at-a-time` — DEFERRED as of 2026-09-18 (needs a decision about blending and queueing)
+
+The scripter holds one running motion per pod. A second `<motion/>` cue replaces the first
+outright: the old overlay row is not restated, so the daemon cuts it on its next tick with no
+blend, and the new play joins afresh. A reply that cues two gestures gets a visible snap between
+them, and a reply that cues a long motion and then a short one loses the long one's ending.
+
+Last-cue-wins is the stated preference over a queue — a queued gesture plays after the words it
+belonged to are long spoken — so the replacement is right; what is missing is the blend, and
+possibly a second overlay row for a gesture that composes with the first rather than replacing it.
+Both are motion-composition decisions with a daemon side (the overlay rows are positional and the
+pick-up rule is the daemon's), not a scripter patch.
+
+Done = a motion cued over a running one either blends out of it or composes with it, the choice is
+stated where `Running` is declared, and a scripter test pins what the replacement script says.
+
+See `TODO(cue-motion-one-at-a-time)` at the `MotionCue::Motion` arm of `cue` in
+`host/crates/speech-surface/src/scripter.rs`.
+
+## `listen-window-owns-the-stow` — DEFERRED as of 2026-09-18 (needs the window to own the head's ending)
+
+`ScriptInput::Heard` re-dates the head's stow to a fixed `presence_linger_ms` from *now*, at two
+instants: the follow-up's onset, and its carve. Between them nothing re-dates anything — the
+endpointer reports no transition while speech continues — so a follow-up spoken without a break for
+longer than `presence_linger_ms` runs the onset's linger out mid-sentence. The head starts down
+while the person is still talking, the carve's `Heard` finds the pod `Stowing` and is refused, and
+`TurnStarted` jerks it back up at dispatch.
+
+The exposure is bounded by `presence_linger_ms` (8 s by default) and the operator can raise it, so
+it is a bad-looking moment rather than a lost turn. The right shape is the window owning the
+ending outright: the listener already waits for the endpointer to go fully idle before emitting
+`ListenExpired`, so a stow dated from *that* covers speech of any length, with a fallback ceiling
+for a window the listener never expires. That is a different ownership of the head's ending than
+the two fixed re-datings, and it is the design decision this waits on.
+
+Done = the head's stow after a listening reply is dated from the window's own end rather than from
+a fixed linger at each of two instants, with a stated ceiling, and a scripter test drives speech
+longer than `presence_linger_ms` with the head never starting down.
+
+See `TODO(listen-window-owns-the-stow)` at `wait_out_linger` in
+`host/crates/speech-surface/src/scripter.rs`.

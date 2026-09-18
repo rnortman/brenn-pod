@@ -207,6 +207,18 @@ pub struct SpeakCmd {
     pub timings: StageTimings,
 }
 
+/// A movement a response asked for.
+///
+/// The names are the peer's own text, unresolved against the deployed library.
+/// A name that does not resolve is refused at the seam that holds the library.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cue {
+    /// Take this pose for the rest of the reply.
+    Pose { name: String, speed: Option<f64> },
+    /// Play this motion once over the standing pose.
+    Motion { name: String, speed: Option<f64> },
+}
+
 /// The payload of a `SpeakCmd`: text to synthesize, or ready PCM to play.
 #[derive(Debug, Clone, Serialize)]
 pub enum SpeakBody {

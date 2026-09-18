@@ -32,27 +32,29 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use futures::channel::mpsc as fmpsc;
+use motion_proto::{MAX_SPEED, MAX_TIMEOUT_MS, MIN_SPEED, Play, PlayWindow, STOW_POSE};
 use pod_ingest::{HostMicros, SegmentRef};
 use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
     AudioSpan, Brain, BrainEvent, BrainEventFn, BrainStats, CarveTiming, CarvedUtterance,
-    ConfidenceGate, DoaTrack, EndpointCause, FlushRejected, GateReject, InterruptProgress,
-    ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment, SegmentTelemetry,
-    SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError, Transcriber, Transcript,
-    Utterance, UtteranceId, WakeCommandReason, WakeConfirmation, stage_delta_us, tracking_event,
-    transcribe_pcm,
+    ConfidenceGate, Cue, CueTap, DoaTrack, EndpointCause, Feed, FlushRejected, GateReject,
+    InterruptProgress, ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment,
+    SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError,
+    Transcriber, Transcript, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation,
+    stage_delta_us, tracking_event, transcribe_pcm,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::barge::TurnLedger;
-use crate::config::WakeWordInStt;
+use crate::config::{CueLibrary, WakeWordInStt};
 use crate::jsonl::JsonlHandle;
+use crate::playback_router::FeedFn;
 use crate::recorder::{
     WakeClass, WakeClassUpdate, sanitize_filename, set_wake_class, sidecar_path,
 };
-use crate::scripter::{ScriptHandle, ScriptInput};
+use crate::scripter::{MotionCue, Raise, ScriptHandle, ScriptInput};
 
 /// The pipeline exited on an unrecoverable fault. The server renders this to a
 /// `pipeline_fatal` JSONL line and a nonzero exit.
@@ -117,6 +119,7 @@ impl PipelineItem {
             PipelineItem::Connected { pod, .. } => pod,
             PipelineItem::Listener(ev) => match ev {
                 WakeDetected { pod, .. }
+                | WakeMuted { pod, .. }
                 | BargeIn { pod, .. }
                 | SoftEndpoint { pod, .. }
                 | Superseded { pod, .. }
@@ -124,7 +127,10 @@ impl PipelineItem {
                 | WakeHeld { pod, .. }
                 | ArmExpired { pod, .. }
                 | EndpointerTransition { pod, .. }
-                | ModelStats { pod, .. } => pod,
+                | ModelStats { pod, .. }
+                | ListenOpened { pod, .. }
+                | ListenHeard { pod, .. }
+                | ListenExpired { pod, .. } => pod,
             },
         }
     }
@@ -142,6 +148,7 @@ impl PipelineItem {
             PipelineItem::Connected { .. } => "connected",
             PipelineItem::Listener(ev) => match ev {
                 WakeDetected { .. } => "wake_detected",
+                WakeMuted { .. } => "wake_muted",
                 BargeIn { .. } => "barge_in",
                 SoftEndpoint { .. } => "soft_endpoint",
                 Superseded { .. } => "superseded",
@@ -150,6 +157,9 @@ impl PipelineItem {
                 ArmExpired { .. } => "arm_expired",
                 EndpointerTransition { .. } => "endpointer_transition",
                 ModelStats { .. } => "model_stats",
+                ListenOpened { .. } => "listen_opened",
+                ListenHeard { .. } => "listen_heard",
+                ListenExpired { .. } => "listen_expired",
             },
         }
     }
@@ -181,6 +191,34 @@ pub(crate) struct BargeWiring {
     pub(crate) flush: FlushFn,
 }
 
+/// How a `<listen/>` reply's capture window is opened: the listener feed and how
+/// long the window runs, in samples.
+///
+/// One struct and not two fields because a window length with nothing to feed is
+/// not a configuration — the two are wired together or not at all. Shared by
+/// both openers so the window's length cannot depend on which of two races won.
+pub(crate) struct ListenWiring {
+    /// The same listener feed the playback fan-out drives the floor with.
+    pub(crate) feed: FeedFn,
+    /// How long the window stays open, in samples at the capture rate. Dated by
+    /// the listener from its own cursor, so nothing here is a wall clock.
+    pub(crate) window_samples: u64,
+}
+
+impl ListenWiring {
+    /// Open the window on `pod`. The one place a `Feed::Listen` is built, so the
+    /// two openers cannot come to disagree about its length.
+    pub(crate) async fn open(&self, pod: PodId) {
+        (self.feed)(
+            pod,
+            Feed::Listen {
+                window_samples: self.window_samples,
+            },
+        )
+        .await;
+    }
+}
+
 /// Pass-through configuration and shared counters for [`run`].
 pub struct PipelineCtx {
     /// The record-store directory, or `None` when recording is disabled.
@@ -198,10 +236,20 @@ pub struct PipelineCtx {
     /// Barge-in wiring, or `None` in a pipeline with no playback path (the replay
     /// rigs), where a detected barge-in is a log line and nothing more.
     pub(crate) barge: Option<BargeWiring>,
+    /// How a `<listen/>` reply opens its capture window, or `None` with no
+    /// listener wired. One of the two openers lives here; the other is the
+    /// playback fan-out, and whichever of the brain's return and the last clip's
+    /// settle comes second is the one that fires.
+    pub(crate) listen: Option<Arc<ListenWiring>>,
     /// Where the interaction's lifecycle points are reported for the head, or
     /// `None` when no presence channel is configured. Every tap is a
     /// non-blocking send; nothing in this task waits on it.
     pub(crate) scripter: Option<ScriptHandle>,
+    /// The poses and motions a reply may name, or `None` when the deployment
+    /// configured no library — in which case no reply can move the head, since
+    /// nothing here could tell an offered name from an invented one, and every
+    /// cue is refused with a line saying so.
+    pub(crate) cues: Option<Arc<CueLibrary>>,
 }
 
 /// How many recent segments and wake detections to retain per pod for sidecar
@@ -224,6 +272,9 @@ struct Carve {
     /// This carve's speech was heard over the pod's own playback, whether or not
     /// it cut it. The gate below makes such a carve prove it is speech.
     over_playback: bool,
+    /// This carve was heard inside an open capture window: the person kept talking
+    /// after a reply that asked them to, with no wake word.
+    follow_up: bool,
     /// The listener's host-receipt stamps for this utterance's audio, from t0 to
     /// the carve. Copied onto the minted `Utterance`'s `StageTimings`.
     timing: CarveTiming,
@@ -363,17 +414,6 @@ pub async fn run(
     ctx: PipelineCtx,
     jsonl: JsonlHandle,
 ) -> Result<(), PipelineFatal> {
-    let PipelineCtx {
-        record_dir,
-        clock_step_clamps,
-        transcriber,
-        brain,
-        confidence_gate,
-        wake_word,
-        barge,
-        scripter,
-    } = ctx;
-
     let mut pods: HashMap<PodId, PodState> = HashMap::new();
     // One `Utterance` id per dispatched utterance; unique within this loop (the
     // single minter), scoped locally so concurrent pipelines never interleave.
@@ -396,7 +436,7 @@ pub async fn run(
             .min();
         tokio::select! {
             () = sleep_until_opt(next_release), if !queue_closed => {
-                release_due_holds(&mut pods, scripter.as_ref(), &jsonl);
+                release_due_holds(&mut pods, ctx.scripter.as_ref(), &jsonl);
             }
             item = rx.recv(), if !queue_closed => match item {
                 None => {
@@ -408,41 +448,19 @@ pub async fn run(
                     }
                 }
                 Some(PipelineItem::Segment { seg, epoch }) => {
-                    handle_segment(*seg, epoch, &mut pods, record_dir.as_deref(), &clock_step_clamps, &jsonl)
+                    handle_segment(*seg, epoch, &mut pods, ctx.record_dir.as_deref(), &ctx.clock_step_clamps, &jsonl)
                         .await;
                 }
                 Some(PipelineItem::Connected { pod, epoch, room, log }) => {
                     handle_connected(pod, epoch, room, log, &mut pods, &jsonl);
                 }
                 Some(PipelineItem::Listener(ev)) => {
-                    handle_listener(
-                        ev,
-                        &mut pods,
-                        record_dir.as_deref(),
-                        transcriber.as_ref(),
-                        wake_word,
-                        &done_tx,
-                        &mut next_utterance_id,
-                        brain.as_ref(),
-                        barge.as_ref(),
-                        scripter.as_ref(),
-                        &jsonl,
-                    )
-                    .await;
+                    handle_listener(ev, &mut pods, &done_tx, &mut next_utterance_id, &ctx, &jsonl)
+                        .await;
                 }
             },
             Some(done) = done_rx.recv() => {
-                handle_stt_done(
-                    done,
-                    &mut pods,
-                    &mut next_utterance_id,
-                    &confidence_gate,
-                    brain.as_ref(),
-                    barge.as_ref(),
-                    scripter.as_ref(),
-                    &jsonl,
-                )
-                .await;
+                handle_stt_done(done, &mut pods, &mut next_utterance_id, &ctx, &jsonl).await;
             }
         }
     }
@@ -605,21 +623,50 @@ pub fn event_line(envelope: serde_json::Value, payload: &impl Serialize) -> serd
 
 /// Route one listener event: record wakes (and upgrade sidecar labels), spawn or
 /// abort speculative STT.
-#[allow(clippy::too_many_arguments)]
 async fn handle_listener(
     ev: ListenerEvent,
     pods: &mut HashMap<PodId, PodState>,
-    record_dir: Option<&Path>,
-    transcriber: Option<&Arc<dyn Transcriber>>,
-    wake_word: WakeWordInStt,
     done_tx: &mpsc::UnboundedSender<SttDone>,
     next_utterance_id: &mut u64,
-    brain: Option<&BrainWiring>,
-    barge: Option<&BargeWiring>,
-    scripter: Option<&ScriptHandle>,
+    ctx: &PipelineCtx,
     jsonl: &JsonlHandle,
 ) {
+    // Destructured: six optional handles, and bare `None`s in positional
+    // arguments are easy to swap silently.
+    let PipelineCtx {
+        record_dir,
+        transcriber,
+        wake_word,
+        brain,
+        barge,
+        scripter,
+        ..
+    } = ctx;
+    let wake_word = *wake_word;
+    let (record_dir, transcriber, brain, barge, scripter) = (
+        record_dir.as_deref(),
+        transcriber.as_ref(),
+        brain.as_ref(),
+        barge.as_ref(),
+        scripter.as_ref(),
+    );
     match ev {
+        ListenerEvent::WakeMuted {
+            pod,
+            epoch,
+            score,
+            wake_end_sample,
+        } => {
+            // A line and nothing else: the detection was discarded in the
+            // listener, so nothing here has an arm, a turn or a head to move.
+            // It is the record that the phrase did fire while the pod was
+            // muted — the reading behind both "the wake word did not work
+            // during the reply" and "the echo still trips the detector".
+            jsonl.emit(
+                "wake_muted",
+                &json!({ "pod": pod.0, "epoch": epoch, "score": score, "wake_end_sample": wake_end_sample }),
+            );
+        }
         ListenerEvent::WakeDetected {
             pod,
             epoch,
@@ -838,6 +885,29 @@ async fn handle_listener(
                 ),
             );
         }
+        ListenerEvent::ListenOpened {
+            pod,
+            epoch,
+            deadline_sample,
+        } => {
+            jsonl.emit(
+                "listen_opened",
+                &json!({ "pod": pod.0, "epoch": epoch, "deadline_sample": deadline_sample }),
+            );
+        }
+        ListenerEvent::ListenHeard { pod, epoch } => {
+            jsonl.emit("listen_heard", &json!({ "pod": pod.0, "epoch": epoch }));
+            // The head's ending was dated from the reply that opened the window,
+            // and nothing between here and the follow-up's dispatch moves it:
+            // `TurnStarted` comes after the endpoint, STT and the gate. Without
+            // this the head starts down mid-follow-up and jerks back up.
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::Heard(pod.clone()));
+            }
+        }
+        ListenerEvent::ListenExpired { pod, epoch } => {
+            jsonl.emit("listen_expired", &json!({ "pod": pod.0, "epoch": epoch }));
+        }
         ListenerEvent::Superseded { pod, utterance_id } => {
             // Emitted before the abort so a supersede is correlatable by utterance
             // id; the transition line alone names no utterance.
@@ -994,6 +1064,7 @@ fn spawn_stt(
         cause,
         barge_in,
         over_playback,
+        follow_up,
         timing,
     } = utterance;
     let carve = Carve {
@@ -1006,6 +1077,7 @@ fn spawn_stt(
         // rides through so the mint on the far side can chain the interrupted turns.
         barge_in,
         over_playback,
+        follow_up,
         timing,
         sent_from,
     };
@@ -1064,12 +1136,29 @@ async fn handle_stt_done(
     done: SttDone,
     pods: &mut HashMap<PodId, PodState>,
     next_utterance_id: &mut u64,
-    confidence_gate: &ConfidenceGate,
-    brain: Option<&BrainWiring>,
-    barge: Option<&BargeWiring>,
-    scripter: Option<&ScriptHandle>,
+    ctx: &PipelineCtx,
     jsonl: &JsonlHandle,
 ) {
+    // The wiring this dispatch reaches for, named once: five of the ctx's
+    // optional handles are used here, and threading them in one by one is how a
+    // call site becomes a row of bare `None`s that an argument-order mistake
+    // typechecks straight through.
+    let PipelineCtx {
+        confidence_gate,
+        brain,
+        barge,
+        listen,
+        scripter,
+        cues,
+        ..
+    } = ctx;
+    let (brain, barge, listen, scripter, cues) = (
+        brain.as_ref(),
+        barge.as_ref(),
+        listen.as_ref(),
+        scripter.as_ref(),
+        cues.as_ref(),
+    );
     let Some(state) = pods.get_mut(&done.pod) else {
         return;
     };
@@ -1177,6 +1266,7 @@ async fn handle_stt_done(
             stt_elapsed_us,
             stt_trim_samples: utterance.wake.map(|w| w.stt_trim_samples),
             stt_sent_from_sample: done.carve.sent_from,
+            follow_up: done.carve.follow_up,
         },
     );
 
@@ -1189,7 +1279,10 @@ async fn handle_stt_done(
     // pod's own voice, or an empty transcript is never gated. A scored wake accept
     // is gated through its wake provenance; a barge-in utterance has no wake word,
     // so a second arm keyed on the barge mark declines the barging speech that
-    // transcribed to nothing — the playback is already cut. A third arm catches
+    // transcribed to nothing — the playback is already cut. A third declines
+    // speech carved inside an open capture window, which is wake-less by
+    // construction and would otherwise reach the brain on nothing but the room's
+    // noise for the whole window. A fourth catches
     // the case the guard let past: audio over the robot's own playback that never
     // sustained enough to cut it, which under a bypassed wake gate would otherwise
     // reach the brain on the strength of the reply's own echo.
@@ -1201,19 +1294,25 @@ async fn handle_stt_done(
         .and_then(|conf| confidence_gate.evaluate(conf));
     let gate = match (utterance.wake, confidence_reject) {
         (Some(wake), Some(reject)) => GateOutcome::DeclineWake(wake, reject),
+        (None, Some(reject)) if done.carve.follow_up => GateOutcome::DeclineFollowUp(reject),
         (None, Some(reject)) if done.carve.barge_in => GateOutcome::DeclineBarge(reject),
         (None, Some(reject)) if done.carve.over_playback => GateOutcome::DeclineEcho(reject),
         _ => GateOutcome::Dispatch,
     };
     // A wake or barge decline is a raise that produced no turn: the head is up and
     // nothing will follow, so the settle starts here rather than waiting for the
-    // engagement's ceiling. An echo decline is not a raise — nobody raised, and
+    // engagement's ceiling. A declined follow-up is the same shape — the head has
+    // been waiting out the capture window and no turn is coming of what it heard,
+    // so it folds a linger from the decline. An echo decline is not a raise —
+    // nobody raised, and
     // `Unanswered` clears the pod's current turn, which would cut short the script
     // of the very reply the echo came from.
     if let Some(scripter) = scripter
         && matches!(
             gate,
-            GateOutcome::DeclineWake(..) | GateOutcome::DeclineBarge(..)
+            GateOutcome::DeclineWake(..)
+                | GateOutcome::DeclineBarge(..)
+                | GateOutcome::DeclineFollowUp(..)
         )
     {
         scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
@@ -1223,12 +1322,20 @@ async fn handle_stt_done(
             decline_low_confidence(&utterance, &wake, reject, wiring)
         }
         GateOutcome::DeclineBarge(reject) => {
-            decline_barge_low_confidence(&utterance, reject, wiring);
+            decline_barge_low_confidence(&utterance, reject, false, wiring);
             // The playback is already cut and `handle` will never run for this
             // utterance, so this is the brain's only chance to hear that its response
             // was interrupted with nothing usable said in its place. Non-blocking by
             // contract, like `interrupt`.
             wiring.brain.barge_declined(&utterance);
+        }
+        GateOutcome::DeclineFollowUp(reject) => {
+            // No `barge_declined`: nothing was interrupted. The reply that opened
+            // the window played out in full and the turn behind it has already
+            // ended; what tripped the gate is the room, not an interruption. A
+            // reader tuning barge thresholds off this count needs to know these
+            // are not barges.
+            decline_barge_low_confidence(&utterance, reject, true, wiring);
         }
         GateOutcome::DeclineEcho(reject) => decline_echo(&utterance, reject, wiring),
         GateOutcome::Dispatch => {
@@ -1240,6 +1347,17 @@ async fn handle_stt_done(
                 &json!({ "pod": utterance.pod.0, "utterance": utterance.id }),
             );
             let (pod, id) = (utterance.pod.clone(), utterance.id);
+            // The movements this turn's reply may ask for. Always wired, even
+            // where nothing could carry them out: a reply that asks a
+            // deployment with no vocabulary or no head to move is a
+            // misconfiguration somewhere, and the tap is what says so.
+            let cue_tap = Some(cue_tap(
+                cues.map(Arc::clone),
+                scripter.cloned(),
+                jsonl.clone(),
+                pod.clone(),
+                id,
+            ));
             // Recorded at every dispatch, barge or not: this turn is what the *next*
             // interrupt would chain.
             let sink = match barge {
@@ -1251,9 +1369,9 @@ async fn handle_stt_done(
                     );
                     let ledger = Arc::clone(&barge.ledger);
                     let (tap_pod, tap_id) = (pod.clone(), id);
-                    ResponseSink::with_tap(
+                    ResponseSink::with_taps(
                         wiring.speak_tx.clone(),
-                        Arc::new(move |cmd: &SpeakCmd| {
+                        Some(Arc::new(move |cmd: &SpeakCmd| {
                             ledger.record_cmd(
                                 &tap_pod,
                                 tap_id,
@@ -1264,10 +1382,11 @@ async fn handle_stt_done(
                                     SpeakBody::Pcm(_) => None,
                                 },
                             );
-                        }),
+                        })),
+                        cue_tap,
                     )
                 }
-                None => ResponseSink::new(wiring.speak_tx.clone()),
+                None => ResponseSink::with_taps(wiring.speak_tx.clone(), None, cue_tap),
             };
             // Around the await, not inside the barge arm below: a turn is in
             // flight for as long as the brain has it, and that is what keeps
@@ -1292,7 +1411,7 @@ async fn handle_stt_done(
                 // that no further command is coming for this turn — which is what
                 // lets its settlement complete, and one of the three facts the
                 // head's ending is scheduled from.
-                let audio = barge.ledger.dispatch_done(&pod, id);
+                let audio = barge.ledger.dispatch_done(&pod, id, end);
                 if let Some(scripter) = scripter {
                     scripter.send(ScriptInput::Audio {
                         pod: pod.clone(),
@@ -1300,9 +1419,170 @@ async fn handle_stt_done(
                         audio,
                     });
                 }
+                // The opener for a reply whose last clip was already heard out
+                // when the brain returned — a chain whose final segment carries
+                // no speech at all settles before this call. The fan-out is the
+                // opener for the ordinary case; `listen_open` is true on exactly
+                // one of the two, so the window opens once.
+                if let Some(listen) = listen
+                    && audio.listen_open
+                {
+                    listen.open(pod.clone()).await;
+                }
             }
         }
     }
+}
+
+/// Resolve one movement a reply named against the deployed library, or say why
+/// it cannot be made.
+///
+/// Every name must resolve before it reaches the wire: an unresolvable name in
+/// a script costs every other movement in that script, because the daemon
+/// refuses the script whole. The speed range is checked here too, because this
+/// is where the number is turned into the absolute pace the wire carries.
+///
+/// The returned reason is what the refusal line reports: short, stable, and
+/// about the cue rather than about the reply.
+fn resolve_cue(library: &CueLibrary, cue: &Cue) -> Result<MotionCue, &'static str> {
+    let (name, speed) = match cue {
+        Cue::Pose { name, speed } | Cue::Motion { name, speed } => (name.as_str(), *speed),
+    };
+    if let Some(speed) = speed
+        && !(speed.is_finite() && (MIN_SPEED..=MAX_SPEED).contains(&speed))
+    {
+        return Err("speed_out_of_range");
+    }
+    match cue {
+        Cue::Pose { .. } => {
+            // Rest is not a pose a reply gets to command: the stow is the
+            // ending the fault ladder and the script compiler both treat
+            // structurally, and a reply that wants the head down simply stops
+            // asking it to stay up.
+            if name == STOW_POSE {
+                return Err("stow_not_cueable");
+            }
+            let (pose, duration_ms) = library.pose(name).ok_or("unknown_pose")?;
+            // Silence is the library's own pace, so a cue at unit speed states
+            // no pace at all — the same thing a presence raise does.
+            let move_ms = match speed {
+                None => None,
+                Some(speed) if (speed - 1.0).abs() < f64::EPSILON => None,
+                Some(speed) => {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "a duration in milliseconds, divided by a speed in 0.25..=2.0"
+                    )]
+                    let move_ms = (duration_ms as f64 / speed).ceil() as u64;
+                    // The wire's own ceiling, checked where the number is made.
+                    // Refused rather than clamped: a pace nobody asked for is
+                    // not a repair.
+                    if move_ms > MAX_TIMEOUT_MS {
+                        return Err("move_too_long");
+                    }
+                    Some(move_ms)
+                }
+            };
+            Ok(MotionCue::Pose(Raise { pose, move_ms }))
+        }
+        Cue::Motion { .. } => {
+            let (motion, span) = library.motion(name).ok_or("unknown_motion")?;
+            let play = match speed {
+                Some(speed) => Play::at_speed(motion.as_ref(), speed),
+                None => Play::new(motion.as_ref()),
+            };
+            let span_ms = PlayWindow {
+                duration_ms: span.duration_ms,
+                blend_out_ms: span.blend_out_ms,
+            }
+            .span_ms(play.speed);
+            // The wire's own ceiling again, for the same reason as the pose's
+            // pace: the span becomes the timeout of every script that restates
+            // this play, and a timeout past the bound is a script the wire
+            // refuses to build at all. Checked where the number is made, and
+            // with the one millisecond the render puts the play's step at.
+            if span_ms.saturating_add(1) > MAX_TIMEOUT_MS {
+                return Err("motion_too_long");
+            }
+            Ok(MotionCue::Motion { play, span_ms })
+        }
+    }
+}
+
+/// Write the line that says a cue asked for did not happen: which movement, and
+/// why. The one place a refusal is narrated, so every reason reads the same.
+fn emit_cue_refused(jsonl: &JsonlHandle, pod: &PodId, turn: UtteranceId, cue: &Cue, reason: &str) {
+    let (kind, name) = match cue {
+        Cue::Pose { name, .. } => ("pose", name),
+        Cue::Motion { name, .. } => ("motion", name),
+    };
+    jsonl.emit(
+        "cue_refused",
+        &json!({
+            "pod": pod.0,
+            "utterance": turn,
+            "kind": kind,
+            "name": name,
+            "reason": reason,
+        }),
+    );
+}
+
+/// The tap the brain hands each response message's movements to: resolve them,
+/// say which were refused, and send the rest to the head as one input.
+///
+/// One input per message and not one per cue, because the movements of one
+/// reply are one decision — the last pose and the last motion in it are what
+/// the head ends up doing, and splitting them would make the head act out an
+/// ordering the reply never meant.
+///
+/// `library` and `scripter` are each absent in a deployment that configured no
+/// cue vocabulary or no head at all. The tap is built anyway: a reply asking
+/// such a deployment to move is narrated as a refusal rather than dropped in
+/// silence, because it is the one failure an operator's own edit produces and
+/// the log is the only place it shows.
+fn cue_tap(
+    library: Option<Arc<CueLibrary>>,
+    scripter: Option<ScriptHandle>,
+    jsonl: JsonlHandle,
+    pod: PodId,
+    turn: UtteranceId,
+) -> CueTap {
+    Arc::new(move |cues: Vec<Cue>| {
+        let (library, scripter) = match (&library, &scripter) {
+            (Some(library), Some(scripter)) => (library, scripter),
+            (library, _) => {
+                let reason = if library.is_none() {
+                    "no_library"
+                } else {
+                    "no_head"
+                };
+                for cue in &cues {
+                    emit_cue_refused(&jsonl, &pod, turn, cue, reason);
+                }
+                return;
+            }
+        };
+        let mut resolved = Vec::with_capacity(cues.len());
+        for cue in cues {
+            match resolve_cue(library, &cue) {
+                Ok(resolved_cue) => resolved.push(resolved_cue),
+                // Dropped, not corrected: the movement the reply asked for
+                // cannot be made, and the nearest one it did not ask for is
+                // not an improvement. The rest of the message's cues stand.
+                Err(reason) => emit_cue_refused(&jsonl, &pod, turn, &cue, reason),
+            }
+        }
+        if !resolved.is_empty() {
+            scripter.send(ScriptInput::Cues {
+                pod: pod.clone(),
+                turn,
+                cues: resolved,
+            });
+        }
+    })
 }
 
 /// Build an `AudioSpan` for `[start_sample, end_sample)` from the pod's recent
@@ -1377,13 +1657,18 @@ fn push_bounded<T>(dq: &mut VecDeque<T>, item: T) {
 
 /// What the STT-confidence gate decided for a minted utterance: dispatch it, or
 /// decline it as a likely hallucination — through the wake provenance for a scored
-/// wake accept, through the barge mark for a barge-in utterance with no wake, or
+/// wake accept, through the barge mark for a barge-in utterance with no wake,
+/// through the follow-up mark for one carved inside an open capture window, or
 /// through the overlap mark for one carved over the pod's own voice that cut
 /// nothing.
 enum GateOutcome {
     Dispatch,
     DeclineWake(WakeConfirmation, GateReject),
     DeclineBarge(GateReject),
+    /// Speech carved inside a `<listen/>` window that transcribed to likely
+    /// hallucination. The window is wake-less by construction, so without this
+    /// an open room's noise would reach the brain ungated for the whole window.
+    DeclineFollowUp(GateReject),
     DeclineEcho(GateReject),
 }
 
@@ -1408,16 +1693,23 @@ fn decline_low_confidence(
     wiring.stats.record_wake_command_absent();
 }
 
-/// Report a confidence-gated barge-in utterance without dispatching it — a
-/// `BargeCommandAbsent` carrying the offending signals in place of wake provenance.
-/// A non-error outcome: the barge already cut the playback, and the barging speech
-/// transcribed to likely hallucination, so the phantom text is never echoed.
-fn decline_barge_low_confidence(utterance: &Utterance, reject: GateReject, wiring: &BrainWiring) {
+/// Report a confidence-gated wake-less utterance without dispatching it — a
+/// `BargeCommandAbsent` carrying the offending signals in place of wake provenance,
+/// and `follow_up` saying which wake-less provenance it had. A non-error outcome:
+/// the speech transcribed to likely hallucination, so the phantom text is never
+/// echoed.
+fn decline_barge_low_confidence(
+    utterance: &Utterance,
+    reject: GateReject,
+    follow_up: bool,
+    wiring: &BrainWiring,
+) {
     (wiring.events)(BrainEvent::BargeCommandAbsent {
         utterance: utterance.id,
         audio_ref: utterance.audio_ref.clone(),
         no_speech_prob: reject.no_speech_prob,
         avg_logprob: reject.avg_logprob,
+        follow_up,
     });
     wiring.stats.record_barge_command_absent();
 }
@@ -1512,6 +1804,9 @@ struct UtteranceLine<'a> {
     stt_elapsed_us: Option<u64>,
     stt_trim_samples: Option<usize>,
     stt_sent_from_sample: Option<usize>,
+    /// Whether this utterance was heard inside a capture window rather than on a
+    /// wake word: it carries no wake provenance and none was needed.
+    follow_up: bool,
 }
 
 /// The `tracking` JSONL line: the full `TrackingEvent` flattened in, plus the
@@ -1579,6 +1874,7 @@ mod tests {
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
             over_playback: false,
+            follow_up: false,
             timing: CarveTiming::default(),
         }
     }
@@ -1700,14 +1996,30 @@ mod tests {
     struct RecordingBrain {
         log: Arc<Mutex<NudgeLog>>,
         end: TurnEnd,
+        /// When set, the turn's one cmd is started and settled clean against
+        /// this ledger before `handle` returns — the chain whose last segment
+        /// carries no speech, where playback is over before the brain is.
+        settle_first: Option<Arc<TurnLedger>>,
+        /// The movements this brain's reply asks for, handed to the cue tap
+        /// ahead of the speech as a real reply's are.
+        cues: Vec<Cue>,
     }
 
     impl Brain for RecordingBrain {
         fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
+            let (pod, id) = (u.pod.clone(), u.id);
+            if !self.cues.is_empty() {
+                out.cue(self.cues.clone());
+            }
             let spoken = EchoTestBrain.handle(u, out);
             let end = self.end;
+            let settle_first = self.settle_first.clone();
             async move {
                 spoken.await;
+                if let Some(ledger) = settle_first {
+                    ledger.record_started(&pod, Some(id), 960, tokio::time::Instant::now());
+                    ledger.settle_job(&pod, Some(id), true);
+                }
                 end
             }
             .boxed()
@@ -1787,9 +2099,13 @@ mod tests {
         events: Arc<Mutex<Vec<BrainEvent>>>,
         stats: Arc<BrainStats>,
         barge: Option<(Arc<TurnLedger>, FlushFn)>,
+        listen: Option<ListenWiring>,
+        settle_first: Option<Arc<TurnLedger>>,
         wake_word: WakeWordInStt,
         nudges: Arc<Mutex<NudgeLog>>,
         scripter: Option<ScriptHandle>,
+        cues: Option<Arc<CueLibrary>>,
+        reply_cues: Vec<Cue>,
         turn_end: TurnEnd,
         queue_depth: usize,
     }
@@ -1805,9 +2121,13 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 stats: Arc::new(BrainStats::default()),
                 barge: None,
+                listen: None,
+                settle_first: None,
                 nudges: Arc::new(Mutex::new(NudgeLog::default())),
                 turn_end: TurnEnd::Closed,
                 scripter: None,
+                cues: None,
+                reply_cues: Vec::new(),
                 queue_depth: 32,
             }
         }
@@ -1817,10 +2137,36 @@ mod tests {
             self.queue_depth = depth;
             self
         }
+        /// Settle the turn's playback against `ledger` before the brain returns,
+        /// so `dispatch_done` is the last of the two facts rather than the first.
+        fn settle_first(mut self, ledger: Arc<TurnLedger>) -> Harness {
+            self.settle_first = Some(ledger);
+            self
+        }
+        /// Wire the `<listen/>` opener to `feed`, with a window of
+        /// `window_samples`, so a test can read what the listener is told.
+        fn listen(mut self, feed: FeedFn, window_samples: u64) -> Harness {
+            self.listen = Some(ListenWiring {
+                feed,
+                window_samples,
+            });
+            self
+        }
         /// Wire the head's taps to `handle`, so a test can read the
         /// interaction lifecycle as the scripter receives it.
         fn scripter(mut self, handle: ScriptHandle) -> Harness {
             self.scripter = Some(handle);
+            self
+        }
+        /// Give the run a cue vocabulary, so a reply's movements resolve into
+        /// the inputs the head receives.
+        fn cues(mut self, library: CueLibrary) -> Harness {
+            self.cues = Some(Arc::new(library));
+            self
+        }
+        /// What this harness's brain asks the head to do in its reply.
+        fn reply_cues(mut self, cues: Vec<Cue>) -> Harness {
+            self.reply_cues = cues;
             self
         }
         /// Wire barge-in against `ledger` and a flush entry point that returns
@@ -1886,6 +2232,8 @@ mod tests {
                     brain: Arc::new(RecordingBrain {
                         log: self.nudges.clone(),
                         end: self.turn_end,
+                        settle_first: self.settle_first.clone(),
+                        cues: self.reply_cues.clone(),
                     }),
                     speak_tx,
                     events,
@@ -1903,6 +2251,7 @@ mod tests {
             }
 
             let ctx = PipelineCtx {
+                cues: self.cues.clone(),
                 record_dir: self.record_dir.clone(),
                 clock_step_clamps: Arc::new(AtomicU64::new(0)),
                 transcriber: self.transcriber.clone(),
@@ -1912,6 +2261,7 @@ mod tests {
                 barge: self
                     .barge
                     .map(|(ledger, flush)| BargeWiring { ledger, flush }),
+                listen: self.listen.map(Arc::new),
                 scripter: self.scripter.clone(),
             };
             let loop_jsonl = jsonl.clone();
@@ -2508,6 +2858,7 @@ mod tests {
                 cause: EndpointCause::SoftEndpoint,
                 barge_in: false,
                 over_playback: false,
+                follow_up: false,
                 timing: CarveTiming::default(),
                 sent_from: Some(0),
             },
@@ -2517,17 +2868,19 @@ mod tests {
             })),
             elapsed_us: 0,
         };
-        handle_stt_done(
-            done,
-            &mut pods,
-            &mut next_id,
-            &ConfidenceGate::OFF,
-            None,
-            None,
-            None,
-            &jsonl,
-        )
-        .await;
+        let ctx = PipelineCtx {
+            record_dir: None,
+            clock_step_clamps: Arc::new(AtomicU64::new(0)),
+            transcriber: None,
+            brain: None,
+            confidence_gate: ConfidenceGate::OFF,
+            wake_word: WakeWordInStt::default(),
+            barge: None,
+            listen: None,
+            scripter: None,
+            cues: None,
+        };
+        handle_stt_done(done, &mut pods, &mut next_id, &ctx, &jsonl).await;
 
         assert_eq!(next_id, 1, "no utterance minted for a stale completion");
         let slot = &pods[&pod()].in_flight;
@@ -2792,6 +3145,7 @@ mod tests {
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
             over_playback: false,
+            follow_up: false,
             timing: CarveTiming::default(),
             sent_from: Some(0),
         };
@@ -4268,6 +4622,270 @@ mod tests {
         writer.await.unwrap();
     }
 
+    /// A listener feed that records what it was handed, in place of the real
+    /// listener (which owns an inference thread).
+    fn spy_listen_feed() -> (FeedFn, Arc<Mutex<Vec<Feed>>>) {
+        let log: Arc<Mutex<Vec<Feed>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let feed: FeedFn = Arc::new(move |_pod, f| {
+            sink.lock().unwrap().push(f);
+            Box::pin(std::future::ready(()))
+        });
+        (feed, log)
+    }
+
+    /// How long a test's capture window runs. Any number, as long as it is the
+    /// one that comes out the other end.
+    const TEST_LISTEN_WINDOW: u64 = 96_000;
+
+    /// The pipeline-side opener. A reply whose last clip was heard out before
+    /// the brain returned leaves `dispatch_done` the call that completes the
+    /// turn, so the window is this task's to open — the fan-out already saw its
+    /// settle and had nothing to open on.
+    #[tokio::test]
+    async fn a_reply_settled_before_dispatch_returns_opens_the_window_here() {
+        let ledger = Arc::new(TurnLedger::new());
+        let (feed, fed) = spy_listen_feed();
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .turn_end(TurnEnd::Open)
+            .barge(Arc::clone(&ledger), Err(FlushRejected::NotPlaying))
+            .settle_first(Arc::clone(&ledger))
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let fed = fed.lock().unwrap();
+        assert!(
+            matches!(
+                fed.as_slice(),
+                [Feed::Listen {
+                    window_samples: TEST_LISTEN_WINDOW
+                }]
+            ),
+            "one window, as long as the configuration says: {fed:?}",
+        );
+    }
+
+    /// The same reply, with nothing asking to keep listening: no window. The
+    /// disposition is the whole difference.
+    #[tokio::test]
+    async fn a_closed_turn_opens_no_window_at_dispatch() {
+        let ledger = Arc::new(TurnLedger::new());
+        let (feed, fed) = spy_listen_feed();
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .turn_end(TurnEnd::Closed)
+            .barge(Arc::clone(&ledger), Err(FlushRejected::NotPlaying))
+            .settle_first(Arc::clone(&ledger))
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        assert!(fed.lock().unwrap().is_empty(), "the reply said nothing");
+    }
+
+    /// Speech heard inside the window reaches the head, so its ending is moved
+    /// out past the follow-up that is still being spoken and transcribed.
+    #[tokio::test]
+    async fn speech_inside_the_window_reaches_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _) = Harness::new()
+            .scripter(handle.clone())
+            .run(vec![PipelineItem::Listener(ListenerEvent::ListenHeard {
+                pod: pod(),
+                epoch: 1,
+            })])
+            .await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Heard(pod())]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l["event"] == "listen_heard")
+                .count(),
+            1,
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The window's own lines and the mute's. Each is an interface: `listen_opened`
+    /// tells a reader when the microphone was opened without a wake word and
+    /// through which sample, `listen_expired` when it closed with nothing said, and
+    /// `wake_muted` that the phrase did fire and the mute is why nothing came of
+    /// it. The names are pinned by the console's tables; the fields are pinned
+    /// here.
+    #[tokio::test]
+    async fn the_window_and_the_mute_write_their_lines() {
+        let (lines, _) = Harness::new()
+            .run(vec![
+                PipelineItem::Listener(ListenerEvent::ListenOpened {
+                    pod: pod(),
+                    epoch: 1,
+                    deadline_sample: 128_000,
+                }),
+                PipelineItem::Listener(ListenerEvent::ListenExpired {
+                    pod: pod(),
+                    epoch: 1,
+                }),
+                PipelineItem::Listener(ListenerEvent::WakeMuted {
+                    pod: pod(),
+                    epoch: 1,
+                    score: 0.87,
+                    wake_end_sample: 4_096,
+                }),
+            ])
+            .await;
+
+        let found = |name: &str| {
+            lines
+                .iter()
+                .find(|l| l["event"] == name)
+                .unwrap_or_else(|| panic!("a {name} line: {lines:?}"))
+                .clone()
+        };
+        let opened = found("listen_opened");
+        assert_eq!(opened["pod"], pod().0);
+        assert_eq!(opened["epoch"], 1);
+        assert_eq!(opened["deadline_sample"], 128_000);
+        let expired = found("listen_expired");
+        assert_eq!(expired["pod"], pod().0);
+        assert_eq!(expired["epoch"], 1);
+        let muted = found("wake_muted");
+        assert_eq!(muted["pod"], pod().0);
+        assert_eq!(muted["epoch"], 1);
+        assert_eq!(muted["wake_end_sample"], 4_096);
+        assert!((muted["score"].as_f64().unwrap() - 0.87).abs() < 1e-6);
+    }
+
+    /// The window is wake-less, so the confidence gate is all that stands
+    /// between an open room and the brain. A follow-up that transcribes to
+    /// hallucination is declined and the head is told the raise produced no
+    /// turn — but nothing was interrupted, so the brain hears no cut.
+    #[tokio::test]
+    async fn a_gated_follow_up_declines_without_telling_the_brain_it_was_cut() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .brain()
+            .scripter(handle.clone())
+            .transcriber(FakeTranscriber(Some((
+                "phantom".into(),
+                Some(conf(0.37, -0.99)),
+            ))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let nudges = h.nudges.clone();
+        let stats = h.stats.clone();
+        let events_seen = h.events.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(follow_up)]).await;
+
+        assert!(cmds.is_empty(), "the phantom never reached the brain");
+        assert_eq!(stats.snapshot().barge_command_absent, 1);
+        assert!(
+            nudges.lock().unwrap().barge_declined.is_empty(),
+            "no reply was cut by a follow-up",
+        );
+        // The decline says which wake-less provenance it had: a reader tuning
+        // barge thresholds off this event must not count a window's noise, and
+        // under the mute no barge is even possible.
+        assert!(
+            matches!(
+                events_seen.lock().unwrap().as_slice(),
+                [BrainEvent::BargeCommandAbsent {
+                    follow_up: true,
+                    ..
+                }]
+            ),
+            "declined as a follow-up: {:?}",
+            events_seen.lock().unwrap()
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["event"] == "utterance" && l["follow_up"] == true),
+            "and the utterance line carries the provenance: {lines:?}"
+        );
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Unanswered(pod())],
+            "the head folds a linger from the decline",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The same follow-up, transcribing to something: it dispatches like any
+    /// other utterance. The gate declines hallucinations, not follow-ups.
+    #[tokio::test]
+    async fn a_clean_follow_up_dispatches() {
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            ..carved(1, 0, 16, None)
+        };
+        let (lines, cmds) = Harness::new()
+            .brain()
+            .transcriber(FakeTranscriber(Some((
+                "and another thing".into(),
+                Some(conf(0.01, -0.2)),
+            ))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            })
+            .run(vec![soft_endpoint(follow_up)])
+            .await;
+
+        assert_eq!(cmds.len(), 1, "the follow-up is answered");
+        // The only per-utterance record that this turn reached the brain with no
+        // wake word behind it.
+        let utterance = lines
+            .iter()
+            .find(|l| l["event"] == "utterance")
+            .unwrap_or_else(|| panic!("an utterance line: {lines:?}"));
+        assert_eq!(utterance["follow_up"], true);
+    }
+
+    /// The mirror: an ordinary wake-gated turn is not a follow-up, so the line
+    /// that distinguishes the two cannot be a constant.
+    #[tokio::test]
+    async fn a_wake_gated_utterance_is_not_a_follow_up_on_the_line() {
+        let (lines, cmds) = Harness::new()
+            .brain()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        assert_eq!(cmds.len(), 1);
+        let utterance = lines
+            .iter()
+            .find(|l| l["event"] == "utterance")
+            .unwrap_or_else(|| panic!("an utterance line: {lines:?}"));
+        assert_eq!(utterance["follow_up"], false);
+    }
+
     #[tokio::test]
     async fn a_gated_barge_tells_the_brain_its_response_was_cut() {
         // The playback is already gone and `handle` never runs, so this is the brain's
@@ -4336,5 +4954,362 @@ mod tests {
             }
             assert!(nudges.lock().unwrap().barge_declined.is_empty());
         }
+    }
+
+    // --- the cue tap ------------------------------------------------------
+
+    /// The vocabulary the cue cases resolve against: one cueable pose at 800 ms,
+    /// the stow no reply may command, and a motion with its own blend-out.
+    fn cue_library() -> CueLibrary {
+        CueLibrary::parse(
+            r#"{
+              "poses": [
+                { "name": "peek", "duration_ms": 800 },
+                { "name": "stow", "duration_ms": 2000 }
+              ],
+              "motions": [
+                { "name": "bench/nod", "duration_ms": 1000, "blend_out_ms": 200 }
+              ]
+            }"#,
+        )
+        .expect("the fixture sidecar parses")
+    }
+
+    /// A speed factor becomes the absolute pace the wire carries, and unit speed
+    /// says nothing at all — the library's own pace, which is what a presence
+    /// raise states too.
+    #[test]
+    fn a_cued_poses_speed_becomes_the_pace_the_wire_carries() {
+        let library = cue_library();
+        let paced = |speed: Option<f64>| match resolve_cue(
+            &library,
+            &Cue::Pose {
+                name: "peek".into(),
+                speed,
+            },
+        ) {
+            Ok(MotionCue::Pose(raise)) => raise.move_ms,
+            other => panic!("a pose resolves to a pose: {other:?}"),
+        };
+        assert_eq!(paced(Some(2.0)), Some(400), "twice as fast is half as long");
+        assert_eq!(paced(Some(0.25)), Some(3_200));
+        assert_eq!(paced(Some(1.0)), None, "unit speed states no pace");
+        assert_eq!(paced(None), None);
+    }
+
+    /// The blend-out is the overlay's own exit ramp and runs on the wall clock:
+    /// speeding a motion up must not shorten the fade that ends it.
+    #[test]
+    fn a_cued_motions_span_is_the_library_duration_at_speed_plus_its_blend_out() {
+        let library = cue_library();
+        let span = |speed: Option<f64>| match resolve_cue(
+            &library,
+            &Cue::Motion {
+                name: "bench/nod".into(),
+                speed,
+            },
+        ) {
+            Ok(MotionCue::Motion { play, span_ms }) => (play.speed, span_ms),
+            other => panic!("a motion resolves to a motion: {other:?}"),
+        };
+        assert_eq!(span(Some(0.5)), (0.5, 2_200));
+        assert_eq!(span(None), (1.0, 1_200));
+        assert_eq!(span(Some(2.0)), (2.0, 700));
+    }
+
+    /// Every way a cue can fail to resolve, and the reason each reports. A
+    /// refused cue is dropped rather than corrected: the nearest movement the
+    /// reply did not ask for is not an improvement.
+    #[test]
+    fn a_cue_this_deployment_cannot_make_is_refused_with_its_reason() {
+        let library = cue_library();
+        let pose = |name: &str, speed: Option<f64>| {
+            resolve_cue(
+                &library,
+                &Cue::Pose {
+                    name: name.into(),
+                    speed,
+                },
+            )
+            .expect_err("refused")
+        };
+        assert_eq!(pose("stow", None), "stow_not_cueable");
+        assert_eq!(pose("nowhere", None), "unknown_pose");
+        assert_eq!(pose("peek", Some(0.1)), "speed_out_of_range");
+        assert_eq!(pose("peek", Some(2.5)), "speed_out_of_range");
+        assert_eq!(pose("peek", Some(f64::NAN)), "speed_out_of_range");
+        assert_eq!(pose("peek", Some(f64::INFINITY)), "speed_out_of_range");
+        assert_eq!(
+            resolve_cue(
+                &library,
+                &Cue::Motion {
+                    name: "bench/perk".into(),
+                    speed: None,
+                },
+            )
+            .expect_err("refused"),
+            "unknown_motion",
+        );
+    }
+
+    /// The wire's ceiling, on both derived numbers. A library copy is edited by
+    /// hand and can name a duration this deployment has never played; the pose's
+    /// pace and the motion's span are both made here, and a number past the
+    /// wire's bound is refused here rather than reaching a script the wire
+    /// cannot build.
+    #[test]
+    fn a_cue_whose_derived_span_or_pace_passes_the_wires_ceiling_is_refused() {
+        let library = CueLibrary::parse(
+            r#"{
+              "poses": [{ "name": "slow", "duration_ms": 400000 }],
+              "motions": [{ "name": "bench/epic", "duration_ms": 400000,
+                            "blend_out_ms": 200 }]
+            }"#,
+        )
+        .expect("the fixture sidecar parses");
+        assert_eq!(
+            resolve_cue(
+                &library,
+                &Cue::Pose {
+                    name: "slow".into(),
+                    speed: Some(0.25),
+                },
+            )
+            .expect_err("refused"),
+            "move_too_long",
+        );
+        assert_eq!(
+            resolve_cue(
+                &library,
+                &Cue::Motion {
+                    name: "bench/epic".into(),
+                    speed: Some(0.25),
+                },
+            )
+            .expect_err("refused"),
+            "motion_too_long",
+        );
+        // The exact edge, on the two sides of one millisecond: the render puts the
+        // play at `after_ms` 1, so the longest span a script can carry is one less
+        // than the wire's ceiling. The scripter's own timeout is capped at that
+        // same ceiling, and this is the one input where the two rules meet — an
+        // off-by-one in either turns a legal cue into a panic in the script task.
+        let edge = |duration_ms: u64| {
+            let library = CueLibrary::parse(&format!(
+                r#"{{ "poses": [], "motions": [{{ "name": "edge", "duration_ms": {duration_ms},
+                      "blend_out_ms": 0 }}] }}"#
+            ))
+            .expect("the fixture sidecar parses");
+            resolve_cue(
+                &library,
+                &Cue::Motion {
+                    name: "edge".into(),
+                    speed: None,
+                },
+            )
+        };
+        assert_eq!(
+            edge(MAX_TIMEOUT_MS).expect_err("refused"),
+            "motion_too_long",
+            "a span at the ceiling leaves no room for the play's own step",
+        );
+        assert!(
+            matches!(
+                edge(MAX_TIMEOUT_MS - 1).expect("admitted"),
+                MotionCue::Motion { span_ms, .. } if span_ms == MAX_TIMEOUT_MS - 1
+            ),
+            "and one millisecond under it is the longest motion the wire carries",
+        );
+
+        // And the same library at unit speed is ordinary: the bound is on the
+        // number, not on the entry.
+        assert!(
+            resolve_cue(
+                &library,
+                &Cue::Motion {
+                    name: "bench/epic".into(),
+                    speed: None,
+                },
+            )
+            .is_ok()
+        );
+    }
+
+    /// A reply's movements reach the head as one input, resolved: the name
+    /// checked against the library and the speed already turned into the
+    /// numbers the scripter puts on the wire.
+    #[tokio::test]
+    async fn a_replys_cues_reach_the_head_resolved() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .scripter(handle.clone())
+            .cues(cue_library())
+            .reply_cues(vec![
+                Cue::Pose {
+                    name: "peek".into(),
+                    speed: Some(2.0),
+                },
+                Cue::Motion {
+                    name: "bench/nod".into(),
+                    speed: None,
+                },
+            ])
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let cues = script_inputs(handle, rx)
+            .await
+            .into_iter()
+            .find_map(|input| match input {
+                ScriptInput::Cues { cues, .. } => Some(cues),
+                _ => None,
+            })
+            .expect("the reply's movements reached the head");
+        assert_eq!(
+            cues,
+            vec![
+                MotionCue::Pose(Raise {
+                    pose: "peek".into(),
+                    move_ms: Some(400),
+                }),
+                MotionCue::Motion {
+                    play: Play::new("bench/nod"),
+                    span_ms: 1_200,
+                },
+            ],
+            "in the order the reply named them",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A name this deployment does not hold never reaches the wire: an
+    /// unresolvable name makes the daemon refuse the whole script it rides in,
+    /// so the other movements in the same reply would go with it.
+    #[tokio::test]
+    async fn an_invented_name_is_refused_at_the_tap_and_the_rest_still_moves() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .scripter(handle.clone())
+            .cues(cue_library())
+            .reply_cues(vec![
+                Cue::Motion {
+                    name: "invented/flourish".into(),
+                    speed: None,
+                },
+                Cue::Pose {
+                    name: "peek".into(),
+                    speed: None,
+                },
+            ])
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let refused = lines
+            .iter()
+            .find(|v| v["event"] == "cue_refused")
+            .expect("the refusal is narrated");
+        assert_eq!(refused["name"], "invented/flourish");
+        assert_eq!(refused["kind"], "motion");
+        assert_eq!(refused["reason"], "unknown_motion");
+        assert_eq!(refused["utterance"], 1);
+
+        let cues = script_inputs(handle, rx)
+            .await
+            .into_iter()
+            .find_map(|input| match input {
+                ScriptInput::Cues { cues, .. } => Some(cues),
+                _ => None,
+            })
+            .expect("what did resolve still reached the head");
+        assert_eq!(
+            cues,
+            vec![MotionCue::Pose(Raise {
+                pose: "peek".into(),
+                move_ms: None,
+            })],
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// With no vocabulary configured nothing can move the head: content moves it
+    /// only where the operator has said what it may be moved to. It is said out
+    /// loud, because the operator's own edit is what produced it and the marker
+    /// never appears in the speech to hint at what went missing.
+    #[tokio::test]
+    async fn a_reply_cues_nothing_when_no_library_is_configured() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .scripter(handle.clone())
+            .reply_cues(vec![Cue::Pose {
+                name: "peek".into(),
+                speed: None,
+            }])
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let refused = lines
+            .iter()
+            .find(|v| v["event"] == "cue_refused")
+            .expect("the missing vocabulary is narrated");
+        assert_eq!(refused["name"], "peek");
+        assert_eq!(refused["kind"], "pose");
+        assert_eq!(refused["reason"], "no_library");
+
+        assert!(
+            !script_inputs(handle, rx)
+                .await
+                .iter()
+                .any(|input| matches!(input, ScriptInput::Cues { .. })),
+            "no library, no movement",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A deployment with a vocabulary but no head is the other half of the same
+    /// misconfiguration, and reads the same way in the log.
+    #[tokio::test]
+    async fn a_reply_cues_nothing_when_no_head_is_scripted() {
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .cues(cue_library())
+            .reply_cues(vec![Cue::Motion {
+                name: "bench/nod".into(),
+                speed: None,
+            }])
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let refused = lines
+            .iter()
+            .find(|v| v["event"] == "cue_refused")
+            .expect("the missing head is narrated");
+        assert_eq!(refused["name"], "bench/nod");
+        assert_eq!(refused["kind"], "motion");
+        assert_eq!(refused["reason"], "no_head");
     }
 }

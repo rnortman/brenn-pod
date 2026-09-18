@@ -93,6 +93,12 @@ pub struct ListenerConfig {
     /// Barge-in trigger knobs. The guard fires only while playback is active and
     /// interruptible for the pod.
     pub barge_in: BargeInConfig,
+    /// How long past the pod's playback floor dropping [`BargeMode::Mute`] goes on
+    /// scoring every chunk as silence. The pacer's `Finished` is an estimate of the
+    /// speaker going quiet — its stream clock says the audio is heard out — not a
+    /// report of it, so the tail covers the device's own output latency past that
+    /// estimate. Inert under the other two modes.
+    pub mute_tail_samples: u64,
 }
 
 impl Default for ListenerConfig {
@@ -114,6 +120,9 @@ impl Default for ListenerConfig {
             command_wait_samples: 128_000,
             default_policy: WakePolicy::WakeGated,
             barge_in: BargeInConfig::default(),
+            // 400 ms. Compiled in beside `arm_slack_samples`: the barge table
+            // selects a rule, it is not a tuning surface.
+            mute_tail_samples: 6_400,
         }
     }
 }
@@ -132,6 +141,18 @@ pub enum BargeMode {
     /// machine's own reply leaking back through the microphone whenever the head
     /// has moved since the reply started, which is most replies.
     Speech,
+    /// Nothing cuts, and nothing over the reply is heard at all: while the pod's
+    /// playback floor is active, and for `mute_tail_samples` after it drops, every
+    /// chunk is scored as silence. For a unit whose echo cancellation cannot be
+    /// trusted, where the two rules above hear the machine's own reply.
+    ///
+    /// The cost: an audible reply cannot be interrupted by voice at all — not by
+    /// the wake word either. Nothing said over it is carved, so a person who talks
+    /// across the robot has to say it again once the robot has stopped.
+    // TODO(barge-mute-costs-every-interruption): the mode trades every voice
+    // interruption for never hearing the echo; trustworthy AEC, or a listener
+    // that subtracts what it knows it is playing, gives the barge back.
+    Mute,
 }
 
 /// Barge-in detection knobs: what may cut a reply, and — for the mode that judges
@@ -250,6 +271,20 @@ struct WakeHold {
     anchor: CarveAnchor,
 }
 
+/// An open capture window: the surface asked the listener to hear the next thing
+/// said with no wake word, because the reply that just finished asked the person to
+/// keep talking.
+///
+/// Its deadline bounds where speech may *begin*, not where it must end: speech that
+/// onsets inside the window carves at its own endpoint however long it runs, which
+/// is the wake hold's rule as well.
+#[derive(Debug, Clone, Copy)]
+struct ListenWindow {
+    /// The last absolute sample index at which speech may still begin inside the
+    /// window.
+    deadline_sample: u64,
+}
+
 /// How far before the wake end a hold may begin. The speech run carrying the wake
 /// phrase can have started arbitrarily earlier — the wake word said at the end of a
 /// breath — and the ring is sized against this bound, so a hold starting further
@@ -350,6 +385,15 @@ pub struct ListenerState {
     current_wake: Option<WakeConfirmation>,
     /// This pod's playback state and barge-in trigger state.
     playback: PlaybackFloor,
+    /// The open capture window, if the surface has asked for one.
+    listen: Option<ListenWindow>,
+    /// The follow-up mark on the utterance currently accumulating, reused across
+    /// continuations exactly as `current_barge` is.
+    current_follow_up: bool,
+    /// Under [`BargeMode::Mute`], the absolute sample index through which chunks go
+    /// on being scored as silence after the playback floor drops. `0` at rest, and
+    /// inert under the other modes.
+    muted_until_sample: u64,
     /// A fired trigger no utterance has taken yet: the next carve consumes it.
     /// Needed because utterance identity is minted at first *carve*, not at onset,
     /// so at trigger time there is often no id to mark.
@@ -431,6 +475,9 @@ impl ListenerState {
             current_start: None,
             current_wake: None,
             playback: PlaybackFloor::default(),
+            listen: None,
+            current_follow_up: false,
+            muted_until_sample: 0,
             barge_pending: false,
             pending_from_wake: false,
             current_barge: false,
@@ -514,6 +561,10 @@ impl ListenerState {
                 // on comparing against the deadline in the one epoch-wide index
                 // domain.
                 self.retire_hold_reanchored_past(pod, base_sample_index, &mut events);
+                // A capture window is retired on the same rule and for the same
+                // reason: nothing arrived across the device-VAD silence to carry
+                // its deadline past.
+                self.retire_listen_reanchored_past(pod, base_sample_index, &mut events);
                 self.drain_transitions(pod, None, &mut events);
                 Ok(events)
             }
@@ -539,8 +590,30 @@ impl ListenerState {
                 may_wake,
                 turn,
             } => {
+                let mut events = Vec::new();
+                // A reply beginning is the end of any capture window's reason to
+                // exist: the window was the previous reply's invitation, and the
+                // pod is talking again. Left open it would outlive this reply and
+                // carve the next thing said as a follow-up to a reply that never
+                // asked for one.
+                if active && !self.playback.active {
+                    self.close_listen(pod, &mut events);
+                }
                 self.set_playback(active, interruptible, may_wake, turn);
-                Ok(Vec::new())
+                Ok(events)
+            }
+            Feed::Listen { window_samples } => {
+                // The Silero cursor is the listener's own "now": the absolute end of
+                // the last chunk scored. The window is dated from there, so it
+                // covers the audio that arrives after the reply, not audio already
+                // behind it.
+                let deadline_sample = self.silero_cursor + window_samples;
+                self.listen = Some(ListenWindow { deadline_sample });
+                Ok(vec![ListenerEvent::ListenOpened {
+                    pod: pod.clone(),
+                    epoch: self.epoch,
+                    deadline_sample,
+                }])
             }
             Feed::SegmentClosed { host_rx, .. } => self.handle_close(pod, host_rx),
         }
@@ -562,6 +635,14 @@ impl ListenerState {
         // pending trigger and the overlap latch went with the stream reset above:
         // they belong to speech nobody can still be hearing.
         self.playback = PlaybackFloor::default();
+        // The reconnect opens a new index domain; a tail dated in the old one means
+        // nothing in it, and the writer whose output it covered is gone.
+        self.muted_until_sample = 0;
+        // The window belongs to a reply the old connection played; nobody on the
+        // new one is waiting to be answered. Reported, like every other close, so
+        // a reader counting windows open against windows ended balances.
+        self.close_listen(pod, events);
+        self.current_follow_up = false;
         self.current_barge = false;
         self.current_over_playback = false;
         self.segment = None;
@@ -663,8 +744,10 @@ impl ListenerState {
             }
             self.reset_stream(pod, first_sample_index, &mut events);
             self.drain_transitions(pod, None, &mut events);
-            // A hold the hole outlasted ends here, on the far side's index.
+            // A hold the hole outlasted ends here, on the far side's index, and a
+            // capture window the same.
             self.retire_hold_reanchored_past(pod, first_sample_index, &mut events);
+            self.retire_listen_reanchored_past(pod, first_sample_index, &mut events);
         }
 
         // A segment's preroll is stamped with the samples' original capture
@@ -756,9 +839,24 @@ impl ListenerState {
         host_rx: HostMicros,
         events: &mut Vec<ListenerEvent>,
     ) {
+        // A muted chunk is silence to the endpointer: it releases an utterance
+        // the robot began talking over, and no onset opens on the echo.
+        //
+        // The barge guard receives the raw probability: it judges under
+        // `BargeMode::Speech` alone and the mute is `BargeMode::Mute`, so the
+        // guard is already off wherever a chunk can be muted. Feeding it zero
+        // would look like a mute holding the guard shut, and a later mode-test
+        // change would inherit a protection that was never intended.
+        //
+        // The stats keep the model's own score, not the substitute. They are the
+        // one reading of what the microphone actually heard while the robot was
+        // talking — which is how loud the echo is, and so whether this
+        // deployment still needs the mute — and a summary of zeros over every
+        // reply would answer that question with the mute's own assumption.
+        let driven = if self.muted(chunk_end_sample) { 0.0 } else { p };
         self.silero_stats.record(p, chunk_end_sample);
         self.drive_barge_guard(pod, p, chunk_end_sample, host_rx, events);
-        let ev = self.endpointer.push(p, chunk_end_sample);
+        let ev = self.endpointer.push(driven, chunk_end_sample);
         // Flushes (inside the drain) before the transition events, so a transition
         // line arrives with the stats of the chunks that led to it — this one
         // included. The drain is also where an `Onset` gets its receipt stamp:
@@ -782,6 +880,7 @@ impl ListenerState {
             self.flush_model_stats(pod, StatsFlushCause::Periodic, events);
         }
         self.check_hold_expiry(pod, chunk_end_sample, events);
+        self.check_listen_expiry(pod, chunk_end_sample, events);
     }
 
     /// Retire a hold whose wait elapsed with nothing following the wake word: the
@@ -802,6 +901,59 @@ impl ListenerState {
             return;
         }
         self.retire_hold(pod, hold, events);
+    }
+
+    /// Close a capture window whose deadline has passed with nothing said inside
+    /// it: the wake word gates the microphone again. The idle condition is the wake
+    /// hold's own — speech that began before the deadline is still carved at its
+    /// endpoint after it, however long it runs.
+    fn check_listen_expiry(
+        &mut self,
+        pod: &PodId,
+        chunk_end_sample: u64,
+        events: &mut Vec<ListenerEvent>,
+    ) {
+        let Some(window) = self.listen else {
+            return;
+        };
+        if !self.endpointer.fully_idle() || chunk_end_sample < window.deadline_sample {
+            return;
+        }
+        self.close_listen(pod, events);
+    }
+
+    /// Close a capture window whose deadline lies behind a point the stream
+    /// re-anchors on, before any audio past that point is scored. The wake hold's
+    /// rule and its reason: a transport segment opens after real device-VAD
+    /// silence, so no chunk ever arrived to carry the deadline past, and without
+    /// this a quiet room leaves the window standing until somebody speaks — at
+    /// which point the onset is announced as speech inside a window the carve then
+    /// refuses. Nothing was received across the hole, so no speech beyond it can
+    /// have begun before the deadline.
+    fn retire_listen_reanchored_past(
+        &mut self,
+        pod: &PodId,
+        anchor_sample: u64,
+        events: &mut Vec<ListenerEvent>,
+    ) {
+        if self
+            .listen
+            .is_some_and(|w| anchor_sample >= w.deadline_sample)
+        {
+            self.close_listen(pod, events);
+        }
+    }
+
+    /// Drop the capture window, reporting the close. The one place the window ends
+    /// other than at the mint it produced, so `listen_opened` and `listen_expired`
+    /// stay balanced however the window ended.
+    fn close_listen(&mut self, pod: &PodId, events: &mut Vec<ListenerEvent>) {
+        if self.listen.take().is_some() {
+            events.push(ListenerEvent::ListenExpired {
+                pod: pod.clone(),
+                epoch: self.epoch,
+            });
+        }
     }
 
     /// Retire a hold whose deadline lies behind a point the stream re-anchors on,
@@ -856,6 +1008,12 @@ impl ListenerState {
             self.playback.may_wake = may_wake;
             return;
         }
+        // The floor going down is the pacer's estimate that the audio is heard out,
+        // so the mute runs on past it by the tail before the microphone is trusted
+        // again.
+        if self.config.barge_in.mode == BargeMode::Mute && self.playback.active && !active {
+            self.muted_until_sample = self.silero_cursor + self.config.mute_tail_samples;
+        }
         self.playback = PlaybackFloor {
             active,
             interruptible,
@@ -864,6 +1022,17 @@ impl ListenerState {
             sustain_run: 0,
             fired: false,
         };
+    }
+
+    /// Whether audio ending at `chunk_end_sample` is heard at all. Under
+    /// [`BargeMode::Mute`] it is not, while the pod's playback floor is active and
+    /// for `mute_tail_samples` after it drops: the wake detections that frame's
+    /// score completes are discarded, and the endpointer is fed silence in place of
+    /// the model's probability. The ring still takes the audio, so nothing a carve
+    /// may need is lost.
+    fn muted(&self, chunk_end_sample: u64) -> bool {
+        self.config.barge_in.mode == BargeMode::Mute
+            && (self.playback.active || chunk_end_sample <= self.muted_until_sample)
     }
 
     /// The barge-in guard, one Silero chunk at a time: count consecutive chunks at
@@ -883,7 +1052,8 @@ impl ListenerState {
         events: &mut Vec<ListenerEvent>,
     ) {
         // What Silero hears over a reply is the reply itself as often as it is a
-        // person, so only the mode that trusts speech judges it.
+        // person, so only the mode that trusts speech judges it. Under `Mute`
+        // the guard never runs at all, so the raw probability is fine here.
         if self.config.barge_in.mode != BargeMode::Speech {
             return;
         }
@@ -942,6 +1112,23 @@ impl ListenerState {
         host_rx: HostMicros,
         events: &mut Vec<ListenerEvent>,
     ) {
+        // A muted detection is discarded whole: nothing is armed, nothing is
+        // cut, and no `WakeDetected` claims a wake this listener acted on. The
+        // model is stateful, so the frames were pushed and scored regardless —
+        // what the mute takes away is the phrase being believed, and while the
+        // robot is talking the phrase is the robot's. The discard is reported,
+        // because "the wake word did nothing during the reply" has to be
+        // tellable from "it never fired", and how often the machine trips
+        // itself is the reading that says whether the mute can be turned off.
+        if self.muted(wake_end_sample) {
+            events.push(ListenerEvent::WakeMuted {
+                pod: pod.clone(),
+                epoch: self.epoch,
+                score,
+                wake_end_sample,
+            });
+            return;
+        }
         // A prior unconsumed arm is superseded by this fresh wake — it fired with
         // no command in between. A hold waiting on that arm goes with it: the
         // repeated wake word starts the turn over.
@@ -1179,6 +1366,7 @@ impl ListenerState {
                 let mut barge = std::mem::take(&mut self.barge_pending);
                 self.pending_from_wake = false;
                 let mut start = start;
+                let mut follow_up = false;
                 let wake = match self.policy {
                     // An arm the utterance covers is consumed here as it is under
                     // gating, even though it attaches to nothing: an utterance
@@ -1251,6 +1439,25 @@ impl ListenerState {
                             // speech that cut it is heard without a wake word, and
                             // carries no wake provenance.
                             None if barge => None,
+                            // Speech that began inside an open capture window is the
+                            // person answering the reply that asked them to keep
+                            // talking: heard without a wake word, like a barge.
+                            // Speech the pod's own voice overlapped is not a
+                            // follow-up whatever the window says — under the mute
+                            // there is no such speech at all, and under the other
+                            // modes it is the echo, which falls to the wake gate as
+                            // ever.
+                            None if !self.current_over_playback
+                                && !self.speech_over_playback
+                                && self.listen.is_some_and(|l| start <= l.deadline_sample) =>
+                            {
+                                follow_up = true;
+                                events.push(ListenerEvent::ListenHeard {
+                                    pod: pod.clone(),
+                                    epoch: self.epoch,
+                                });
+                                None
+                            }
                             None => return None,
                         }
                     }
@@ -1265,6 +1472,14 @@ impl ListenerState {
                 self.current_start = Some(start);
                 self.current_wake = wake;
                 self.current_barge = barge;
+                self.current_follow_up = follow_up;
+                // One utterance per window, whatever its provenance: the window
+                // closes on the dispatch it produced. A wake word said inside one
+                // takes the arm path above and closes it just the same.
+                // TODO(listen-window-single-utterance): a follow-up the gate then
+                // declines has spent the window, and the person has to say the
+                // wake word again to be heard.
+                self.listen = None;
                 // A barge mark carries its own overlap wherever it was parked:
                 // both rules fire only with the floor open, so the speech a mark
                 // describes — parked, or carried here by a `WakeHold` — was over
@@ -1308,6 +1523,7 @@ impl ListenerState {
             cause,
             barge_in: self.current_barge,
             over_playback: self.current_over_playback,
+            follow_up: self.current_follow_up,
             timing: CarveTiming {
                 first_audio_rx: anchor.first_audio_rx,
                 t0_projected: anchor.t0_projected,
@@ -1449,6 +1665,24 @@ impl ListenerState {
                 // answer. Only a genuine onset resets it: a continuation resumes
                 // the same speech under `Continuation`.
                 self.speech_over_playback = self.playback.active;
+                // Somebody started talking inside the capture window. Said as early
+                // as the listener can say it, well before the endpoint, the STT and
+                // the gate that decide whether it becomes a turn. An onset over the
+                // pod's own voice is not a person in the window: under the mute
+                // there is no such onset, and under the other modes it is the echo.
+                //
+                // No deadline test: an open window is one whose deadline has not
+                // been reached with the room idle, and the speech confirming this
+                // onset began before it — the transition's own offset is where the
+                // run was confirmed, chunks after it started. The carve tests the
+                // run's real start against the deadline, which is the same speech
+                // and the same answer.
+                if self.listen.is_some() && !self.playback.active {
+                    events.push(ListenerEvent::ListenHeard {
+                        pod: pod.clone(),
+                        epoch,
+                    });
+                }
             }
             events.push(ListenerEvent::EndpointerTransition {
                 pod: pod.clone(),
@@ -1473,6 +1707,7 @@ impl ListenerState {
         self.current_start = None;
         self.current_wake = None;
         self.current_barge = false;
+        self.current_follow_up = false;
         self.current_over_playback = false;
         self.speech_over_playback = false;
         self.current_onset_rx = None;
@@ -1659,8 +1894,17 @@ impl ListenerStats {
                 // `PlaybackStats::jobs_flushed`, and the speech that caused it is
                 // counted by the `SoftEndpoint` it carves like any other utterance.
                 ListenerEvent::BargeIn { .. } => {}
-                // Pure observability, no stage-health counter.
-                ListenerEvent::EndpointerTransition { .. } | ListenerEvent::ModelStats { .. } => {}
+                // Not a wake this listener acted on, so it is not counted as
+                // one: `wakes` is the tally of arms, and a muted detection
+                // armed nothing. Its own line carries it.
+                ListenerEvent::WakeMuted { .. } => {}
+                // Pure observability, no stage-health counter. A capture window's
+                // consequence is the utterance it carves, counted as any other is.
+                ListenerEvent::EndpointerTransition { .. }
+                | ListenerEvent::ModelStats { .. }
+                | ListenerEvent::ListenOpened { .. }
+                | ListenerEvent::ListenHeard { .. }
+                | ListenerEvent::ListenExpired { .. } => {}
             }
         }
     }
@@ -3339,6 +3583,479 @@ mod tests {
         assert_eq!(barge_causes(&cut)[0].0, BargeCause::Speech);
     }
 
+    /// Open a capture window with the stream at `cursor`. The synthetic driver
+    /// feeds the endpointer directly and never advances the state's own Silero
+    /// cursor, which is the "now" the window is dated from, so a case says where
+    /// the stream is.
+    fn open_listen(
+        state: &mut ListenerState,
+        cursor: u64,
+        window_samples: u64,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> Vec<ListenerEvent> {
+        state.silero_cursor = cursor;
+        state
+            .handle(&pod(), Feed::Listen { window_samples }, oww, silero)
+            .expect("listen feed")
+    }
+
+    fn listen_heards(events: &[ListenerEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, ListenerEvent::ListenHeard { .. }))
+            .count()
+    }
+
+    /// The window carries speech past the wake gate: a person answering a reply
+    /// that asked them to keep talking says nothing to arm with. The carve has no
+    /// wake provenance, says it is a follow-up, and the window closes on it.
+    ///
+    /// `ListenHeard` twice, which is the point of emitting it twice: once at the
+    /// onset, covering the speech itself, and once at the carve, covering the
+    /// stretch between the endpoint and the turn the STT and the gate eventually
+    /// make of it.
+    #[test]
+    fn speech_inside_the_window_carves_with_no_wake_and_says_it_is_a_follow_up() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        let mut cursor = 0u64;
+
+        let opened = open_listen(&mut state, cursor, 4_096, &mut oww, &mut silero);
+        assert!(
+            matches!(
+                opened.as_slice(),
+                [ListenerEvent::ListenOpened {
+                    deadline_sample: 4_096,
+                    ..
+                }]
+            ),
+            "the window is dated from the stream's own now: {opened:?}"
+        );
+
+        let onset = drive(&mut state, 0.9, 2, &mut cursor);
+        assert_eq!(listen_heards(&onset), 1, "heard at the onset: {onset:?}");
+
+        let carved_at = drive(&mut state, 0.1, 3, &mut cursor);
+        let carved = soft_endpoints(&carved_at);
+        assert_eq!(carved.len(), 1, "and carved: {carved_at:?}");
+        assert!(carved[0].follow_up, "as a follow-up");
+        assert!(carved[0].wake.is_none(), "with no wake word behind it");
+        assert_eq!(
+            listen_heards(&carved_at),
+            1,
+            "and heard again at the carve: {carved_at:?}"
+        );
+        assert!(state.listen.is_none(), "the window closed on the carve");
+
+        // One window per reply: the next thing said, once this utterance's
+        // continuation window has run out, needs the wake word again.
+        let mut again = drive(&mut state, 0.1, 4, &mut cursor);
+        again.extend(drive(&mut state, 0.9, 2, &mut cursor));
+        again.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert!(
+            soft_endpoints(&again).is_empty(),
+            "the window does not reopen: {again:?}"
+        );
+        assert_eq!(listen_heards(&again), 0);
+    }
+
+    /// The deadline bounds where speech may *begin*, not where it must end. Speech
+    /// that onsets one chunk inside the window and runs well past it is carved at
+    /// its own endpoint; a window that runs out with the room idle expires instead,
+    /// and the wake word gates the microphone again.
+    #[test]
+    fn a_window_bounds_the_onset_and_expires_on_an_idle_room() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![5_i16; 32_768]);
+        let mut cursor = 0u64;
+
+        open_listen(&mut state, cursor, 1_024, &mut oww, &mut silero);
+        let mut spoken = drive(&mut state, 0.9, 2, &mut cursor);
+        // Well past the deadline, and still talking.
+        spoken.extend(drive(&mut state, 0.9, 8, &mut cursor));
+        assert!(
+            !spoken
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::ListenExpired { .. })),
+            "speech holds the window open under its own deadline: {spoken:?}"
+        );
+        let ended = drive(&mut state, 0.1, 3, &mut cursor);
+        let carved = soft_endpoints(&ended);
+        assert_eq!(carved.len(), 1, "carved at its endpoint: {ended:?}");
+        assert!(carved[0].follow_up);
+
+        // A second window, with nobody answering it.
+        let opened = open_listen(&mut state, cursor, 1_024, &mut oww, &mut silero);
+        assert_eq!(opened.len(), 1, "opened: {opened:?}");
+        // Long enough for the previous utterance's continuation window to run out:
+        // the expiry waits for the endpointer to be fully idle, not merely quiet.
+        let quiet = drive(&mut state, 0.1, 6, &mut cursor);
+        assert!(
+            quiet
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::ListenExpired { .. })),
+            "the deadline passed on an idle room: {quiet:?}"
+        );
+        assert!(state.listen.is_none());
+
+        let mut late = drive(&mut state, 0.9, 2, &mut cursor);
+        late.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert!(
+            soft_endpoints(&late).is_empty(),
+            "speech after it needs the wake word: {late:?}"
+        );
+    }
+
+    /// A wake word said inside the window takes the arm path, as it does with no
+    /// window at all: the carve carries wake provenance rather than the follow-up
+    /// mark, and the window closes at the mint like any other.
+    #[test]
+    fn a_wake_inside_the_window_carves_with_its_own_provenance() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        let mut cursor = 0u64;
+
+        open_listen(&mut state, cursor, 4_096, &mut oww, &mut silero);
+        state.arm_wake_for_test(0.9, 512);
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "one carve: {events:?}");
+        assert!(carved[0].wake.is_some(), "on the wake word: {events:?}");
+        assert!(!carved[0].follow_up, "which is not a follow-up");
+        assert!(state.listen.is_none(), "and the window closed with it");
+    }
+
+    /// Speech the pod's own voice overlapped is not a follow-up whatever the window
+    /// says — it is the reply leaking back through the microphone, and it falls to
+    /// the wake gate exactly as it does today. Nor is such an onset `ListenHeard`:
+    /// the head must not be held up by the robot's own tail.
+    #[test]
+    fn speech_over_the_pods_own_voice_is_no_follow_up() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(wake_mode_config());
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        let mut cursor = 0u64;
+
+        open_listen(&mut state, cursor, 8_192, &mut oww, &mut silero);
+        play(&mut state, true, false);
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        assert_eq!(
+            listen_heards(&events),
+            0,
+            "an onset over the reply is the reply: {events:?}"
+        );
+        play(&mut state, false, false);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert!(
+            soft_endpoints(&events).is_empty(),
+            "and it carves nothing without a wake word: {events:?}"
+        );
+        assert!(
+            state.listen.is_some(),
+            "the window is still open for a person"
+        );
+    }
+
+    /// A window can only run out on audio, and a quiet room sends none: the device
+    /// VAD closes the segment and the deadline passes with nothing to observe it.
+    /// The next segment retires it on its base, so the speech that eventually
+    /// breaks the silence is not announced as an answer to a reply given minutes
+    /// ago and then dropped at the wake gate.
+    #[test]
+    fn a_window_a_quiet_room_outlived_is_retired_at_the_next_segment() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        open(&mut state, 0, &mut oww, &mut silero);
+        state.push_ring_for_test(0, &vec![5_i16; 32_768]);
+
+        open_listen(&mut state, 0, 1_024, &mut oww, &mut silero);
+        let reopened = open_segment(&mut state, 16_384, 0, &mut oww, &mut silero);
+        assert!(
+            reopened
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::ListenExpired { .. })),
+            "the silence the segment followed ran the window out: {reopened:?}"
+        );
+        assert!(state.listen.is_none());
+
+        let mut cursor = 16_384u64;
+        let mut late = drive(&mut state, 0.9, 2, &mut cursor);
+        assert_eq!(
+            listen_heards(&late),
+            0,
+            "nobody is being answered: {late:?}"
+        );
+        late.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert!(
+            soft_endpoints(&late).is_empty(),
+            "and the wake word gates the microphone again: {late:?}"
+        );
+    }
+
+    /// The deadline bounds where speech *begins*, and the confirming onset lands
+    /// chunks later: speech that starts a chunk inside the window and confirms
+    /// after it is a follow-up at both announcements. The window survives its own
+    /// deadline here because the expiry waits for a fully idle endpointer, which a
+    /// building onset run is not — which is what makes the two agree.
+    #[test]
+    fn speech_that_begins_inside_the_window_and_confirms_after_it_is_a_follow_up() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        let mut cursor = 0u64;
+
+        // The deadline falls inside the run's first chunk; the onset is confirmed
+        // only by the second, at 1024.
+        open_listen(&mut state, cursor, 256, &mut oww, &mut silero);
+        let mut events = drive(&mut state, 0.9, 1, &mut cursor);
+        assert!(
+            state.listen.is_some(),
+            "a building run is not an idle room: {events:?}"
+        );
+        events.extend(drive(&mut state, 0.9, 1, &mut cursor));
+        assert_eq!(listen_heards(&events), 1, "heard at the onset: {events:?}");
+
+        let ended = drive(&mut state, 0.1, 3, &mut cursor);
+        let carved = soft_endpoints(&ended);
+        assert_eq!(carved.len(), 1, "carved: {ended:?}");
+        assert!(
+            carved[0].follow_up,
+            "and the carve agrees it began inside the window: {ended:?}"
+        );
+        assert_eq!(listen_heards(&ended), 1, "heard again at the carve");
+    }
+
+    /// A reply beginning ends the previous reply's window. Without this a window
+    /// opened by a reply whose carve raced its own settle would outlive the turn
+    /// behind it and carve the next thing said as a follow-up to a reply that never
+    /// asked for one.
+    #[test]
+    fn a_reply_starting_closes_the_window() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        open(&mut state, 0, &mut oww, &mut silero);
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+
+        open_listen(&mut state, 0, 8_192, &mut oww, &mut silero);
+        let started = state
+            .handle(&pod(), playback_feed(true), &mut oww, &mut silero)
+            .expect("playback feed");
+        assert!(
+            started
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::ListenExpired { .. })),
+            "the window ends with the reply that starts over it: {started:?}"
+        );
+        assert!(state.listen.is_none());
+
+        state
+            .handle(&pod(), playback_feed(false), &mut oww, &mut silero)
+            .expect("playback feed");
+        let mut cursor = 0u64;
+        let mut after = drive(&mut state, 0.9, 2, &mut cursor);
+        after.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert_eq!(listen_heards(&after), 0);
+        assert!(
+            soft_endpoints(&after).is_empty(),
+            "what follows this reply needs the wake word: {after:?}"
+        );
+    }
+
+    /// A playback report through the real feed, so the rules the feed arm owns run.
+    fn playback_feed(active: bool) -> Feed {
+        Feed::PlaybackState {
+            active,
+            interruptible: true,
+            may_wake: false,
+            turn: active.then_some(UtteranceId(1)),
+        }
+    }
+
+    /// The mute's knobs: a two-chunk (1024-sample) tail, so a case steps across
+    /// its edge in the same 512-sample chunks it drives everything else in, and
+    /// `Bypass` so a carve needs no arm — these cases are about what the models'
+    /// scores reach, not about the wake gate.
+    fn mute_config() -> ListenerConfig {
+        ListenerConfig {
+            barge_in: BargeInConfig {
+                mode: BargeMode::Mute,
+                ..ListenerConfig::default().barge_in
+            },
+            mute_tail_samples: 1_024,
+            ..synth_config(WakePolicy::Bypass)
+        }
+    }
+
+    /// The reply stops with the stream at `cursor`. The synthetic driver feeds the
+    /// endpointer directly and never advances the state's own Silero cursor, which
+    /// is what the tail is dated from, so a case that means to cross the tail says
+    /// where the stream is.
+    fn stop_playback_at(state: &mut ListenerState, cursor: u64) {
+        state.silero_cursor = cursor;
+        state.set_playback(false, false, false, None);
+    }
+
+    /// Under the mute a wake detection over the reply, and through the tail after
+    /// it, is discarded whole: nothing armed, nothing reported, nothing cut. This
+    /// is the mode's stated cost — the wake word cannot interrupt a reply either —
+    /// and it is what keeps a reply that trips the detector on its own voice from
+    /// arming the turn that carves the robot's own words.
+    #[test]
+    fn under_mute_a_wake_over_the_reply_and_its_tail_is_discarded() {
+        let mut state = ListenerState::new(mute_config());
+        play(&mut state, true, true);
+
+        let over = state.detect_wake_for_test(&pod(), 0.9, 4_096);
+        assert!(
+            !over
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::WakeDetected { .. })),
+            "not reported as a wake this listener acted on: {over:?}"
+        );
+        assert!(state.wake.is_none(), "and nothing is armed");
+        assert!(!state.barge_pending, "and nothing is cut");
+        // But the discard is on the record: the phrase did fire, and an
+        // operator asking whether the mute can come off reads it here.
+        assert!(
+            matches!(
+                over.as_slice(),
+                [ListenerEvent::WakeMuted {
+                    score,
+                    wake_end_sample: 4_096,
+                    ..
+                }] if (*score - 0.9).abs() < f32::EPSILON
+            ),
+            "the muted detection is reported as such: {over:?}"
+        );
+
+        // The pacer says the audio is heard out at 4096; the tail runs to 5120.
+        stop_playback_at(&mut state, 4_096);
+        let tail = state.detect_wake_for_test(&pod(), 0.9, 5_120);
+        assert!(
+            matches!(tail.as_slice(), [ListenerEvent::WakeMuted { .. }]),
+            "the tail is still the robot: {tail:?}"
+        );
+        assert!(state.wake.is_none());
+
+        let after = state.detect_wake_for_test(&pod(), 0.9, 5_121);
+        assert!(
+            after
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::WakeDetected { .. })),
+            "one sample past the tail the microphone is trusted again: {after:?}"
+        );
+        assert!(state.wake.is_some(), "and the turn is armed");
+
+        // The same detection under the default mode, which hears it all along.
+        let mut heard = ListenerState::new(wake_mode_config());
+        play(&mut heard, true, true);
+        let cut = heard.detect_wake_for_test(&pod(), 0.9, 4_096);
+        assert_eq!(
+            barge_causes(&cut),
+            vec![(BargeCause::Wake, 4_096)],
+            "byte for byte what it does today: {cut:?}"
+        );
+    }
+
+    /// Under the mute, speech over the reply and through the tail is scored as
+    /// silence: no onset, no utterance, nothing to carve. Speech one chunk past the
+    /// tail opens one as ever. The same inputs under the default mode carve the
+    /// echo, which is exactly the mistake this mode exists to stop.
+    #[test]
+    fn under_mute_speech_over_the_reply_and_its_tail_opens_no_utterance() {
+        let mut state = ListenerState::new(mute_config());
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        play(&mut state, true, true);
+        let mut cursor = 0u64;
+
+        let over = drive(&mut state, 0.9, 6, &mut cursor);
+        assert!(
+            transitions(&over).is_empty(),
+            "the endpointer saw silence: {over:?}"
+        );
+        // The stats are not silenced with it: they are the one record of how
+        // loud the room was while the robot talked, which is what says whether
+        // this deployment still needs the mute.
+        assert_eq!(
+            state.silero_stats.flush().map(|s| s.max),
+            Some(0.9),
+            "the model's own score is what the summary carries"
+        );
+
+        stop_playback_at(&mut state, cursor);
+        let tail = drive(&mut state, 0.9, 2, &mut cursor);
+        assert!(
+            transitions(&tail).is_empty(),
+            "and goes on seeing it through the tail: {tail:?}"
+        );
+
+        let mut spoken = drive(&mut state, 0.9, 2, &mut cursor);
+        spoken.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&spoken);
+        assert_eq!(carved.len(), 1, "speech past the tail carves: {spoken:?}");
+        assert!(
+            !carved[0].over_playback,
+            "and was heard with nothing playing: {spoken:?}"
+        );
+
+        // The same drive under the default mode: the echo becomes an utterance.
+        let mut heard = ListenerState::new(ListenerConfig {
+            default_policy: WakePolicy::Bypass,
+            ..wake_mode_config()
+        });
+        heard.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        play(&mut heard, true, true);
+        let mut cursor = 0u64;
+        let mut echo = drive(&mut heard, 0.9, 6, &mut cursor);
+        echo.extend(drive(&mut heard, 0.1, 3, &mut cursor));
+        let echoed = soft_endpoints(&echo);
+        assert_eq!(echoed.len(), 1, "unchanged under the default: {echo:?}");
+        assert!(echoed[0].over_playback, "the reply's own voice: {echo:?}");
+    }
+
+    /// A person is mid-sentence when the reply starts: the chunks from there on are
+    /// silence, so the endpointer releases the utterance and it carves as what was
+    /// heard before the robot spoke. The overlap latch is set on it either way, so
+    /// the gate's echo rule applies to it exactly as it does today.
+    #[test]
+    fn under_mute_an_utterance_the_reply_starts_over_is_released_and_carved() {
+        let mut state = ListenerState::new(mute_config());
+        state.push_ring_for_test(0, &vec![7_i16; 16_384]);
+        let mut cursor = 0u64;
+
+        let onset = drive(&mut state, 0.9, 3, &mut cursor);
+        assert!(
+            !transitions(&onset).is_empty(),
+            "speech with nothing playing onsets as ever: {onset:?}"
+        );
+
+        play(&mut state, true, true);
+        let released = drive(&mut state, 0.9, 4, &mut cursor);
+        let carved = soft_endpoints(&released);
+        assert_eq!(
+            carved.len(),
+            1,
+            "the hangover runs out on the muted chunks: {released:?}"
+        );
+        assert!(
+            carved[0].over_playback,
+            "and the carve says the reply overlapped it: {released:?}"
+        );
+    }
+
     /// A wake landing while an utterance is already accumulating marks that
     /// utterance rather than the carve after it — the speech rule's own placement,
     /// because identity is minted at the first carve either way.
@@ -4929,6 +5646,25 @@ mod tests {
         assert_eq!(snapshot.utterances, 1, "the command it kept: {command:?}");
     }
 
+    /// A muted detection armed nothing, so it is no wake: `wakes` is the count an
+    /// operator reads to decide whether the mute can come off, and detections the
+    /// robot tripped on its own voice would answer that question with themselves.
+    #[test]
+    fn a_muted_wake_is_counted_as_no_wake_at_all() {
+        let stats = ListenerStats::default();
+        stats.record_events(&[ListenerEvent::WakeMuted {
+            pod: pod(),
+            epoch: 1,
+            score: 0.9,
+            wake_end_sample: 4_096,
+        }]);
+        assert_eq!(
+            stats.snapshot(),
+            ListenerStats::default().snapshot(),
+            "no counter moved"
+        );
+    }
+
     /// A forward gap keeps the ring's runs at their true indexes and carves the
     /// hole as silence, which is what an inter-segment hole is too. So a hold
     /// survives one, and the command after the dropped chunk still coalesces from
@@ -5087,6 +5823,51 @@ mod tests {
             1,
             "the waiting wake is accounted for: {reconnect:?}"
         );
+    }
+
+    /// A reconnect opens a new index domain, in which a capture window's deadline
+    /// and a mute tail dated in the old one mean nothing: a stale window would
+    /// carve the new connection's first speech with no wake word behind it, and a
+    /// stale tail would score that speech as silence. Both go with the connection,
+    /// and the window's close is reported like every other.
+    #[test]
+    fn a_reconnect_clears_the_window_and_the_mute_tail() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(mute_config());
+        open(&mut state, 0, &mut oww, &mut silero);
+
+        // The reply is heard out, arming the tail, and its window opens behind it.
+        play(&mut state, true, true);
+        stop_playback_at(&mut state, 0);
+        assert_eq!(state.muted_until_sample, 1_024, "the tail is armed");
+        open_listen(&mut state, 0, 8_192, &mut oww, &mut silero);
+
+        let reconnect = state
+            .handle(&pod(), Feed::Connected { epoch: 7 }, &mut oww, &mut silero)
+            .expect("reconnect");
+        assert!(
+            state.listen.is_none(),
+            "the window went with the connection"
+        );
+        assert_eq!(state.muted_until_sample, 0, "and so did the tail");
+        assert!(
+            reconnect
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::ListenExpired { .. })),
+            "the window's end is on the record: {reconnect:?}"
+        );
+
+        // The new connection's first speech, in its own index domain: scored
+        // rather than muted, and nobody's follow-up.
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        let mut cursor = 0u64;
+        let mut after = drive(&mut state, 0.9, 2, &mut cursor);
+        assert_eq!(listen_heards(&after), 0, "no window is open: {after:?}");
+        after.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&after);
+        assert_eq!(carved.len(), 1, "and the speech is heard: {after:?}");
+        assert!(!carved[0].follow_up, "as nobody's follow-up");
     }
 
     /// The responsiveness guard: a wake-gated carve whose speech runs past the wake

@@ -9,6 +9,36 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **An LLM reply can now drive the robot's head.** The brain's response may
+  embed `<pose name="..." speed="..."/>` and `<motion name="..." speed="..."/>`
+  markers. A pose retargets the head for the rest of the reply; a motion plays
+  once over the current pose, and a second motion interrupts the first. Names
+  are resolved against a local copy of the daemon's pose/motion library
+  (configured via `[brenn] library_names`); an unknown or out-of-range cue is
+  refused with a `cue_refused` log line and never reaches the wire. The help
+  document sent to the brain now lists every pose and motion it may name.
+- **`<listen/>` keeps the microphone open after a reply.** A reply ending in
+  `<listen/>` opens a bounded capture window (duration = `presence_linger_ms`)
+  so the person can respond without saying the wake word. The head stays up for
+  the duration of the window, and a `Heard` signal re-dates the stow whenever
+  speech is detected inside it, so the head never starts down while a follow-up
+  is in flight. Follow-ups are confidence-gated the same way wake and barge
+  carves are.
+- **Echo mute mode.** `[barge] mode = "mute"` suppresses all capture while the
+  pod's own playback is active and for a short tail after it drops, so the
+  robot never hears its own reply. The cost: under mute, no voice interruption
+  is possible at all, wake word included. The default remains `"wake"`.
+
+### Changed
+
+- **`continuation_timeout_ms` default raised from 10 s to 30 s**, matching a
+  realistic cloud round-trip budget. The help document renders the configured
+  value so it cannot contradict the running config. The wake-deafness cost of a
+  long continuation wait is now stated in the key's doc comment.
+- **`<listen/>` is no longer reported as unsupported.** The
+  `LinkListenUnsupported` event, its counter, and the `TODO(brenn-brain-listen)`
+  marker are removed.
+
 - **The head's poses are named per event.** Five new optional `[brenn]` keys:
   `presence_wake_pose` (where the head goes on a wake word and on a barge —
   listening) and `presence_turn_pose` (where it goes when an utterance is
