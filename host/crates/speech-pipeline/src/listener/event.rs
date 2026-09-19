@@ -78,9 +78,20 @@ pub enum Feed {
     /// carved with no wake word. Fed by the surface when a reply that asked to keep
     /// listening has finished sounding.
     ///
-    /// One-shot. The window closes on the first utterance minted under it, whatever
-    /// its provenance, and on the deadline passing with the endpointer idle.
+    /// The window closes on the first utterance minted under it, whatever its
+    /// provenance, and on the deadline passing with the endpointer idle. A
+    /// candidate the pipeline's gate then declines did not become a turn and costs
+    /// the window nothing: [`Feed::CandidateDeclined`] restores it at the deadline
+    /// it opened with, which is never re-dated.
     Listen { window_samples: u64 },
+    /// The pipeline's gate declined the candidate `id`: it became no turn. Fed for
+    /// every gate outcome that is not a dispatch, whether or not any window is
+    /// involved — the listener is what decides whether a decline reopens anything.
+    ///
+    /// When `id` is the candidate whose mint closed a capture window, the window
+    /// returns with its original deadline ([`ListenerEvent::ListenRestored`]); any
+    /// other id is a no-op.
+    CandidateDeclined { id: ListenerUtteranceId },
     /// The transport segment closed (the authoritative outer boundary). Finalizes
     /// any in-progress utterance and clears the wake arm.
     SegmentClosed {
@@ -323,8 +334,11 @@ pub enum ListenerEvent {
         summary: ScoreSummary,
     },
     /// A capture window opened: speech beginning at or before `deadline_sample`
-    /// carves with no wake word. Accounting only — the window is the listener's own
-    /// state and nothing downstream acts on this.
+    /// carves with no wake word. A reader is entitled to conclude that this pod
+    /// hears the next thing said without the wake word until that sample, and that
+    /// it stops doing so at the next `ListenExpired`. `deadline_sample` is
+    /// accounting only — the deadline is the listener's own state and nothing
+    /// downstream acts on it.
     ListenOpened {
         pod: PodId,
         epoch: u64,
@@ -332,18 +346,55 @@ pub enum ListenerEvent {
         /// the window.
         deadline_sample: u64,
     },
-    /// Speech was heard inside an open capture window — at its onset, and again at
-    /// the carve that closes the window. A reader is entitled to conclude that a
-    /// person is talking to this pod right now and to hold off anything that would
-    /// end the interaction; it says nothing about what was said, which only the
-    /// utterance that follows can.
+    /// The capture window an utterance's mint closed is open again, at the same
+    /// `deadline_sample` it opened with: the pipeline's gate declined that
+    /// candidate, so no turn came of it and it cost the window nothing. The
+    /// deadline is never re-dated by a decline, so the window still ends where it
+    /// always would have.
+    ///
+    /// Says exactly what [`ListenerEvent::ListenOpened`] says, for a reader
+    /// tracking whether the microphone is open: an utterance minted under a window
+    /// closes it, and this line is what says it came back. It follows every such
+    /// utterance whose candidate the gate declined, unless a newer utterance, a
+    /// newer window, or a `ListenExpired` intervened first.
+    ListenRestored {
+        pod: PodId,
+        epoch: u64,
+        /// The restored window's deadline — the one it opened with.
+        deadline_sample: u64,
+        /// The listener's cursor at the restore, in `deadline_sample`'s index
+        /// domain: `deadline_sample − at_sample` is what is left of the window.
+        /// Unlike [`ListenerEvent::ListenOpened`]'s deadline this is acted on —
+        /// it is how long a reader has before the grant this line announces runs
+        /// out, and the surface dates the head's own fallback from it.
+        at_sample: u64,
+    },
+    /// Speech was heard inside an open capture window: when it begins, when it
+    /// resumes after a pause the endpointer took for an ending, when a restored
+    /// window comes back with such speech already running, and again at the carve
+    /// that closes the window. A reader is entitled to conclude that a person is
+    /// talking to this pod right now and to hold off anything that would end the
+    /// interaction; it says nothing about what was said, which only the utterance
+    /// that follows can.
     ListenHeard { pod: PodId, epoch: u64 },
-    /// A capture window ended with nothing carved under it: the wake word gates
-    /// the microphone again. Its deadline passed with the endpointer idle, or the
-    /// window outlived its reason — a new reply began over it, the stream
-    /// re-anchored past its deadline, or the connection went. One of these follows
-    /// every `ListenOpened` that no utterance closed, so a reader may balance the
-    /// two. Accounting only.
+    /// A capture window ended: the wake word gates the microphone again, and a
+    /// reader is entitled to conclude that this pod no longer hears anything said
+    /// without it. Its deadline passed with the endpointer idle and no wake hold
+    /// standing, or the window outlived its reason — a new reply began over it, the
+    /// stream re-anchored past its deadline, or the connection went.
+    ///
+    /// The head may already be down when this arrives: the surface brings it down
+    /// on its own wall clock when the deadline passes in a silence no audio
+    /// crosses (`listen_released`), and this line follows whenever audio next
+    /// reaches the listener.
+    ///
+    /// Says nothing about whether a turn came of the window; that is read from
+    /// `brain_dispatched`. The one ending this line does not cover is a window an
+    /// utterance's mint closed, which ends silently — the utterance is the record,
+    /// and a `ListenRestored` follows when the gate declines it. When that
+    /// candidate becomes a turn instead, its window is simply over: the reply
+    /// beginning is that turn's, `brain_dispatched` is the record, and no line
+    /// ends a window the turn already answered.
     ListenExpired { pod: PodId, epoch: u64 },
 }
 

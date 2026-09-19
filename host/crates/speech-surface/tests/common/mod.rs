@@ -908,14 +908,26 @@ pub fn listener_daemon_config(record_dir: Option<&Path>) -> String {
     daemon_config_with(record_dir, &listener_block())
 }
 
-/// The streaming listener plus a `wav` brain answering every carved utterance with
-/// the clip at `clip`. Recording off unless `record_dir` is given. The listener
-/// tables precede `[brain]` so the TOML is well-ordered.
-pub fn listener_wav_brain_config(record_dir: Option<&Path>, clip: &Path) -> String {
+/// The streaming listener plus a `wav` brain answering with the clip at `clip`
+/// every carved utterance that transcribes to words. `[stt]` points at
+/// `speaches_url`: the gate declines an utterance with no text before any brain
+/// sees it, so this mode needs a transcriber like every other. No `[tts]` — the
+/// reply is the fixed clip, never synthesized. Recording off unless `record_dir`
+/// is given. The listener tables precede `[stt]` and `[brain]` so the TOML is
+/// well-ordered.
+pub fn listener_wav_brain_config(
+    record_dir: Option<&Path>,
+    clip: &Path,
+    speaches_url: &str,
+) -> String {
     daemon_config_with(
         record_dir,
         &format!(
-            "{}[brain]\n\
+            "{}[stt]\n\
+             backend = \"http\"\n\
+             url = \"{speaches_url}\"\n\
+             model = \"test-whisper\"\n\
+             [brain]\n\
              mode = \"wav\"\n\
              clip = \"{}\"\n",
             listener_block(),

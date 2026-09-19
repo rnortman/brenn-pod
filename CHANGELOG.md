@@ -20,10 +20,9 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 - **`<listen/>` keeps the microphone open after a reply.** A reply ending in
   `<listen/>` opens a bounded capture window (duration = `presence_linger_ms`)
   so the person can respond without saying the wake word. The head stays up for
-  the duration of the window, and a `Heard` signal re-dates the stow whenever
-  speech is detected inside it, so the head never starts down while a follow-up
-  is in flight. Follow-ups are confidence-gated the same way wake and barge
-  carves are.
+  as long as the window is open, so it never starts down while a follow-up is in
+  flight. Follow-ups are confidence-gated the same way wake and barge carves
+  are.
 - **Echo mute mode.** `[barge] mode = "mute"` suppresses all capture while the
   pod's own playback is active and for a short tail after it drops, so the
   robot never hears its own reply. The cost: under mute, no voice interruption
@@ -31,6 +30,26 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Changed
 
+- **Noise inside a `<listen/>` window no longer kills the conversation.** A
+  cough, the television, or a half-word during a capture window used to close
+  it permanently, forcing the person to say the wake word again to be heard.
+  The window now survives any candidate the gate declines — at its original
+  deadline, never re-dated — and a new `listen_restored` line records the
+  recovery. The head tracks the window rather than a fixed timer: it stays up
+  while the window is open (bounded by `presence_max_engaged_ms` as a fault
+  ceiling) and stows when the window expires, instead of folding
+  `presence_linger_ms` on each speech report. Because the listener's sample
+  clock only advances when audio arrives, a wall-clock `listen_released` backs
+  the expiry in a quiet room. New log lines: `listen_restored` (with
+  `at_sample`), `listen_released`.
+- **An utterance that transcribes to nothing is declined before any brain.**
+  The gate makes "does this carry usable text?" its first test, so no brain is
+  called for speech that said nothing. A wake-gated empty is now
+  `brain_wake_command_absent {reason: "empty"}` under every brain mode (was
+  `brain_no_transcript` under `mode = "brenn"`), and `mode = "wav"` needs an
+  `[stt]` table to answer anything. The gate also classifies a candidate's
+  provenance once, so a carve that began inside a window and went on to cut the
+  reply is declined as a barge rather than as a follow-up.
 - **`continuation_timeout_ms` default raised from 10 s to 30 s**, matching a
   realistic cloud round-trip budget. The help document renders the configured
   value so it cannot contradict the running config. The wake-deafness cost of a

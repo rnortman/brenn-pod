@@ -203,8 +203,10 @@ pub struct ScriptTiming {
     /// than this sets that headroom instead, because that last step's own move
     /// has to fit inside the timeout too. Must not exceed [`MAX_TIMEOUT_MS`].
     pub refresh: Duration,
-    /// How long the head stays up after a turn that asked to keep listening, and
-    /// after a raise that produced no turn at all. The `<listen/>` window.
+    /// How long the head stays up after a raise that produced no turn at all,
+    /// and the schedule a turn that asked to keep listening ends on while
+    /// nobody speaks into its window. Dated the same as the capture window's
+    /// own deadline, from one configured key.
     pub linger: Duration,
     /// The *floor* under the timeout every emitted script carries: the daemon
     /// stows this long after receipt whatever else happens. On a hold script,
@@ -214,6 +216,15 @@ pub struct ScriptTiming {
     /// its own timeline instead, because the timeout is a ceiling on that
     /// timeline and may not be shorter than it. Must not exceed
     /// [`MAX_TIMEOUT_MS`].
+    ///
+    /// Also the host-side bound on speech inside a capture window: a person
+    /// still talking is engaged with no new fact, so
+    /// [`ScriptInput::Heard`] dates the head's ending this far out and lets the
+    /// window's own end pull it in. It is reached by a follow-up spoken for
+    /// longer than this, and otherwise only when none of the window's endings
+    /// arrives — a turn starting, the window expiring, the surface's own
+    /// wall-clock release of it, or a wake hold's ending. That is a fault, not a
+    /// quiet room.
     pub max_engaged: Duration,
     /// How long after the estimated end of a closed turn's speech the head
     /// starts down. Absorbs the jitter between an estimate made when playback
@@ -299,11 +310,20 @@ pub enum ScriptInput {
         end: TurnEnd,
     },
     /// A raise produced no turn: the wake arm expired with no command, or the
-    /// confidence gate declined what was said.
+    /// gate declined what was said with no capture window to hand the head to.
+    /// The head folds a linger from here.
     Unanswered(PodId),
-    /// Speech was heard inside an open `<listen/>` window. The head keeps
-    /// waiting where it stands, a linger from now.
+    /// Speech was heard inside an open `<listen/>` capture window. The head
+    /// keeps waiting where it stands, out to the engagement ceiling, because
+    /// the microphone is busy and only the window's own end says how long for.
     Heard(PodId),
+    /// The capture window's grant is over: its deadline is behind the pod, so
+    /// nothing more will be heard on that window's account. Sent when the
+    /// listener reports the window closed, and on the surface's own wall clock
+    /// when the deadline passes in a silence the listener's sample-domain clock
+    /// never crosses. The head comes down, unless the pod holds a turn whose own
+    /// schedule owns the ending instead.
+    ListenExpired(PodId),
     /// A reply asked the head to move. The movements of one response message,
     /// in the order the reply named them; the last pose and the last motion in
     /// the batch are the ones that take effect.
@@ -341,6 +361,7 @@ impl ScriptInput {
             | ScriptInput::TurnEnded { pod, .. }
             | ScriptInput::Unanswered(pod)
             | ScriptInput::Heard(pod)
+            | ScriptInput::ListenExpired(pod)
             | ScriptInput::Cues { pod, .. }
             | ScriptInput::Audio { pod, .. } => pod,
         }
@@ -361,6 +382,8 @@ pub enum Cause {
     Unanswered,
     /// Speech inside an open capture window.
     Heard,
+    /// The capture window that was holding the head up closed.
+    ListenExpired,
     /// A reply asked the head to move.
     Cue,
     /// A cued motion's own span ran out, so the standing want is said plainly
@@ -382,6 +405,7 @@ impl Cause {
             Cause::Turn => "turn",
             Cause::Unanswered => "unanswered",
             Cause::Heard => "heard",
+            Cause::ListenExpired => "listen_expired",
             Cause::Cue => "cue",
             Cause::MotionEnded => "motion_ended",
             Cause::Closing => "closing",
@@ -580,8 +604,9 @@ impl Scripter {
                     self.reconsider(&pod, now)
                 }
             }
-            ScriptInput::Unanswered(_) => self.wait_out_linger(&pod, now, Cause::Unanswered),
-            ScriptInput::Heard(_) => self.wait_out_linger(&pod, now, Cause::Heard),
+            ScriptInput::Unanswered(_) => self.wait_out_linger(&pod, now),
+            ScriptInput::Heard(_) => self.heard(&pod, now),
+            ScriptInput::ListenExpired(_) => self.listen_expired(&pod, now),
             ScriptInput::Cues { cues, .. } => self.cue(&pod, now, cues),
             ScriptInput::Audio { turn, audio, .. } => {
                 let p = self.pods.entry(pod.clone()).or_default();
@@ -616,12 +641,15 @@ impl Scripter {
     /// raise — the confidence gate declines and the arm then expires — and
     /// raising the head to lower it again is not what either means. A `Heard`
     /// and a `Cues` are refused for the same reason and one more: content never
-    /// raises a head that is at rest.
+    /// raises a head that is at rest. A `ListenExpired` is refused because an
+    /// ending it would schedule has already happened — a window closing over a
+    /// head that is down has nothing left to bring down.
     #[must_use]
     pub fn refusal(&self, input: &ScriptInput) -> Option<&'static str> {
         match input {
             ScriptInput::Unanswered(pod)
             | ScriptInput::Heard(pod)
+            | ScriptInput::ListenExpired(pod)
             | ScriptInput::Cues { pod, .. }
                 if !self.engaged(pod) =>
             {
@@ -774,6 +802,17 @@ impl Scripter {
         millis(self.timing.refresh).max(self.stow.move_ms.unwrap_or(0))
     }
 
+    /// The furthest stow instant a script emitted at `now` can express.
+    ///
+    /// Every script carries a timeout that covers its own timeline and no
+    /// timeout may exceed [`MAX_TIMEOUT_MS`], so a stow-terminal timeline
+    /// reaches at most the ceiling less the room such a timeout keeps past its
+    /// last step. Any stow this scripter plans is held under it, whether it
+    /// comes from a turn's audio or from the engagement ceiling.
+    fn furthest_stow(&self, now: Now) -> Instant {
+        now.at + Duration::from_millis(MAX_TIMEOUT_MS.saturating_sub(self.stow_headroom_ms()))
+    }
+
     /// A stow at `stow_at` as a want, cut back to the last instant a script
     /// emitted at `now` may name — and the offset it asked for when the cut
     /// engaged.
@@ -801,9 +840,7 @@ impl Scripter {
     /// is the rule the no-horizon branch of [`Scripter::reconsider`] already
     /// keeps, for the same reason.
     fn closing(&self, pod: &PodId, now: Now, at: Raise, stow_at: Instant) -> (Want, Option<u64>) {
-        let headroom =
-            Duration::from_millis(MAX_TIMEOUT_MS.saturating_sub(self.stow_headroom_ms()));
-        let ceiling = now.at + headroom;
+        let ceiling = self.furthest_stow(now);
         if stow_at <= ceiling {
             return (Want::Closing { at, stow_at }, None);
         }
@@ -821,37 +858,98 @@ impl Scripter {
     }
 
     /// Keep the head where it stands and re-date its ending to a linger from
-    /// now. The answer to both facts that say "the interaction is not over, and
-    /// nothing new is coming through the brain": a raise that produced no turn,
-    /// and speech heard inside an open capture window.
+    /// now: a raise produced no turn, and nothing else is going to end this
+    /// engagement, so the settle starts here.
     ///
     /// The turn's facts are dropped first. A `TurnEnded` or `Audio` about the
     /// turn that just finished, arriving after this, would otherwise reconsider
     /// the ending back to that turn's own horizon; with no turn standing it is
-    /// refused.
+    /// refused. So is whatever the last reply asked the head to do — an
+    /// unanswered raise ends it.
     ///
     /// Callers must have refused every want that holds the head nowhere — the
     /// closing carries the standing raise, so there has to be one.
-    // TODO(listen-window-owns-the-stow): the hold is a fixed linger from each of
-    // the two instants speech is reported at, so a follow-up spoken without a
-    // break for longer than that sees the head start down mid-sentence.
-    fn wait_out_linger(&mut self, pod: &PodId, now: Now, cause: Cause) -> Option<ScriptPublish> {
+    fn wait_out_linger(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
         let p = self.pods.entry(pod.clone()).or_default();
         p.clear_turn();
-        // An unanswered raise ends what the last reply was doing; speech heard
-        // inside the window does not — a cued nod plays on while the person
-        // talks, and cutting it would be the head reacting to being listened
-        // to.
-        if cause == Cause::Unanswered {
-            p.running = None;
-        }
+        p.running = None;
         let at = p
             .want
             .at()
             .cloned()
             .expect("the caller's guard refused every want that holds the head nowhere");
         let (want, clamped) = self.closing(pod, now, at, now.at + self.timing.linger);
-        self.set(pod, now, want, cause, clamped)
+        self.set(pod, now, want, Cause::Unanswered, clamped)
+    }
+
+    /// Hold the head where it stands while somebody is talking into the capture
+    /// window, out to the engagement ceiling.
+    ///
+    /// The window is what ends this, not a duration decided here: the listener
+    /// waits for the room to go idle past the deadline before it reports the
+    /// window closed, so speech of any length is covered and the
+    /// [`ScriptInput::ListenExpired`] that follows is what brings the head
+    /// down. The ceiling is the fallback for a window that never reports an
+    /// end — `max_engaged` already means "engaged this long with no new fact
+    /// whatever happens".
+    ///
+    /// Not routed through [`Scripter::closing`]: that fn narrates its cut as
+    /// `script_horizon_clamped`, which means an operator's slip, and a
+    /// `max_engaged` legally equal to [`MAX_TIMEOUT_MS`] would have every
+    /// window's speech report a slip that did not happen. The bound taken here
+    /// is the scripter's own bound on its own plan, so it carries no
+    /// `clamped_from_ms`.
+    ///
+    /// The turn's facts are dropped, for [`Scripter::wait_out_linger`]'s
+    /// reason. A running motion is not: a cued nod plays on while the person
+    /// talks, and cutting it would be the head reacting to being listened to.
+    ///
+    /// Callers must have refused every want that holds the head nowhere — the
+    /// closing carries the standing raise, so there has to be one.
+    fn heard(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
+        let at = {
+            let p = self.pods.entry(pod.clone()).or_default();
+            p.clear_turn();
+            p.want
+                .at()
+                .cloned()
+                .expect("the caller's guard refused every want that holds the head nowhere")
+        };
+        let stow_at = (now.at + self.timing.max_engaged).min(self.furthest_stow(now));
+        self.set(pod, now, Want::Closing { at, stow_at }, Cause::Heard, None)
+    }
+
+    /// The capture window closed, so the head comes down now.
+    ///
+    /// Only for a pod holding no turn. A pod holding one is on that turn's
+    /// schedule, and that schedule already ends the head — the stow margin after
+    /// a closed turn, the linger after an open one, which is the window's own
+    /// deadline by the shared configured key. The window's end has nothing to add
+    /// there, and acting on it would stow the head over a reply: the turn's end
+    /// is known the moment the brain returns, before its words are synthesised
+    /// and long before they sound, so a window ending anywhere in that stretch —
+    /// the connection going, the stream re-anchoring — would cut the answer the
+    /// person is waiting for.
+    ///
+    /// What this ends is the engagement a [`ScriptInput::Heard`] left standing
+    /// after it cleared the turn's facts, which is the one engagement with no
+    /// other ending.
+    ///
+    /// A stow that is already due goes out through the same path every other
+    /// already-due stow takes, so the daemon is told once and confirmed once.
+    ///
+    /// Callers must have refused every want that holds the head nowhere: a
+    /// window closing over a head that is already down ends nothing.
+    fn listen_expired(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
+        let at = {
+            let p = self.pods.get(pod)?;
+            if p.turn.is_some() {
+                return None;
+            }
+            p.want.at()?.clone()
+        };
+        let (want, clamped) = self.closing(pod, now, at, now.at);
+        self.set(pod, now, want, Cause::ListenExpired, clamped)
     }
 
     /// Decide whether the turn in flight can be scheduled to its end yet, and
@@ -2094,11 +2192,12 @@ mod tests {
     }
 
     /// Speech heard inside the capture window keeps the head where the reply
-    /// left it and moves its ending out to a linger from the moment it was
-    /// heard. Nothing is raised and nothing retargets: the person is still
+    /// left it and moves its ending out to the engagement ceiling — the window
+    /// is what will end it, and this is only the bound for a window that never
+    /// does. Nothing is raised and nothing retargets: the person is still
     /// talking to the same head.
     #[test]
-    fn speech_inside_the_window_re_dates_the_stow_from_now() {
+    fn speech_inside_the_window_holds_the_head_to_the_ceiling() {
         let mut fx = two_pose_fixture();
         fx.publish(ScriptInput::Wake(pod()), ZERO);
         fx.apply(
@@ -2133,11 +2232,264 @@ mod tests {
         let heard = fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(3));
         assert_eq!(
             steps(&heard),
-            vec![(0, NEUTRAL), (8_000, STOW_POSE)],
-            "a linger from the instant the speech was heard, off the same pose",
+            vec![(0, NEUTRAL), (millis(CEILING), STOW_POSE)],
+            "the ceiling from the instant the speech was heard, off the same pose",
         );
         assert_eq!(heard.cause, Cause::Heard);
         assert!(heard.change);
+        assert!(
+            heard.clamped_from_ms.is_none(),
+            "the scripter bounding its own plan is not an operator's slip",
+        );
+    }
+
+    /// The ceiling `Heard` dates from is the scripter's own bound, not
+    /// `closing`'s clamp: a deployment that sets the engagement ceiling to the
+    /// wire's own maximum — which validation admits — gets the furthest stow it
+    /// can express and no `script_horizon_clamped` line, because nothing was
+    /// clamped.
+    #[test]
+    fn a_ceiling_at_the_wires_maximum_states_no_slip() {
+        let mut fx = fixture_with(ScriptTiming {
+            max_engaged: Duration::from_millis(MAX_TIMEOUT_MS),
+            ..timing()
+        });
+        fx.wake_and_dispatch(ZERO);
+        let heard = fx.publish(ScriptInput::Heard(pod()), ZERO);
+        // The stow's own pace is unset here, so the room the timeout keeps past
+        // it is the refresh period.
+        assert_eq!(
+            steps(&heard),
+            vec![(0, NEUTRAL), (MAX_TIMEOUT_MS - millis(REFRESH), STOW_POSE)],
+            "the furthest stow a script can express",
+        );
+        assert!(heard.clamped_from_ms.is_none(), "nothing was cut back");
+        assert!(stow_fits(&heard));
+    }
+
+    /// The `<listen/>` promise, kept for as long as the person talks: speech
+    /// that runs past the linger does not see the head start down, because the
+    /// ending is the window's to give and the window has not ended.
+    #[test]
+    fn speech_outlasting_the_linger_never_starts_the_head_down() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
+        );
+        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(1));
+        // Past the linger, and past the instant an ending dated from the reply
+        // would have stowed at. Every tick in between is a refresh of the same
+        // standing answer.
+        let mut at = Duration::from_secs(2);
+        while at < LINGER * 2 {
+            for publish in fx.tick(at) {
+                assert_eq!(publish.cause, Cause::Refresh, "at {at:?}");
+                assert_eq!(
+                    stow_ms(&publish),
+                    millis(CEILING) - millis(at) + 1_000,
+                    "the same absolute ending, restated: {at:?}",
+                );
+            }
+            at += REFRESH;
+        }
+        assert!(
+            matches!(fx.want(), Want::Closing { .. }),
+            "the head is still up with its ending ahead of it",
+        );
+
+        // And the window's own end is what brings it down.
+        let expired = fx.publish(ScriptInput::ListenExpired(pod()), at);
+        assert_eq!(expired.cause, Cause::ListenExpired);
+        assert_eq!(steps(&expired), vec![(0, STOW_POSE)]);
+    }
+
+    /// The window closing is what stows the head after a listening reply: the
+    /// ending `Heard` dated at the ceiling is pulled to now.
+    #[test]
+    fn the_windows_end_stows_the_head_it_was_holding_up() {
+        let mut fx = two_pose_fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
+        );
+        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(1));
+        let expired = fx.publish(ScriptInput::ListenExpired(pod()), Duration::from_secs(4));
+        assert_eq!(
+            steps(&expired),
+            vec![(0, STOW_POSE)],
+            "a stow already due goes out on its own",
+        );
+        assert_eq!(expired.cause, Cause::ListenExpired);
+        assert!(expired.change);
+        assert_eq!(
+            fx.want(),
+            Want::Stowing,
+            "armed for the one confirming re-send every closing gets",
+        );
+    }
+
+    /// A window nobody spoke into is left to the turn that opened it. The pod
+    /// still holds that turn's facts, so it is on that turn's schedule, and the
+    /// linger that schedule ends on is dated from the same configured key as the
+    /// window's own deadline — the window's end has nothing to add.
+    #[test]
+    fn the_window_leaves_an_ending_nobody_spoke_into_to_its_turn() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
+        );
+        fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0 + Duration::from_secs(2))),
+            },
+            ZERO,
+        );
+        let want = fx.want();
+        assert!(
+            fx.apply(ScriptInput::ListenExpired(pod()), Duration::from_secs(9))
+                .is_none(),
+            "the turn's own ending stands",
+        );
+        assert_eq!(fx.want(), want);
+    }
+
+    /// The window can end anywhere in the stretch between the brain returning and
+    /// the reply sounding — a re-anchor past its deadline is enough. The turn's
+    /// end is known there and its audio has not started, so the head has to be
+    /// left alone until the horizon says where the reply ends.
+    #[test]
+    fn the_windows_end_leaves_a_reply_that_has_not_sounded_yet_alone() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        fx.apply(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 1, None),
+            },
+            ZERO,
+        );
+        let want = fx.want();
+        assert!(
+            fx.apply(ScriptInput::ListenExpired(pod()), Duration::from_secs(1))
+                .is_none(),
+            "the answer is synthesised but not yet spoken",
+        );
+        assert_eq!(fx.want(), want, "and the head is still up for it");
+
+        // The reply starts: the ending is the horizon's, as it always was.
+        let started = fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0 + Duration::from_secs(4))),
+            },
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            stow_ms(&started),
+            millis(Duration::from_secs(3) + MARGIN),
+            "dated from the horizon, not from the window",
+        );
+    }
+
+    /// A window can still end under a turn in flight — the connection goes, or the
+    /// stream re-anchors, while the brain has the follow-up it carried. The turn
+    /// owns the head from there: pulling the stow in would cut the answer the
+    /// person is waiting for, so the expiry changes nothing.
+    #[test]
+    fn a_turn_in_flight_outranks_the_window_that_carried_it() {
+        const FOLLOW_UP: UtteranceId = UtteranceId(8);
+        let mut fx = two_pose_fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
+        );
+        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(1));
+        let raised = fx.publish(
+            ScriptInput::TurnStarted {
+                pod: pod(),
+                turn: FOLLOW_UP,
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(raised.cause, Cause::Turn);
+        let want = fx.want();
+        assert!(
+            fx.apply(ScriptInput::ListenExpired(pod()), Duration::from_secs(2))
+                .is_none(),
+            "the reply's start closed the window; the turn owns the ending",
+        );
+        assert_eq!(fx.want(), want, "and the head is still up for the answer");
+    }
+
+    /// A window closing over a head that is already down or on its way ends
+    /// nothing: the stow in front of the daemon stands.
+    #[test]
+    fn a_windows_end_for_a_head_at_rest_is_refused() {
+        let mut fx = fixture();
+        assert_eq!(
+            fx.scripter.refusal(&ScriptInput::ListenExpired(pod())),
+            Some("head_at_rest"),
+            "no head is up",
+        );
+        assert!(fx.apply(ScriptInput::ListenExpired(pod()), ZERO).is_none());
+
+        fx.wake_and_dispatch(ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Closed,
+            },
+            ZERO,
+        );
+        fx.publish(
+            ScriptInput::Audio {
+                pod: pod(),
+                turn: TURN,
+                audio: audio(true, 1, 0, Some(fx.t0)),
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(fx.want(), Want::Stowing);
+        assert_eq!(
+            fx.scripter.refusal(&ScriptInput::ListenExpired(pod())),
+            Some("head_at_rest"),
+            "a stow in front of the daemon is not re-decided by a window",
+        );
     }
 
     /// The window's speech clears the finished turn, so a fact about that turn
@@ -2173,27 +2525,6 @@ mod tests {
             fx.want(),
             want,
             "and the ending stands where `Heard` put it"
-        );
-    }
-
-    /// Two facts that mean the same thing about the same instant say it once.
-    /// A declined follow-up is both — heard, then unanswered — and the head is
-    /// not re-instructed for the second.
-    #[test]
-    fn heard_then_unanswered_at_one_instant_publishes_once() {
-        let mut fx = fixture();
-        fx.wake_and_dispatch(ZERO);
-        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(2));
-        assert!(
-            fx.apply(ScriptInput::Unanswered(pod()), Duration::from_secs(2))
-                .is_none(),
-            "the same closing, already standing",
-        );
-        let later = fx.publish(ScriptInput::Unanswered(pod()), Duration::from_secs(4));
-        assert_eq!(
-            steps(&later),
-            vec![(0, NEUTRAL), (8_000, STOW_POSE)],
-            "a decline that lands later does move the ending out",
         );
     }
 
@@ -3259,6 +3590,12 @@ mod tests {
                         },
                         ZERO,
                     ));
+                    // The window's two inputs on top of the turn's own ending,
+                    // in the order a follow-up produces them: the ceiling, then
+                    // the pull-in. Each is a want this scripter can be driven
+                    // to, so each has to be lawful under every timing here.
+                    seen.extend(fx.apply(ScriptInput::Heard(pod()), ZERO));
+                    seen.extend(fx.apply(ScriptInput::ListenExpired(pod()), ZERO));
                     // Far enough past any stow this table can produce that the
                     // repair emit fires, and then its confirmation.
                     seen.extend(fx.tick(Duration::from_secs(1_000_000)));
@@ -4460,7 +4797,7 @@ mod tests {
         );
     }
 
-    /// Speech inside the capture window re-dates the ending and leaves the nod
+    /// Speech inside the capture window moves the ending out and leaves the nod
     /// alone: the head does not react to being listened to.
     #[test]
     fn heard_keeps_a_running_motion() {
@@ -4480,8 +4817,55 @@ mod tests {
         assert_eq!(
             timeline(&publish),
             vec![(0, NEUTRAL.to_string()), (1, "play nod".to_string())],
-            "the play stands; the re-dated ending is not said until the lift"
+            "the play stands; the ending behind it is not said until the lift"
         );
+        assert_eq!(
+            fx.want(),
+            Want::Closing {
+                at: Raise::to(NEUTRAL),
+                stow_at: fx.t0 + Duration::from_secs(1) + CEILING,
+            },
+            "and the ending waiting behind the nod is the ceiling's",
+        );
+    }
+
+    /// The window closing leaves the nod alone too, for `Heard`'s reason: a cued
+    /// gesture playing while the microphone goes wake-gated is not the head
+    /// reacting to the microphone. The ending goes behind the play, where every
+    /// closing over a running motion puts it, and the lift is what says it.
+    #[test]
+    fn the_windows_end_keeps_a_running_motion() {
+        let mut fx = fixture();
+        fx.wake_and_dispatch(ZERO);
+        fx.publish(cued(vec![motion_cue("nod", 20_000)]), ZERO);
+        fx.apply(
+            ScriptInput::TurnEnded {
+                pod: pod(),
+                turn: TURN,
+                end: TurnEnd::Open,
+            },
+            ZERO,
+        );
+        fx.publish(ScriptInput::Heard(pod()), Duration::from_secs(1));
+        let publish = fx.publish(ScriptInput::ListenExpired(pod()), Duration::from_secs(2));
+        assert_eq!(publish.cause, Cause::ListenExpired);
+        assert_eq!(
+            timeline(&publish),
+            vec![(0, NEUTRAL.to_string()), (1, "play nod".to_string())],
+            "the play stands; the stow behind it is not said until the lift"
+        );
+        assert_eq!(
+            fx.want(),
+            Want::Closing {
+                at: Raise::to(NEUTRAL),
+                stow_at: fx.t0 + Duration::from_secs(2),
+            },
+            "and the ending waiting behind the nod is now, not the ceiling",
+        );
+        // The nod ends: the stow that was waiting behind it goes out.
+        let lifted = fx.tick(Duration::from_secs(20));
+        assert_eq!(lifted.len(), 1, "one lift: {lifted:?}");
+        assert_eq!(steps(&lifted[0]), vec![(0, STOW_POSE)]);
     }
 
     /// An unanswered raise ends what the reply was doing: nothing is coming of

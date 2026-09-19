@@ -73,9 +73,10 @@ cannot move the machine.
 
 **The brain** here is `mode = "echo"` — the parrot: transcribe what you said and read it
 back. STT and TTS come from a local `speaches` container. (`mode = "wav"` — answer every
-utterance with one fixed clip, no container needed — exists as a fault-isolation fallback,
-not as a step on the way; see the last section. `mode = "llm"` is not a thing yet; the
-config parser rejects it.)
+utterance *that carries text* with one fixed clip; it still needs the container for
+`[stt]`, since an utterance that transcribes to nothing never reaches any brain — exists
+as a fault-isolation fallback, not as a step on the way; see the last section. `mode =
+"llm"` is not a thing yet; the config parser rejects it.)
 
 Host configs live under `host/config/`, which is gitignored (`.gitignore`:
 `host/config/*.toml`) — they hold a LAN address and a path to a secrets file, so they stay
@@ -339,9 +340,11 @@ Capture these before changing anything — they are what an investigation needs:
 
 To isolate a failure, simplify the host side — the pod side never changes:
 
-- **Take STT/TTS out of play:** switch `[brain]` to `mode = "wav"` with
-  `clip = "testdata/wake/wake-phrase.wav"` and drop the `[stt]`/`[tts]` tables. A clip
-  played back on a wake proves the whole pod loop with zero external services.
+- **Take TTS and the LLM out of play:** switch `[brain]` to `mode = "wav"` with
+  `clip = "testdata/wake/wake-phrase.wav"` and drop the `[tts]` table; keep `[stt]`, since
+  an utterance that transcribes to nothing reaches no brain. A clip played back on a wake
+  proves the whole pod loop down to the transcript. Taking STT out of play means dropping
+  `[brain]` — the listener-only shape below.
 - **Take the listener out of play:** drop the `[wake]`, `[endpointer]` and `[brain]`
   tables. The daemon is recording-only — expect the loud `listener_absent` startup line —
   and `host/framelogs/` answers whether segments are arriving at all.
@@ -354,7 +357,7 @@ Common shapes:
 | Pod connects and is dropped | The pod's key-table line and the pushed key disagree — someone edited one side by hand. Re-run the provision command; to rotate both sides, delete the pod's line first |
 | Nothing connects at all | `listen_addr` on a loopback address; a firewall on the workstation's `:7380` |
 | Selftest refuses to run (exit 3) | `brenn-app.service` is running; the registry will not share the hardware with it |
-| Segments arrive, nothing comes back | Whether `speaches-up.sh` finished and `:8000` answers; in the `wav` fallback, the brain clip path |
+| Segments arrive, nothing comes back | Whether `speaches-up.sh` finished and `:8000` answers; in the `wav` fallback, *also* the brain clip path |
 | Daemon dies at startup on a model load | `make -C host fetch-models` never ran, or a `[wake]`/`[endpointer]` model path is wrong — they are relative to `host/`. A missing model is fatal, never a quietly deaf listener |
 | Daemon rejects the config naming `mode` | `mode = "bypass"` from an old config — the mode is gone; the only value is `"oww"` |
 | Nothing wakes | The wake threshold is too high for the room, you are too far from the array, or that is not the phrase the configured model listens for |

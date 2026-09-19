@@ -607,7 +607,7 @@ pub struct Utterance {
     /// Why the host endpointer ended this utterance's audio where it did.
     pub endpoint_cause: EndpointCause,
     /// Wake provenance for a scored accept; `None` for a bypassed utterance.
-    /// Internal routing input for the brain (a scored accept with an empty
+    /// Internal routing input for the gate (a scored accept with an empty
     /// transcript is a wake-with-no-command, not a failure) — skipped from the
     /// wire envelope, where the wake detection line already carries the same numbers.
     #[serde(skip)]
@@ -619,6 +619,24 @@ pub struct Utterance {
     /// This utterance's speech was heard over the pod's own playback at some
     /// point in its life, whether or not it cut it.
     pub over_playback: bool,
+}
+
+impl Utterance {
+    /// The words this utterance actually carries: the transcript trimmed of
+    /// surrounding whitespace, or `None` when there is no transcript at all or it
+    /// trims away to nothing.
+    ///
+    /// `None` is the ordinary outcome of speech that was not a command — noise
+    /// through a bypassed wake gate, a wake word with nothing behind it, an STT
+    /// attempt that failed — not an error. The pipeline's gate makes this its
+    /// first test and declines such an utterance before any brain is called, so
+    /// every `Brain::handle` may read the text as present.
+    pub fn spoken_text(&self) -> Option<&str> {
+        self.transcript
+            .as_ref()
+            .map(|t| t.text.trim())
+            .filter(|t| !t.is_empty())
+    }
 }
 
 /// Host-clock stamps at each pipeline boundary, one `Option` per stage. Grows a
@@ -814,6 +832,39 @@ mod tests {
                 codec: Codec::S16Le,
                 mono_beam_only: true,
             }
+        );
+    }
+
+    /// An utterance carrying `transcript` verbatim, for the `spoken_text` cases.
+    fn said(transcript: Option<&str>) -> Utterance {
+        Utterance {
+            transcript: transcript.map(|text| Transcript {
+                text: text.into(),
+                confidence: None,
+            }),
+            ..test_utterance()
+        }
+    }
+
+    #[test]
+    fn spoken_text_is_none_for_an_absent_transcript() {
+        // STT never ran, or it failed: there is nothing to answer.
+        assert_eq!(said(None).spoken_text(), None);
+    }
+
+    #[test]
+    fn spoken_text_is_none_for_text_that_trims_away() {
+        // The two shapes STT returns for speech that carried no words.
+        assert_eq!(said(Some("")).spoken_text(), None);
+        assert_eq!(said(Some("  \n\t ")).spoken_text(), None);
+    }
+
+    #[test]
+    fn spoken_text_is_the_trimmed_text() {
+        // Surrounding whitespace is the backend's, not the speaker's.
+        assert_eq!(
+            said(Some("  turn on the light\n")).spoken_text(),
+            Some("turn on the light")
         );
     }
 

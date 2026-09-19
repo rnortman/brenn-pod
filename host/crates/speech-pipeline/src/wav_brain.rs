@@ -1,6 +1,11 @@
-//! `WavBrain` — the first `Brain` implementation. It answers every wake-gated
-//! utterance with one fixed, pre-loaded PCM clip queued as `SpeakBody::Pcm`. No
-//! transcriber, no synthesizer: it exercises the brain→playback plumbing alone.
+//! `WavBrain` — the first `Brain` implementation. It answers every utterance that
+//! reaches it with one fixed, pre-loaded PCM clip queued as `SpeakBody::Pcm`, and
+//! never reads the transcript. No synthesizer: with STT the only stage in front of
+//! it, it exercises the brain→playback plumbing alone.
+//!
+//! It still needs a transcriber wired: reaching any brain takes usable text
+//! (see `Brain::handle`), so a deployment with no `[stt]` table answers
+//! nothing, this brain included.
 //!
 //! The clip is shared by `Arc::clone` — zero copies per utterance. A full or
 //! disconnected response sink drops the reply (the utterance's audio still lives
@@ -16,7 +21,8 @@ use crate::brain::{BrainEventFn, BrainStats, send_or_report};
 use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{InterruptProgress, SpeakBody, SpeakCmd, Utterance, UtteranceId};
 
-/// The trivial `Brain`: every utterance is answered by queueing one fixed clip.
+/// The trivial `Brain`: every utterance that reaches it is answered by queueing
+/// one fixed clip, whatever it said.
 pub struct WavBrain {
     clip: Arc<[i16]>,
     events: BrainEventFn,

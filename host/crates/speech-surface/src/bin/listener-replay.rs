@@ -252,6 +252,7 @@ fn replay_log(path: &Path, listener: &mut ReplayListener) -> Result<LogCounts, R
             // A framelog carries no capture window: nothing in a replay feeds one,
             // so a window never opens and these never fire.
             ListenerEvent::ListenOpened { .. }
+            | ListenerEvent::ListenRestored { .. }
             | ListenerEvent::ListenHeard { .. }
             | ListenerEvent::ListenExpired { .. } => {}
         }

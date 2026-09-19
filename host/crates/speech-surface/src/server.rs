@@ -1588,10 +1588,11 @@ enum BrainBuildError {
 /// stamp — plus a startup `brain_absent` info line (the `listener_absent` idiom).
 /// `mode = "wav"` loads and format-validates the configured clip (a load failure
 /// is fatal at startup, naming the path and the offending property) and builds a
-/// `WavBrain` answering every utterance with it, emitting a `brain_clip_loaded`
-/// line carrying the clip's sample count and duration. `mode = "brenn"` builds a
-/// `BrennBrain` over `link` — the caller's already-constructed transport, since
-/// the bridge behind it has a lifecycle no constructor can own.
+/// `WavBrain` answering with it every utterance that reaches it, emitting a
+/// `brain_clip_loaded` line carrying the clip's sample count and duration.
+/// `mode = "brenn"` builds a `BrennBrain` over `link` — the caller's
+/// already-constructed transport, since the bridge behind it has a lifecycle
+/// no constructor can own.
 ///
 /// A `mode = "brenn"` config with no `[brenn]` table or no `link` is a broken
 /// invariant `Config::validate` already rejects — but the library entry points do
@@ -1694,8 +1695,10 @@ type BuiltTranscriber = (Arc<dyn Transcriber>, Arc<SttStats>);
 type BuiltSynthesizer = (Arc<dyn Synthesizer>, Arc<TtsStats>);
 
 /// Build the transcriber from `[stt]` config. An absent `[stt]` table wires no
-/// transcriber — the utterance mints with a null transcript, unchanged — plus a
-/// startup `stt_absent` info line (the `brain_absent` idiom). `backend = "http"`
+/// transcriber — the utterance mints with a null transcript, which the gate then
+/// declines, so a `[brain]` configured alongside is a brain that is never called,
+/// whatever its mode — plus a startup `stt_absent` info line (the `brain_absent`
+/// idiom) and a `brain_no_transcript` line per utterance. `backend = "http"`
 /// builds an `HttpTranscriber` against the configured speaches endpoint and emits
 /// an `stt_configured` line naming the URL, model, and language. A malformed URL or a client
 /// that will not build is fatal at startup (`BuildError`), not a per-request

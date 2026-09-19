@@ -129,6 +129,7 @@ impl PipelineItem {
                 | EndpointerTransition { pod, .. }
                 | ModelStats { pod, .. }
                 | ListenOpened { pod, .. }
+                | ListenRestored { pod, .. }
                 | ListenHeard { pod, .. }
                 | ListenExpired { pod, .. } => pod,
             },
@@ -158,6 +159,7 @@ impl PipelineItem {
                 EndpointerTransition { .. } => "endpointer_transition",
                 ModelStats { .. } => "model_stats",
                 ListenOpened { .. } => "listen_opened",
+                ListenRestored { .. } => "listen_restored",
                 ListenHeard { .. } => "listen_heard",
                 ListenExpired { .. } => "listen_expired",
             },
@@ -217,6 +219,15 @@ impl ListenWiring {
         )
         .await;
     }
+
+    /// Report that the gate declined the candidate `id`: it became no turn. Said
+    /// for every non-dispatch outcome and whatever the candidate's provenance,
+    /// because whether a decline gives a capture window back is the listener's
+    /// decision and not this task's — the pipeline knows what the gate did, the
+    /// listener knows what the window was.
+    pub(crate) async fn declined(&self, pod: PodId, id: ListenerUtteranceId) {
+        (self.feed)(pod, Feed::CandidateDeclined { id }).await;
+    }
 }
 
 /// Pass-through configuration and shared counters for [`run`].
@@ -273,7 +284,9 @@ struct Carve {
     /// it cut it. The gate below makes such a carve prove it is speech.
     over_playback: bool,
     /// This carve was heard inside an open capture window: the person kept talking
-    /// after a reply that asked them to, with no wake word.
+    /// after a reply that asked them to, with no wake word. May hold alongside
+    /// `barge_in` when that speech went on to cut a reply; the gate reads the
+    /// barge first.
     follow_up: bool,
     /// The listener's host-receipt stamps for this utterance's audio, from t0 to
     /// the carve. Copied onto the minted `Utterance`'s `StageTimings`.
@@ -316,6 +329,21 @@ struct HoldRelease {
     /// When the standing hold is treated as unanswered for the head.
     at: tokio::time::Instant,
     /// The hold's own deadline, carried so the release line joins its `wake_held`.
+    deadline_sample: u64,
+}
+
+/// Wall-clock fallback for a restored capture window, the [`HoldRelease`] of the
+/// microphone. The listener's window is in the sample domain too, and its deadline
+/// falling in a silence no audio crosses is the ordinary quiet room rather than a
+/// pathology: the cursor stops, the expiry is not observed, and the head that
+/// speech inside the window held up has nothing to bring it down. This is the
+/// head's own deadline for the window, and it moves only the head — the microphone
+/// stays the listener's, whose `ListenExpired` still arrives when audio next does.
+struct ListenRelease {
+    /// When the window's grant is treated as over for the head.
+    at: tokio::time::Instant,
+    /// The window's deadline, carried so the release line joins its
+    /// `listen_restored`.
     deadline_sample: u64,
 }
 
@@ -368,6 +396,11 @@ struct PodState {
     /// The head's release for a wake hold standing on this pod, armed on
     /// `WakeHeld` and cancelled when the listener resolves the hold either way.
     hold_release: Option<HoldRelease>,
+    /// The head's release for a capture window restored on this pod, armed on
+    /// `ListenRestored` and cancelled by anything that says the window's ending
+    /// is somebody else's — speech inside it, a mint, a wake hold, or the
+    /// listener's own expiry.
+    listen_release: Option<ListenRelease>,
 }
 
 impl PodState {
@@ -396,8 +429,10 @@ impl PodState {
             // connection's first utterance to the old connection's log.
             self.room = None;
             self.log = None;
-            // A reconnected pod's presence starts over with its next wake.
+            // A reconnected pod's presence starts over with its next wake, and
+            // the window the old connection was listening through went with it.
             self.hold_release = None;
+            self.listen_release = None;
             if let Some(f) = self.in_flight.take() {
                 f.abort.abort();
             }
@@ -429,22 +464,29 @@ pub async fn run(
         if queue_closed && !pods.values().any(|s| s.in_flight.is_some()) {
             break;
         }
-        // The earliest head release standing on any pod.
+        // The earliest head release standing on any pod, of either kind.
         let next_release = pods
             .values()
-            .filter_map(|s| s.hold_release.as_ref().map(|h| h.at))
+            .flat_map(|s| {
+                [
+                    s.hold_release.as_ref().map(|h| h.at),
+                    s.listen_release.as_ref().map(|l| l.at),
+                ]
+            })
+            .flatten()
             .min();
         tokio::select! {
             () = sleep_until_opt(next_release), if !queue_closed => {
-                release_due_holds(&mut pods, ctx.scripter.as_ref(), &jsonl);
+                release_due(&mut pods, ctx.scripter.as_ref(), &jsonl);
             }
             item = rx.recv(), if !queue_closed => match item {
                 None => {
                     queue_closed = true;
-                    // No more listener events can resolve a hold, and the loop is
-                    // now waiting on in-flight STT alone.
+                    // No more listener events can resolve a hold or a window, and
+                    // the loop is now waiting on in-flight STT alone.
                     for state in pods.values_mut() {
                         state.hold_release = None;
+                        state.listen_release = None;
                     }
                 }
                 Some(PipelineItem::Segment { seg, epoch }) => {
@@ -476,26 +518,52 @@ async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
     }
 }
 
-/// Tell the head that every hold whose wall-clock wait has run out went unanswered.
-/// Presence only: a release against a head that is already down is a no-op.
-fn release_due_holds(
+/// Tell the head that every wait whose wall clock has run out is over: a hold
+/// nothing answered, and a capture window whose deadline passed in a silence the
+/// listener's own clock never crossed. Presence only: a release against a head
+/// that is already down is a no-op.
+fn release_due(
     pods: &mut HashMap<PodId, PodState>,
     scripter: Option<&ScriptHandle>,
     jsonl: &JsonlHandle,
 ) {
     let now = tokio::time::Instant::now();
     for (pod, state) in pods.iter_mut() {
-        let Some(release) = state.hold_release.take_if(|r| r.at <= now) else {
-            continue;
-        };
-        // Distinguishable in the records from a head that came down on
-        // `arm_expired`, and joined to its `wake_held` by the deadline.
-        jsonl.emit(
-            "wake_hold_released",
-            &json!({ "pod": pod.0, "deadline_sample": release.deadline_sample }),
-        );
-        if let Some(scripter) = scripter {
-            scripter.send(ScriptInput::Unanswered(pod.clone()));
+        if let Some(release) = state.hold_release.take_if(|r| r.at <= now) {
+            // Distinguishable in the records from a head that came down on
+            // `arm_expired`, and joined to its `wake_held` by the deadline.
+            jsonl.emit(
+                "wake_hold_released",
+                &json!({ "pod": pod.0, "deadline_sample": release.deadline_sample }),
+            );
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::Unanswered(pod.clone()));
+            }
+        }
+        if let Some(release) = state.listen_release.take_if(|r| r.at <= now) {
+            // The restored window's deadline passed on the wall clock with no audio
+            // arriving to carry the listener's cursor past it, and the head was
+            // brought down for that reason without waiting for the listener. A
+            // reader is entitled to conclude that this window's grant has ended —
+            // speech is no longer heard without a wake word on its account, its
+            // deadline being behind it — and that the head came down. What this
+            // line does not say is whether a wake hold stands: a `wake_held` not
+            // yet resolved by an `utterance`, an `arm_expired` or a
+            // `wake_hold_released` is that hold's own grant and its own record.
+            //
+            // The listener's `listen_expired` for the same window follows when
+            // audio next arrives, at a reply start, or at a reconnect, so the
+            // window's own lines stay balanced; this one is the head's record,
+            // not the window's. Distinguishable from a head that came down on
+            // `listen_expired`, and joined to its `listen_restored` by the
+            // deadline.
+            jsonl.emit(
+                "listen_released",
+                &json!({ "pod": pod.0, "deadline_sample": release.deadline_sample }),
+            );
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::ListenExpired(pod.clone()));
+            }
         }
     }
 }
@@ -730,8 +798,11 @@ async fn handle_listener(
             }
             // Nothing is minted under a hold, so a carve on this pod is either the
             // hold consumed or a fresh wake's own: the wait the head is waiting out
-            // is over either way.
+            // is over either way. A mint also spends whatever window this pod had,
+            // so the window's own wall-clock release is over with it — a decline
+            // re-arms it from the restore.
             state.hold_release = None;
+            state.listen_release = None;
             // Abort any in-flight STT at id ≤ the arriving one (a continuation reuses
             // its id, so this covers the re-STT-the-whole-utterance case), then spawn.
             if let Some(f) = state.in_flight.take() {
@@ -895,18 +966,94 @@ async fn handle_listener(
                 &json!({ "pod": pod.0, "epoch": epoch, "deadline_sample": deadline_sample }),
             );
         }
+        ListenerEvent::ListenRestored {
+            pod,
+            epoch,
+            deadline_sample,
+            at_sample,
+        } => {
+            // The line first and ungated, like the open it repeats: the window is
+            // the listener's own state, a reader tracking the microphone reads this
+            // exactly as it reads `listen_opened`, and dropping a superseded
+            // connection's line would leave a window that did come back unrecorded.
+            jsonl.emit(
+                "listen_restored",
+                &json!({
+                    "pod": pod.0,
+                    "epoch": epoch,
+                    "deadline_sample": deadline_sample,
+                    "at_sample": at_sample,
+                }),
+            );
+            let state = pods.entry(pod.clone()).or_default();
+            if !state.adopt_epoch(epoch) {
+                return; // Stale: a reconnect superseded this epoch.
+            }
+            // The head's wall-clock deadline for what is left of the window. Armed
+            // under the hold's rules and for the hold's reasons: with no scripter
+            // there is no head to bring down and a timer over a replay faster than
+            // real time would be a fiction, and the cursor lags the wall clock by
+            // the hangover and transport latency, so this instant lands after the
+            // listener's own deadline — where audio keeps arriving the listener's
+            // `ListenExpired` gets there first and cancels it.
+            //
+            // Nothing is armed with no time left: the listener ran its own expiry
+            // check at this restore and kept the window, so the room is not idle —
+            // audio is arriving, its clock is live, and a zero-length arm would
+            // stow the head now over an onset run or a resumed answer the carve
+            // will accept. Nothing is armed under a standing hold either: the head
+            // is on the hold's schedule, which has an ending of its own.
+            if scripter.is_some() && state.hold_release.is_none() && deadline_sample > at_sample {
+                let wait = Duration::from_millis(
+                    (deadline_sample - at_sample) / crate::config::SAMPLES_PER_MS,
+                );
+                state.listen_release = Some(ListenRelease {
+                    at: tokio::time::Instant::now() + wait,
+                    deadline_sample,
+                });
+            }
+        }
         ListenerEvent::ListenHeard { pod, epoch } => {
             jsonl.emit("listen_heard", &json!({ "pod": pod.0, "epoch": epoch }));
-            // The head's ending was dated from the reply that opened the window,
-            // and nothing between here and the follow-up's dispatch moves it:
-            // `TurnStarted` comes after the endpoint, STT and the gate. Without
-            // this the head starts down mid-follow-up and jerks back up.
+            let state = pods.entry(pod.clone()).or_default();
+            if !state.adopt_epoch(epoch) {
+                return; // Stale: a reconnect superseded this epoch.
+            }
+            // Speech is running inside the window, so the sample domain is live and
+            // will produce a mint or an expiry of its own: the head's wall-clock
+            // fallback for a room that went quiet has nothing to answer for.
+            state.listen_release = None;
+            // Past the epoch check, with the wake and the carve: this moves the
+            // head, and a superseded connection's speech is not an interaction.
+            //
+            // The microphone is busy, so the head waits where the reply left it
+            // until the window itself ends. Without this the ending dated from
+            // that reply runs out mid-follow-up and the head starts down while
+            // the person is still talking.
             if let Some(scripter) = scripter {
                 scripter.send(ScriptInput::Heard(pod.clone()));
             }
         }
         ListenerEvent::ListenExpired { pod, epoch } => {
             jsonl.emit("listen_expired", &json!({ "pod": pod.0, "epoch": epoch }));
+            let state = pods.entry(pod.clone()).or_default();
+            if !state.adopt_epoch(epoch) {
+                return; // Stale: a reconnect superseded this epoch.
+            }
+            // The listener said the window is over, so the head's own fallback for
+            // saying it has nothing left to say.
+            state.listen_release = None;
+            // Past the epoch check for the same reason as the heard above: this
+            // stows a head. A reconnect's own expiry is emitted under the epoch
+            // it is closing, before the listener adopts the new one, so it is
+            // current here and the head comes down with the connection.
+            //
+            // The window is what held the head up after a listening reply, so
+            // its end is what brings the head down. A turn in flight overrides
+            // that, which the scripter decides from the facts it already holds.
+            if let Some(scripter) = scripter {
+                scripter.send(ScriptInput::ListenExpired(pod.clone()));
+            }
         }
         ListenerEvent::Superseded { pod, utterance_id } => {
             // Emitted before the abort so a supersede is correlatable by utterance
@@ -961,6 +1108,9 @@ async fn handle_listener(
             if !state.adopt_epoch(epoch) {
                 return; // Stale: a reconnect superseded this epoch.
             }
+            // A hold now stands and owns the head's ending — the mirror of the
+            // window release's own arm rule, which stands down under a hold.
+            state.listen_release = None;
             // Past the epoch check because the arm touches per-pod state and the
             // `Unanswered` it eventually sends is not a no-op against a live turn.
             // With no scripter wired (replay, brainless tuning) nothing is armed:
@@ -1273,54 +1423,108 @@ async fn handle_stt_done(
     let Some(wiring) = brain else {
         return;
     };
-    // STT-confidence gate: a trigger whose text trips the gate is a likely
-    // hallucination — declined as a no-command outcome, never echoed. Fail-open on a
-    // missing summary; an utterance with no wake, no barge, no overlap with the
-    // pod's own voice, or an empty transcript is never gated. A scored wake accept
-    // is gated through its wake provenance; a barge-in utterance has no wake word,
-    // so a second arm keyed on the barge mark declines the barging speech that
-    // transcribed to nothing — the playback is already cut. A third declines
-    // speech carved inside an open capture window, which is wake-less by
-    // construction and would otherwise reach the brain on nothing but the room's
-    // noise for the whole window. A fourth catches
-    // the case the guard let past: audio over the robot's own playback that never
-    // sustained enough to cut it, which under a bypassed wake gate would otherwise
-    // reach the brain on the strength of the reply's own echo.
-    let confidence_reject = utterance
-        .transcript
-        .as_ref()
-        .filter(|t| !t.text.trim().is_empty())
-        .and_then(|t| t.confidence.as_ref())
-        .and_then(|conf| confidence_gate.evaluate(conf));
-    let gate = match (utterance.wake, confidence_reject) {
-        (Some(wake), Some(reject)) => GateOutcome::DeclineWake(wake, reject),
-        (None, Some(reject)) if done.carve.follow_up => GateOutcome::DeclineFollowUp(reject),
-        (None, Some(reject)) if done.carve.barge_in => GateOutcome::DeclineBarge(reject),
-        (None, Some(reject)) if done.carve.over_playback => GateOutcome::DeclineEcho(reject),
-        _ => GateOutcome::Dispatch,
+    // The gate, in two tests. First and unconditionally: an utterance with no
+    // usable text is no turn. That is a fact about the speech, not about any
+    // brain — a bypassed gate hearing the room, a wake word with nothing behind
+    // it, an STT attempt that failed — so it is decided here, once, before a
+    // brain is reached.
+    //
+    // Then the STT-confidence gate: a trigger whose text trips it is a likely
+    // hallucination — declined as a no-command outcome, never echoed. Fail-open
+    // on a missing summary; an utterance with no wake, no barge and no overlap
+    // with the pod's own voice is never gated. Past the emptiness test every
+    // transcript here carries text, so a score attached to an empty one can no
+    // longer gate anything.
+    //
+    // The carve's provenance is classified once, above both tests, and both
+    // declines read that one classification — a carve can carry more than one
+    // mark, and two readings of it would report the same speech two ways.
+    let from = provenance(&done.carve);
+    let gate = if utterance.spoken_text().is_none() {
+        GateOutcome::DeclineEmpty(from)
+    } else {
+        let confidence_reject = utterance
+            .transcript
+            .as_ref()
+            .and_then(|t| t.confidence.as_ref())
+            .and_then(|conf| confidence_gate.evaluate(conf));
+        // Every declining arm binds the reject, which is what keeps the arm order
+        // immaterial: an arm matching `..` in that position would decline a
+        // provenance whose transcript passed the moment the dispatch arm moved
+        // below it.
+        match (from, confidence_reject) {
+            (_, None) => GateOutcome::Dispatch,
+            (Provenance::Bypassed, Some(_)) => GateOutcome::Dispatch,
+            (Provenance::Wake(wake), Some(reject)) => GateOutcome::DeclineWake(wake, reject),
+            (Provenance::Barge, Some(reject)) => GateOutcome::DeclineBarge(reject),
+            (Provenance::FollowUp, Some(reject)) => GateOutcome::DeclineFollowUp(reject),
+            (Provenance::OverPlayback, Some(reject)) => GateOutcome::DeclineEcho(reject),
+        }
     };
-    // A wake or barge decline is a raise that produced no turn: the head is up and
-    // nothing will follow, so the settle starts here rather than waiting for the
-    // engagement's ceiling. A declined follow-up is the same shape — the head has
-    // been waiting out the capture window and no turn is coming of what it heard,
-    // so it folds a linger from the decline. An echo decline is not a raise —
-    // nobody raised, and
-    // `Unanswered` clears the pod's current turn, which would cut short the script
-    // of the very reply the echo came from.
-    if let Some(scripter) = scripter
+    // Whether the head starts its settle is one read of the one classification.
+    // A declined wake or barge is a raise that produced no turn: the head is up
+    // and nothing will follow, so the settle starts here rather than waiting for
+    // the engagement's ceiling. A carve in a quiet room that said nothing is the
+    // same: under a bypassed wake gate nothing else will end the engagement, so
+    // the settle starts here too. A declined follow-up is not — its capture
+    // window is handed back below and owns the head until it expires, and folding
+    // a linger from here would date the head's ending off noise instead of off
+    // the window. A decline over the pod's own voice is not a raise either:
+    // nobody raised, and `Unanswered` clears the pod's current turn, which would
+    // cut short the script of the very reply the echo came from.
+    //
+    // Both declines answer this off the value they were classified under, so no
+    // decline's head response can drift from its report.
+    let starts_the_settle = !matches!(gate, GateOutcome::Dispatch)
         && matches!(
-            gate,
-            GateOutcome::DeclineWake(..)
-                | GateOutcome::DeclineBarge(..)
-                | GateOutcome::DeclineFollowUp(..)
-        )
+            from,
+            Provenance::Wake(_) | Provenance::Barge | Provenance::Bypassed
+        );
+    if let Some(scripter) = scripter
+        && starts_the_settle
     {
         scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
     }
+    // Every decline, uniformly and whatever its reason: this candidate produced no
+    // turn. Said before the accounting below so a capture window the candidate spent
+    // is back as early as the verdict allows — the person answering a `<listen/>`
+    // reply is talking into the gap this closes.
+    if let Some(listen) = listen
+        && !matches!(gate, GateOutcome::Dispatch)
+    {
+        listen
+            .declined(utterance.pod.clone(), done.carve.id.clone())
+            .await;
+    }
     match gate {
-        GateOutcome::DeclineWake(wake, reject) => {
-            decline_low_confidence(&utterance, &wake, reject, wiring)
-        }
+        GateOutcome::DeclineEmpty(from) => match from {
+            // A scored wake accept with nothing behind it. Its own non-failure
+            // category, carrying the wake score and the segment reference so a
+            // follow-up tool can re-fetch the audio for retro-transcription.
+            Provenance::Wake(wake) => {
+                decline_wake_command(&utterance, &wake, WakeCommandReason::Empty, wiring)
+            }
+            Provenance::Barge => {
+                decline_no_transcript(&utterance, wiring);
+                // The playback is already cut and `handle` will never run for this
+                // utterance, so this is the brain's only chance to hear that its
+                // response was interrupted with nothing usable said in its place.
+                // Non-blocking by contract, like `interrupt`.
+                wiring.brain.barge_declined(&utterance);
+            }
+            Provenance::FollowUp | Provenance::OverPlayback | Provenance::Bypassed => {
+                decline_no_transcript(&utterance, wiring)
+            }
+        },
+        GateOutcome::DeclineWake(wake, reject) => decline_wake_command(
+            &utterance,
+            &wake,
+            WakeCommandReason::LowConfidence {
+                no_speech_prob: reject.no_speech_prob,
+                avg_logprob: reject.avg_logprob,
+            },
+            wiring,
+        ),
         GateOutcome::DeclineBarge(reject) => {
             decline_barge_low_confidence(&utterance, reject, false, wiring);
             // The playback is already cut and `handle` will never run for this
@@ -1330,11 +1534,12 @@ async fn handle_stt_done(
             wiring.brain.barge_declined(&utterance);
         }
         GateOutcome::DeclineFollowUp(reject) => {
-            // No `barge_declined`: nothing was interrupted. The reply that opened
-            // the window played out in full and the turn behind it has already
-            // ended; what tripped the gate is the room, not an interruption. A
-            // reader tuning barge thresholds off this count needs to know these
-            // are not barges.
+            // No `barge_declined`: nothing was interrupted. That is the
+            // classification's guarantee rather than a fact about windows —
+            // speech that did cut a reply is a barge above, whatever window it
+            // began in — so what tripped the gate here is the room. A reader
+            // tuning barge thresholds off this count needs to know these are not
+            // barges.
             decline_barge_low_confidence(&utterance, reject, true, wiring);
         }
         GateOutcome::DeclineEcho(reject) => decline_echo(&utterance, reject, wiring),
@@ -1655,14 +1860,20 @@ fn push_bounded<T>(dq: &mut VecDeque<T>, item: T) {
     dq.push_back(item);
 }
 
-/// What the STT-confidence gate decided for a minted utterance: dispatch it, or
-/// decline it as a likely hallucination — through the wake provenance for a scored
-/// wake accept, through the barge mark for a barge-in utterance with no wake,
-/// through the follow-up mark for one carved inside an open capture window, or
-/// through the overlap mark for one carved over the pod's own voice that cut
-/// nothing.
+/// What the gate decided for a minted utterance: dispatch it, decline it for
+/// carrying no usable text at all, or decline it as a likely hallucination —
+/// through the wake provenance for a scored wake accept, through the barge mark
+/// for a barge-in utterance with no wake, through the follow-up mark for one
+/// carved inside an open capture window, or through the overlap mark for one
+/// carved over the pod's own voice that cut nothing.
 enum GateOutcome {
     Dispatch,
+    /// The utterance transcribed to nothing usable — absent, empty, or
+    /// whitespace-only. Decided first and for every provenance: no text is no
+    /// turn, whatever the room was doing, so no brain is called. How it is
+    /// reported and what the head does still follow the provenance, which it
+    /// carries so that both read the one classification.
+    DeclineEmpty(Provenance),
     DeclineWake(WakeConfirmation, GateReject),
     DeclineBarge(GateReject),
     /// Speech carved inside a `<listen/>` window that transcribed to likely
@@ -1672,25 +1883,72 @@ enum GateOutcome {
     DeclineEcho(GateReject),
 }
 
-/// Report a confidence-gated scored-wake accept through the brain's event/counter
-/// vocabulary without dispatching it — a `WakeCommandAbsent` carrying the
-/// low-confidence reason. A non-error outcome; the phantom text is never echoed.
-fn decline_low_confidence(
+/// What the room was doing when a candidate was carved. Classified once, by
+/// [`provenance`], and read by both of the gate's declines — how each is
+/// reported, and whether the head starts its settle.
+#[derive(Clone, Copy)]
+enum Provenance {
+    /// A scored wake accept.
+    Wake(WakeConfirmation),
+    /// Speech that cut the pod's own reply. Over playback by construction — the
+    /// listener asserts it — and a barge whatever window it began in: the cut is
+    /// what the decline has to answer for.
+    Barge,
+    /// Speech carved inside a `<listen/>` capture window that cut nothing.
+    FollowUp,
+    /// Speech over the pod's own voice that neither cut it nor began in a window:
+    /// the echo, or somebody talking across the reply.
+    OverPlayback,
+    /// Anything else — a carve in a quiet room, which under a bypassed wake gate
+    /// is every carve.
+    Bypassed,
+}
+
+/// Read the carve's marks once, in the order they imply. A wake arm is the
+/// provenance whatever else the room did. A barge carries the overlap mark and
+/// may carry the window mark, and is a barge either way, because the reply it
+/// cut is what the decline owes an answer for. Past it the window mark speaks
+/// for speech that cut nothing, and the overlap mark for speech that neither cut
+/// nor began in a window. The rest is the room.
+fn provenance(carve: &Carve) -> Provenance {
+    match carve.wake {
+        Some(wake) => Provenance::Wake(wake),
+        None if carve.barge_in => Provenance::Barge,
+        None if carve.follow_up => Provenance::FollowUp,
+        None if carve.over_playback => Provenance::OverPlayback,
+        None => Provenance::Bypassed,
+    }
+}
+
+/// Report a declined scored-wake accept through the brain's event/counter
+/// vocabulary without dispatching it — a `WakeCommandAbsent` carrying `reason`,
+/// the wake score and the audio span. A non-error outcome: the wake word fired
+/// and no command came of it, either because nothing was said or because what
+/// came back was a likely hallucination. Neither the phantom text nor the empty
+/// one is ever echoed.
+fn decline_wake_command(
     utterance: &Utterance,
     wake: &WakeConfirmation,
-    reject: GateReject,
+    reason: WakeCommandReason,
     wiring: &BrainWiring,
 ) {
     (wiring.events)(BrainEvent::wake_command_absent(
         utterance.id,
         utterance.audio_ref.clone(),
         wake,
-        WakeCommandReason::LowConfidence {
-            no_speech_prob: reject.no_speech_prob,
-            avg_logprob: reject.avg_logprob,
-        },
+        reason,
     ));
     wiring.stats.record_wake_command_absent();
+}
+
+/// Report an utterance the gate declined for carrying no usable text, with no
+/// wake provenance to report it through. A non-error outcome: noise through a
+/// bypassed gate, a barge that captured nothing, an STT attempt that failed.
+fn decline_no_transcript(utterance: &Utterance, wiring: &BrainWiring) {
+    (wiring.events)(BrainEvent::NoTranscript {
+        utterance: utterance.id,
+    });
+    wiring.stats.record_no_transcript();
 }
 
 /// Report a confidence-gated wake-less utterance without dispatching it — a
@@ -1805,7 +2063,11 @@ struct UtteranceLine<'a> {
     stt_trim_samples: Option<usize>,
     stt_sent_from_sample: Option<usize>,
     /// Whether this utterance was heard inside a capture window rather than on a
-    /// wake word: it carries no wake provenance and none was needed.
+    /// wake word: it carries no wake provenance and none was needed. This answers
+    /// where the speech *began*. What the gate makes of the candidate answers what
+    /// the speech *did*, so a `brain_barge_command_absent` for this same utterance
+    /// may carry `follow_up: false` — the speech began in a window and went on to
+    /// cut the reply that opened it.
     follow_up: bool,
 }
 
@@ -1876,6 +2138,19 @@ mod tests {
             over_playback: false,
             follow_up: false,
             timing: CarveTiming::default(),
+        }
+    }
+
+    /// A barge carve, the shape the listener produces for speech that cut the
+    /// pod's reply: both marks, never the barge alone. The listener sets the
+    /// overlap with the barge at the mint and asserts the pair, so a fixture
+    /// carrying only `barge_in` pins a candidate production cannot make — and the
+    /// rules that read the overlap mark would be tested against the wrong room.
+    fn barged(seq: u64, start: u64, end: u64) -> CarvedUtterance {
+        CarvedUtterance {
+            barge_in: true,
+            over_playback: true,
+            ..carved(seq, start, end, None)
         }
     }
 
@@ -3325,15 +3600,16 @@ mod tests {
 
     #[tokio::test]
     async fn stt_failure_still_mints_null_transcript() {
-        let (lines, cmds) = Harness::new()
-            .transcriber(FakeTranscriber(None))
-            .brain()
-            .run(vec![soft_endpoint(carved(1, 0, 16, None))])
-            .await;
+        let h = Harness::new().transcriber(FakeTranscriber(None)).brain();
+        let stats = h.stats.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(carved(1, 0, 16, None))]).await;
         assert!(lines.iter().any(|v| v["event"] == "stt_failed"));
         let utt = lines.iter().find(|v| v["event"] == "utterance").unwrap();
         assert!(utt["transcript"].is_null());
-        assert_eq!(cmds.len(), 1, "dispatched despite STT failure");
+        // The line is still minted — the audio and its stamps are the record —
+        // but a failed STT leaves no text, and no text is no turn.
+        assert!(cmds.is_empty(), "nothing to answer: {lines:?}");
+        assert_eq!(stats.snapshot().no_transcript, 1);
     }
 
     #[tokio::test]
@@ -4227,10 +4503,7 @@ mod tests {
         ledger.record_dispatch(&pod(), UtteranceId(1), Some("what time is it".into()));
         ledger.record_cmd(&pod(), UtteranceId(1), Some("it is half past three".into()));
 
-        let barge_carve = CarvedUtterance {
-            barge_in: true,
-            ..carved(1, 0, 16, None)
-        };
+        let barge_carve = barged(1, 0, 16);
         let (lines, _) = Harness::new()
             .brain()
             .transcriber(FakeTranscriber(Some(("no, cancel that".into(), None))))
@@ -4257,10 +4530,7 @@ mod tests {
         // that finds nothing to chain must not mint an empty one, or every consumer
         // would have to reason about a chain with no last segment.
         let ledger = Arc::new(TurnLedger::new());
-        let barge_carve = CarvedUtterance {
-            barge_in: true,
-            ..carved(1, 0, 16, None)
-        };
+        let barge_carve = barged(1, 0, 16);
         let (lines, _) = Harness::new()
             .brain()
             .transcriber(FakeTranscriber(Some(("hello again".into(), None))))
@@ -4331,10 +4601,7 @@ mod tests {
         // wake-keyed gate can't cover it (a barge has no wake), so the barge arm
         // declines it — the playback is already cut, so this is the honest outcome.
         let ledger = Arc::new(TurnLedger::new());
-        let barge_carve = CarvedUtterance {
-            barge_in: true,
-            ..carved(1, 0, 16, None)
-        };
+        let barge_carve = barged(1, 0, 16);
         let h = Harness::new()
             .brain()
             .transcriber(FakeTranscriber(Some((
@@ -4370,10 +4637,7 @@ mod tests {
         // The same gate, but a confident transcript: a real barge command must pass
         // — the gate declines only the hallucinations.
         let ledger = Arc::new(TurnLedger::new());
-        let barge_carve = CarvedUtterance {
-            barge_in: true,
-            ..carved(1, 0, 16, None)
-        };
+        let barge_carve = barged(1, 0, 16);
         let h = Harness::new()
             .brain()
             .transcriber(FakeTranscriber(Some((
@@ -4486,16 +4750,7 @@ mod tests {
                 0,
                 1,
             ),
-            (
-                CarvedUtterance {
-                    barge_in: true,
-                    over_playback: true,
-                    ..carved(1, 0, 16, None)
-                },
-                vec![ScriptInput::Unanswered(pod())],
-                1,
-                0,
-            ),
+            (barged(1, 0, 16), vec![ScriptInput::Unanswered(pod())], 1, 0),
         ] {
             let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
             let (handle, rx) = crate::scripter::channel(jsonl.clone());
@@ -4731,12 +4986,326 @@ mod tests {
         writer.await.unwrap();
     }
 
+    /// The window's end reaches the head too, and is what brings it down after a
+    /// listening reply: the microphone is wake-gated again, so the promise the
+    /// raised head was making is over.
+    #[tokio::test]
+    async fn the_windows_end_reaches_the_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _) = Harness::new()
+            .scripter(handle.clone())
+            .run(vec![PipelineItem::Listener(ListenerEvent::ListenExpired {
+                pod: pod(),
+                epoch: 1,
+            })])
+            .await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::ListenExpired(pod())]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l["event"] == "listen_expired")
+                .count(),
+            1,
+            "and the line stands whatever the head did with it",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// Both of the window's head-moving events sit past the epoch check, for the
+    /// wake's reason: a superseded connection's room is not an interaction, and
+    /// neither its speech may hold a head up nor its expiry bring one down.
+    #[tokio::test]
+    async fn a_stale_epoch_window_event_moves_no_head() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        Harness::new()
+            .scripter(handle.clone())
+            .run(vec![
+                wake_detected(2, 8),
+                PipelineItem::Listener(ListenerEvent::ListenHeard {
+                    pod: pod(),
+                    epoch: 1,
+                }),
+                PipelineItem::Listener(ListenerEvent::ListenExpired {
+                    pod: pod(),
+                    epoch: 1,
+                }),
+            ])
+            .await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod())],
+            "the live epoch's wake raises; the superseded window moves nothing",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The window's two accounting lines are lines and nothing else, so they are
+    /// written whatever epoch they carry — dropping them would leave a window
+    /// that did open, or did come back, unrecorded in the one log a reader has.
+    /// Neither says anything to the head directly: the open is accounting, and
+    /// the restore's only effect is the wall-clock release it arms, which a
+    /// superseded connection's line does not get either.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_epoch_window_still_writes_its_line() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![
+                wake_detected(2, 8),
+                PipelineItem::Listener(ListenerEvent::ListenOpened {
+                    pod: pod(),
+                    epoch: 1,
+                    deadline_sample: 128_000,
+                }),
+                PipelineItem::Listener(ListenerEvent::ListenRestored {
+                    pod: pod(),
+                    epoch: 1,
+                    deadline_sample: 128_000,
+                    at_sample: 112_000,
+                }),
+            ])
+            .await;
+        run.settle().await;
+        // Past the restore's remaining second, had it armed anything.
+        run.advance(Duration::from_secs(2)).await;
+        let (lines, _) = run.finish().await;
+
+        for name in ["listen_opened", "listen_restored"] {
+            assert!(
+                lines.iter().any(|l| l["event"] == name && l["epoch"] == 1),
+                "a {name} line under the superseded epoch: {lines:?}",
+            );
+        }
+        assert!(
+            !lines.iter().any(|l| l["event"] == "listen_released"),
+            "and the superseded restore arms no release: {lines:?}",
+        );
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod())],
+            "the live epoch's wake raises; the window's lines move no head",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    // --- the window's wall-clock release ----------------------------------
+
+    /// A restored window with `samples` left on it, and nothing else.
+    fn listen_restored(epoch: u64, deadline_sample: u64, at_sample: u64) -> PipelineItem {
+        PipelineItem::Listener(ListenerEvent::ListenRestored {
+            pod: pod(),
+            epoch,
+            deadline_sample,
+            at_sample,
+        })
+    }
+
+    /// The headline quiet room: a cough inside the window was declined, the window
+    /// came back, and then nothing more was ever said. The listener's clock stops
+    /// with the audio, so the deadline passes unobserved — the surface's own wall
+    /// clock is what brings the head down, at the deadline rather than at the
+    /// engagement ceiling half a minute later.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_window_nobody_speaks_into_brings_the_head_down_at_its_deadline() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, mut rx) = crate::scripter::channel(jsonl.clone());
+        // 8_000 samples left: 500 ms at the spine rate.
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![listen_restored(1, 24_000, 16_000)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(400)).await;
+        assert!(
+            rx.try_recv().is_none(),
+            "the window's own time is not up yet",
+        );
+        run.advance(Duration::from_millis(200)).await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::ListenExpired(pod())],
+        );
+        let released: Vec<&Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "listen_released")
+            .collect();
+        assert_eq!(released.len(), 1, "released once: {lines:?}");
+        assert_eq!(released[0]["pod"], "pod-x");
+        assert_eq!(
+            released[0]["deadline_sample"], 24_000,
+            "joined to its listen_restored: {lines:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// Everything that says the window's ending belongs to somebody else cancels
+    /// the release: speech inside it (the sample domain is live again), a mint (the
+    /// window is spent and a verdict is owed), a wake hold (the hold's own ending
+    /// takes over), and the listener saying it itself.
+    #[tokio::test(start_paused = true)]
+    async fn anything_that_owns_the_windows_ending_cancels_the_release() {
+        for (what, cancel) in [
+            (
+                "speech inside the window",
+                PipelineItem::Listener(ListenerEvent::ListenHeard {
+                    pod: pod(),
+                    epoch: 1,
+                }),
+            ),
+            ("a mint", soft_endpoint(carved(1, 0, 16, None))),
+            ("a wake hold", wake_held(1, 15_360, 111_360)),
+            (
+                "the listener's own expiry",
+                PipelineItem::Listener(ListenerEvent::ListenExpired {
+                    pod: pod(),
+                    epoch: 1,
+                }),
+            ),
+            (
+                "a newer connection",
+                PipelineItem::Listener(ListenerEvent::ListenExpired {
+                    pod: pod(),
+                    epoch: 2,
+                }),
+            ),
+        ] {
+            let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+            let (handle, rx) = crate::scripter::channel(jsonl.clone());
+            let mut run = Harness::new()
+                .scripter(handle.clone())
+                .start(vec![listen_restored(1, 24_000, 16_000)])
+                .await;
+            run.settle().await;
+            run.feed(cancel).await;
+            run.advance(Duration::from_millis(600)).await;
+            let (lines, _) = run.finish().await;
+
+            assert!(
+                !lines.iter().any(|l| l["event"] == "listen_released"),
+                "{what} owns the ending: {lines:?}"
+            );
+            // The `ListenExpired` cases send the head one of their own, which is
+            // the point: what must not happen is the release saying it twice.
+            assert!(
+                script_inputs(handle, rx)
+                    .await
+                    .iter()
+                    .filter(|i| matches!(i, ScriptInput::ListenExpired(_)))
+                    .count()
+                    <= 1,
+                "{what}: the head is told once",
+            );
+            drop(jsonl);
+            writer.await.unwrap();
+        }
+    }
+
+    /// A restore with the deadline already behind it arms nothing. The listener ran
+    /// its own expiry check at that restore and kept the window open, so the room is
+    /// not idle — audio is arriving and its clock is live. A zero-length arm would
+    /// stow the head at once over an onset run or a resumed answer the carve will
+    /// still accept.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_with_no_time_left_arms_nothing() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![listen_restored(1, 16_000, 24_000)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_secs(5)).await;
+        let (lines, _) = run.finish().await;
+
+        assert!(
+            !lines.iter().any(|l| l["event"] == "listen_released"),
+            "{lines:?}"
+        );
+        assert!(script_inputs(handle, rx).await.is_empty());
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A wake word held inside the window, then the cough's decline landing under
+    /// it. The hold is the interaction now and has an ending of its own, so the
+    /// window's release stands down and the hold's release is the only thing the
+    /// head hears.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_under_a_standing_hold_arms_nothing() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        // The hold's wait is 500 ms; the window's remaining time is 1 s, so a
+        // release that armed would be distinguishable from the hold's.
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![
+                wake_detected(1, 15_360),
+                wake_held(1, 15_360, 23_360),
+                listen_restored(1, 32_000, 16_000),
+            ])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(1_500)).await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())],
+            "the hold's own ending, and nothing from the window",
+        );
+        assert!(
+            !lines.iter().any(|l| l["event"] == "listen_released"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l["event"] == "wake_hold_released")
+                .count(),
+            1,
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A replay or a brainless tuning run, as for the hold: no head to bring down,
+    /// and a wall-clock timer over audio replayed faster than real time would be a
+    /// fiction.
+    #[tokio::test(start_paused = true)]
+    async fn no_scripter_arms_no_window_release() {
+        let mut run = Harness::new()
+            .start(vec![listen_restored(1, 24_000, 16_000)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+        assert!(
+            !lines.iter().any(|l| l["event"] == "listen_released"),
+            "{lines:?}"
+        );
+    }
+
     /// The window's own lines and the mute's. Each is an interface: `listen_opened`
     /// tells a reader when the microphone was opened without a wake word and
-    /// through which sample, `listen_expired` when it closed with nothing said, and
-    /// `wake_muted` that the phrase did fire and the mute is why nothing came of
-    /// it. The names are pinned by the console's tables; the fields are pinned
-    /// here.
+    /// through which sample, `listen_restored` that a window an utterance closed
+    /// came back because no turn came of that utterance, `listen_expired` that it
+    /// is closed for good, and `wake_muted` that the phrase did fire and the mute
+    /// is why nothing came of it. The names are pinned by the console's tables; the
+    /// fields are pinned here.
     #[tokio::test]
     async fn the_window_and_the_mute_write_their_lines() {
         let (lines, _) = Harness::new()
@@ -4745,6 +5314,12 @@ mod tests {
                     pod: pod(),
                     epoch: 1,
                     deadline_sample: 128_000,
+                }),
+                PipelineItem::Listener(ListenerEvent::ListenRestored {
+                    pod: pod(),
+                    epoch: 1,
+                    deadline_sample: 128_000,
+                    at_sample: 96_000,
                 }),
                 PipelineItem::Listener(ListenerEvent::ListenExpired {
                     pod: pod(),
@@ -4770,6 +5345,17 @@ mod tests {
         assert_eq!(opened["pod"], pod().0);
         assert_eq!(opened["epoch"], 1);
         assert_eq!(opened["deadline_sample"], 128_000);
+        let restored = found("listen_restored");
+        assert_eq!(restored["pod"], pod().0);
+        assert_eq!(restored["epoch"], 1);
+        assert_eq!(
+            restored["deadline_sample"], 128_000,
+            "the deadline the window opened with, never re-dated"
+        );
+        assert_eq!(
+            restored["at_sample"], 96_000,
+            "and where the listener's clock stood, so a reader can tell what is left"
+        );
         let expired = found("listen_expired");
         assert_eq!(expired["pod"], pod().0);
         assert_eq!(expired["epoch"], 1);
@@ -4782,8 +5368,9 @@ mod tests {
 
     /// The window is wake-less, so the confidence gate is all that stands
     /// between an open room and the brain. A follow-up that transcribes to
-    /// hallucination is declined and the head is told the raise produced no
-    /// turn — but nothing was interrupted, so the brain hears no cut.
+    /// hallucination is declined, the window it spent is handed back, and the
+    /// head is left to that window — nothing was interrupted, so the brain
+    /// hears no cut either.
     #[tokio::test]
     async fn a_gated_follow_up_declines_without_telling_the_brain_it_was_cut() {
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
@@ -4792,6 +5379,7 @@ mod tests {
             follow_up: true,
             ..carved(1, 0, 16, None)
         };
+        let (feed, fed) = spy_listen_feed();
         let h = Harness::new()
             .brain()
             .scripter(handle.clone())
@@ -4802,7 +5390,8 @@ mod tests {
             .gate(ConfidenceGate {
                 no_speech_max: 0.2,
                 avg_logprob_min: None,
-            });
+            })
+            .listen(feed, TEST_LISTEN_WINDOW);
         let nudges = h.nudges.clone();
         let stats = h.stats.clone();
         let events_seen = h.events.clone();
@@ -4834,10 +5423,13 @@ mod tests {
                 .any(|l| l["event"] == "utterance" && l["follow_up"] == true),
             "and the utterance line carries the provenance: {lines:?}"
         );
-        assert_eq!(
-            script_inputs(handle, rx).await,
-            vec![ScriptInput::Unanswered(pod())],
-            "the head folds a linger from the decline",
+        assert!(
+            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+            "the window the phantom spent is handed back",
+        );
+        assert!(
+            script_inputs(handle, rx).await.is_empty(),
+            "and the head is the restored window's to end, not this decline's",
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -4895,16 +5487,145 @@ mod tests {
         assert_eq!(utterance["follow_up"], false);
     }
 
+    /// One carve, both marks: speech that began inside a `<listen/>` window and
+    /// went on to cut the reply it drew. The listener produces exactly this
+    /// shape (`a_follow_up_that_cuts_its_own_reply_carries_both_marks`), and the
+    /// gate classifies it once — as a barge, under either decline, because the
+    /// cut is what the decline has to answer for. A transcript that passes still
+    /// dispatches, which is the arm the provenance must not swallow.
+    #[tokio::test]
+    async fn a_follow_up_that_cut_the_reply_is_declined_as_a_barge() {
+        enum Said {
+            Nothing,
+            Phantom,
+            Something,
+        }
+
+        for (said, transcriber) in [
+            (Said::Nothing, says("", None)),
+            (Said::Phantom, says("phantom", Some(conf(0.97, -1.5)))),
+            (Said::Something, says("yes please", Some(conf(0.01, -0.2)))),
+        ] {
+            let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+            let (handle, rx) = crate::scripter::channel(jsonl.clone());
+            let both = CarvedUtterance {
+                follow_up: true,
+                ..barged(1, 0, 16)
+            };
+            let (feed, fed) = spy_listen_feed();
+            let h = Harness::new()
+                .brain()
+                .scripter(handle.clone())
+                .transcriber(transcriber)
+                .gate(ConfidenceGate {
+                    no_speech_max: 0.2,
+                    avg_logprob_min: None,
+                })
+                .listen(feed, TEST_LISTEN_WINDOW);
+            let nudges = h.nudges.clone();
+            let events_seen = h.events.clone();
+            let stats = h.stats.clone();
+            let (lines, cmds) = h.run(vec![soft_endpoint(both)]).await;
+            let dispatched = lines.iter().any(|l| l["event"] == "brain_dispatched");
+            let cut_notices = nudges.lock().unwrap().barge_declined.len();
+            let handed_back = fed.lock().unwrap().clone();
+            let inputs = script_inputs(handle, rx).await;
+            let events_seen = events_seen.lock().unwrap().clone();
+
+            match said {
+                Said::Nothing | Said::Phantom => {
+                    assert!(cmds.is_empty(), "the gate declined: {lines:?}");
+                    assert!(!dispatched, "and no dispatch was announced: {lines:?}");
+                    assert_eq!(cut_notices, 1, "the brain is owed word of the cut");
+                    assert_eq!(
+                        inputs,
+                        vec![ScriptInput::Unanswered(pod())],
+                        "and the head settles: the reply it was up for will not finish",
+                    );
+                    assert!(
+                        matches!(
+                            handed_back.as_slice(),
+                            [Feed::CandidateDeclined { id }] if *id == uid(1)
+                        ),
+                        "the candidate goes back whatever the decline's reason. \
+                         Whether a window comes back is the listener's call, and \
+                         in this room it does not: the reply this speech cut took \
+                         the spent window when it started: {handed_back:?}",
+                    );
+                }
+                Said::Something => {
+                    assert_eq!(cmds.len(), 1, "a barge that said something is answered");
+                    assert!(dispatched, "and dispatched as one: {lines:?}");
+                    assert_eq!(cut_notices, 0, "nothing was declined to report");
+                    assert!(handed_back.is_empty(), "{handed_back:?}");
+                    // This carve's provenance is `Barge`, which the settle rule
+                    // names; only the dispatch keeps the head off the settle.
+                    // A barge that said something is answered, so the turn owns
+                    // the head and nothing settles.
+                    assert_eq!(
+                        inputs,
+                        vec![
+                            ScriptInput::TurnStarted {
+                                pod: pod(),
+                                turn: UtteranceId(1),
+                            },
+                            ScriptInput::TurnEnded {
+                                pod: pod(),
+                                turn: UtteranceId(1),
+                                end: TurnEnd::Closed,
+                            },
+                        ],
+                        "the turn brackets the head and nothing settles",
+                    );
+                }
+            }
+            match said {
+                Said::Nothing => {
+                    assert!(
+                        matches!(events_seen.as_slice(), [BrainEvent::NoTranscript { .. }]),
+                        "no text is no turn, whatever cut what: {events_seen:?}",
+                    );
+                    assert_eq!(stats.snapshot().no_transcript, 1);
+                }
+                Said::Phantom => {
+                    assert!(
+                        matches!(
+                            events_seen.as_slice(),
+                            [BrainEvent::BargeCommandAbsent {
+                                follow_up: false,
+                                ..
+                            }]
+                        ),
+                        "reported as the barge it was, not as the window it began \
+                         in — the reader's repair is the barge thresholds: \
+                         {events_seen:?}",
+                    );
+                    assert_eq!(stats.snapshot().barge_command_absent, 1);
+                    assert!(
+                        lines
+                            .iter()
+                            .any(|l| l["event"] == "utterance" && l["follow_up"] == true),
+                        "the two lines answer different questions about one id: the \
+                         `utterance` line says where the speech began, the decline \
+                         says what it did, and this carve is the one where they \
+                         disagree: {lines:?}",
+                    );
+                }
+                Said::Something => assert!(events_seen.is_empty(), "{events_seen:?}"),
+            }
+
+            drop(jsonl);
+            writer.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn a_gated_barge_tells_the_brain_its_response_was_cut() {
         // The playback is already gone and `handle` never runs, so this is the brain's
         // one chance to hear about the cut — with the interrupted turn attached.
         let ledger = Arc::new(TurnLedger::new());
         ledger.interrupt(&pod(), UtteranceId(99), cut(100, 1_000));
-        let barge_carve = CarvedUtterance {
-            barge_in: true,
-            ..carved(1, 0, 16, None)
-        };
+        let barge_carve = barged(1, 0, 16);
         let h = Harness::new()
             .brain()
             .transcriber(FakeTranscriber(Some((
@@ -4963,6 +5684,419 @@ mod tests {
             }
             assert!(nudges.lock().unwrap().barge_declined.is_empty());
         }
+    }
+
+    // --- the gate's emptiness test ----------------------------------------
+
+    /// A transcriber that answers with the given text and confidence — the
+    /// empty-transcript cases say `""` or whitespace.
+    fn says(text: &str, confidence: Option<TranscriptConfidence>) -> FakeTranscriber {
+        FakeTranscriber(Some((text.into(), confidence)))
+    }
+
+    #[tokio::test]
+    async fn an_empty_transcript_never_reaches_the_brain() {
+        // The one rule, before any provenance is read: no text is no turn. The
+        // dispatch's own bookkeeping — the console line, `TurnStarted` — must not
+        // happen either, or the head raises for a turn that never was.
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let h = Harness::new()
+            .brain()
+            .scripter(handle.clone())
+            .transcriber(says("   \n ", None));
+        let stats = h.stats.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(carved(1, 0, 16, None))]).await;
+
+        assert!(cmds.is_empty(), "nothing was said, so nothing was answered");
+        assert!(
+            !lines.iter().any(|l| l["event"] == "brain_dispatched"),
+            "no dispatch line for a candidate that produced no turn: {lines:?}"
+        );
+        assert_eq!(stats.snapshot().no_transcript, 1);
+        assert!(
+            !script_inputs(handle, rx)
+                .await
+                .iter()
+                .any(|i| matches!(i, ScriptInput::TurnStarted { .. })),
+            "the head never raises for a turn that was not started",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_wake_is_command_absent_under_every_brain() {
+        // The wake word fired and nothing followed. Reported through the wake
+        // provenance — the score and the audio span are what a retro-transcription
+        // pass needs — never as a bare `NoTranscript`. The head was raised by the
+        // wake and no turn is coming, so the settle starts here.
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let wake = Some(WakeConfirmation {
+            score: 0.99,
+            wake_end_sample: 8,
+            stt_trim_samples: 0,
+        });
+        let h = Harness::new()
+            .brain()
+            .scripter(handle.clone())
+            .transcriber(says("", None));
+        let events_seen = h.events.clone();
+        let stats = h.stats.clone();
+        let (_lines, cmds) = h.run(vec![soft_endpoint(carved(1, 0, 16, wake))]).await;
+
+        assert!(cmds.is_empty());
+        assert!(
+            matches!(
+                events_seen.lock().unwrap().as_slice(),
+                [BrainEvent::WakeCommandAbsent {
+                    reason: WakeCommandReason::Empty,
+                    score: 0.99,
+                    ..
+                }]
+            ),
+            "reported through the wake provenance: {:?}",
+            events_seen.lock().unwrap()
+        );
+        assert_eq!(stats.snapshot().wake_command_absent, 1);
+        assert_eq!(stats.snapshot().no_transcript, 0);
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Unanswered(pod())],
+            "a raise that produced no turn folds a linger from here",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_barge_still_tells_the_brain_its_response_was_cut() {
+        // The reply is already cut and `handle` will never run, so the notice here
+        // is the peer's only way to learn it was interrupted — the same obligation
+        // the confidence decline carries, now for speech that said nothing at all.
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let ledger = Arc::new(TurnLedger::new());
+        ledger.interrupt(&pod(), UtteranceId(99), cut(100, 1_000));
+        let barge_carve = barged(1, 0, 16);
+        let h = Harness::new()
+            .brain()
+            .scripter(handle.clone())
+            .transcriber(says(" ", None))
+            .barge(Arc::clone(&ledger), Err(FlushRejected::NotPlaying));
+        let nudges = h.nudges.clone();
+        let events_seen = h.events.clone();
+        let stats = h.stats.clone();
+        let (_lines, cmds) = h.run(vec![soft_endpoint(barge_carve)]).await;
+
+        assert!(cmds.is_empty());
+        assert_eq!(
+            nudges.lock().unwrap().barge_declined,
+            [(UtteranceId(1), Some(UtteranceId(99)))]
+        );
+        assert!(
+            matches!(
+                events_seen.lock().unwrap().as_slice(),
+                [BrainEvent::NoTranscript { .. }]
+            ),
+            "a barge carries no wake provenance to report it through: {:?}",
+            events_seen.lock().unwrap()
+        );
+        assert_eq!(stats.snapshot().no_transcript, 1);
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Unanswered(pod())],
+            "the barge raised the head and nothing came of it",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_echo_of_the_pods_own_reply_moves_no_head() {
+        // Audio over the pod's own playback that said nothing. Nobody raised for
+        // it, and the reply whose echo it is still owns the head — `Unanswered`
+        // here would cut that reply's own script short.
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let echo = CarvedUtterance {
+            over_playback: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .brain()
+            .scripter(handle.clone())
+            .transcriber(says("", None));
+        let stats = h.stats.clone();
+        let (_lines, cmds) = h.run(vec![soft_endpoint(echo)]).await;
+
+        assert!(cmds.is_empty());
+        assert_eq!(stats.snapshot().no_transcript, 1);
+        assert_eq!(
+            stats.snapshot().echo_declined,
+            0,
+            "the emptiness test decided it, not the overlap arm"
+        );
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![],
+            "the reply's own script is live and untouched",
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_follow_up_leaves_the_head_to_the_window() {
+        // Speech inside a `<listen/>` window that transcribed to nothing. The head
+        // is up because the microphone is open; the window's own ending is what
+        // brings it down, so the decline says nothing to the scripter.
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            ..carved(1, 0, 16, None)
+        };
+        let (feed, fed) = spy_listen_feed();
+        let h = Harness::new()
+            .brain()
+            .scripter(handle.clone())
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .transcriber(says("", None));
+        let stats = h.stats.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(follow_up)]).await;
+
+        assert!(cmds.is_empty());
+        assert_eq!(stats.snapshot().no_transcript, 1);
+        assert_eq!(
+            stats.snapshot().barge_command_absent,
+            0,
+            "an empty follow-up is not a confidence decline"
+        );
+        assert!(
+            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+            "and the window the noise spent is handed back — the whole point: {:?}",
+            fed.lock().unwrap(),
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l["event"] == "utterance" && l["follow_up"] == true),
+            "the utterance line still carries the provenance: {lines:?}"
+        );
+        assert_eq!(script_inputs(handle, rx).await, vec![]);
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_carve_in_a_quiet_room_starts_the_settle() {
+        // A bypassed wake gate mints every carve with no wake, no barge and no
+        // follow-up mark. Nothing else will end this engagement, so the decline
+        // has to: otherwise the head sits at its ceiling over a room gone quiet.
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let h = Harness::new()
+            .brain()
+            .scripter(handle.clone())
+            .transcriber(says("", None));
+        let stats = h.stats.clone();
+        let (_lines, cmds) = h.run(vec![soft_endpoint(carved(1, 0, 16, None))]).await;
+
+        assert!(cmds.is_empty());
+        assert_eq!(stats.snapshot().no_transcript, 1);
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Unanswered(pod())]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// The whole gate contract for a `WakePolicy::Bypass` deployment, where the
+    /// listener mints every carve with no wake, no barge and no overlap: such a
+    /// carve is never gated, whatever STT thought of its own transcript. If this
+    /// regresses, the pod declines all speech and answers nothing, and the
+    /// symptom reads as an STT fault rather than a gate one.
+    #[tokio::test]
+    async fn a_bypassed_carve_is_never_gated_on_confidence() {
+        let h = Harness::new()
+            .brain()
+            .transcriber(says("phantom", Some(conf(0.97, -1.5))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let stats = h.stats.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(carved(1, 0, 16, None))]).await;
+
+        assert_eq!(cmds.len(), 1, "the carve reached `handle`: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l["event"] == "brain_dispatched"),
+            "and was announced as a turn: {lines:?}"
+        );
+        let snap = stats.snapshot();
+        assert_eq!(
+            (
+                snap.wake_command_absent,
+                snap.barge_command_absent,
+                snap.echo_declined,
+                snap.no_transcript
+            ),
+            (0, 0, 0, 0),
+            "a score the gate would reject declines nothing here",
+        );
+    }
+
+    /// A `[brain]` with no `[stt]`: a deployment shape an operator can still
+    /// write, and the one the gate's rule decided against validating against —
+    /// the reporting is supposed to make it self-evident instead. Every utterance
+    /// carries a null transcript, so every one is declined, no brain is ever
+    /// called, and each decline is a `brain_no_transcript` line with its window
+    /// handed back.
+    #[tokio::test]
+    async fn a_brain_with_no_transcriber_answers_nothing() {
+        let (feed, fed) = spy_listen_feed();
+        let h = Harness::new().brain().listen(feed, TEST_LISTEN_WINDOW);
+        let stats = h.stats.clone();
+        let events_seen = h.events.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(carved(1, 0, 16, None))]).await;
+
+        assert!(cmds.is_empty(), "nothing was transcribed to answer");
+        assert!(
+            !lines.iter().any(|l| l["event"] == "brain_dispatched"),
+            "the brain is never called: {lines:?}"
+        );
+        assert_eq!(stats.snapshot().no_transcript, 1);
+        assert!(
+            matches!(
+                events_seen.lock().unwrap().as_slice(),
+                [BrainEvent::NoTranscript { .. }]
+            ),
+            "and the per-utterance line says why: {:?}",
+            events_seen.lock().unwrap()
+        );
+        assert!(
+            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+            "the candidate became no turn: {:?}",
+            fed.lock().unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_text_carrying_a_gate_tripping_score_is_declined_as_empty() {
+        // STT returned nothing and scored its own silence badly. The emptiness
+        // test runs first, so this is a `NoTranscript` — a confidence decline
+        // would claim a hallucination where there was no text to hallucinate.
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .brain()
+            .transcriber(says("   ", Some(conf(0.97, -1.5))))
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            });
+        let events_seen = h.events.clone();
+        let stats = h.stats.clone();
+        let (_lines, cmds) = h.run(vec![soft_endpoint(follow_up)]).await;
+
+        assert!(cmds.is_empty());
+        assert_eq!(stats.snapshot().no_transcript, 1);
+        assert_eq!(stats.snapshot().barge_command_absent, 0);
+        assert!(
+            matches!(
+                events_seen.lock().unwrap().as_slice(),
+                [BrainEvent::NoTranscript { .. }]
+            ),
+            "the emptiness test got there first: {:?}",
+            events_seen.lock().unwrap()
+        );
+    }
+
+    // --- handing a declined candidate back to the listener ----------------
+
+    /// Run one carve through the gate with a spy listener feed wired, and return
+    /// what the listener was told. The confidence gate is set to reject the
+    /// phantom text the low-confidence cases transcribe to, so the case chooses
+    /// its outcome by what it says rather than by how it is wired.
+    async fn fed_by_the_gate(carve: CarvedUtterance, transcriber: FakeTranscriber) -> Vec<Feed> {
+        let (feed, fed) = spy_listen_feed();
+        Harness::new()
+            .brain()
+            .transcriber(transcriber)
+            .gate(ConfidenceGate {
+                no_speech_max: 0.2,
+                avg_logprob_min: None,
+            })
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .run(vec![soft_endpoint(carve)])
+            .await;
+        let fed = fed.lock().unwrap();
+        fed.clone()
+    }
+
+    /// Every gate outcome that is not a dispatch says so to the listener, in the
+    /// same words and whatever the candidate's provenance: this became no turn.
+    /// The pipeline knows what the gate did and nothing about windows; the
+    /// listener knows what window the candidate spent and nothing about the gate,
+    /// and it is the one that decides whether anything comes back.
+    #[tokio::test]
+    async fn every_decline_hands_the_candidate_back_to_the_listener() {
+        let wake = Some(WakeConfirmation {
+            score: 0.99,
+            wake_end_sample: 8,
+            stt_trim_samples: 0,
+        });
+        let phantom = || says("phantom", Some(conf(0.97, -1.5)));
+        let marked = |mark: fn(&mut CarvedUtterance)| {
+            let mut c = carved(1, 0, 16, None);
+            mark(&mut c);
+            c
+        };
+
+        for (what, carve, transcriber) in [
+            (
+                "an empty transcript",
+                carved(1, 0, 16, None),
+                says("", None),
+            ),
+            ("a low-confidence wake", carved(1, 0, 16, wake), phantom()),
+            ("a low-confidence barge", barged(1, 0, 16), phantom()),
+            (
+                "a low-confidence follow-up",
+                marked(|c| c.follow_up = true),
+                phantom(),
+            ),
+            (
+                "an echo of the pod's own reply",
+                marked(|c| c.over_playback = true),
+                phantom(),
+            ),
+        ] {
+            let fed = fed_by_the_gate(carve, transcriber).await;
+            assert!(
+                matches!(fed.as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+                "{what} is handed back by its own id: {fed:?}"
+            );
+        }
+    }
+
+    /// The other half of the same rule, and the one only a negative assertion can
+    /// hold: a candidate that *became* a turn spent the window it was carved in,
+    /// and nothing tells the listener otherwise.
+    #[tokio::test]
+    async fn a_dispatched_candidate_is_never_handed_back() {
+        let fed = fed_by_the_gate(
+            carved(1, 0, 16, None),
+            says("hello world", Some(conf(0.01, -0.2))),
+        )
+        .await;
+
+        assert!(fed.is_empty(), "the turn keeps the window: {fed:?}");
     }
 
     // --- the cue tap ------------------------------------------------------

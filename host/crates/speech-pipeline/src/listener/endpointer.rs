@@ -250,6 +250,17 @@ impl Endpointer {
         matches!(self.state, State::Idle { onset_run: 0, .. })
     }
 
+    /// Where the speech now running began, when speech is running. `None` in
+    /// `Idle` — an onset run that has not confirmed is not speech yet — and
+    /// `None` in `SoftEndpointed`, whose continuation window is the tail of a
+    /// speech that has already ended rather than one in progress.
+    pub fn speech_start(&self) -> Option<u64> {
+        match self.state {
+            State::Speech { start, .. } => Some(start),
+            State::Idle { .. } | State::SoftEndpointed { .. } => None,
+        }
+    }
+
     /// Feed one Silero chunk. `p` is P(speech); `chunk_end_sample` is the absolute
     /// index one past the chunk's last sample. Returns a boundary event if this
     /// chunk crossed one.

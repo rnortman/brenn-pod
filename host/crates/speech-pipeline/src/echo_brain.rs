@@ -3,20 +3,17 @@
 //! `SpeakBody::Text`; the router's synthesizer renders it to speech. No clip, no
 //! transcriber inside the brain: the transcript rides in on the utterance.
 //!
-//! An utterance with no transcript — absent, or trimmed to nothing (noise reaching
-//! a bypassed wake gate legitimately transcribes to `""` or punctuation-only) — is
-//! declined here, in the brain, not gated out upstream: a future audio-native brain
-//! consumes the raw segment and needs no transcript, so the pipeline must never make
-//! a transcript a dispatch precondition. A full or disconnected response sink drops
-//! the reply (the utterance's audio still lives in the record store, so a lost
-//! readback costs responsiveness, not data). Both cases are made loud via a typed
-//! event plus a counter.
+//! An utterance with no transcript never arrives — `handle` is called only with
+//! usable text (see `Brain::handle`). A full or
+//! disconnected response sink drops the reply (the utterance's audio still lives
+//! in the record store, so a lost readback costs responsiveness, not data); that
+//! is made loud via a typed event plus a counter.
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::sync::Arc;
 
-use crate::brain::{BrainEvent, BrainEventFn, BrainStats, WakeCommandReason, send_or_report};
+use crate::brain::{BrainEventFn, BrainStats, send_or_report};
 use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{
     ContextSegment, InterruptProgress, SpeakBody, SpeakCmd, Utterance, UtteranceId,
@@ -73,51 +70,26 @@ impl Brain for EchoBrain {
     fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
         let utterance = u.id;
         let text = u
-            .transcript
-            .as_ref()
-            .map(|t| t.text.trim())
-            .filter(|t| !t.is_empty());
+            .spoken_text()
+            .expect("the gate declines an utterance with no text before dispatch")
+            .to_string();
 
-        match text {
-            Some(text) => {
-                // A barge-in utterance reads back where it cut the last response
-                // before parroting the new transcript; a plain utterance just
-                // parrots. The chain is non-empty by construction when present, so
-                // `last` is the turn this speech interrupted.
-                let reply = match u.barge_in.as_ref().and_then(|b| b.chain.last()) {
-                    Some(seg) => barge_readback(seg, text),
-                    None => text.to_string(),
-                };
-                let cmd = SpeakCmd {
-                    target: u.pod,
-                    in_reply_to: Some(u.id),
-                    body: SpeakBody::Text(reply),
-                    interruptible: true,
-                    timings: u.timings.clone(),
-                };
-                send_or_report(&mut out, cmd, utterance, &self.events, &self.stats);
-            }
-            None => match u.wake {
-                // A scored wake accept with nothing to echo: the wake word fired
-                // but no command followed. Its own non-failure category, carrying
-                // the wake context and segment reference for retro-transcription.
-                Some(w) => {
-                    (self.events)(BrainEvent::wake_command_absent(
-                        utterance,
-                        u.audio_ref,
-                        &w,
-                        WakeCommandReason::Empty,
-                    ));
-                    self.stats.record_wake_command_absent();
-                }
-                // A bypassed gate transcribing to nothing: legitimate noise, the
-                // pre-existing declined-for-no-transcript path.
-                None => {
-                    (self.events)(BrainEvent::NoTranscript { utterance });
-                    self.stats.record_no_transcript();
-                }
-            },
-        }
+        // A barge-in utterance reads back where it cut the last response before
+        // parroting the new transcript; a plain utterance just parrots. The chain
+        // is non-empty by construction when present, so `last` is the turn this
+        // speech interrupted.
+        let reply = match u.barge_in.as_ref().and_then(|b| b.chain.last()) {
+            Some(seg) => barge_readback(seg, &text),
+            None => text,
+        };
+        let cmd = SpeakCmd {
+            target: u.pod,
+            in_reply_to: Some(u.id),
+            body: SpeakBody::Text(reply),
+            interruptible: true,
+            timings: u.timings.clone(),
+        };
+        send_or_report(&mut out, cmd, utterance, &self.events, &self.stats);
         // A parrot never asks to be answered, so every turn it takes is closed.
         futures::future::ready(TurnEnd::Closed).boxed()
     }
@@ -136,6 +108,7 @@ mod tests {
     use futures::channel::mpsc;
     use pod_ingest::SegmentRef;
 
+    use crate::brain::BrainEvent;
     use crate::types::{
         AudioSpan, DoaTrack, PodId, RoomId, StageTimings, Transcript, WakeConfirmation,
     };
@@ -233,96 +206,6 @@ mod tests {
             SpeakBody::Text(text) => assert_eq!(text, "spaced out"),
             SpeakBody::Pcm(_) => panic!("EchoBrain queues Text"),
         }
-    }
-
-    #[test]
-    fn absent_transcript_declines_and_counts() {
-        let (events, seen) = event_collector();
-        let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, Arc::clone(&stats));
-
-        let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
-        drop(brain.handle(utterance_with(None), ResponseSink::new(tx)));
-
-        assert!(rx.try_recv().is_err(), "no reply for an absent transcript");
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![BrainEvent::NoTranscript {
-                utterance: UtteranceId(42)
-            }]
-        );
-        assert_eq!(stats.snapshot().no_transcript, 1);
-    }
-
-    #[test]
-    fn whitespace_only_transcript_declines_and_counts() {
-        let (events, seen) = event_collector();
-        let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, Arc::clone(&stats));
-
-        let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
-        drop(brain.handle(utterance_with(Some("   \t ")), ResponseSink::new(tx)));
-
-        assert!(rx.try_recv().is_err(), "no reply for a blank transcript");
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![BrainEvent::NoTranscript {
-                utterance: UtteranceId(42)
-            }]
-        );
-        assert_eq!(stats.snapshot().no_transcript, 1);
-    }
-
-    #[test]
-    fn wake_positive_empty_transcript_is_command_absent_not_no_transcript() {
-        let (events, seen) = event_collector();
-        let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, Arc::clone(&stats));
-
-        let wake = Some(WakeConfirmation {
-            score: 0.998,
-            wake_end_sample: 39_040,
-            stt_trim_samples: 35_840,
-        });
-        let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
-        drop(brain.handle(utterance_full(Some("   "), wake), ResponseSink::new(tx)));
-
-        assert!(rx.try_recv().is_err(), "no reply for an empty command");
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![BrainEvent::WakeCommandAbsent {
-                utterance: UtteranceId(42),
-                audio_ref: test_audio_span(),
-                score: 0.998,
-                wake_end_sample: 39_040,
-                stt_trim_samples: 35_840,
-                reason: WakeCommandReason::Empty,
-            }]
-        );
-        // Routed to its own non-failure counter, never the generic error path.
-        assert_eq!(stats.snapshot().wake_command_absent, 1);
-        assert_eq!(stats.snapshot().no_transcript, 0);
-    }
-
-    #[test]
-    fn bypassed_empty_transcript_stays_no_transcript() {
-        // No wake provenance (bypassed gate): an empty transcript is legitimate
-        // noise, the generic declined-for-no-transcript path — not a wake-no-follow.
-        let (events, seen) = event_collector();
-        let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, Arc::clone(&stats));
-
-        let (tx, _rx) = mpsc::channel::<SpeakCmd>(1);
-        drop(brain.handle(utterance_full(Some(""), None), ResponseSink::new(tx)));
-
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![BrainEvent::NoTranscript {
-                utterance: UtteranceId(42)
-            }]
-        );
-        assert_eq!(stats.snapshot().no_transcript, 1);
-        assert_eq!(stats.snapshot().wake_command_absent, 0);
     }
 
     #[test]

@@ -1146,12 +1146,17 @@ impl BrennConfig {
     /// How long a `<listen/>` capture window runs, in samples at the capture
     /// rate.
     ///
-    /// Exactly as long as the head lingers after such a reply, so the
-    /// microphone's deadline and the head's stow are dated the same instant
-    /// from one key. In samples because the listener dates the window from its
-    /// own audio cursor. Saturating because the linger is untrusted TOML: an
-    /// absurd value becomes a window that never expires rather than a wrapped
-    /// count that expires at once.
+    /// Exactly as long as the head lingers after such a reply, from one key:
+    /// the window's own expiry is what stows the head, and the linger is the
+    /// schedule that ending keeps while nobody speaks into the window, so the
+    /// two have to be dated the same instant. Speech inside the window moves
+    /// the head's ending out to `presence_max_engaged_ms` and hands it back to
+    /// the window, which is why nothing here re-dates the deadline.
+    ///
+    /// In samples because the listener dates the window from its own audio
+    /// cursor. Saturating because the linger is untrusted TOML: an absurd value
+    /// becomes a window that never expires rather than a wrapped count that
+    /// expires at once.
     pub fn listen_window_samples(&self) -> u64 {
         self.presence_linger_ms.saturating_mul(SAMPLES_PER_MS)
     }

@@ -23,8 +23,16 @@ pub enum BrainEvent {
     /// The response sink was full or disconnected; the utterance went unanswered.
     SinkFull { utterance: UtteranceId },
     /// The utterance carried no usable transcript (absent, or whitespace-only), so
-    /// a transcript-driven brain declined to answer. Not a failure: noise reaching
-    /// a bypassed wake gate legitimately transcribes to nothing.
+    /// the gate declined it and no brain was called. Not a failure: noise reaching
+    /// a bypassed wake gate legitimately transcribes to nothing, and an STT attempt
+    /// that failed leaves the same absent transcript (`stt_failed` names that
+    /// cause separately).
+    ///
+    /// A reader is entitled to conclude that this utterance produced no turn: no
+    /// `brain_dispatched` follows it and nothing was spoken. The JSONL name
+    /// `brain_no_transcript` is kept for readers that key on it. A *wake-gated*
+    /// empty is never reported here — it is a `WakeCommandAbsent` with
+    /// `WakeCommandReason::Empty`, under every brain.
     NoTranscript { utterance: UtteranceId },
     /// A scored wake accept with no usable command: either the transcript came
     /// back empty, or STT confidence flagged it as a likely hallucination (the
@@ -54,6 +62,11 @@ pub enum BrainEvent {
     /// `true` is speech inside a `<listen/>` capture window, nothing was
     /// interrupted, and the repair is the confidence gate or the room. A
     /// deployment where nothing can barge reads every one of these as `true`.
+    ///
+    /// Speech that began inside a window and then cut the reply it drew is
+    /// reported `false`: the cut is what the reader is entitled to act on, and
+    /// the barge thresholds are its repair. `true` is reserved for a window's
+    /// speech that cut nothing.
     BargeCommandAbsent {
         utterance: UtteranceId,
         audio_ref: AudioSpan,
@@ -108,8 +121,8 @@ pub enum BrainEvent {
 impl BrainEvent {
     /// Build the no-command event for a scored wake accept, packing the wake
     /// context and segment reference and tagging it with `reason`. Shared by the
-    /// brain's empty-transcript path and the pipeline's confidence-gate decline so
-    /// the two no-command sites pack identical fields and only the reason differs.
+    /// gate's empty-transcript and confidence declines so the two no-command sites
+    /// pack identical fields and only the reason differs.
     pub fn wake_command_absent(
         utterance: UtteranceId,
         audio_ref: AudioSpan,
@@ -132,7 +145,9 @@ impl BrainEvent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WakeCommandReason {
     /// The transcript came back empty or whitespace-only — the wake word fired
-    /// with no follow-on speech.
+    /// with no follow-on speech, or STT failed and left no transcript at all.
+    /// The one report for a wake-gated empty, whatever brain is configured: the
+    /// gate decides it, so no brain's own vocabulary can vary it.
     Empty,
     /// The transcript carried text but STT confidence tripped the gate — a likely
     /// hallucination. Carries the offending signals for the log line.

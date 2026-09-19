@@ -832,22 +832,8 @@ impl Brain for BrennBrain {
         async move {
             let utterance = u.id;
             let text = u
-                .transcript
-                .as_ref()
-                .map(|t| t.text.trim())
-                .filter(|t| !t.is_empty());
-            let Some(text) = text else {
-                // A barge that carved nothing usable still cut a reply, and no
-                // utterance message will follow to say so — the notice is the peer's
-                // only way to learn it was interrupted. Not a link failure, so
-                // nothing is spoken.
-                if let Some(interrupted) = InterruptedBody::for_utterance(&u) {
-                    link.notify_interruption(interruption_body(&u.pod, &u.room, interrupted));
-                }
-                (events)(BrainEvent::NoTranscript { utterance });
-                stats.record_no_transcript();
-                return TurnEnd::Closed;
-            };
+                .spoken_text()
+                .expect("the gate declines an utterance with no text before dispatch");
             let body = utterance_body(&u, text);
             let (tx, mut rx) = mpsc::channel::<ParsedResponse>(SLOT_CAPACITY);
             let slot = SlotGuard::arm(pending, utterance, tx);
@@ -2200,61 +2186,6 @@ mod tests {
             f.events()
         );
         assert_eq!(f.stats.snapshot().link_tags_stripped, 0);
-    }
-
-    #[tokio::test]
-    async fn a_missing_transcript_declines_without_publishing() {
-        let mut f = Fixture::new();
-        let u = Utterance {
-            transcript: None,
-            ..test_utterance()
-        };
-        assert_eq!(f.dispatch(u).await.unwrap(), TurnEnd::Closed);
-
-        assert!(f.published().is_empty(), "nothing to say to the peer");
-        assert!(f.log.lock().unwrap().interruptions.is_empty());
-        assert!(f.spoken().is_empty(), "not a link failure, so no apology");
-        assert_eq!(
-            f.events(),
-            vec![BrainEvent::NoTranscript {
-                utterance: UtteranceId(42)
-            }]
-        );
-        assert_eq!(f.stats.snapshot().no_transcript, 1);
-    }
-
-    #[tokio::test]
-    async fn a_barge_that_transcribed_to_nothing_still_reports_the_interruption() {
-        let f = Fixture::new();
-        let u = with_chain(
-            Utterance {
-                transcript: Some(Transcript {
-                    text: "  ".into(),
-                    confidence: None,
-                }),
-                ..test_utterance()
-            },
-            vec![segment(Some("one two three"), 700, 1_000)],
-        );
-        f.dispatch(u).await.unwrap();
-
-        assert!(f.published().is_empty());
-        let notices = &f.log.lock().unwrap().interruptions;
-        assert_eq!(notices.len(), 1);
-        assert_eq!(
-            parsed(&notices[0]),
-            json!({
-                "type": "interruption",
-                "pod": "pod-x",
-                "room": "kitchen",
-                "interrupted": {
-                    "utterance": 122,
-                    "heard_ms": 700,
-                    "total_ms": 1_000,
-                    "heard_text": "one two",
-                },
-            })
-        );
     }
 
     #[tokio::test]

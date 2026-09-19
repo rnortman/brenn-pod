@@ -1,7 +1,8 @@
 //! Playback integration, two scenarios:
 //!
-//! - **Brain-positive**: a daemon with the streaming listener and `[brain] mode =
-//!   "wav"` answers a carved utterance by queueing its configured clip as paced
+//! - **Brain-positive**: a daemon with the streaming listener, `[stt]` at an
+//!   in-process fake speaches, and `[brain] mode = "wav"` answers a carved
+//!   utterance by queueing its configured clip as paced
 //!   playback back over the same TCP connection the pod streamed in on. `replay-pod
 //!   --linger-until-eoa --linger-playout-ms` holds the connection open through the
 //!   daemon's playback and past the clip's audible end, as a device playing out its
@@ -55,7 +56,8 @@ fn write_clip_wav(path: &Path, n: usize) {
 }
 
 /// The wake phrase, replayed against a listener + `wav`-brain daemon, arms
-/// openWakeWord, the endpointer carves one utterance, and the brain
+/// openWakeWord, the endpointer carves one utterance, STT transcribes it to words
+/// — which is what lets it past the gate at all — and the brain
 /// answers it with the configured clip queued as paced playback. The daemon writes
 /// the clip back over the same connection; the lingering `replay-pod` stays
 /// connected, decodes the returned `Hello`/`Audio`/`EndOfAudio`, and reports the
@@ -70,8 +72,15 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
     write_clip_wav(&clip, CLIP_SAMPLES);
 
     // Recording off: the playback path is independent of the record store, so
-    // the brain-positive scenario needs no record dir.
-    let mut daemon = common::spawn_daemon(&common::listener_wav_brain_config(None, &clip));
+    // the brain-positive scenario needs no record dir. The fake speaches serves
+    // `[stt]` only — the reply is the configured clip, so no TTS request is ever
+    // made and its sample count is irrelevant here.
+    let speaches_url = common::spawn_fake_speaches(0);
+    let mut daemon = common::spawn_daemon(&common::listener_wav_brain_config(
+        None,
+        &clip,
+        &speaches_url,
+    ));
     let jsonl_path = daemon.jsonl_path.clone();
     let addr = daemon.listen_addr();
 
@@ -162,6 +171,7 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
         "onset_ms",
         "soft_endpoint_ms",
         "stt_start_ms",
+        "stt_done_ms",
         "brain_ms",
         "speak_rx_ms",
         "first_write_ms",
@@ -173,11 +183,14 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
             daemon.diagnostics()
         );
     }
-    // The stages are ordered on the axis, and t0 really is the origin.
+    // The stages are ordered on the axis, and t0 really is the origin. STT is on
+    // the axis here: the brain is only reached by an utterance that transcribed
+    // to words, so the transcription precedes the dispatch that answers it.
     let offset = |f: &str| s[f].as_i64().unwrap();
     assert!(
         offset("soft_endpoint_ms") <= offset("stt_start_ms")
-            && offset("stt_start_ms") <= offset("brain_ms")
+            && offset("stt_start_ms") <= offset("stt_done_ms")
+            && offset("stt_done_ms") <= offset("brain_ms")
             && offset("brain_ms") <= offset("speak_rx_ms")
             && offset("speak_rx_ms") <= offset("first_write_ms"),
         "the stackup must be monotonic from the soft endpoint to the first write\n{}",
@@ -188,7 +201,13 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
         "the VAD went high before the response played\n{}",
         daemon.diagnostics()
     );
-    for field in ["endpoint_to_stt_us", "brain_us", "speak_to_first_write_us"] {
+    for field in [
+        "endpoint_to_stt_us",
+        "stt_us",
+        "stt_to_brain_us",
+        "brain_us",
+        "speak_to_first_write_us",
+    ] {
         assert!(
             s[field].as_u64().is_some(),
             "latency_summary blame {field} must be present and numeric, got {}\n{}",
@@ -196,21 +215,17 @@ fn wav_brain_answers_wake_with_paced_clip_playback() {
             daemon.diagnostics()
         );
     }
-    // This daemon wires no `[stt]` and the wav brain replies with PCM, so neither
-    // stage ran and neither can be blamed. `parrot_integration` is where the full
-    // stackup — STT and TTS included — is asserted end to end.
+    // The wav brain replies with PCM, so no synthesis ran and none can be blamed.
+    // `parrot_integration` is where the TTS half of the stackup is asserted.
     for field in [
-        "stt_done_ms",
         "tts_done_ms",
-        "stt_us",
-        "stt_to_brain_us",
         "speak_to_synth_start_us",
         "tts_us",
         "synth_to_first_write_us",
     ] {
         assert!(
             s[field].is_null(),
-            "no stt and a pcm reply leave {field} null, got {}\n{}",
+            "a pcm reply leaves {field} null, got {}\n{}",
             s[field],
             daemon.diagnostics()
         );

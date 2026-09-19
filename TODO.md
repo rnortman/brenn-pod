@@ -733,27 +733,6 @@ feeding — and the wake word cuts a reply again without the echo arming it.
 See `TODO(barge-mute-costs-every-interruption)` at `BargeMode::Mute` in
 `host/crates/speech-pipeline/src/listener/runtime.rs`.
 
-## `listen-window-single-utterance` — DEFERRED as of 2026-09-18 (needs a decision about what closes a window)
-
-A `<listen/>` capture window is one-shot: it closes at the first utterance minted inside it,
-whatever that utterance's provenance, and nothing reopens it before the next reply that asks to
-listen. So a follow-up the confidence gate then **declines** — a cough, a television, a mumbled
-half-word — has spent the window. The person is answered with nothing, the head waits out one
-linger, and to be heard again they have to say the wake word.
-
-One utterance per window is what keeps the window's lifetime obviously bounded: it cannot outlive
-the dispatch it produced, so there is no accounting for a window that opened three replies ago.
-Reopening on a decline needs an answer to how many declines a window survives and how its deadline
-is re-dated, which is the open-microphone policy question the one-shot rule deliberately does not
-ask.
-
-Done = a follow-up the gate declines does not cost the window, under a stated bound on how long a
-window may stay open and how many declines it absorbs, and a listener test drives a declined carve
-inside a window and carves a second utterance in the same one.
-
-See `TODO(listen-window-single-utterance)` at the window's close in `carve_utterance` in
-`host/crates/speech-pipeline/src/listener/runtime.rs`.
-
 ## `cue-motion-one-at-a-time` — DEFERRED as of 2026-09-18 (needs a decision about blending and queueing)
 
 The scripter holds one running motion per pod. A second `<motion/>` cue replaces the first
@@ -771,29 +750,6 @@ Done = a motion cued over a running one either blends out of it or composes with
 stated where `Running` is declared, and a scripter test pins what the replacement script says.
 
 See `TODO(cue-motion-one-at-a-time)` at the `MotionCue::Motion` arm of `cue` in
-`host/crates/speech-surface/src/scripter.rs`.
-
-## `listen-window-owns-the-stow` — DEFERRED as of 2026-09-18 (needs the window to own the head's ending)
-
-`ScriptInput::Heard` re-dates the head's stow to a fixed `presence_linger_ms` from *now*, at two
-instants: the follow-up's onset, and its carve. Between them nothing re-dates anything — the
-endpointer reports no transition while speech continues — so a follow-up spoken without a break for
-longer than `presence_linger_ms` runs the onset's linger out mid-sentence. The head starts down
-while the person is still talking, the carve's `Heard` finds the pod `Stowing` and is refused, and
-`TurnStarted` jerks it back up at dispatch.
-
-The exposure is bounded by `presence_linger_ms` (8 s by default) and the operator can raise it, so
-it is a bad-looking moment rather than a lost turn. The right shape is the window owning the
-ending outright: the listener already waits for the endpointer to go fully idle before emitting
-`ListenExpired`, so a stow dated from *that* covers speech of any length, with a fallback ceiling
-for a window the listener never expires. That is a different ownership of the head's ending than
-the two fixed re-datings, and it is the design decision this waits on.
-
-Done = the head's stow after a listening reply is dated from the window's own end rather than from
-a fixed linger at each of two instants, with a stated ceiling, and a scripter test drives speech
-longer than `presence_linger_ms` with the head never starting down.
-
-See `TODO(listen-window-owns-the-stow)` at `wait_out_linger` in
 `host/crates/speech-surface/src/scripter.rs`.
 
 ## `measured-t0-e2e-coverage` — DEFERRED as of 2026-09-16 (needs a decision about which carve should produce a measured t0)

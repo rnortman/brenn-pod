@@ -251,6 +251,12 @@ pub trait Brain: Send + Sync {
     /// turn ended. The return is a statement about the conversation, not about
     /// delivery: a turn whose replies were all refused by a full queue still ends
     /// `Open` if the response that produced them asked to keep listening.
+    ///
+    /// `u` carries usable text by contract: `u.spoken_text()` is `Some`. An
+    /// utterance that transcribed to nothing is not a turn, and is declined
+    /// before any brain is reached. A brain that does not read the text may
+    /// ignore this; one that does may read it without a fallback branch, and
+    /// needs a transcriber wired to be called at all.
     fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, TurnEnd>;
     /// The turn `id` was cut mid-playback; `progress` says how much of the
     /// response clip the user heard. Invoked only with a turn the playback writer
