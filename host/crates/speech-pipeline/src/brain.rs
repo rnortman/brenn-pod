@@ -290,9 +290,10 @@ impl BrainStats {
 }
 
 /// Queue a brain's response, reporting a full or disconnected sink through the
-/// shared event plus counter. Every `Brain` routes its send through here so the
-/// sink-failure contract stays identical across implementations.
-pub(crate) fn send_or_report(
+/// shared event plus counter. Every reply producer — each `Brain`, and the
+/// surface's offline reply — routes its send through here so the sink-failure
+/// contract stays identical across them.
+pub fn send_or_report(
     out: &mut ResponseSink,
     cmd: SpeakCmd,
     utterance: UtteranceId,

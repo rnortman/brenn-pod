@@ -97,9 +97,11 @@ STUBS="$WORK/stubs"
 mkdir -p "$STUBS"
 
 # Stubbed ssh: answers the two read-only queries the tool makes and captures the
-# push. Which call is which is decided by the command it carries.
+# push. Which call is which is decided by the command it carries. Every call is
+# logged, so a case can assert that none was made.
 cat >"$STUBS/ssh" <<'SSH_EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"${STUB_SSH_LOG:-/dev/null}"
 for arg in "$@"; do
 	case "$arg" in
 	*/proc/sys/kernel/hostname*)
@@ -171,6 +173,7 @@ new_tree() {
 	host_config "listen_addr = \"192.168.1.20:7380\"" "pod_psk_file = \"${PSK_FILE}\""
 	export STUB_HOSTNAME=reachy00 STUB_KEY="$KEY_NEW"
 	export STUB_PUSH="$PUSHED" STUB_REMOTE_CMD="$REMOTE_CMD"
+	export STUB_SSH_LOG="$TREE/ssh.log"
 	unset STUB_NO_MOUNT STUB_PUSH_FAIL
 }
 
@@ -186,6 +189,23 @@ run_argv() {
 # The ordinary shape every other case wants: the unit first, the rest after it.
 run_tool() {
 	run_argv reachy-dev "$@"
+}
+
+# run_split <args…> — the subject with stdout and stderr kept apart: stdout in
+# $TREE/emit.out, stderr in $TREE/emit.err and in $OUT, so the expect_* helpers
+# read the messages and the case reads the file.
+run_split() {
+	set +e
+	PATH="$STUBS:$PATH" "$TREE/firmware/tools/$(basename -- "$TOOL")" "$@" \
+		>"$TREE/emit.out" 2>"$TREE/emit.err"
+	EC=$?
+	set -e
+	OUT=$(cat -- "$TREE/emit.err")
+}
+
+# The composing mode: the file on stdout and nothing pushed.
+run_emit() {
+	run_split --emit "$@"
 }
 
 new_tree
@@ -594,6 +614,104 @@ expect_ok "hash-in-table-path-reads-the-real-table" "reusing its key"
 check "hash-in-table-path-no-truncated-sibling" \
 	"$(yes_no [ ! -e "$TREE/keys/psk" ])" \
 	"a table was created at the truncated path"
+
+# ── --emit: the same file on stdout, no device contacted ──────────────────────
+
+# The build that carries the link in a payload reads stdout as the file, so the
+# file must be all stdout holds, and no ssh may run: there is no unit to reach.
+new_tree
+run_emit reachy00
+expect_ok "emit-composes-without-ssh" "filed a new key for reachy00"
+check "emit-composes-without-ssh-no-ssh" \
+	"$(yes_no [ ! -s "$TREE/ssh.log" ])" "ssh calls: $(cat -- "$TREE/ssh.log" 2>&1)"
+printf 'ADDR=192.168.1.20:7380\nPSK=%s\n' "$KEY_NEW" >"$TREE/want.conf"
+check "emit-composes-without-ssh-stdout-is-the-file" \
+	"$(yes_no cmp -s -- "$TREE/want.conf" "$TREE/emit.out")" \
+	"stdout: $(cat -A -- "$TREE/emit.out")"
+check "emit-composes-without-ssh-files-the-key" \
+	"$(yes_no grep -qxF "\"reachy00\" = \"${KEY_NEW}\"" -- "$PSK_FILE")" \
+	"table holds: $(cat -- "$PSK_FILE" 2>&1)"
+check "emit-composes-without-ssh-table-owner-only" \
+	"$(yes_no [ "$(stat -c '%a' -- "$PSK_FILE")" = 600 ])" \
+	"mode $(stat -c '%a' -- "$PSK_FILE")"
+check "emit-composes-without-ssh-says-composed" \
+	"$(yes_no grep -qF "composed for reachy00" <<<"$OUT")" "stderr: $OUT"
+check "emit-composes-without-ssh-nothing-pushed" "$(yes_no [ ! -e "$PUSHED" ])" "something was pushed"
+
+new_tree
+key_table 600 "\"reachy00\" = \"${KEY_OLD}\"
+"
+cp -- "$PSK_FILE" "$TREE/table.before"
+run_emit reachy00
+expect_ok "emit-reuses-a-filed-key" "reusing its key"
+check "emit-reuses-a-filed-key-on-stdout" \
+	"$(yes_no grep -qxF "PSK=${KEY_OLD}" -- "$TREE/emit.out")" \
+	"stdout: $(cat -- "$TREE/emit.out")"
+check "emit-reuses-a-filed-key-table-unchanged" \
+	"$(yes_no cmp -s -- "$TREE/table.before" "$PSK_FILE")" \
+	"table changed: $(cat -- "$PSK_FILE")"
+
+new_tree
+mkdir -p "$TREE/firmware/.local"
+printf 'CHANNEL=1\nVAD_THRESHOLD=0.6\n' >"$TREE/firmware/.local/audio.conf.extra"
+run_emit reachy00
+expect_ok "emit-appends-extra" "appended audio.conf.extra verbatim"
+{
+	printf 'ADDR=192.168.1.20:7380\nPSK=%s\n' "$KEY_NEW"
+	cat -- "$TREE/firmware/.local/audio.conf.extra"
+} >"$TREE/want.conf"
+check "emit-appends-extra-byte-for-byte" \
+	"$(yes_no cmp -s -- "$TREE/want.conf" "$TREE/emit.out")" \
+	"stdout: $(cat -A -- "$TREE/emit.out")"
+check "emit-appends-extra-status-not-on-stdout" \
+	"$(no_yes grep -qF "verbatim" -- "$TREE/emit.out")" \
+	"stdout: $(cat -- "$TREE/emit.out")"
+
+# The positional is the pod id: nothing asks a unit its hostname.
+new_tree
+STUB_HOSTNAME=other
+run_emit reachy07
+expect_ok "emit-pod-id-is-the-positional" "filed a new key for reachy07"
+check "emit-pod-id-is-the-positional-filed-under-it" \
+	"$(yes_no grep -qxF "\"reachy07\" = \"${KEY_NEW}\"" -- "$PSK_FILE")" \
+	"table holds: $(cat -- "$PSK_FILE" 2>&1)"
+check "emit-pod-id-is-the-positional-not-the-hostname" \
+	"$(no_yes grep -qF "other" -- "$PSK_FILE")" \
+	"table holds: $(cat -- "$PSK_FILE" 2>&1)"
+
+# The refusals are the push's own, in both modes.
+new_tree
+host_config "listen_addr = \"127.0.0.1:7380\"" "pod_psk_file = \"${PSK_FILE}\""
+run_emit reachy00
+expect_die "emit-refuses-loopback-without-on-unit" "is not an address the pod can dial"
+check "emit-refuses-loopback-without-on-unit-stdout-empty" \
+	"$(yes_no [ ! -s "$TREE/emit.out" ])" "stdout: $(cat -- "$TREE/emit.out")"
+run_emit --on-unit reachy00
+expect_ok "emit-on-unit-accepts-loopback"
+check "emit-on-unit-accepts-loopback-addr" \
+	"$(yes_no [ "$(head -n1 -- "$TREE/emit.out")" = "ADDR=127.0.0.1:7380" ])" \
+	"stdout: $(cat -- "$TREE/emit.out")"
+
+new_tree
+run_emit 'bad id'
+expect_die "emit-refuses-a-bad-pod-id" 'the pod id "bad id" cannot be a key-table entry'
+check "emit-refuses-a-bad-pod-id-stdout-empty" \
+	"$(yes_no [ ! -s "$TREE/emit.out" ])" "stdout: $(cat -- "$TREE/emit.out")"
+check "emit-refuses-a-bad-pod-id-nothing-filed" "$(yes_no [ ! -e "$PSK_FILE" ])" "a key was filed"
+
+new_tree
+rm -f -- "$TREE/host/config/parrot.toml"
+run_emit reachy00
+expect_die "emit-refusal-prints-nothing-on-stdout" "no speech daemon config at"
+check "emit-refusal-prints-nothing-on-stdout-empty" \
+	"$(yes_no [ ! -s "$TREE/emit.out" ])" "stdout: $(cat -- "$TREE/emit.out")"
+
+# The push's status lines are on stderr too, so stdout means the same in both modes.
+new_tree
+run_split reachy-dev
+expect_ok "push-status-lines-on-stderr" "provisioned —"
+check "push-status-lines-on-stderr-stdout-empty" \
+	"$(yes_no [ ! -s "$TREE/emit.out" ])" "stdout: $(cat -- "$TREE/emit.out")"
 
 # ── Layer 3: the Makefile's half of the opt-in ────────────────────────────────
 #

@@ -231,6 +231,20 @@ impl Config {
                     .to_string(),
             );
         }
+        // The offline reply is a turn, and with no brain the pipeline takes none: the clip
+        // would load, be announced, and never play.
+        if self.brain.is_none()
+            && self
+                .stt
+                .as_ref()
+                .is_some_and(|stt| stt.unreachable_clip.is_some())
+        {
+            return Err(
+                "stt.unreachable_clip requires a [brain] table (with no brain no turn is \
+                 taken, so the clip would never play)"
+                    .to_string(),
+            );
+        }
         // A bypassing gate sends every utterance in the room to the brain, and the
         // bus brain hands each one to a harness that acts on it: a daemon that
         // looks healthy and answers everything anyone says near it.
@@ -1214,6 +1228,16 @@ pub struct SttConfig {
     /// `"trim"` cuts it (leaving a margin); `"keep"` sends the whole carve.
     #[serde(default)]
     pub wake_word: WakeWordInStt,
+    /// A 16 kHz mono S16 clip the pod plays as a closed turn when a wake-accepted
+    /// utterance's transcription fails (the transcriber unreachable, timed out, or
+    /// answering with an error). Requires a `[brain]`: the reply is a turn, and with
+    /// no brain none is taken. Optional; opened as given, so a relative path is
+    /// relative to the daemon's working directory. Loaded and format-checked at
+    /// startup — a missing or non-conforming file is fatal. Must not say the wake
+    /// phrase: a `Pcm` reply is never treated as possibly waking the pod, so a clip
+    /// that did would wake it on its own voice.
+    #[serde(default)]
+    pub unreachable_clip: Option<PathBuf>,
 }
 
 impl SttConfig {
@@ -2691,7 +2715,37 @@ voice = "af_heart"
         ))
         .expect("parse");
         assert!(config.stt.as_ref().unwrap().language.is_none());
+        assert!(config.stt.as_ref().unwrap().unreachable_clip.is_none());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn stt_unreachable_clip_is_a_path_as_given() {
+        let config = Config::parse(&with_addr(
+            "[stt]\nbackend = \"http\"\nurl = \"http://h:8000\"\nmodel = \"m\"\n\
+             unreachable_clip = \"clips/offline.wav\"\n\
+             [brain]\nmode = \"wav\"\nclip = \"ack.wav\"",
+        ))
+        .expect("parse");
+        assert_eq!(
+            config.stt.as_ref().unwrap().unreachable_clip,
+            Some(PathBuf::from("clips/offline.wav"))
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn stt_unreachable_clip_without_brain_rejected() {
+        let config = Config::parse(&with_addr(
+            "[stt]\nbackend = \"http\"\nurl = \"http://h:8000\"\nmodel = \"m\"\n\
+             unreachable_clip = \"clips/offline.wav\"",
+        ))
+        .expect("parse");
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("stt.unreachable_clip requires a [brain]"),
+            "{err}"
+        );
     }
 
     #[test]

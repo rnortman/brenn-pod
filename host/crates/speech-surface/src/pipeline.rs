@@ -41,8 +41,8 @@ use speech_pipeline::{
     ConfidenceGate, Cue, CueTap, DoaTrack, EndpointCause, Feed, FlushRejected, GateReject,
     InterruptProgress, ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment,
     SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError,
-    Transcriber, Transcript, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation,
-    stage_delta_us, tracking_event, transcribe_pcm,
+    Transcriber, Transcript, TurnEnd, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation,
+    send_or_report, stage_delta_us, tracking_event, transcribe_pcm,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -230,6 +230,15 @@ impl ListenWiring {
     }
 }
 
+/// The clip the pipeline answers a failed wake transcription with.
+#[derive(Clone)]
+pub struct UnreachableClip {
+    /// The configured path as written, reported verbatim on the reply's line.
+    pub path: String,
+    /// The clip's samples: 16 kHz mono S16, non-empty.
+    pub pcm: Arc<[i16]>,
+}
+
 /// Pass-through configuration and shared counters for [`run`].
 pub struct PipelineCtx {
     /// The record-store directory, or `None` when recording is disabled.
@@ -261,6 +270,9 @@ pub struct PipelineCtx {
     /// nothing here could tell an offered name from an invented one, and every
     /// cue is refused with a line saying so.
     pub(crate) cues: Option<Arc<CueLibrary>>,
+    /// What a wake-accepted utterance whose transcription failed is answered
+    /// with, as a closed turn. `None` keeps the decline.
+    pub unreachable_clip: Option<UnreachableClip>,
 }
 
 /// How many recent segments and wake detections to retain per pod for sidecar
@@ -1300,6 +1312,7 @@ async fn handle_stt_done(
         listen,
         scripter,
         cues,
+        unreachable_clip,
         ..
     } = ctx;
     let (brain, barge, listen, scripter, cues) = (
@@ -1324,6 +1337,8 @@ async fn handle_stt_done(
     // `stt_started → transcribed` includes. Only a success carries it onto the
     // utterance line; a failure already reports it on its own line.
     let mut stt_elapsed_us = None;
+    // A transcriber was wired and failed. No transcriber at all is not a failure.
+    let stt_errored = matches!(done.result, Some(Err(_)));
     let (transcript, transcribed) = match done.result {
         None => (None, false),
         Some(Ok(t)) => {
@@ -1439,9 +1454,18 @@ async fn handle_stt_done(
     // The carve's provenance is classified once, above both tests, and both
     // declines read that one classification — a carve can carry more than one
     // mark, and two readings of it would report the same speech two ways.
+    //
+    // One carve with no text is answered rather than declined: a wake accept
+    // whose transcription failed, with a clip configured to say so. Every other
+    // provenance, and an empty transcript, keeps its decline.
     let from = provenance(&done.carve);
     let gate = if utterance.spoken_text().is_none() {
-        GateOutcome::DeclineEmpty(from)
+        match unreachable_clip {
+            Some(clip) if stt_errored && matches!(from, Provenance::Wake(_)) => {
+                GateOutcome::OfflineReply(clip)
+            }
+            _ => GateOutcome::DeclineEmpty(from),
+        }
     } else {
         let confidence_reject = utterance
             .transcript
@@ -1473,9 +1497,12 @@ async fn handle_stt_done(
     // nobody raised, and `Unanswered` clears the pod's current turn, which would
     // cut short the script of the very reply the echo came from.
     //
+    // A turn — a dispatch or the offline reply — is not a decline, and ends the
+    // head's engagement through its own script.
+    //
     // Both declines answer this off the value they were classified under, so no
     // decline's head response can drift from its report.
-    let starts_the_settle = !matches!(gate, GateOutcome::Dispatch)
+    let starts_the_settle = !matches!(gate, GateOutcome::Dispatch | GateOutcome::OfflineReply(_))
         && matches!(
             from,
             Provenance::Wake(_) | Provenance::Barge | Provenance::Bypassed
@@ -1486,11 +1513,12 @@ async fn handle_stt_done(
         scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
     }
     // Every decline, uniformly and whatever its reason: this candidate produced no
-    // turn. Said before the accounting below so a capture window the candidate spent
+    // turn. A dispatch or the offline reply is a turn, so neither is reported
+    // here. Said before the accounting below so a capture window the candidate spent
     // is back as early as the verdict allows — the person answering a `<listen/>`
     // reply is talking into the gap this closes.
     if let Some(listen) = listen
-        && !matches!(gate, GateOutcome::Dispatch)
+        && !matches!(gate, GateOutcome::Dispatch | GateOutcome::OfflineReply(_))
     {
         listen
             .declined(utterance.pod.clone(), done.carve.id.clone())
@@ -1563,37 +1591,15 @@ async fn handle_stt_done(
                 pod.clone(),
                 id,
             ));
-            // Recorded at every dispatch, barge or not: this turn is what the *next*
-            // interrupt would chain.
-            let sink = match barge {
-                Some(barge) => {
-                    barge.ledger.record_dispatch(
-                        &pod,
-                        id,
-                        utterance.transcript.as_ref().map(|t| t.text.clone()),
-                    );
-                    let ledger = Arc::clone(&barge.ledger);
-                    let (tap_pod, tap_id) = (pod.clone(), id);
-                    ResponseSink::with_taps(
-                        wiring.speak_tx.clone(),
-                        Some(Arc::new(move |cmd: &SpeakCmd| {
-                            ledger.record_cmd(
-                                &tap_pod,
-                                tap_id,
-                                match &cmd.body {
-                                    SpeakBody::Text(text) => Some(text.clone()),
-                                    // A synthesized clip has no words to read back;
-                                    // it still counts toward the turn's settlement.
-                                    SpeakBody::Pcm(_) => None,
-                                },
-                            );
-                        })),
-                        cue_tap,
-                    )
-                }
-                None => ResponseSink::with_taps(wiring.speak_tx.clone(), None, cue_tap),
-            };
-            // Around the await, not inside the barge arm below: a turn is in
+            let sink = turn_sink(
+                barge,
+                &wiring.speak_tx,
+                &pod,
+                id,
+                utterance.transcript.as_ref().map(|t| t.text.clone()),
+                cue_tap,
+            );
+            // Around the await, not inside `end_turn`'s barge arm: a turn is in
             // flight for as long as the brain has it, and that is what keeps
             // the head up through a long think in a pipeline with no playback
             // path at all. This is also the turn every later fact names.
@@ -1604,37 +1610,123 @@ async fn handle_stt_done(
                 });
             }
             let end = wiring.brain.handle(utterance, sink).await;
+            end_turn(barge, scripter, listen, &pod, id, end).await;
+        }
+        GateOutcome::OfflineReply(clip) => {
+            // No brain sees this utterance, and no `brain_dispatched` or
+            // `wake_command_absent` is written for it: the clip is the whole
+            // turn, queued here the way the `wav` brain queues its one clip.
+            // Its presence says a wake-accepted utterance's transcription
+            // failed and the configured clip was queued to the pod as a
+            // non-interruptible closed turn in its place; `utterance_seq`
+            // joins it to the `stt_failed` line before it.
+            jsonl.emit(
+                "stt_unreachable_reply",
+                &json!({
+                    "pod": utterance.pod.0,
+                    "utterance_seq": done.carve.id.seq,
+                    "clip": clip.path,
+                }),
+            );
+            let (pod, id) = (utterance.pod.clone(), utterance.id);
+            let mut sink = turn_sink(barge, &wiring.speak_tx, &pod, id, None, None);
             if let Some(scripter) = scripter {
-                scripter.send(ScriptInput::TurnEnded {
+                scripter.send(ScriptInput::TurnStarted {
                     pod: pod.clone(),
                     turn: id,
-                    end,
                 });
             }
-            if let Some(barge) = barge {
-                // Dispatch awaits the brain inline, so returning here is the proof
-                // that no further command is coming for this turn — which is what
-                // lets its settlement complete, and one of the three facts the
-                // head's ending is scheduled from.
-                let audio = barge.ledger.dispatch_done(&pod, id, end);
-                if let Some(scripter) = scripter {
-                    scripter.send(ScriptInput::Audio {
-                        pod: pod.clone(),
-                        turn: id,
-                        audio,
-                    });
-                }
-                // The opener for a reply whose last clip was already heard out
-                // when the brain returned — a chain whose final segment carries
-                // no speech at all settles before this call. The fan-out is the
-                // opener for the ordinary case; `listen_open` is true on exactly
-                // one of the two, so the window opens once.
-                if let Some(listen) = listen
-                    && audio.listen_open
-                {
-                    listen.open(pod.clone()).await;
-                }
-            }
+            // Not interruptible: a non-interruptible clip opens no barge floor,
+            // so speech over it cannot cut the whole answer short.
+            let cmd = SpeakCmd {
+                target: pod.clone(),
+                in_reply_to: Some(id),
+                body: SpeakBody::Pcm(Arc::clone(&clip.pcm)),
+                interruptible: false,
+                timings: utterance.timings.clone(),
+            };
+            send_or_report(&mut sink, cmd, id, &wiring.events, &wiring.stats);
+            end_turn(barge, scripter, listen, &pod, id, TurnEnd::Closed).await;
+        }
+    }
+}
+
+/// The sink one turn replies through: the ledger-tapped sink when barge-in is
+/// wired, the bare one otherwise. The dispatch is recorded in the ledger first,
+/// barge or not: this turn is what the *next* interrupt would chain.
+fn turn_sink(
+    barge: Option<&BargeWiring>,
+    speak_tx: &fmpsc::Sender<SpeakCmd>,
+    pod: &PodId,
+    id: UtteranceId,
+    transcript: Option<String>,
+    cue_tap: Option<CueTap>,
+) -> ResponseSink {
+    match barge {
+        Some(barge) => {
+            barge.ledger.record_dispatch(pod, id, transcript);
+            let ledger = Arc::clone(&barge.ledger);
+            let (tap_pod, tap_id) = (pod.clone(), id);
+            ResponseSink::with_taps(
+                speak_tx.clone(),
+                Some(Arc::new(move |cmd: &SpeakCmd| {
+                    ledger.record_cmd(
+                        &tap_pod,
+                        tap_id,
+                        match &cmd.body {
+                            SpeakBody::Text(text) => Some(text.clone()),
+                            // A synthesized clip has no words to read back;
+                            // it still counts toward the turn's settlement.
+                            SpeakBody::Pcm(_) => None,
+                        },
+                    );
+                })),
+                cue_tap,
+            )
+        }
+        None => ResponseSink::with_taps(speak_tx.clone(), None, cue_tap),
+    }
+}
+
+/// Close a turn: `TurnEnded`, then with barge wiring the ledger's
+/// `dispatch_done`, the scripter's `Audio`, and the `<listen/>` opener.
+async fn end_turn(
+    barge: Option<&BargeWiring>,
+    scripter: Option<&ScriptHandle>,
+    listen: Option<&Arc<ListenWiring>>,
+    pod: &PodId,
+    id: UtteranceId,
+    end: TurnEnd,
+) {
+    if let Some(scripter) = scripter {
+        scripter.send(ScriptInput::TurnEnded {
+            pod: pod.clone(),
+            turn: id,
+            end,
+        });
+    }
+    if let Some(barge) = barge {
+        // Called once the turn has queued its last command — dispatch awaits
+        // the brain inline — so this is the proof that no further command is
+        // coming for this turn, which is what lets its settlement complete,
+        // and one of the three facts the head's ending is scheduled from.
+        let audio = barge.ledger.dispatch_done(pod, id, end);
+        if let Some(scripter) = scripter {
+            scripter.send(ScriptInput::Audio {
+                pod: pod.clone(),
+                turn: id,
+                audio,
+            });
+        }
+        // The opener for a reply whose last clip was already heard out
+        // when the brain returned — a chain whose final segment carries
+        // no speech at all settles before this call. The fan-out is the
+        // opener for the ordinary case; `listen_open` is true on exactly
+        // one of the two, so the window opens once.
+        if let Some(listen) = listen
+            && audio.listen_open
+        {
+            listen.open(pod.clone()).await;
         }
     }
 }
@@ -1866,8 +1958,11 @@ fn push_bounded<T>(dq: &mut VecDeque<T>, item: T) {
 /// for a barge-in utterance with no wake, through the follow-up mark for one
 /// carved inside an open capture window, or through the overlap mark for one
 /// carved over the pod's own voice that cut nothing.
-enum GateOutcome {
+enum GateOutcome<'c> {
     Dispatch,
+    /// A wake-accepted carve whose transcription failed, with a clip
+    /// configured: answered with the clip as a closed turn instead of declined.
+    OfflineReply(&'c UnreachableClip),
     /// The utterance transcribed to nothing usable — absent, empty, or
     /// whitespace-only. Decided first and for every provenance: no text is no
     /// turn, whatever the room was doing, so no brain is called. How it is
@@ -2383,6 +2478,7 @@ mod tests {
         reply_cues: Vec<Cue>,
         turn_end: TurnEnd,
         queue_depth: usize,
+        unreachable_clip: Option<UnreachableClip>,
     }
 
     impl Harness {
@@ -2404,7 +2500,17 @@ mod tests {
                 cues: None,
                 reply_cues: Vec::new(),
                 queue_depth: 32,
+                unreachable_clip: None,
             }
+        }
+        /// Answer a failed wake transcription with `pcm`, configured under the
+        /// path `clips/offline.wav`.
+        fn unreachable_clip(mut self, pcm: &[i16]) -> Harness {
+            self.unreachable_clip = Some(UnreachableClip {
+                path: "clips/offline.wav".into(),
+                pcm: Arc::from(pcm),
+            });
+            self
         }
         /// Bound the queue's sheddable lane, so a test can pin a depth narrower
         /// than the burst it pre-loads.
@@ -2538,6 +2644,7 @@ mod tests {
                     .map(|(ledger, flush)| BargeWiring { ledger, flush }),
                 listen: self.listen.map(Arc::new),
                 scripter: self.scripter.clone(),
+                unreachable_clip: self.unreachable_clip.clone(),
             };
             let loop_jsonl = jsonl.clone();
             let join = tokio::task::spawn(async move {
@@ -3154,6 +3261,7 @@ mod tests {
             listen: None,
             scripter: None,
             cues: None,
+            unreachable_clip: None,
         };
         handle_stt_done(done, &mut pods, &mut next_id, &ctx, &jsonl).await;
 
@@ -3610,6 +3718,237 @@ mod tests {
         // but a failed STT leaves no text, and no text is no turn.
         assert!(cmds.is_empty(), "nothing to answer: {lines:?}");
         assert_eq!(stats.snapshot().no_transcript, 1);
+    }
+
+    /// A scored wake accept, the provenance the offline reply answers.
+    fn offline_wake() -> Option<WakeConfirmation> {
+        Some(WakeConfirmation {
+            score: 0.9,
+            wake_end_sample: 0,
+            stt_trim_samples: 0,
+        })
+    }
+
+    const OFFLINE_PCM: [i16; 4] = [1, -1, 2, -2];
+
+    /// A wake the transcriber could not hear, with a clip configured: the clip is
+    /// the whole turn — queued non-interruptible through the ledger-tapped sink,
+    /// bracketed for the head like a dispatch, and never a decline.
+    #[tokio::test]
+    async fn failed_wake_stt_plays_the_offline_clip() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (feed, fed) = spy_listen_feed();
+        let h = Harness::new()
+            .transcriber(FakeTranscriber(None))
+            .brain()
+            .unreachable_clip(&OFFLINE_PCM)
+            .barge(Arc::new(TurnLedger::new()), Err(FlushRejected::NotPlaying))
+            .scripter(handle.clone())
+            .listen(feed, TEST_LISTEN_WINDOW);
+        let events_seen = h.events.clone();
+        let stats = h.stats.clone();
+        let (lines, cmds) = h
+            .run(vec![soft_endpoint(carved(1, 0, 16, offline_wake()))])
+            .await;
+
+        assert_eq!(cmds.len(), 1, "the clip is the one reply: {cmds:?}");
+        let cmd = &cmds[0];
+        assert!(
+            matches!(&cmd.body, SpeakBody::Pcm(pcm) if pcm[..] == OFFLINE_PCM),
+            "the configured clip, and not a brain's reply: {:?}",
+            cmd.body
+        );
+        assert_eq!(cmd.in_reply_to, Some(UtteranceId(1)));
+        assert!(!cmd.interruptible, "speech over the clip cannot cut it");
+
+        let inputs = script_inputs(handle, rx).await;
+        assert!(
+            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            "a turn, not a decline: {inputs:?}"
+        );
+        let [
+            ScriptInput::TurnStarted { pod: p1, turn: t1 },
+            ScriptInput::TurnEnded {
+                pod: p2,
+                turn: t2,
+                end: TurnEnd::Closed,
+            },
+            ScriptInput::Audio {
+                pod: p3,
+                turn: t3,
+                audio,
+            },
+        ] = inputs.as_slice()
+        else {
+            panic!("the turn brackets the head: {inputs:?}");
+        };
+        assert!([p1, p2, p3].iter().all(|p| **p == pod()));
+        assert!([t1, t2, t3].iter().all(|t| **t == UtteranceId(1)));
+        assert!(audio.dispatch_done);
+        assert_eq!(audio.cmds_sent, 1, "the ledger counted the clip");
+
+        let names = events(&lines);
+        let failed = names.iter().position(|e| *e == "stt_failed");
+        let reply = names.iter().position(|e| *e == "stt_unreachable_reply");
+        assert!(
+            matches!((failed, reply), (Some(f), Some(r)) if f < r),
+            "stt_failed, then the reply: {names:?}"
+        );
+        let line = &lines[reply.unwrap()];
+        assert_eq!(line["pod"], "pod-x");
+        assert_eq!(line["utterance_seq"], 1);
+        assert_eq!(line["clip"], "clips/offline.wav");
+        assert!(
+            !names.contains(&"brain_dispatched"),
+            "no brain saw it: {names:?}"
+        );
+        assert!(
+            events_seen.lock().unwrap().is_empty(),
+            "no no-command outcome is reported: {:?}",
+            events_seen.lock().unwrap()
+        );
+        assert_eq!(stats.snapshot().wake_command_absent, 0);
+        assert!(
+            !fed.lock()
+                .unwrap()
+                .iter()
+                .any(|f| matches!(f, Feed::CandidateDeclined { .. })),
+            "the listener is not told it was declined: {:?}",
+            fed.lock().unwrap()
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A wake the transcriber heard as nothing is no failure: the services are
+    /// up, so it stays the unanswered wake it always was.
+    #[tokio::test]
+    async fn empty_wake_transcript_still_unanswered_with_clip() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let h = Harness::new()
+            .transcriber(says("", None))
+            .brain()
+            .unreachable_clip(&OFFLINE_PCM)
+            .scripter(handle.clone());
+        let stats = h.stats.clone();
+        let (lines, cmds) = h
+            .run(vec![soft_endpoint(carved(1, 0, 16, offline_wake()))])
+            .await;
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Unanswered(pod())]
+        );
+        assert_eq!(stats.snapshot().wake_command_absent, 1);
+        assert!(!events(&lines).contains(&"stt_unreachable_reply"));
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A barge whose transcription failed keeps its decline: the cut stands, the
+    /// brain hears of it, and the clip does not play.
+    #[tokio::test]
+    async fn failed_barge_stt_still_declines_with_clip() {
+        let h = Harness::new()
+            .transcriber(FakeTranscriber(None))
+            .brain()
+            .unreachable_clip(&OFFLINE_PCM);
+        let nudges = h.nudges.clone();
+        let events_seen = h.events.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(barged(1, 0, 16))]).await;
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(matches!(
+            events_seen.lock().unwrap().as_slice(),
+            [BrainEvent::NoTranscript { .. }]
+        ));
+        assert_eq!(nudges.lock().unwrap().barge_declined.len(), 1);
+        assert!(!events(&lines).contains(&"stt_unreachable_reply"));
+    }
+
+    /// Speech over the pod's own voice is most often the clip itself; answering
+    /// it with the clip again would be a loop.
+    #[tokio::test]
+    async fn failed_over_playback_stt_still_declines_with_clip() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let over = CarvedUtterance {
+            over_playback: true,
+            ..carved(1, 0, 16, None)
+        };
+        let h = Harness::new()
+            .transcriber(FakeTranscriber(None))
+            .brain()
+            .unreachable_clip(&OFFLINE_PCM)
+            .scripter(handle.clone());
+        let events_seen = h.events.clone();
+        let (lines, cmds) = h.run(vec![soft_endpoint(over)]).await;
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(matches!(
+            events_seen.lock().unwrap().as_slice(),
+            [BrainEvent::NoTranscript { .. }]
+        ));
+        assert!(script_inputs(handle, rx).await.is_empty());
+        assert!(!events(&lines).contains(&"stt_unreachable_reply"));
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// Without the key, a failed wake transcription is the unanswered wake it
+    /// always was.
+    #[tokio::test]
+    async fn failed_wake_stt_without_clip_is_unchanged() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let h = Harness::new()
+            .transcriber(FakeTranscriber(None))
+            .brain()
+            .scripter(handle.clone());
+        let stats = h.stats.clone();
+        let (lines, cmds) = h
+            .run(vec![soft_endpoint(carved(1, 0, 16, offline_wake()))])
+            .await;
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(events(&lines).contains(&"stt_failed"));
+        assert!(!events(&lines).contains(&"stt_unreachable_reply"));
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::Unanswered(pod())]
+        );
+        assert_eq!(stats.snapshot().wake_command_absent, 1);
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A follow-up exists only inside a window a reply opened seconds ago, so a
+    /// failed transcription there keeps its decline and hands the window back.
+    #[tokio::test]
+    async fn failed_follow_up_stt_still_declines_with_clip() {
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            ..carved(1, 0, 16, None)
+        };
+        let (feed, fed) = spy_listen_feed();
+        let (lines, cmds) = Harness::new()
+            .transcriber(FakeTranscriber(None))
+            .brain()
+            .unreachable_clip(&OFFLINE_PCM)
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .run(vec![soft_endpoint(follow_up)])
+            .await;
+
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert!(
+            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+            "{:?}",
+            fed.lock().unwrap()
+        );
+        assert!(!events(&lines).contains(&"stt_unreachable_reply"));
     }
 
     #[tokio::test]

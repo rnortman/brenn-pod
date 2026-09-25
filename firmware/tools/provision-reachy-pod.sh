@@ -3,6 +3,7 @@
 # Give one Reachy pod the configuration it needs to reach the audio host.
 #
 #   tools/provision-reachy-pod.sh [--on-unit] <host> [speech-config]
+#   tools/provision-reachy-pod.sh [--on-unit] --emit <pod-id> [speech-config]
 #
 # Everything is derived; the operator types nothing but the unit. The pod id is
 # the device's own hostname, which is also its TLS-PSK identity. The address it
@@ -36,6 +37,12 @@
 # The key never appears in an argument vector, a shell history, or either
 # machine's process table: it is composed by shell builtins and delivered on
 # ssh's standard input.
+#
+# --emit composes the same file and prints it on stdout instead of pushing it,
+# and nothing else goes to stdout: every status line is on stderr. There is no
+# ssh at all, so the positional is the pod id — the name the key table is keyed
+# by, which is the unit's hostname — because the script cannot ask a unit it
+# does not contact. It is how a payload build carries the pod's link.
 
 set -euo pipefail
 
@@ -51,24 +58,27 @@ default_speech_config=host/config/parrot.toml
 # VAD_HANGOVER_MS. Gitignored — it is one workstation's opinion about one unit.
 extra_conf="${firmware_root}/.local/audio.conf.extra"
 
-# Where the pod reads its configuration. The same path is compiled into the pod
-# (devices/reachy-pod/src/config.rs, CONF_DIR); a change in one without the other
-# leaves the pod parked on a file nobody writes.
+# Where the push writes the configuration: the pod's compiled-in default path
+# (devices/reachy-pod/src/config.rs, CONF_DIR), which it reads when its launcher
+# names no other. A change in one without the other leaves a standalone pod
+# parked on a file nobody writes.
 conf_dir="${store_mount}/conf"
 conf_file="${conf_dir}/audio.conf"
 
-usage="usage: ${prog} [--on-unit] <host> [speech-config]"
+usage="usage: ${prog} [--on-unit] [--emit] <host|pod-id> [speech-config]"
 
-# The flag may stand anywhere among the two positionals: the Makefile appends it
+# The flags may stand anywhere among the two positionals: the Makefile appends it
 # after them, and an operator typing the command reaches for it first. An
 # unknown word starting with a dash is refused rather than taken as a hostname —
 # a misspelt flag silently provisioning a unit named "--on-unti" is a link that
 # comes up nowhere.
 on_unit=
+emit=
 positional=()
 for arg in "$@"; do
 	case "$arg" in
 	--on-unit) on_unit=1 ;;
+	--emit) emit=1 ;;
 	-*) die "unknown option ${arg}" "$usage" ;;
 	*) positional+=("$arg") ;;
 	esac
@@ -234,22 +244,31 @@ esac
 
 # ── Who the pod is: its own hostname, which is its PSK identity ───────────────
 
-# Read out of /proc rather than through a `hostname` binary: this is the value
-# gethostname reports, which is the identity the pod actually presents, and it
-# needs no tool to be installed in the image.
-pod_id=$(ssh_root cat /proc/sys/kernel/hostname) || die \
-	"cannot ask root@${host} for its hostname; nothing was provisioned." \
-	"ssh's own error is above."
+if [ -z "$emit" ]; then
+	# Read out of /proc rather than through a `hostname` binary: this is the
+	# value gethostname reports, which is the identity the pod actually
+	# presents, and it needs no tool to be installed in the image.
+	pod_id=$(ssh_root cat /proc/sys/kernel/hostname) || die \
+		"cannot ask root@${host} for its hostname; nothing was provisioned." \
+		"ssh's own error is above."
 
-# First line, ends trimmed — and only the ends. Interior whitespace is left in
-# place so the charset check below refuses it: the pod presents the name as the
-# kernel holds it, so a name silently de-spaced here is filed under an identity
-# no handshake ever offers.
-pod_id=${pod_id%%$'\n'*}
-pod_id=${pod_id#"${pod_id%%[![:space:]]*}"}
-pod_id=${pod_id%"${pod_id##*[![:space:]]}"}
-[ -n "$pod_id" ] || die "root@${host} reports no hostname" \
-	"The hostname is the pod's TLS-PSK identity; a unit without one cannot connect."
+	# First line, ends trimmed — and only the ends. Interior whitespace is left
+	# in place so the charset check below refuses it: the pod presents the name
+	# as the kernel holds it, so a name silently de-spaced here is filed under an
+	# identity no handshake ever offers.
+	pod_id=${pod_id%%$'\n'*}
+	pod_id=${pod_id#"${pod_id%%[![:space:]]*}"}
+	pod_id=${pod_id%"${pod_id##*[![:space:]]}"}
+	[ -n "$pod_id" ] || die "root@${host} reports no hostname" \
+		"The hostname is the pod's TLS-PSK identity; a unit without one cannot connect."
+	subject="root@${host} reports the hostname \"${pod_id}\", which"
+	rename="Give the unit a plainer hostname and re-run."
+else
+	# Nothing is contacted, so the pod id is what the caller named.
+	pod_id=$host
+	subject="the pod id \"${pod_id}\""
+	rename="Name the pod by its plainer hostname and re-run."
+fi
 
 # The id becomes a quoted TOML key in the key table and an identity in the
 # handshake. Quoting handles the dot an FQDN-configured unit brings; a quote, a
@@ -259,9 +278,9 @@ pod_id=${pod_id%"${pod_id##*[![:space:]]}"}
 # daemon's next start.
 case "$pod_id" in
 	*[!A-Za-z0-9._-]*)
-		die "root@${host} reports the hostname \"${pod_id}\", which cannot be a key-table entry" \
+		die "${subject} cannot be a key-table entry" \
 			"A pod id may hold letters, digits, dot, hyphen and underscore." \
-			"Give the unit a plainer hostname and re-run."
+			"$rename"
 		;;
 esac
 
@@ -342,7 +361,24 @@ else
 	echo "${prog}: filed a new key for ${pod_id} in ${psk_file}" >&2
 fi
 
-# ── The push: composed by builtins, delivered on ssh's stdin ──────────────────
+# ── The file: composed by builtins, printed or delivered on ssh's stdin ───────
+
+# The one writer of the pod's link format, for both destinations.
+compose_conf() {
+	printf 'ADDR=%s\nPSK=%s\n' "$listen_addr" "$psk"
+	if [ -f "$extra_conf" ]; then
+		cat -- "$extra_conf"
+	fi
+}
+
+if [ -n "$emit" ]; then
+	compose_conf
+	echo "${prog}: link configuration composed for ${pod_id} — points at ${listen_addr}" >&2
+	if [ -f "$extra_conf" ]; then
+		echo "${prog}: appended $(basename -- "$extra_conf") verbatim" >&2
+	fi
+	exit 0
+fi
 
 # The store is a mount brenn-os provides. Creating the directory under an absent
 # mount would put the file in /run, where the mount then hides it — and the pod
@@ -357,16 +393,11 @@ remote="${remote} cat >${conf_file}.new;"
 remote="${remote} chown ${app_user} ${conf_file}.new; chmod 600 ${conf_file}.new;"
 remote="${remote} mv -f ${conf_file}.new ${conf_file}"
 
-{
-	printf 'ADDR=%s\nPSK=%s\n' "$listen_addr" "$psk"
-	if [ -f "$extra_conf" ]; then
-		cat -- "$extra_conf"
-	fi
-} | ssh_root "$remote" || die \
+compose_conf | ssh_root "$remote" || die \
 	"the configuration did not reach root@${host}:${conf_file}" \
 	"ssh's own error is above; nothing partial is left behind (the file is renamed into place)."
 
-echo "${prog}: ${pod_id} provisioned — ${conf_file} points at ${listen_addr}"
+echo "${prog}: ${pod_id} provisioned — ${conf_file} points at ${listen_addr}" >&2
 if [ -f "$extra_conf" ]; then
-	echo "${prog}: appended $(basename -- "$extra_conf") verbatim"
+	echo "${prog}: appended $(basename -- "$extra_conf") verbatim" >&2
 fi

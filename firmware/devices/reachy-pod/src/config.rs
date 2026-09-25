@@ -1,15 +1,14 @@
 //! The pod's runtime configuration: where the audio host is, which key to present,
 //! and how the capture and gate are tuned.
 //!
-//! One file, `audio.conf`, in [`CONF_DIR`] — RAM, beside the payload store, not the
-//! device's flash. It is `KEY=VALUE` lines — the shape every other configuration file
-//! on the device takes — and it holds the pod's pre-shared key, so it is owner-only
-//! and pushed per unit rather than baked into a payload.
+//! One file of `KEY=VALUE` lines — the shape every other configuration file on the
+//! device takes. It holds the pod's pre-shared key, so it is owner-only.
 //!
-//! Configuration is pushed the way the payload is pushed, and a reboot clears both.
-//! That is what keeps normal operation off the eMMC, and it costs nothing: a pod that
-//! starts before its file is back parks and re-reads every [`RECHECK_INTERVAL`], so
-//! re-pushing after a reboot is the whole recovery.
+//! Where it lives is the launcher's choice: `run --config PATH` names it. The
+//! compiled-in [`CONF_DIR`]`/audio.conf` — RAM, beside the payload store, not the
+//! device's flash — is the default, the path a standalone pod's configuration is
+//! pushed to. A pod that starts before its file is readable parks and re-reads every
+//! [`RECHECK_INTERVAL`].
 //!
 //! The pod id is not in the file. It is the host name, which provisioning sets per
 //! unit and which doubles as the TLS-PSK identity, exactly as the ESP pod uses its
@@ -28,11 +27,9 @@ use audio_pipeline::vad::{VAD_HANGOVER_MS, VAD_HANGOVER_MS_MAX, vad_threshold_ok
 use pod_streamer::telemetry::VAD_THRESHOLD_DEFAULT;
 use psk_link::{MAX_IDENTITY_LEN, PSK_LEN, parse_psk_hex};
 
-/// Where this pod's configuration is pushed: a directory in the same tmpfs the
-/// payload store lives in. Compiled in rather than named by the environment —
-/// where the pod reads its own configuration is the pod's knowledge, not something
-/// the platform hands it, and one constant is one place for the pushing tool and
-/// the reading pod to agree.
+/// The default configuration directory, used when the launcher names no file: a
+/// directory in the same tmpfs the payload store lives in, where a standalone pod's
+/// configuration is pushed.
 pub const CONF_DIR: &str = "/run/brenn-app/conf";
 
 /// The configuration file's name inside [`CONF_DIR`].
@@ -130,17 +127,12 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The configuration file's path.
+/// The default configuration file's path, the one a standalone pod is pushed to.
 pub fn conf_path() -> PathBuf {
     Path::new(CONF_DIR).join(CONF_FILE_NAME)
 }
 
 impl Config {
-    /// Read and parse [`conf_path`].
-    pub fn load() -> Result<Self, ConfigError> {
-        Self::load_from(&conf_path())
-    }
-
     /// Read and parse one file.
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Unreadable {

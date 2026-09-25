@@ -9,6 +9,18 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **The robot now answers when it can't hear you.** If the speech-to-text
+  service (the transcriber) is unreachable, times out or errors after a wake
+  word, the pod plays a clip you configure — e.g. "I can't hear you right
+  now" — instead of going silent. Set it with the new `[stt] unreachable_clip`
+  key (a 16 kHz mono clip); it needs a `[brain]` table, and a configuration
+  that sets it without one is refused at startup. Without the key nothing
+  changes. Each such reply is logged as `stt_unreachable_reply`.
+- **The pod's link configuration can now travel with its launcher.**
+  `reachy-pod run --config PATH` reads the link configuration from `PATH`
+  instead of the compiled-in default, and `provision-reachy-pod.sh --emit
+  <pod-id>` prints that file instead of pushing it over ssh, so a build can
+  stage it. Pods provisioned with `make reachy-provision` work as before.
 - **An LLM reply can now drive the robot's head.** The brain's response may
   embed `<pose name="..." speed="..."/>` and `<motion name="..." speed="..."/>`
   markers. A pose retargets the head for the rest of the reply; a motion plays
@@ -30,6 +42,9 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Changed
 
+- **The provisioning tool's status lines go to stderr.** The
+  `provisioned — … points at …` and `appended … verbatim` lines join the key
+  messages there, so stdout carries nothing but a composed file.
 - **Noise inside a `<listen/>` window no longer kills the conversation.** A
   cough, the television, or a half-word during a capture window used to close
   it permanently, forcing the person to say the wake word again to be heard.

@@ -9,9 +9,10 @@
 //! doctrine forbids, and nobody re-reads a transcript the status called good.
 
 use std::io;
+use std::path::PathBuf;
 
-use crate::logging;
 use crate::selftest::Report;
+use crate::{config, logging};
 
 /// Every case ran and passed.
 pub const EXIT_OK: u8 = 0;
@@ -21,14 +22,19 @@ pub const EXIT_FAILED: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
 
 /// What the arguments selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Bring the pipeline up and hold it there.
     ///
     /// `chip_rebooted` says the audio chip was already rebooted in this launch by
     /// whoever started this process, so the pipeline attaches to the board it finds
     /// and does not reset it again.
-    Run { chip_rebooted: bool },
+    Run {
+        chip_rebooted: bool,
+        /// The link configuration's path as the launcher names it; `None` is the
+        /// compiled-in default, [`config::conf_path`].
+        config: Option<PathBuf>,
+    },
     /// Reboot the audio chip, wait for the board and its sound card to come back,
     /// and exit.
     RebootChip,
@@ -48,16 +54,40 @@ pub enum Command {
 /// than one refused.
 pub fn parse(args: &[String]) -> Command {
     match args {
-        [command] if command == "run" => Command::Run {
-            chip_rebooted: false,
-        },
-        [command, flag] if command == "run" && flag == "--chip-rebooted" => Command::Run {
-            chip_rebooted: true,
-        },
+        [command, rest @ ..] if command == "run" => parse_run(rest),
         [command] if command == "reboot-chip" => Command::RebootChip,
         [command] if command == "selftest" => Command::Selftest,
         [command, flag] if command == "selftest" && flag == "--manual" => Command::SelftestManual,
         _ => Command::Unrecognized,
+    }
+}
+
+/// Read `run`'s flags: `--chip-rebooted` and `--config PATH`, in either order,
+/// each at most once. `--config` takes the next word as its value, so it cannot
+/// be last or followed by another flag; `--config=PATH` is not a spelling this
+/// accepts. Anything else is [`Command::Unrecognized`].
+fn parse_run(rest: &[String]) -> Command {
+    let mut chip_rebooted = false;
+    let mut config: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--chip-rebooted" if !chip_rebooted => {
+                chip_rebooted = true;
+                i += 1;
+            }
+            "--config"
+                if config.is_none() && i + 1 < rest.len() && !rest[i + 1].starts_with("--") =>
+            {
+                config = Some(PathBuf::from(&rest[i + 1]));
+                i += 2;
+            }
+            _ => return Command::Unrecognized,
+        }
+    }
+    Command::Run {
+        chip_rebooted,
+        config,
     }
 }
 
@@ -85,7 +115,8 @@ pub fn usage(err: &mut dyn io::Write, given: &[String]) -> u8 {
     }
     let _ = writeln!(
         err,
-        "usage: reachy-pod run [--chip-rebooted] | reboot-chip | selftest [--manual]"
+        "usage: reachy-pod run [--chip-rebooted] [--config PATH] | reboot-chip | \
+         selftest [--manual]"
     );
     let _ = writeln!(err);
     let _ = writeln!(
@@ -96,6 +127,11 @@ pub fn usage(err: &mut dyn io::Write, given: &[String]) -> u8 {
         err,
         "  run --chip-rebooted the same, on a chip whoever started this process has \
          already rebooted"
+    );
+    let _ = writeln!(
+        err,
+        "  run --config PATH   read the link configuration from PATH instead of {}",
+        config::conf_path().display()
     );
     let _ = writeln!(
         err,
@@ -147,13 +183,15 @@ mod tests {
         assert_eq!(
             parse(&args(&["run"])),
             Command::Run {
-                chip_rebooted: false
+                chip_rebooted: false,
+                config: None,
             }
         );
         assert_eq!(
             parse(&args(&["run", "--chip-rebooted"])),
             Command::Run {
-                chip_rebooted: true
+                chip_rebooted: true,
+                config: None,
             },
             "a launcher that rebooted the chip before starting anything says so"
         );
@@ -196,9 +234,55 @@ mod tests {
         assert_eq!(
             parse(&args(&["run", "--channel=1"])),
             Command::Unrecognized,
-            "the pipeline takes its settings from audio.conf, so an argument here \
-             was meant to do something this binary will not do"
+            "the pipeline takes its settings from the link configuration file, and \
+             --config, which says where that file is, is the one argument run takes \
+             besides --chip-rebooted"
         );
+    }
+
+    #[test]
+    fn run_takes_its_config_path_in_either_order() {
+        let run = |chip_rebooted, config: Option<&str>| Command::Run {
+            chip_rebooted,
+            config: config.map(PathBuf::from),
+        };
+        assert_eq!(
+            parse(&args(&["run", "--config", "/x/audio.conf"])),
+            run(false, Some("/x/audio.conf"))
+        );
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--chip-rebooted",
+                "--config",
+                "conf/audio.conf"
+            ])),
+            run(true, Some("conf/audio.conf"))
+        );
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--config",
+                "conf/audio.conf",
+                "--chip-rebooted"
+            ])),
+            run(true, Some("conf/audio.conf")),
+            "the flags are accepted in either order"
+        );
+        for refused in [
+            &["run", "--config"][..],
+            &["run", "--config", "--chip-rebooted"],
+            &["run", "--chip-rebooted", "--config"],
+            &["run", "--config", "a", "--config", "b"],
+            &["run", "--chip-rebooted", "--chip-rebooted"],
+            &["run", "--config=conf/audio.conf"],
+            &["run", "--config", "a", "extra"],
+            &["reboot-chip", "--config", "a"],
+            &["selftest", "--config", "a"],
+            &["selftest", "--manual", "--config", "a"],
+        ] {
+            assert_eq!(parse(&args(refused)), Command::Unrecognized, "{refused:?}");
+        }
     }
 
     #[test]
@@ -260,9 +344,15 @@ mod tests {
         );
         assert!(
             printed.contains(
-                "usage: reachy-pod run [--chip-rebooted] | reboot-chip | selftest [--manual]"
+                "usage: reachy-pod run [--chip-rebooted] [--config PATH] | reboot-chip | \
+                 selftest [--manual]"
             ),
             "{printed}"
+        );
+        assert!(printed.contains("--config PATH"), "{printed}");
+        assert!(
+            printed.contains(&config::conf_path().display().to_string()),
+            "the usage text names the default path: {printed}"
         );
         assert!(
             printed.contains(logging::LEVEL_ENV),
@@ -276,7 +366,8 @@ mod tests {
         assert!(!printed.contains("unrecognized"), "{printed}");
         assert!(
             printed.contains(
-                "usage: reachy-pod run [--chip-rebooted] | reboot-chip | selftest [--manual]"
+                "usage: reachy-pod run [--chip-rebooted] [--config PATH] | reboot-chip | \
+                 selftest [--manual]"
             ),
             "{printed}"
         );

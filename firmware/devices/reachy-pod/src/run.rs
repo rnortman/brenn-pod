@@ -19,6 +19,7 @@
 //! is a failure, and the first thread to end names it.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -252,6 +253,13 @@ pub fn supervise(rx: &Receiver<ThreadExit>) -> ThreadExit {
             cause: "every worker thread went away without reporting".to_string(),
         },
     }
+}
+
+/// Where this invocation reads its link configuration: the path the launcher
+/// named, else [`config::conf_path`]. One source per invocation — the launcher
+/// decides, and there is no fallback from one file to another.
+pub fn config_path(given: Option<&Path>) -> PathBuf {
+    given.map_or_else(config::conf_path, Path::to_path_buf)
 }
 
 /// Read the configuration, waiting for it to appear.
@@ -555,11 +563,12 @@ const fn chip_note(already_rebooted: bool) -> &'static str {
 /// startup failure with one clear line, not four threads racing to report it.
 /// The chip comes first of all, because bringing it up reboots it and the sound
 /// card goes away with it — unless the launcher already did that, in which case
-/// this attaches to the board it finds. Configuration is the exception — a missing
-/// `audio.conf` is waited for, because it arrives per unit and may simply not be
-/// placed yet.
-pub fn run(chip_rebooted: bool) -> u8 {
-    let config = wait_for_config(&mut Config::load, &std::thread::sleep);
+/// this attaches to the board it finds. Configuration is the exception — the link
+/// configuration, at the path the launcher named or else the compiled-in one, is
+/// waited for, because it arrives per unit and may simply not be placed yet.
+pub fn run(chip_rebooted: bool, config: Option<&Path>) -> u8 {
+    let path = config_path(config);
+    let config = wait_for_config(&mut || Config::load_from(&path), &std::thread::sleep);
     let pod_id = config::hostname();
     if let Err(why) = config::check_pod_id(&pod_id) {
         log::error!("startup: {why}");
@@ -765,6 +774,15 @@ mod tests {
     use audio_pipeline::playback::PlaybackSink;
     use audio_pipeline::ring::SAMPLE_RATE_HZ;
     use std::collections::VecDeque;
+
+    #[test]
+    fn config_path_is_the_launchers_or_the_default() {
+        assert_eq!(
+            config_path(Some(Path::new("conf/audio.conf"))),
+            PathBuf::from("conf/audio.conf")
+        );
+        assert_eq!(config_path(None), config::conf_path());
+    }
 
     /// The field an operator is pointed at when the bus shows misses: the reset
     /// this process made, or one a step ahead of it made.

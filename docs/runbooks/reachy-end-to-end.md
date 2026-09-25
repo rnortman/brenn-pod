@@ -174,6 +174,11 @@ immediately as a parse error naming the field.
 
 ## Step 2 — provision the pod: one command
 
+The Reachy payload built by brenn-reachy carries the pod's link itself: its build runs
+`provision-reachy-pod.sh --on-unit --emit <pod-id> <speech-config>` and its launcher
+starts the pod with `run --config conf/audio.conf`. The push this step describes is the
+standalone arrangement's.
+
 ```bash
 make -C firmware reachy-provision
 ```

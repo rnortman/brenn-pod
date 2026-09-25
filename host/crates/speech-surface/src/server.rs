@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,7 +58,7 @@ use crate::clip::{ClipError, load_clip};
 use crate::config::{BrainMode, Config, CueLibrary, PskTable, SttBackend, SttConfig, TtsBackend};
 use crate::iso8601_ms;
 use crate::jsonl::JsonlHandle;
-use crate::pipeline::{BargeWiring, BrainWiring, ListenWiring, PipelineFatal};
+use crate::pipeline::{BargeWiring, BrainWiring, ListenWiring, PipelineFatal, UnreachableClip};
 use crate::playback_router::{
     self, FeedFn, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
 };
@@ -808,6 +808,10 @@ impl Server {
         let (transcriber, stt_stats) = build_transcriber(&config, &jsonl)
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .unzip();
+        // The clip a failed wake transcription is answered with; a missing or
+        // non-conforming file is fatal at startup, like the wav brain's clip.
+        let unreachable_clip = load_unreachable_clip(&config, &jsonl)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         // Build the synthesizer from `[tts]`; a malformed endpoint or a client
         // that will not build is fatal at startup. No synthesizer wired (absent
         // `[tts]`) leaves a `Text` reply as a counted `speak_unsupported`
@@ -1053,6 +1057,7 @@ impl Server {
                 }),
                 scripter: script_handle.clone(),
                 cues: cue_library.clone(),
+                unreachable_clip,
             },
             jsonl.clone(),
         ));
@@ -1624,17 +1629,7 @@ fn build_brain(
                 // driving the server without validating reaches here with no clip.
                 // Return the same actionable error rather than panicking.
                 let path = brain.clip.clone().ok_or(ClipError::MissingPath)?;
-                let clip = load_clip(&path)?;
-                let samples = clip.len();
-                let duration_ms = audio_ms(samples as u64);
-                jsonl.emit(
-                    "brain_clip_loaded",
-                    &json!({
-                        "clip": path.display().to_string(),
-                        "samples": samples,
-                        "duration_ms": duration_ms,
-                    }),
-                );
+                let clip = load_announced_clip(&path, "brain_clip_loaded", jsonl)?;
                 let brain = WavBrain::new(clip, events.clone(), stats.clone());
                 Ok((Some(Arc::new(brain) as Arc<dyn Brain>), events, stats, None))
             }
@@ -1693,6 +1688,49 @@ type BuiltTranscriber = (Arc<dyn Transcriber>, Arc<SttStats>);
 
 /// A wired synthesizer and the stats handle `stage_health` snapshots.
 type BuiltSynthesizer = (Arc<dyn Synthesizer>, Arc<TtsStats>);
+
+/// Load `[stt] unreachable_clip`, the clip a wake-accepted utterance whose
+/// transcription failed is answered with. `None`, and no line, when there is no
+/// `[stt]` or it names no clip. Otherwise the clip is loaded and format-checked
+/// the way the `wav` brain's is — a failure is fatal at startup — and an
+/// `stt_clip_loaded` line carries its sample count and duration.
+fn load_unreachable_clip(
+    config: &Config,
+    jsonl: &JsonlHandle,
+) -> Result<Option<UnreachableClip>, ClipError> {
+    let Some(path) = config
+        .stt
+        .as_ref()
+        .and_then(|stt| stt.unreachable_clip.as_ref())
+    else {
+        return Ok(None);
+    };
+    let pcm = load_announced_clip(path, "stt_clip_loaded", jsonl)?;
+    Ok(Some(UnreachableClip {
+        path: path.display().to_string(),
+        pcm,
+    }))
+}
+
+/// Load one startup clip and announce it as `event` with the
+/// `{clip, samples, duration_ms}` fields the console and the analyzers read.
+/// Every startup clip goes through here so the line's shape is one shape.
+fn load_announced_clip(
+    path: &Path,
+    event: &str,
+    jsonl: &JsonlHandle,
+) -> Result<Arc<[i16]>, ClipError> {
+    let pcm = load_clip(path)?;
+    jsonl.emit(
+        event,
+        &json!({
+            "clip": path.display().to_string(),
+            "samples": pcm.len(),
+            "duration_ms": audio_ms(pcm.len() as u64),
+        }),
+    );
+    Ok(pcm)
+}
 
 /// Build the transcriber from `[stt]` config. An absent `[stt]` table wires no
 /// transcriber — the utterance mints with a null transcript, which the gate then
@@ -5753,6 +5791,101 @@ mod tests {
         let lines = read_lines(&path);
         assert_eq!(events_named(&lines, "stt_absent").len(), 1);
         assert!(events_named(&lines, "stt_configured").is_empty());
+    }
+
+    /// A config with an `http` `[stt]` table, naming `clip` as its
+    /// `unreachable_clip` when given.
+    fn unreachable_clip_config(store: &Path, clip: Option<&Path>) -> Arc<Config> {
+        let clip_line = match clip {
+            Some(p) => format!("unreachable_clip = {:?}\n", p.to_str().unwrap()),
+            None => String::new(),
+        };
+        let text = format!(
+            "listen_addr = \"127.0.0.1:0\"\n\
+             [record]\nenabled = false\ndir = {:?}\n\
+             [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
+             model = \"whisper-small\"\n{clip_line}",
+            store.to_str().unwrap(),
+        );
+        Arc::new(test_config(&text).expect("config parses"))
+    }
+
+    #[tokio::test]
+    async fn load_unreachable_clip_loads_and_emits_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_path = dir.path().join("offline.wav");
+        // 1600 samples at 16 kHz = 100 ms.
+        write_spine_wav(&clip_path, &vec![0i16; 1600]);
+        let cfg = unreachable_clip_config(&dir.path().join("store"), Some(&clip_path));
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let clip = load_unreachable_clip(&cfg, &handle)
+            .unwrap()
+            .expect("a configured clip");
+        assert_eq!(clip.pcm.len(), 1600);
+        assert_eq!(clip.path, clip_path.display().to_string());
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let loaded = events_named(&lines, "stt_clip_loaded");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0]["samples"], 1600);
+        assert_eq!(loaded[0]["duration_ms"], 100);
+        assert_eq!(loaded[0]["clip"], clip_path.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn load_unreachable_clip_absent_is_none_and_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let with_stt = unreachable_clip_config(&dir.path().join("store"), None);
+        assert!(load_unreachable_clip(&with_stt, &handle).unwrap().is_none());
+        let without_stt = config(&dir.path().join("store"), false);
+        assert!(
+            load_unreachable_clip(&without_stt, &handle)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        assert!(events_named(&lines, "stt_clip_loaded").is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_unreachable_clip_refuses_a_missing_or_nonconforming_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, _join, _path) = jsonl_file(dir.path()).await;
+
+        let missing = unreachable_clip_config(
+            &dir.path().join("store"),
+            Some(&dir.path().join("nope.wav")),
+        );
+        assert!(matches!(
+            load_unreachable_clip(&missing, &handle),
+            Err(ClipError::Open { .. })
+        ));
+
+        let stereo_path = dir.path().join("stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&stereo_path, spec).unwrap();
+        for _ in 0..3200 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let stereo = unreachable_clip_config(&dir.path().join("store"), Some(&stereo_path));
+        assert!(matches!(
+            load_unreachable_clip(&stereo, &handle),
+            Err(ClipError::Format { .. })
+        ));
     }
 
     #[tokio::test]

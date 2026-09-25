@@ -29,7 +29,10 @@ fn main() -> ExitCode {
         // Returns only on a failure, and every ending is one: with the code in
         // hand, returning from `main` takes the remaining threads down with the
         // process, which is what the service unit restarts.
-        cli::Command::Run { chip_rebooted } => run::run(chip_rebooted),
+        cli::Command::Run {
+            chip_rebooted,
+            config,
+        } => run::run(chip_rebooted, config.as_deref()),
         cli::Command::RebootChip => run::reboot_chip(),
         cli::Command::Selftest => run_selftest(selftest::run),
         cli::Command::SelftestManual => run_selftest(selftest::run_manual),

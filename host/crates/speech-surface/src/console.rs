@@ -26,6 +26,10 @@ const CONSOLE_INFO: &[&str] = &[
     "brain_echo",
     "stt_absent",
     "stt_configured",
+    // The clip a failed wake transcription is answered with, loaded at startup.
+    "stt_clip_loaded",
+    // A wake the transcriber could not hear, answered with that clip.
+    "stt_unreachable_reply",
     "tts_absent",
     "tts_configured",
     "conn_hello",
@@ -496,6 +500,8 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
         "brain_clip_loaded" => Some(narrate_brain_clip(fields)),
         "stt_absent" => Some("stt: none".to_string()),
         "stt_configured" => Some(narrate_stt_configured(fields)),
+        "stt_clip_loaded" => Some(narrate_stt_clip(fields)),
+        "stt_unreachable_reply" => Some(narrate_stt_unreachable_reply(fields)),
         "tts_absent" => Some("tts: none".to_string()),
         "tts_configured" => Some(narrate_tts_configured(fields)),
         _ => None,
@@ -554,6 +560,25 @@ fn narrate_stt_configured(fields: &Value) -> String {
         Some(_) => "?".to_string(),
     };
     format!("stt configured — {url} model={model} lang={lang}")
+}
+
+/// The offline clip as prose, the way `brain_clip_loaded` names its clip:
+/// `stt: offline clip clips/offline.wav (3.2s)`. The clip path and the duration
+/// degrade to `?` when absent or the wrong type.
+fn narrate_stt_clip(fields: &Value) -> String {
+    let clip = fmt_str(fields.get("clip"));
+    let dur = fmt_duration_ms(fields.get("duration_ms"), 1);
+    format!("stt: offline clip {clip} ({dur})")
+}
+
+/// A failed wake transcription answered with the offline clip:
+/// `stt unreachable — offline clip clips/offline.wav for reachy00 #12`. Each
+/// field degrades to `?` when absent or the wrong type.
+fn narrate_stt_unreachable_reply(fields: &Value) -> String {
+    let clip = fmt_str(fields.get("clip"));
+    let pod = fmt_str(fields.get("pod"));
+    let seq = fmt_u64(fields.get("utterance_seq"));
+    format!("stt unreachable — offline clip {clip} for {pod} #{seq}")
 }
 
 /// The configured brain as prose. `brain_absent` / `brain_echo` are fixed
@@ -2609,6 +2634,33 @@ mod tests {
     }
 
     #[test]
+    fn stt_offline_clip_narrates() {
+        let mut r = Renderer::new(false);
+        let loaded = r
+            .render(
+                0,
+                "stt_clip_loaded",
+                &json!({ "clip": "clips/offline.wav", "samples": 1600, "duration_ms": 100 }),
+            )
+            .unwrap();
+        assert!(
+            loaded.ends_with("stt: offline clip clips/offline.wav (0.1s)"),
+            "{loaded}"
+        );
+        assert!(!loaded.contains("!!!"), "{loaded}");
+        let reply = r
+            .render(
+                0,
+                "stt_unreachable_reply",
+                &json!({ "pod": "reachy00", "utterance_seq": 12, "clip": "clips/offline.wav" }),
+            )
+            .unwrap();
+        assert!(!reply.contains("!!!"), "{reply}");
+        assert!(reply.contains("clips/offline.wav"), "{reply}");
+        assert!(reply.contains("reachy00"), "{reply}");
+    }
+
+    #[test]
     fn stt_startup_narrates() {
         let mut r = Renderer::new(false);
         // Tag-less calm lines: the startup emits carry no room/pod.
@@ -3211,9 +3263,11 @@ mod tests {
         ("stage_health", Class::Calm),
         ("stage_health_emitter_exited", Class::Loud),
         ("stt_absent", Class::Calm),
+        ("stt_clip_loaded", Class::Calm),
         ("stt_configured", Class::Calm),
         ("stt_failed", Class::Loud),
         ("stt_started", Class::Calm),
+        ("stt_unreachable_reply", Class::Calm),
         ("synth", Class::Calm),
         ("synth_failed", Class::Loud),
         ("tracking", Class::FileOnly),

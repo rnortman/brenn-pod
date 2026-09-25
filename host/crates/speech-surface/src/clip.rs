@@ -1,4 +1,5 @@
-//! Startup loader for the `WavBrain` clip: read a `.wav` into the one PCM
+//! Startup loader for the daemon's clips (the `wav` brain's `[brain] clip`, the
+//! offline reply's `[stt] unreachable_clip`): read a `.wav` into the one PCM
 //! format the outbound chain assumes (`SPINE_FORMAT`: 16 kHz mono S16) or fail
 //! fatally, naming the path and the offending property.
 //!
@@ -14,7 +15,7 @@ use std::sync::Arc;
 // it here so this crate's loaders and `wav-import` reach it under one path.
 pub use speech_pipeline::{SpineFormatViolation, check_spine_format};
 
-/// A failure loading the brain clip, carrying the offending path and property.
+/// A failure loading a startup clip, carrying the offending path and property.
 #[derive(Debug, thiserror::Error)]
 pub enum ClipError {
     #[error("failed to open clip {path}: {source}")]

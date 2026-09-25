@@ -24,7 +24,9 @@ pub mod wav;
 pub mod wav_brain;
 
 pub use assembler::{AssemblerLimits, AssemblerStats, SegmentAssembler};
-pub use brain::{BrainEvent, BrainEventFn, BrainStats, BrainStatsSnapshot, WakeCommandReason};
+pub use brain::{
+    BrainEvent, BrainEventFn, BrainStats, BrainStatsSnapshot, WakeCommandReason, send_or_report,
+};
 // The embedding surface only. The wire vocabulary — `scan`, `Tag`, the body
 // builders, the help document — reads as nothing in particular at the root of a
 // pipeline crate and means something only as "the bus brain's codec", so it stays
