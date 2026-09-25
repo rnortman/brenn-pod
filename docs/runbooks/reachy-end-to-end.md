@@ -152,9 +152,12 @@ What each table is doing:
 - `listen_addr` is required and must name a concrete interface — the daemon refuses
   `0.0.0.0` rather than guess. It is also where step 2 gets the address the pod dials.
 - `pod_psk_file` is the listener's key table — one line per pod, every pod type in the
-  one file, mode 0600. You never write it by hand: step 2 creates and updates it (the
-  same table `podctl provision-audio-psk` maintains for ESP pods). A pod absent from it
-  simply cannot connect — the listener speaks only TLS-PSK.
+  one file, mode 0600. A host running from a brenn-os payload declares
+  `secrets_posture = "payload"` beside it, because the OS unpacks the payload
+  root-owned and world-readable; the host then refuses only a key file others can
+  write. You never write it by hand: step 2 creates and updates it (the same table
+  `podctl provision-audio-psk` maintains for ESP pods). A pod absent from it simply
+  cannot connect — the listener speaks only TLS-PSK.
 - `[record]` drops every captured segment under `host/framelogs/` — your evidence if
   something goes wrong.
 - `[wake]` and `[endpointer]` together build the continuous listener — the thing that

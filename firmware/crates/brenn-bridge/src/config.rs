@@ -247,13 +247,13 @@ pub struct Token(String);
 impl Token {
     /// Read, mode-check, and trim the token at `path`.
     ///
-    /// Refuses a file any other local account can read — the host's one secrets
-    /// posture, `pod_secrets`, which the PSK table is held to as well. Trailing
+    /// Refuses a file the posture refuses — `pod_secrets`, which the PSK table is
+    /// held to as well. Trailing
     /// whitespace is trimmed — an editor's newline is not part of the credential
     /// — and an empty result is a refusal, since an empty token would
     /// authenticate nothing while looking configured.
-    pub fn load(path: &Path) -> Result<Token, ConfigError> {
-        if let Some(message) = pod_secrets::mode_error(path, "token file") {
+    pub fn load(path: &Path, posture: pod_secrets::Posture) -> Result<Token, ConfigError> {
+        if let Some(message) = pod_secrets::mode_error(path, "token file", posture) {
             return Err(ConfigError::TokenMode {
                 path: path.to_path_buf(),
                 message,

@@ -21,7 +21,7 @@
 //! use brenn_bridge::{Bridge, BridgeEvent, Config, ResumePolicy, SubscriptionDepths};
 //!
 //! let config = Config::load(Path::new("/etc/brenn/bridge.toml"))?;
-//! let (bridge, handle, mut events) = Bridge::new(&config)?;
+//! let (bridge, handle, mut events) = Bridge::new(&config, pod_secrets::Posture::OwnerOnly)?;
 //! let task = tokio::spawn(bridge.run());
 //!
 //! handle

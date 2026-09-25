@@ -47,7 +47,13 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     /// Path to the per-pod PSK secrets file ([`PskTable`]). Required: the ingest
     /// listener speaks only TLS-PSK, so a daemon without keys can serve no pod.
+    /// A host running from a brenn-os payload declares `secrets_posture =
+    /// "payload"`, because the OS unpacks the tree world-readable.
     pub pod_psk_file: PathBuf,
+    /// Who protects `pod_psk_file` and the bridge's `token_file`. Defaults to
+    /// `owner-only`.
+    #[serde(default)]
+    pub secrets_posture: SecretsPostureConfig,
     /// Accept-gate semaphore size.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -835,6 +841,30 @@ impl WakePolicyConfig {
     }
 }
 
+/// Who protects the host's secrets files (`pod_psk_file`, the bridge's
+/// `token_file`). `owner-only` refuses a file any other account can read;
+/// `payload` is for a host running from a read-only tree the OS unpacks
+/// world-readable (a brenn-os payload), and refuses only a file others can write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretsPostureConfig {
+    /// The files are the host's own.
+    #[default]
+    OwnerOnly,
+    /// The files are members of a read-only, world-readable payload tree.
+    Payload,
+}
+
+impl SecretsPostureConfig {
+    /// The secrets policy's `Posture`.
+    pub fn to_posture(self) -> pod_secrets::Posture {
+        match self {
+            SecretsPostureConfig::OwnerOnly => pod_secrets::Posture::OwnerOnly,
+            SecretsPostureConfig::Payload => pod_secrets::Posture::Payload,
+        }
+    }
+}
+
 /// Brain configuration. A present `[brain]` table names an explicit `mode`;
 /// `mode = "wav"` additionally requires a `clip` path.
 #[derive(Debug, Clone, Deserialize)]
@@ -1421,13 +1451,13 @@ pub struct PskTable {
 }
 
 impl PskTable {
-    /// Read and validate the secrets file at `path`.
-    pub fn load(path: &Path) -> Result<PskTable, ConfigError> {
+    /// Read and validate the secrets file at `path`, its mode held to `posture`.
+    pub fn load(path: &Path, posture: pod_secrets::Posture) -> Result<PskTable, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        let mode_check = pod_secrets::mode_error(path, "psk file");
+        let mode_check = pod_secrets::mode_error(path, "psk file", posture);
         let table = PskTable::parse(&text)
             .and_then(|table| match mode_check {
                 Some(message) => Err(message),
@@ -2191,6 +2221,55 @@ threshold = 0.7
         assert!(
             message.contains("gated") && message.contains("bypass"),
             "the message names the legal spellings: {message}"
+        );
+    }
+
+    #[test]
+    fn secrets_posture_parses_both_spellings() {
+        for (text, want) in [
+            (
+                "secrets_posture = \"payload\"",
+                SecretsPostureConfig::Payload,
+            ),
+            (
+                "secrets_posture = \"owner-only\"",
+                SecretsPostureConfig::OwnerOnly,
+            ),
+        ] {
+            let config = Config::parse(&with_addr(text)).expect("parse");
+            assert_eq!(config.secrets_posture, want, "{text}");
+        }
+    }
+
+    #[test]
+    fn secrets_posture_defaults_owner_only() {
+        let config = Config::parse(&with_addr("")).expect("parse");
+        assert_eq!(config.secrets_posture, SecretsPostureConfig::OwnerOnly);
+    }
+
+    #[test]
+    fn secrets_posture_rejects_a_third_value() {
+        let err = Config::parse(&with_addr("secrets_posture = \"world\"")).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown variant"),
+            "refused as a variant, not as an unknown key: {message}"
+        );
+        assert!(
+            message.contains("owner-only") && message.contains("payload"),
+            "the message names the legal spellings: {message}"
+        );
+    }
+
+    #[test]
+    fn secrets_posture_maps_to_the_policy() {
+        assert_eq!(
+            SecretsPostureConfig::OwnerOnly.to_posture(),
+            pod_secrets::Posture::OwnerOnly
+        );
+        assert_eq!(
+            SecretsPostureConfig::Payload.to_posture(),
+            pod_secrets::Posture::Payload
         );
     }
 
@@ -3572,29 +3651,56 @@ max_backoff_ms = 9000
         }
     }
 
-    /// A secrets file any other local account can read is a startup failure, not
-    /// a warning — the whole fleet's keys sit in it.
+    /// The key table's mode is held to the declared posture: a secrets file any
+    /// other local account can read is a startup failure under `OwnerOnly`, and
+    /// one any other account can write is refused under either.
     #[cfg(unix)]
     #[test]
-    fn psk_table_rejects_group_readable_file() {
+    fn psk_table_mode_follows_the_posture() {
+        use pod_secrets::Posture;
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("psk.toml");
         std::fs::write(&path, format!("pod-a = \"{KEY_A}\"\n")).expect("write");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
-        let err = PskTable::load(&path).unwrap_err();
+        let chmod = |mode| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+
+        chmod(0o644);
+        let err = PskTable::load(&path, Posture::OwnerOnly).unwrap_err();
         assert!(
             err.to_string().contains("group/world-accessible"),
-            "message: {err}",
+            "message: {err}"
         );
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        let table = PskTable::load(&path).expect("loads at 0600");
+        let table = PskTable::load(&path, Posture::Payload).expect("loads at 0644 as a payload");
         assert_eq!(table.len(), 1);
+
+        chmod(0o600);
+        for posture in [Posture::OwnerOnly, Posture::Payload] {
+            let table = PskTable::load(&path, posture).expect("loads at 0600");
+            assert_eq!(table.len(), 1);
+        }
+
+        chmod(0o622);
+        let err = PskTable::load(&path, Posture::OwnerOnly).unwrap_err();
+        assert!(
+            err.to_string().contains("group/world-accessible"),
+            "message: {err}"
+        );
+        let err = PskTable::load(&path, Posture::Payload).unwrap_err();
+        assert!(
+            err.to_string().contains("group/world-writable"),
+            "message: {err}"
+        );
     }
 
     #[test]
     fn psk_table_load_reports_a_missing_file() {
-        let err = PskTable::load(Path::new("/nonexistent/psk.toml")).unwrap_err();
+        let err = PskTable::load(
+            Path::new("/nonexistent/psk.toml"),
+            pod_secrets::Posture::OwnerOnly,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("/nonexistent/psk.toml"), "{err}");
     }
 

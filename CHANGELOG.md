@@ -9,6 +9,14 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **The voice host now starts on a robot deployed from a brenn-os payload.**
+  brenn-os unpacks a payload (the read-only bundle of binaries, configs and
+  keys it fetches onto the device) world-readable, so the host refused its
+  own pod key file ("psk file mode 0644 is group/world-accessible") and would
+  not start. Set the new top-level `secrets_posture = "payload"` on such a host:
+  the pod key file and the bus token file may then be world-readable, and are
+  refused only if another account could write them. The default,
+  `"owner-only"`, keeps the existing rule that these files be mode 0600.
 - **The robot now answers when it can't hear you.** If the speech-to-text
   service (the transcriber) is unreachable, times out or errors after a wake
   word, the pod plays a clip you configure — e.g. "I can't hear you right

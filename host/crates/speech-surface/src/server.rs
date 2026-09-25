@@ -435,7 +435,8 @@ impl Server {
     /// key file, and an OpenSSL context failure are all fatal: a daemon that came
     /// up without keys would refuse its whole fleet while looking healthy.
     pub async fn bind(config: Arc<Config>, jsonl: JsonlHandle) -> std::io::Result<Server> {
-        let table = PskTable::load(&config.pod_psk_file).map_err(std::io::Error::other)?;
+        let table = PskTable::load(&config.pod_psk_file, config.secrets_posture.to_posture())
+            .map_err(std::io::Error::other)?;
         let pods = table.len();
         let ssl = build_psk_context(table).map_err(std::io::Error::other)?;
         let listener = TcpListener::bind(config.listen_addr).await?;
@@ -765,8 +766,11 @@ impl Server {
                 let bridge = match supplied {
                     Some(bridge) => bridge,
                     None => {
-                        let (bridge, handle, events) = brenn_bridge::Bridge::new(&brenn.bridge)
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        let (bridge, handle, events) = brenn_bridge::Bridge::new(
+                            &brenn.bridge,
+                            config.secrets_posture.to_posture(),
+                        )
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
                         BrennBridge {
                             task: tokio::spawn(bridge.run()),
                             handle,

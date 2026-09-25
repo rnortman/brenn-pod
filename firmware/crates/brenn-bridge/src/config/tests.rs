@@ -194,7 +194,7 @@ fn write_token(dir: &tempfile::TempDir, name: &str, contents: &str, mode: u32) -
 fn a_private_token_file_loads_trimmed() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = write_token(&dir, "token", "  s3cret-token\n", 0o600);
-    let token = Token::load(&path).expect("a 0600 file loads");
+    let token = Token::load(&path, pod_secrets::Posture::OwnerOnly).expect("a 0600 file loads");
     assert_eq!(token.clone().into_inner(), "s3cret-token");
     assert_eq!(
         format!("{token:?}"),
@@ -209,7 +209,8 @@ fn a_group_or_world_readable_token_file_is_refused() {
     let dir = tempfile::tempdir().expect("a temp dir");
     for mode in [0o640, 0o604, 0o644, 0o660] {
         let path = write_token(&dir, &format!("token-{mode:o}"), "s3cret", mode);
-        let error = Token::load(&path).expect_err("a readable-by-others token is refused");
+        let error = Token::load(&path, pod_secrets::Posture::OwnerOnly)
+            .expect_err("a readable-by-others token is refused");
         assert!(
             matches!(error, ConfigError::TokenMode { .. }),
             "expected a mode refusal, got {error:?}"
@@ -223,10 +224,51 @@ fn a_group_or_world_readable_token_file_is_refused() {
 
 #[cfg(unix)]
 #[test]
+fn a_token_file_mode_follows_the_posture() {
+    use pod_secrets::Posture;
+    let dir = tempfile::tempdir().expect("a temp dir");
+
+    let readable = write_token(&dir, "token-644", "s3cret\n", 0o644);
+    let error = Token::load(&readable, Posture::OwnerOnly)
+        .expect_err("a world-readable token is refused under OwnerOnly");
+    assert!(
+        matches!(error, ConfigError::TokenMode { .. }),
+        "expected a mode refusal, got {error:?}"
+    );
+    assert!(error.to_string().contains("chmod 600"), "{error}");
+    let token = Token::load(&readable, Posture::Payload).expect("a 0644 payload member loads");
+    assert_eq!(token.into_inner(), "s3cret");
+
+    let private = write_token(&dir, "token-600", "s3cret\n", 0o600);
+    for posture in [Posture::OwnerOnly, Posture::Payload] {
+        let token = Token::load(&private, posture).expect("a 0600 file loads");
+        assert_eq!(token.into_inner(), "s3cret");
+    }
+
+    let writable = write_token(&dir, "token-622", "s3cret\n", 0o622);
+    for posture in [Posture::OwnerOnly, Posture::Payload] {
+        let error =
+            Token::load(&writable, posture).expect_err("an others-writable token is refused");
+        assert!(
+            matches!(error, ConfigError::TokenMode { .. }),
+            "expected a mode refusal, got {error:?}"
+        );
+        if posture == Posture::Payload {
+            assert!(
+                error.to_string().contains("group/world-writable"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn an_empty_token_file_is_refused_as_empty_not_as_a_credential() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = write_token(&dir, "token", "\n  \n", 0o600);
-    let error = Token::load(&path).expect_err("whitespace is not a credential");
+    let error = Token::load(&path, pod_secrets::Posture::OwnerOnly)
+        .expect_err("whitespace is not a credential");
     assert!(
         matches!(error, ConfigError::TokenEmpty { .. }),
         "expected an empty refusal, got {error:?}"
@@ -237,7 +279,8 @@ fn an_empty_token_file_is_refused_as_empty_not_as_a_credential() {
 fn a_missing_token_file_reports_as_a_read_failure() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("absent");
-    let error = Token::load(&path).expect_err("a missing token is refused");
+    let error = Token::load(&path, pod_secrets::Posture::OwnerOnly)
+        .expect_err("a missing token is refused");
     assert!(
         matches!(error, ConfigError::TokenRead { .. }),
         "a file that is not there has no mode to complain about: {error:?}"

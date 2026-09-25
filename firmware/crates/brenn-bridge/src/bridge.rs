@@ -339,13 +339,17 @@ impl Bridge<NativeConnector> {
     /// so an embedder composing a config in memory would otherwise lose the
     /// wss-only refusal and the anti-wedge timing floors that [`Config::load`]
     /// enforces.
+    ///
+    /// The token file's `posture` is the embedder's declaration, passed through
+    /// to [`Token::load`].
     pub fn new(
         config: &Config,
+        posture: pod_secrets::Posture,
     ) -> Result<(Self, BridgeHandle, mpsc::Receiver<BridgeEvent>), ConfigError> {
         config
             .validate()
             .map_err(|message| ConfigError::Rejected { message })?;
-        let token = Token::load(&config.token_file)?;
+        let token = Token::load(&config.token_file, posture)?;
         Ok(Bridge::with_connector(
             config.conn_config(),
             config.reconnect.max_futile_attachments,

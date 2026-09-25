@@ -171,7 +171,8 @@ async fn run(cli: Cli) -> Result<u8, String> {
     let subscriptions = fold_subscriptions(subscriptions)?;
 
     let config = Config::load(&cli.config).map_err(|err| err.to_string())?;
-    let (bridge, handle, mut events) = Bridge::new(&config).map_err(|err| err.to_string())?;
+    let (bridge, handle, mut events) =
+        Bridge::new(&config, pod_secrets::Posture::OwnerOnly).map_err(|err| err.to_string())?;
     emit(
         "probe_started",
         json!({

@@ -1142,7 +1142,7 @@ fn building_a_bridge_validates_the_config_it_is_handed() {
          token_file = \"/etc/brenn/token\"\n",
     )
     .expect("the fixture parses");
-    match Bridge::new(&cleartext) {
+    match Bridge::new(&cleartext, pod_secrets::Posture::OwnerOnly) {
         Err(ConfigError::Rejected { message }) => assert!(message.contains("wss://"), "{message}"),
         Err(other) => panic!("expected the wss refusal, got {other:?}"),
         Ok(_) => panic!("a cleartext URL must never reach a connector"),
@@ -1157,13 +1157,39 @@ fn building_a_bridge_validates_the_config_it_is_handed() {
          initial_backoff_ms = 0\n",
     )
     .expect("the fixture parses");
-    match Bridge::new(&spinning) {
+    match Bridge::new(&spinning, pod_secrets::Posture::OwnerOnly) {
         Err(ConfigError::Rejected { message }) => {
             assert!(message.contains("initial_backoff_ms"), "{message}")
         }
         Err(other) => panic!("expected the timing refusal, got {other:?}"),
         Ok(_) => panic!("a spin-loop backoff must be refused at build time"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn building_a_bridge_passes_the_posture_to_the_token() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let token = dir.path().join("token");
+    std::fs::write(&token, "s3cret-token\n").expect("the fixture writes");
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644))
+        .expect("the fixture chmods");
+    let config = Config::parse(&format!(
+        "server_url = \"wss://brenn.example.net/remote/pod-kitchen/ws\"\n\
+         token_file = {:?}\n",
+        token.display().to_string()
+    ))
+    .expect("the fixture parses");
+    match Bridge::new(&config, pod_secrets::Posture::OwnerOnly) {
+        Err(ConfigError::TokenMode { .. }) => {}
+        Err(other) => panic!("expected the token mode refusal, got {other:?}"),
+        Ok(_) => panic!("a world-readable token must be refused under OwnerOnly"),
+    }
+    assert!(
+        Bridge::new(&config, pod_secrets::Posture::Payload).is_ok(),
+        "a world-readable, owner-writable token is a payload member"
+    );
 }
 
 #[tokio::test]
