@@ -42,7 +42,7 @@ pub use config::{
     RecordConfig, RoomLookup, UNMAPPED_ROOM,
 };
 /// The seam a composing process chooses where the head looks on a wake through.
-pub use gaze::{DoaSample, GazePose, WakeGaze};
+pub use gaze::{DoaSample, GazeLook, WakeGaze};
 pub use jsonl::{JsonlHandle, emit_line, format_line};
 pub use prune::{PruneFailure, PruneHalt, PruneOutcome, PruneRequest, PruneTier, PrunedLog, prune};
 /// The link's TLS-PSK parameters, shared with the device clients.

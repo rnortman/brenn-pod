@@ -91,7 +91,7 @@ use tokio_util::sync::CancellationToken;
 use crate::barge::TurnAudio;
 use crate::brenn::publish_once;
 use crate::config::BrennConfig;
-use crate::gaze::GazePose;
+use crate::gaze::GazeLook;
 use crate::jsonl::JsonlHandle;
 use crate::time::due;
 
@@ -103,50 +103,90 @@ use crate::time::due;
 /// and answering apart.
 pub const DEFAULT_PRESENCE_POSE: &str = "neutral";
 
-/// The move one presence event asks for: a pose, and the pace of the move to it.
+// TODO(quality-raise-enum-widens-pose-only-sites): stow, the configured wake/turn poses and a cue are always a pose; give them a pose-only type.
+/// The move one presence event asks for: a pose and the pace of the move to
+/// it, or — for a wake a gaze chose — a direction to face.
 ///
-/// One value, because the two are one decision — choosing where the head goes
-/// is choosing how fast it gets there — and because a want carries what it is
-/// standing at, so a re-paced raise is a different answer and is published.
-/// Where the pose *is* stays the daemon's library's; a name this side cannot
-/// resolve is not an error it can detect.
+/// A pose and its pace are one value, because the two are one decision —
+/// choosing where the head goes is choosing how fast it gets there — and
+/// because a want carries what it is standing at, so a re-paced raise is a
+/// different answer and is published. Where a pose *is* stays the daemon's
+/// library's; a name this side cannot resolve is not an error it can detect.
 ///
-/// The name is held as [`Arc<str>`] because every hold and every closing want
-/// carries it, and those are cloned per input.
+/// A pose's name is held as [`Arc<str>`] because every hold and every closing
+/// want carries it, and those are cloned per input.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Raise {
-    /// The pose's name in the daemon's library.
-    pub pose: Arc<str>,
-    /// The pace stated for the move, or `None` to leave it to the library.
-    pub move_ms: Option<u64>,
+pub enum Raise {
+    /// A pose in the daemon's library.
+    Pose {
+        /// The pose's name in the daemon's library.
+        pose: Arc<str>,
+        /// The pace stated for the move, or `None` to leave it to the library.
+        move_ms: Option<u64>,
+    },
+    /// A direction, in the wire's look units. It states no pace: a look's
+    /// pace is the daemon's.
+    Look {
+        bearing_mrad: i32,
+        elevation_mrad: i32,
+    },
 }
 
 impl Raise {
     /// A raise to `pose` at the library's own pace.
     #[must_use]
     pub fn to(pose: &str) -> Self {
-        Self {
+        Raise::Pose {
             pose: pose.into(),
             move_ms: None,
+        }
+    }
+
+    /// The pose this raise names, or `None` for a look.
+    #[must_use]
+    pub fn pose(&self) -> Option<&str> {
+        match self {
+            Raise::Pose { pose, .. } => Some(pose.as_ref()),
+            Raise::Look { .. } => None,
+        }
+    }
+
+    /// The pace stated for a pose's move, or `None`: the library's own pace
+    /// for a pose, and always for a look.
+    #[must_use]
+    pub fn move_ms(&self) -> Option<u64> {
+        match self {
+            Raise::Pose { move_ms, .. } => *move_ms,
+            Raise::Look { .. } => None,
         }
     }
 
     /// Whether this raise is the reserved `keep`: the head holds where it is
     /// commanded now rather than moving to a pose.
     pub(crate) fn is_keep(&self) -> bool {
-        self.pose.as_ref() == motion_proto::KEEP_BASE
+        matches!(self, Raise::Pose { pose, .. } if pose.as_ref() == motion_proto::KEEP_BASE)
     }
 
     /// This raise as a base step due `after_ms` past the script's arrival. A
     /// `keep` is a keep step and its `move_ms` is ignored: a keep has no
-    /// destination, so no pace.
+    /// destination, so no pace. A look is a look step.
     pub(crate) fn step(&self, after_ms: u64) -> Step {
         if self.is_keep() {
             return Step::keep(after_ms);
         }
-        match self.move_ms {
-            Some(move_ms) => Step::timed(after_ms, self.pose.as_ref(), move_ms),
-            None => Step::new(after_ms, self.pose.as_ref()),
+        match self {
+            Raise::Pose {
+                pose,
+                move_ms: Some(move_ms),
+            } => Step::timed(after_ms, pose.as_ref(), *move_ms),
+            Raise::Pose {
+                pose,
+                move_ms: None,
+            } => Step::new(after_ms, pose.as_ref()),
+            Raise::Look {
+                bearing_mrad,
+                elevation_mrad,
+            } => Step::look(after_ms, *bearing_mrad, *elevation_mrad),
         }
     }
 
@@ -176,11 +216,13 @@ impl Raise {
     }
 
     /// A gaze as the raise a wake carries, or why it cannot be one. It stands in
-    /// for the turn pose at dispatch, so it is held to [`Raise::check_turn`].
-    pub(crate) fn from_gaze(gaze: GazePose) -> Result<Raise, TurnRefusal> {
-        let raise = Raise {
-            pose: gaze.name.as_str().into(),
-            move_ms: gaze.move_ms,
+    /// for the turn pose at dispatch, so it is held to [`Raise::check_turn`]; a
+    /// look is never `keep`, so what that refuses here is a direction the wire
+    /// does not carry.
+    pub(crate) fn from_gaze(gaze: GazeLook) -> Result<Raise, TurnRefusal> {
+        let raise = Raise::Look {
+            bearing_mrad: gaze.bearing_mrad,
+            elevation_mrad: gaze.elevation_mrad,
         };
         raise.check_turn().map(|()| raise)
     }
@@ -347,7 +389,7 @@ impl Now {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScriptInput {
     /// A confirmed wake word. The head goes up: to `gaze` when the wake carried
-    /// one, the pose the composing process chose from where the phrase was heard,
+    /// one, the look the composing process chose from where the phrase was heard,
     /// and otherwise to the configured wake pose. A gaze then stands in for the
     /// turn pose until the head's stow is due or the next wake replaces it.
     Wake {
@@ -880,7 +922,7 @@ impl Scripter {
     /// pace would lift the daemon's backstop on a raised head past the
     /// configured engagement ceiling.
     fn stow_headroom_ms(&self) -> u64 {
-        millis(self.timing.refresh).max(self.stow.move_ms.unwrap_or(0))
+        millis(self.timing.refresh).max(self.stow.move_ms().unwrap_or(0))
     }
 
     /// The furthest stow instant a script emitted at `now` can express.
@@ -1276,9 +1318,9 @@ impl Scripter {
         // the timeout is capped at that same ceiling, so the timeout covers the
         // window and neither reaches past the wire's bound. The two refusals a
         // step
-        // carries are screened at the same door: every pose name here is either
+        // carries are screened at the same door: every raise here is either
         // `STOW_POSE`, one config validation has already offered to this same
-        // constructor, or a gaze `Raise::from_gaze` has, and every stated pace
+        // constructor, or a gaze's look `Raise::from_gaze` has, and every stated pace
         // is one it has bounded. A cued pose
         // or play is screened at the same door one step earlier — its name
         // against the library, its speed against the wire's own range and its
@@ -1873,7 +1915,7 @@ mod tests {
     /// the cases that assert what a pod is being asked for.
     fn holding(pose: &str) -> Want {
         Want::Hold {
-            at: Raise {
+            at: Raise::Pose {
                 pose: pose.into(),
                 move_ms: None,
             },
@@ -1883,7 +1925,7 @@ mod tests {
     /// A hold want at a caller-specified pace.
     fn holding_at(pose: &str, move_ms: Option<u64>) -> Want {
         Want::Hold {
-            at: Raise {
+            at: Raise::Pose {
                 pose: pose.into(),
                 move_ms,
             },
@@ -2110,7 +2152,7 @@ mod tests {
     /// A keep has no destination, so the pace a `keep` raise states is ignored.
     #[test]
     fn a_keep_raise_ignores_its_pace() {
-        let raise = Raise {
+        let raise = Raise::Pose {
             pose: motion_proto::KEEP_BASE.into(),
             move_ms: Some(600),
         };
@@ -2194,11 +2236,19 @@ mod tests {
         }
     }
 
-    /// A wake that carried a gaze toward `look_l30`.
+    /// The look a gaze chose: 30° left, 27° up.
+    fn gazed() -> Raise {
+        Raise::Look {
+            bearing_mrad: 524,
+            elevation_mrad: 471,
+        }
+    }
+
+    /// A wake that carried a gaze toward 30° left, 27° up.
     fn gaze_wake() -> ScriptInput {
         ScriptInput::Wake {
             pod: pod(),
-            gaze: Some(Raise::to("look_l30")),
+            gaze: Some(gazed()),
         }
     }
 
@@ -2216,12 +2266,12 @@ mod tests {
     fn a_gaze_raise_is_used_for_the_turn() {
         let mut fx = fixture();
         let wake = fx.publish(gaze_wake(), ZERO);
-        assert_eq!(steps(&wake)[0].1, "look_l30");
+        assert_eq!(wake.script.steps()[0], Step::look(0, 524, 471));
         assert!(
             fx.apply(turn_started(), ZERO).is_none(),
             "the turn's want is the wake's"
         );
-        assert_eq!(fx.want(), holding("look_l30"));
+        assert_eq!(fx.want(), Want::Hold { at: gazed() });
     }
 
     /// Every wake replaces the gaze, and one without a gaze clears it: the turn
@@ -2244,7 +2294,7 @@ mod tests {
         fx.publish(ScriptInput::Barge(pod()), ZERO);
         assert_eq!(fx.want(), holding(PEEK));
         fx.apply(turn_started(), ZERO);
-        assert_eq!(fx.want(), holding("look_l30"));
+        assert_eq!(fx.want(), Want::Hold { at: gazed() });
     }
 
     /// The gaze belongs to one interaction: once its stow is due, a later turn
@@ -2264,38 +2314,30 @@ mod tests {
         assert_eq!(fx.want(), holding(NEUTRAL));
     }
 
-    /// A gaze is held to the door the turn pose passes: no `keep`, and nothing a
-    /// motion script cannot carry.
+    /// A gaze is held to the wire's door: a direction no motion script may
+    /// carry is refused as uncarried, and one it may is the look it names.
     #[test]
-    fn a_gaze_is_screened_at_the_turn_pose_s_door() {
-        let gaze = |name: &str, move_ms| GazePose {
-            name: name.into(),
-            move_ms,
+    fn a_gaze_is_screened_by_the_wire() {
+        let gaze = |bearing_mrad, elevation_mrad| GazeLook {
+            bearing_mrad,
+            elevation_mrad,
         };
-        assert_eq!(
-            Raise::from_gaze(gaze(motion_proto::KEEP_BASE, None)),
-            Err(TurnRefusal::Keep)
-        );
-        for uncarried in [gaze("", None), gaze("look_l30", Some(0))] {
+        for uncarried in [gaze(3142, 0), gaze(-3142, 0), gaze(0, 1571), gaze(0, -1571)] {
             assert!(
-                matches!(
-                    Raise::from_gaze(uncarried.clone()),
-                    Err(TurnRefusal::Uncarried(_))
-                ),
+                matches!(Raise::from_gaze(uncarried), Err(TurnRefusal::Uncarried(_))),
                 "{uncarried:?} is refused as uncarried"
             );
         }
-        assert_eq!(
-            Raise::from_gaze(gaze("look_l30", None)),
-            Ok(Raise::to("look_l30"))
-        );
-        assert_eq!(
-            Raise::from_gaze(gaze("look_l30", Some(600))),
-            Ok(Raise {
-                pose: "look_l30".into(),
-                move_ms: Some(600),
-            })
-        );
+        for carried in [gaze(3141, 1570), gaze(-3141, -1570), gaze(524, 471)] {
+            assert_eq!(
+                Raise::from_gaze(carried),
+                Ok(Raise::Look {
+                    bearing_mrad: carried.bearing_mrad,
+                    elevation_mrad: carried.elevation_mrad,
+                }),
+                "{carried:?} is carried"
+            );
+        }
     }
 
     /// A raise to the pose the head is already at says nothing: the same event
@@ -2352,15 +2394,15 @@ mod tests {
             scripter: Scripter::new(
                 timing(),
                 ScriptRaises {
-                    wake: Raise {
+                    wake: Raise::Pose {
                         pose: PEEK.into(),
                         move_ms: Some(600),
                     },
-                    turn: Raise {
+                    turn: Raise::Pose {
                         pose: NEUTRAL.into(),
                         move_ms: Some(900),
                     },
-                    stow: Raise {
+                    stow: Raise::Pose {
                         pose: STOW_POSE.into(),
                         move_ms: Some(1_500),
                     },
@@ -2398,7 +2440,7 @@ mod tests {
             scripter: Scripter::new(
                 timing(),
                 ScriptRaises {
-                    stow: Raise {
+                    stow: Raise::Pose {
                         pose: STOW_POSE.into(),
                         move_ms: Some(1_200),
                     },
@@ -2973,7 +3015,7 @@ mod tests {
             assert_eq!(
                 fx.want(),
                 Want::Closing {
-                    at: Raise {
+                    at: Raise::Pose {
                         pose: NEUTRAL.into(),
                         move_ms: None,
                     },
@@ -3598,7 +3640,7 @@ mod tests {
             scripter: Scripter::new(
                 timing(),
                 ScriptRaises {
-                    stow: Raise {
+                    stow: Raise::Pose {
                         pose: STOW_POSE.into(),
                         move_ms: Some(PACE_MS),
                     },
@@ -4767,7 +4809,7 @@ mod tests {
 
     /// A pose a reply asked for, at the pace the tap computed for it.
     fn pose_cue(pose: &str, move_ms: Option<u64>) -> MotionCue {
-        MotionCue::Pose(Raise {
+        MotionCue::Pose(Raise::Pose {
             pose: pose.into(),
             move_ms,
         })

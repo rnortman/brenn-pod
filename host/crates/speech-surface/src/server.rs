@@ -4809,7 +4809,7 @@ mod tests {
             _pod: &PodId,
             _doa: &[crate::gaze::DoaSample],
             _wake_end_sample: u64,
-        ) -> Option<crate::gaze::GazePose> {
+        ) -> Option<crate::gaze::GazeLook> {
             None
         }
     }

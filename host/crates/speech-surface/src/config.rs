@@ -1171,7 +1171,7 @@ impl BrennConfig {
             format!(
                 "{} state a raise to {:?} that no motion script may carry: {refusal}",
                 named.join(" and "),
-                raise.pose,
+                raise.pose().unwrap_or_default(),
             )
         };
         let raises = self.script_raises();
@@ -1203,15 +1203,15 @@ impl BrennConfig {
     /// The three moves the scripter asks for: each pose with its own pace.
     pub fn script_raises(&self) -> crate::scripter::ScriptRaises {
         crate::scripter::ScriptRaises {
-            wake: crate::scripter::Raise {
+            wake: crate::scripter::Raise::Pose {
                 pose: self.presence_wake_pose.as_str().into(),
                 move_ms: self.presence_wake_move_ms,
             },
-            turn: crate::scripter::Raise {
+            turn: crate::scripter::Raise::Pose {
                 pose: self.presence_turn_pose.as_str().into(),
                 move_ms: self.presence_turn_move_ms,
             },
-            stow: crate::scripter::Raise {
+            stow: crate::scripter::Raise::Pose {
                 pose: motion_proto::STOW_POSE.into(),
                 move_ms: self.presence_stow_move_ms,
             },
@@ -3450,9 +3450,9 @@ max_backoff_ms = 9000
         .expect("parse")
         .brenn
         .expect("a [brenn] table");
-        assert_eq!(quiet.script_raises().wake.move_ms, None);
-        assert_eq!(quiet.script_raises().turn.move_ms, None);
-        assert_eq!(quiet.script_raises().stow.move_ms, None);
+        assert_eq!(quiet.script_raises().wake.move_ms(), None);
+        assert_eq!(quiet.script_raises().turn.move_ms(), None);
+        assert_eq!(quiet.script_raises().stow.move_ms(), None);
     }
 
     /// Pose and pace are screened as the one step the scripter emits, so a
@@ -3549,16 +3549,17 @@ max_backoff_ms = 9000
         assert!(err.contains("presence_turn_pose"), "message: {err}");
     }
 
-    /// A configured turn pose and a gaze standing for it are held to one door:
-    /// the config validates exactly when the same raise passes `check_turn`.
+    /// A configured turn pose is held to `Raise::check_turn`, the door a gaze's
+    /// look passes too: the config validates exactly when the same raise passes
+    /// it.
     #[test]
     fn the_turn_pose_and_a_gaze_meet_one_door() {
         for (pose, move_ms) in [
             ("neutral", None),
             (motion_proto::KEEP_BASE, None),
             ("", None),
-            ("look_l30", Some(0)),
-            ("look_l30", Some(600)),
+            ("peek", Some(0)),
+            ("peek", Some(600)),
         ] {
             let mut body = format!("presence_turn_pose = {pose:?}");
             if let Some(ms) = move_ms {
@@ -3572,7 +3573,7 @@ max_backoff_ms = 9000
             .expect("parse");
             assert_eq!(
                 config.validate().is_ok(),
-                crate::scripter::Raise {
+                crate::scripter::Raise::Pose {
                     pose: pose.into(),
                     move_ms,
                 }
@@ -3600,11 +3601,11 @@ max_backoff_ms = 9000
         .expect("parse")
         .brenn
         .expect("a [brenn] table");
-        assert_eq!(brenn.script_raises().wake.pose.as_ref(), "peek");
-        assert_eq!(brenn.script_raises().turn.pose.as_ref(), "neutral");
-        assert_eq!(brenn.script_raises().wake.move_ms, Some(600));
-        assert_eq!(brenn.script_raises().turn.move_ms, Some(900));
-        assert_eq!(brenn.script_raises().stow.move_ms, Some(1_500));
+        assert_eq!(brenn.script_raises().wake.pose(), Some("peek"));
+        assert_eq!(brenn.script_raises().turn.pose(), Some("neutral"));
+        assert_eq!(brenn.script_raises().wake.move_ms(), Some(600));
+        assert_eq!(brenn.script_raises().turn.move_ms(), Some(900));
+        assert_eq!(brenn.script_raises().stow.move_ms(), Some(1_500));
     }
 
     #[test]

@@ -825,3 +825,21 @@ that a session ends with the beams released.
 
 See `TODO(fixed-beams-runtime)` above the `EndOfAudio` variant in
 `firmware/crates/audio-pipeline/src/wire.rs`.
+
+## `quality-raise-enum-widens-pose-only-sites`
+
+Give the pose-only raise sites a pose-only type. `Raise` is `Pose { pose, move_ms } | Look {
+bearing_mrad, elevation_mrad }`, and `ScriptRaises { wake, turn, stow }` and `MotionCue::Pose` hold
+it, although a configured stow, a configured wake or turn pose, and a reply's cue are always poses.
+So `stow_headroom_ms` reads `self.stow.move_ms().unwrap_or(0)`, and the config refusal in
+`config.rs` prints `raise.pose().unwrap_or_default()`: each makes up an answer for a variant it
+cannot receive. A `struct PoseRaise { pose, move_ms }` held by `ScriptRaises` and `MotionCue::Pose`,
+with `enum Raise { Pose(PoseRaise), Look(GazeLook) }` only where a gaze can appear (the wake's gaze,
+the held and closing want, `step()`), removes those accessors' defaults and lets the type state that
+a stow is a pose with a pace.
+
+Deferral context: No path routes a look into a stow or a cue today, so the defaults are unreached.
+The enum's current shape, covering the configured and cued poses, was chosen deliberately when the
+gaze began carrying a direction, so splitting it is a design decision. It also reshapes the look
+tests in `scripter.rs`, `pipeline.rs` and `config.rs`. Marked at `enum Raise`,
+`host/crates/speech-surface/src/scripter.rs`.

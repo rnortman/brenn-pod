@@ -12,13 +12,13 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 - **A process composing the voice server can choose where the head looks when
   the wake word is heard** — the hook behind "look at the talker". The new
   `Sinks.gaze` seam (a `WakeGaze`) is asked once per wake with the microphone array's direction readings from the end of
-  the phrase, and names a library pose, with an optional pace, for the head to
-  raise to. The chosen pose is also the pose the head answers from, in place
-  of `presence_turn_pose`, until the head stows or the next wake. A `keep`, or
-  a name or pace no motion script may carry, is refused with a `gaze_refused`
-  line and the wake takes the configured pose; a seam supplied to a run with
-  no scripter is reported once as `gaze_seam_unused`. Without the seam nothing
-  changes.
+  the phrase, and names a direction — a bearing and an elevation in
+  milliradians, the motion wire's look — for the head to face. The chosen look
+  is also what the head answers from, in place of `presence_turn_pose`, until
+  the head stows or the next wake. A direction no motion script may carry is
+  refused with a `gaze_refused` line (carrying the direction) and the wake
+  takes the configured pose; a seam supplied to a run with no scripter is
+  reported once as `gaze_seam_unused`. Without the seam nothing changes.
 - **`presence_wake_pose = "keep"` freezes the head where it is on a wake**
   instead of moving it to a pose. If nothing follows, the head stows at
   `presence_max_engaged_ms`. `presence_turn_pose` may not be `keep`, and a

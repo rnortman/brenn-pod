@@ -3,17 +3,19 @@
 //!
 //! The server carries the microphone array's readings to the seam and asks it
 //! once per wake; the motion knowledge — where the array sits, where the head
-//! stands, which pose faces a bearing — stays with the composer.
+//! stands, how the head and the body share a bearing — stays with the composer.
 
 pub use speech_pipeline::DoaSample;
 use speech_pipeline::PodId;
 
-/// A pose the head should raise to on a wake, named in the daemon's library,
-/// with the pace of the move (`None`: the library's own).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GazePose {
-    pub name: String,
-    pub move_ms: Option<u64>,
+/// A direction the head should face on a wake, in the motion wire's look
+/// units: `bearing_mrad` from the base's forward, positive to the robot's
+/// left; `elevation_mrad` above level. How the head and the body share the
+/// bearing, and the pace, are the motion daemon's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GazeLook {
+    pub bearing_mrad: i32,
+    pub elevation_mrad: i32,
 }
 
 /// Chooses where the head looks when the wake word is heard.
@@ -25,14 +27,13 @@ pub struct GazePose {
 /// span. They say where the array heard the phrase from, relative to the array.
 /// `wake_end_sample` is the listener's absolute index one past the phrase.
 ///
-/// `Some` is the raise this wake takes, and then the pose the head answers from
-/// at dispatch in place of the configured turn pose. `None` means respond as
-/// configured. The name must be a library pose the daemon resolves; `keep`, and
-/// any name or pace no motion script may carry, is refused by the server and
-/// answered as `None` with a `gaze_refused` line.
+/// `Some` is the look this wake raises to, and then the look the head answers
+/// from at dispatch in place of the configured turn pose. `None` means respond
+/// as configured. A direction no motion script may carry is refused by the
+/// server and answered as `None` with a `gaze_refused` line.
 ///
 /// Called on the pipeline task once per wake, after the epoch check. It must not
 /// block or await.
 pub trait WakeGaze: Send + Sync + 'static {
-    fn choose(&self, pod: &PodId, doa: &[DoaSample], wake_end_sample: u64) -> Option<GazePose>;
+    fn choose(&self, pod: &PodId, doa: &[DoaSample], wake_end_sample: u64) -> Option<GazeLook>;
 }

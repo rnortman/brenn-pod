@@ -806,21 +806,23 @@ async fn handle_listener(
             // Past the epoch check for the same reason: a superseded
             // connection's wake is not an interaction, and it must not raise a
             // head. The gaze is asked here, past the check, so a superseded
-            // connection's readings never choose a pose.
+            // connection's readings never choose a look.
             if let Some(scripter) = scripter {
                 let gaze = gaze
                     .and_then(|g| g.choose(&pod, &doa, wake_end_sample))
-                    .and_then(|pose| {
-                        let name = pose.name.clone();
-                        match Raise::from_gaze(pose) {
-                            Ok(raise) => Some(raise),
-                            Err(reason) => {
-                                jsonl.emit(
-                                    "gaze_refused",
-                                    &json!({ "pod": pod.0, "pose": name, "reason": reason.to_string() }),
-                                );
-                                None
-                            }
+                    .and_then(|look| match Raise::from_gaze(look) {
+                        Ok(raise) => Some(raise),
+                        Err(reason) => {
+                            jsonl.emit(
+                                "gaze_refused",
+                                &json!({
+                                    "pod": pod.0,
+                                    "bearing_mrad": look.bearing_mrad,
+                                    "elevation_mrad": look.elevation_mrad,
+                                    "reason": reason.to_string(),
+                                }),
+                            );
+                            None
                         }
                     });
                 scripter.send(ScriptInput::Wake {
@@ -1886,7 +1888,7 @@ fn resolve_cue(library: &CueLibrary, cue: &Cue) -> Result<MotionCue, &'static st
                     Some(move_ms)
                 }
             };
-            Ok(MotionCue::Pose(Raise { pose, move_ms }))
+            Ok(MotionCue::Pose(Raise::Pose { pose, move_ms }))
         }
         Cue::Motion { .. } => {
             let (motion, span) = library.motion(name).ok_or("unknown_motion")?;
@@ -2296,7 +2298,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::config::JsonlSink;
-    use crate::gaze::{DoaSample, GazePose};
+    use crate::gaze::{DoaSample, GazeLook};
     use crate::test_support::segment as build_segment;
 
     fn pod() -> PodId {
@@ -4939,16 +4941,16 @@ mod tests {
 
     /// A gaze that answers every wake with `answer`, and records what it was asked.
     struct RecordingGaze {
-        answer: Option<GazePose>,
+        answer: Option<GazeLook>,
         asked: Mutex<Vec<(PodId, Vec<DoaSample>, u64)>>,
     }
 
     impl RecordingGaze {
-        fn answering(name: &str, move_ms: Option<u64>) -> Arc<RecordingGaze> {
+        fn answering(bearing_mrad: i32, elevation_mrad: i32) -> Arc<RecordingGaze> {
             Arc::new(RecordingGaze {
-                answer: Some(GazePose {
-                    name: name.into(),
-                    move_ms,
+                answer: Some(GazeLook {
+                    bearing_mrad,
+                    elevation_mrad,
                 }),
                 asked: Mutex::new(Vec::new()),
             })
@@ -4956,12 +4958,12 @@ mod tests {
     }
 
     impl WakeGaze for RecordingGaze {
-        fn choose(&self, pod: &PodId, doa: &[DoaSample], wake_end_sample: u64) -> Option<GazePose> {
+        fn choose(&self, pod: &PodId, doa: &[DoaSample], wake_end_sample: u64) -> Option<GazeLook> {
             self.asked
                 .lock()
                 .unwrap()
                 .push((pod.clone(), doa.to_vec(), wake_end_sample));
-            self.answer.clone()
+            self.answer
         }
     }
 
@@ -4973,13 +4975,13 @@ mod tests {
         }]
     }
 
-    /// The raise a `look_l30` gaze at 600 ms becomes.
-    fn look_l30_wake() -> ScriptInput {
+    /// The raise a gaze toward 30° left, 27° up becomes.
+    fn look_wake() -> ScriptInput {
         ScriptInput::Wake {
             pod: pod(),
-            gaze: Some(Raise {
-                pose: "look_l30".into(),
-                move_ms: Some(600),
+            gaze: Some(Raise::Look {
+                bearing_mrad: 524,
+                elevation_mrad: 471,
             }),
         }
     }
@@ -4990,14 +4992,14 @@ mod tests {
     async fn a_gaze_rides_the_wake_input() {
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
         let (handle, rx) = crate::scripter::channel(jsonl.clone());
-        let gaze = RecordingGaze::answering("look_l30", Some(600));
+        let gaze = RecordingGaze::answering(524, 471);
         let (lines, _) = Harness::new()
             .scripter(handle.clone())
             .gaze(gaze.clone())
             .run(vec![wake_detected_with(1, 8_000, one_reading())])
             .await;
 
-        assert_eq!(script_inputs(handle, rx).await, vec![look_l30_wake()]);
+        assert_eq!(script_inputs(handle, rx).await, vec![look_wake()]);
         assert_eq!(
             *gaze.asked.lock().unwrap(),
             vec![(pod(), one_reading(), 8_000)]
@@ -5033,15 +5035,16 @@ mod tests {
         writer.await.unwrap();
     }
 
-    /// A gaze naming `keep` cannot stand in for the turn pose: it is refused with
-    /// a line, and the wake takes the configured pose.
+    /// A direction the wire does not carry cannot stand in for the turn pose:
+    /// it is refused with a line carrying the direction, and the wake takes the
+    /// configured pose.
     #[tokio::test]
-    async fn a_keep_gaze_is_refused_and_the_wake_takes_the_configured_pose() {
+    async fn a_direction_the_wire_refuses_is_refused_and_the_wake_takes_the_configured_pose() {
         let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
         let (handle, rx) = crate::scripter::channel(jsonl.clone());
         let (lines, _) = Harness::new()
             .scripter(handle.clone())
-            .gaze(RecordingGaze::answering(motion_proto::KEEP_BASE, None))
+            .gaze(RecordingGaze::answering(3142, 471))
             .run(vec![wake_detected_with(1, 8_000, one_reading())])
             .await;
 
@@ -5050,11 +5053,18 @@ mod tests {
             .iter()
             .find(|v| v["event"] == "gaze_refused")
             .expect("a gaze_refused line");
-        assert_eq!(refused["pose"], "keep");
+        assert_eq!(refused["bearing_mrad"], 3142);
+        assert_eq!(refused["elevation_mrad"], 471);
         assert_eq!(
             refused["reason"],
-            crate::scripter::TurnRefusal::Keep.to_string()
+            Raise::from_gaze(GazeLook {
+                bearing_mrad: 3142,
+                elevation_mrad: 471,
+            })
+            .unwrap_err()
+            .to_string()
         );
+        assert!(refused.get("pose").is_none(), "{refused}");
         drop(jsonl);
         writer.await.unwrap();
     }
@@ -5067,7 +5077,7 @@ mod tests {
         let (handle, rx) = crate::scripter::channel(jsonl.clone());
         let (lines, _) = Harness::new()
             .scripter(handle.clone())
-            .gaze(RecordingGaze::answering("look_l30", Some(600)))
+            .gaze(RecordingGaze::answering(524, 471))
             .run(vec![
                 wake_detected_with(1, 8_000, one_reading()),
                 PipelineItem::Listener(ListenerEvent::BargeIn {
@@ -5080,7 +5090,7 @@ mod tests {
             ])
             .await;
 
-        assert_eq!(script_inputs(handle, rx).await, vec![look_l30_wake()]);
+        assert_eq!(script_inputs(handle, rx).await, vec![look_wake()]);
         assert!(lines.iter().any(|v| v["event"] == "barge_in"), "{lines:?}");
         drop(jsonl);
         writer.await.unwrap();
@@ -7126,7 +7136,7 @@ mod tests {
                 speed,
             },
         ) {
-            Ok(MotionCue::Pose(raise)) => raise.move_ms,
+            Ok(MotionCue::Pose(raise)) => raise.move_ms(),
             other => panic!("a pose resolves to a pose: {other:?}"),
         };
         assert_eq!(paced(Some(2.0)), Some(400), "twice as fast is half as long");
@@ -7312,7 +7322,7 @@ mod tests {
         assert_eq!(
             cues,
             vec![
-                MotionCue::Pose(Raise {
+                MotionCue::Pose(Raise::Pose {
                     pose: "peek".into(),
                     move_ms: Some(400),
                 }),
@@ -7374,7 +7384,7 @@ mod tests {
             .expect("what did resolve still reached the head");
         assert_eq!(
             cues,
-            vec![MotionCue::Pose(Raise {
+            vec![MotionCue::Pose(Raise::Pose {
                 pose: "peek".into(),
                 move_ms: None,
             })],
