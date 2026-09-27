@@ -98,9 +98,9 @@ pub const PP_ECHOONOFF_CMD: u8 = 23;
 /// trade-off.
 pub const PP_DTSENSITIVE_CMD: u8 = 31;
 
-/// Payload length of every single-value AEC and PP register named here: one
-/// `int32` or one `float`, four bytes either way (five on the wire with the status
-/// byte).
+/// Payload length of every single-value `int32` or `float` AEC and PP register named
+/// here: four bytes either way (five on the wire with the status byte).
+/// [`AEC_FIXEDBEAMSGATING_CMD`], a single `uint8`, is the exception.
 pub const SCALAR_READ_LEN: usize = 4;
 
 /// `AEC_AZIMUTH_VALUES` command ID. Read byte = 75 | 0x80 = 0xCB.
@@ -115,6 +115,31 @@ pub const AEC_SPENERGY_VALUES_CMD: u8 = 80;
 /// `AEC_SPENERGY_VALUES` payload length in bytes: 4 × f32 = 16 payload + 1 status = 17 total.
 /// Same layout as [`AEC_AZIMUTH_READ_LEN`].
 pub const AEC_SPENERGY_READ_LEN: usize = 16;
+
+/// `AEC_FIXEDBEAMSONOFF` command ID (`int32 × 1`). 1 fixes both focused beams at
+/// the azimuths and elevations below instead of letting them track; 0 returns them
+/// to tracking. Off by default, and back to off on every chip reboot.
+pub const AEC_FIXEDBEAMSONOFF_CMD: u8 = 37;
+
+/// `AEC_FIXEDBEAMSAZIMUTH_VALUES` command ID (`float × 2`, radians) — the azimuth
+/// each focused beam is fixed at, in the chip's own azimuth convention. Default
+/// (0, 0). Used only while [`AEC_FIXEDBEAMSONOFF_CMD`] is 1.
+pub const AEC_FIXEDBEAMSAZIMUTH_VALUES_CMD: u8 = 81;
+
+/// `AEC_FIXEDBEAMSELEVATION_VALUES` command ID (`float × 2`, radians) — the
+/// elevation each focused beam is fixed at. Default (0, 0).
+pub const AEC_FIXEDBEAMSELEVATION_VALUES_CMD: u8 = 82;
+
+/// Payload length of either fixed-beam angle pair: 2 × f32 = 8 bytes (9 on a read
+/// with the status byte).
+pub const AEC_FIXEDBEAMS_PAIR_LEN: usize = 8;
+
+/// `AEC_FIXEDBEAMSGATING` command ID (`uint8 × 1`) — whether fixed beams with low
+/// speech energy are muted, leaving one active at a time. Off by default.
+pub const AEC_FIXEDBEAMSGATING_CMD: u8 = 83;
+
+/// `AEC_FIXEDBEAMSGATING` payload length: one byte.
+pub const AEC_FIXEDBEAMSGATING_LEN: usize = 1;
 
 /// Audio manager servicer resource ID. Owns the output-routing registers: which
 /// internal source each of the board's two output channels carries.
@@ -185,6 +210,20 @@ pub const AEC_AZIMUTH_VALUES_LABEL: &str = "AEC_AZIMUTH_VALUES (resid 33 cmd 75)
 
 /// [`AEC_SPENERGY_VALUES_CMD`] on [`AEC_RESID`], as a reader names it.
 pub const AEC_SPENERGY_VALUES_LABEL: &str = "AEC_SPENERGY_VALUES (resid 33 cmd 80)";
+
+/// [`AEC_FIXEDBEAMSONOFF_CMD`] on [`AEC_RESID`], as a reader names it.
+pub const AEC_FIXEDBEAMSONOFF_LABEL: &str = "AEC_FIXEDBEAMSONOFF (resid 33 cmd 37)";
+
+/// [`AEC_FIXEDBEAMSAZIMUTH_VALUES_CMD`] on [`AEC_RESID`], as a reader names it.
+pub const AEC_FIXEDBEAMSAZIMUTH_VALUES_LABEL: &str =
+    "AEC_FIXEDBEAMSAZIMUTH_VALUES (resid 33 cmd 81)";
+
+/// [`AEC_FIXEDBEAMSELEVATION_VALUES_CMD`] on [`AEC_RESID`], as a reader names it.
+pub const AEC_FIXEDBEAMSELEVATION_VALUES_LABEL: &str =
+    "AEC_FIXEDBEAMSELEVATION_VALUES (resid 33 cmd 82)";
+
+/// [`AEC_FIXEDBEAMSGATING_CMD`] on [`AEC_RESID`], as a reader names it.
+pub const AEC_FIXEDBEAMSGATING_LABEL: &str = "AEC_FIXEDBEAMSGATING (resid 33 cmd 83)";
 
 /// [`AUDIO_MGR_OP_L_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
 pub const AUDIO_MGR_OP_L_LABEL: &str = "AUDIO_MGR_OP_L (resid 35 cmd 15)";
@@ -380,6 +419,22 @@ pub fn decode_f32x4(p: &[u8; 16]) -> [f32; 4] {
     ]
 }
 
+/// Decode two consecutive IEEE-754 little-endian f32 values from an 8-byte payload.
+pub fn decode_f32x2(p: &[u8; 8]) -> [f32; 2] {
+    [
+        f32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+        f32::from_le_bytes([p[4], p[5], p[6], p[7]]),
+    ]
+}
+
+/// Encode two f32 values as the 8-byte little-endian payload a write carries.
+pub fn encode_f32x2(v: [f32; 2]) -> [u8; 8] {
+    let mut p = [0u8; 8];
+    p[..4].copy_from_slice(&v[0].to_le_bytes());
+    p[4..].copy_from_slice(&v[1].to_le_bytes());
+    p
+}
+
 /// Decode one IEEE-754 little-endian f32 from a 4-byte payload.
 pub fn decode_f32(p: &[u8; 4]) -> f32 {
     f32::from_le_bytes(*p)
@@ -458,6 +513,30 @@ mod tests {
                 AEC_SPENERGY_VALUES_LABEL,
                 AEC_RESID,
                 AEC_SPENERGY_VALUES_CMD,
+            ),
+            (
+                "AEC_FIXEDBEAMSONOFF",
+                AEC_FIXEDBEAMSONOFF_LABEL,
+                AEC_RESID,
+                AEC_FIXEDBEAMSONOFF_CMD,
+            ),
+            (
+                "AEC_FIXEDBEAMSAZIMUTH_VALUES",
+                AEC_FIXEDBEAMSAZIMUTH_VALUES_LABEL,
+                AEC_RESID,
+                AEC_FIXEDBEAMSAZIMUTH_VALUES_CMD,
+            ),
+            (
+                "AEC_FIXEDBEAMSELEVATION_VALUES",
+                AEC_FIXEDBEAMSELEVATION_VALUES_LABEL,
+                AEC_RESID,
+                AEC_FIXEDBEAMSELEVATION_VALUES_CMD,
+            ),
+            (
+                "AEC_FIXEDBEAMSGATING",
+                AEC_FIXEDBEAMSGATING_LABEL,
+                AEC_RESID,
+                AEC_FIXEDBEAMSGATING_CMD,
             ),
             (
                 "AUDIO_MGR_OP_L",
@@ -960,6 +1039,78 @@ mod tests {
             i2c_read_header(AEC_RESID, AEC_AECCONVERGED_CMD, SCALAR_READ_LEN),
             [33, 0x83, 5]
         );
+    }
+
+    #[test]
+    fn the_fixed_beam_registers_frame_as_the_vendor_table_gives_them() {
+        assert_eq!(
+            [
+                AEC_FIXEDBEAMSONOFF_CMD,
+                AEC_FIXEDBEAMSAZIMUTH_VALUES_CMD,
+                AEC_FIXEDBEAMSELEVATION_VALUES_CMD,
+                AEC_FIXEDBEAMSGATING_CMD,
+            ],
+            [37, 81, 82, 83]
+        );
+        assert_eq!(
+            i2c_read_header(AEC_RESID, AEC_FIXEDBEAMSONOFF_CMD, SCALAR_READ_LEN),
+            [33, 0xA5, 5]
+        );
+        assert_eq!(
+            i2c_read_header(
+                AEC_RESID,
+                AEC_FIXEDBEAMSAZIMUTH_VALUES_CMD,
+                AEC_FIXEDBEAMS_PAIR_LEN
+            ),
+            [33, 0xD1, 9]
+        );
+        assert_eq!(
+            i2c_read_header(
+                AEC_RESID,
+                AEC_FIXEDBEAMSELEVATION_VALUES_CMD,
+                AEC_FIXEDBEAMS_PAIR_LEN
+            ),
+            [33, 0xD2, 9]
+        );
+        assert_eq!(
+            i2c_read_header(
+                AEC_RESID,
+                AEC_FIXEDBEAMSGATING_CMD,
+                AEC_FIXEDBEAMSGATING_LEN
+            ),
+            [33, 0xD3, 2]
+        );
+        assert_eq!(
+            i2c_write_header(AEC_RESID, AEC_FIXEDBEAMSONOFF_CMD, SCALAR_READ_LEN),
+            [33, 37, 4]
+        );
+        assert_eq!(
+            i2c_write_header(
+                AEC_RESID,
+                AEC_FIXEDBEAMSAZIMUTH_VALUES_CMD,
+                AEC_FIXEDBEAMS_PAIR_LEN
+            ),
+            [33, 81, 8]
+        );
+        assert_eq!(
+            i2c_write_header(
+                AEC_RESID,
+                AEC_FIXEDBEAMSELEVATION_VALUES_CMD,
+                AEC_FIXEDBEAMS_PAIR_LEN
+            ),
+            [33, 82, 8]
+        );
+        const { assert!(AEC_FIXEDBEAMS_PAIR_LEN <= CTRL_BUF_CAPACITY) };
+    }
+
+    #[test]
+    fn an_angle_pair_round_trips_little_endian() {
+        // 0x3F800000 = 1.0f32; little-endian on the wire is 00 00 80 3F.
+        assert_eq!(encode_f32x2([1.0, 0.0]), [0, 0, 0x80, 0x3F, 0, 0, 0, 0]);
+        let pair = [core::f32::consts::FRAC_PI_2, -0.5];
+        let back = decode_f32x2(&encode_f32x2(pair));
+        assert_eq!(back.map(f32::to_bits), pair.map(f32::to_bits));
+        assert!(decode_f32x2(&encode_f32x2([f32::NAN, 0.0]))[0].is_nan());
     }
 
     #[test]

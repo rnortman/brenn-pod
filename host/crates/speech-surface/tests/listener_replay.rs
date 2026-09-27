@@ -24,13 +24,28 @@ use speech_pipeline::{
 };
 use speech_surface::replay::{ReplayListener, StopReason, replay_framelog};
 
+/// The wake tail the espeak wake-phrase fixture needs. On that synthetic voice
+/// the detector fires inside the phrase, up to ~700 ms before it ends, and the
+/// re-onset after it carries the wake-only carve to ~1.1 s past the wake end —
+/// unlike live speech, where the shipped default is measured. The real-audio hold
+/// tests are about the hold, so they state this rather than inherit the default.
+const FIXTURE_WAKE_TAIL_SAMPLES: u64 = 24_000;
+
+/// Production knobs, with the tail the fixture needs.
+fn fixture_config() -> ListenerConfig {
+    ListenerConfig {
+        wake_tail_samples: FIXTURE_WAKE_TAIL_SAMPLES,
+        ..ListenerConfig::default()
+    }
+}
+
 /// Load a `ReplayListener` with the wake-command hold off: the plain replays
 /// have no command after the wake phrase, so the hold must be disabled or it
 /// suppresses the carve these tests assert on.
 fn committed_listener() -> ReplayListener {
     committed_listener_with(ListenerConfig {
         command_wait_samples: 0,
-        ..ListenerConfig::default()
+        ..fixture_config()
     })
 }
 
@@ -382,13 +397,13 @@ fn wake_carves(events: &[ListenerEvent]) -> Vec<&speech_pipeline::CarvedUtteranc
         .collect()
 }
 
-/// The shipped default: a wake, a 2 s pause and a command replay as one utterance
+/// The shipped wait: a wake, a 2 s pause and a command replay as one utterance
 /// covering all three. This is the failure the hold was built for — the wake word
 /// closing its own utterance and the command arriving to no arm.
 #[test]
 fn a_wake_a_pause_and_a_command_coalesce_into_one_utterance() {
     let pause_len = 32_000; // 2.0 s
-    let (summary, wake_len) = replay_wake_pause_command(pause_len, ListenerConfig::default());
+    let (summary, wake_len) = replay_wake_pause_command(pause_len, fixture_config());
 
     let wakes = summary
         .events
@@ -500,7 +515,7 @@ fn the_off_switch_publishes_the_wake_word_alone_and_drops_the_command() {
         pause_len,
         ListenerConfig {
             command_wait_samples: 0,
-            ..ListenerConfig::default()
+            ..fixture_config()
         },
     );
 
@@ -526,7 +541,7 @@ fn the_off_switch_publishes_the_wake_word_alone_and_drops_the_command() {
         first.pcm.len()
     );
     let tail = first.pcm.len() - wake.wake_end_sample;
-    let wake_tail = ListenerConfig::default().wake_tail_samples as usize;
+    let wake_tail = fixture_config().wake_tail_samples as usize;
     assert!(
         tail < wake_tail,
         "the published utterance ends {tail} samples after the wake, inside the \
@@ -565,7 +580,7 @@ fn the_off_switch_publishes_the_wake_word_alone_and_drops_the_command() {
 fn a_pause_past_the_wait_expires_the_arm_and_loses_the_command() {
     // 10.0 s, past the 8 s wait.
     let pause_len = 160_000;
-    let (summary, wake_len) = replay_wake_pause_command(pause_len, ListenerConfig::default());
+    let (summary, wake_len) = replay_wake_pause_command(pause_len, fixture_config());
 
     let held_at = summary
         .events
@@ -647,7 +662,7 @@ fn a_wake_and_a_command_in_two_device_segments_coalesce() {
         0,
     );
 
-    let mut listener = committed_listener_with(ListenerConfig::default());
+    let mut listener = committed_listener_with(fixture_config());
     let summary = replay_framelog(&framelog, &mut listener, 1).expect("replay");
 
     assert_eq!(

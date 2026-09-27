@@ -19,8 +19,8 @@ use audio_pipeline::playback::{
 use audio_pipeline::wire::MAX_AUDIO_PAYLOAD;
 use serde::Deserialize;
 use speech_pipeline::{
-    BargeMode, ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig, FRAME_MS,
-    ListenerConfig, PacerConfig, Url, WakePolicy,
+    BargeInConfig, BargeMode, ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig,
+    FRAME_MS, ListenerConfig, PacerConfig, Url, WakePolicy,
 };
 
 use crate::psk::parse_psk_hex;
@@ -599,7 +599,9 @@ pub struct WakeConfig {
     pub threshold: f32,
     /// An utterance whose speech ends within this many ms of the wake end held the
     /// wake word alone: it is not sent to STT, and the wake waits for its command.
-    /// At least one Silero chunk (32 ms).
+    /// At least one Silero chunk (32 ms). The default is 500 ms, measured on live
+    /// speech; a command shorter than about half a second said in one breath with
+    /// the phrase is held as a bare wake.
     #[serde(default = "default_wake_tail_ms")]
     pub wake_tail_ms: u32,
     /// How long the wake waits, after a wake-only utterance, for the command to
@@ -758,7 +760,8 @@ impl EndpointerConfig {
     }
 
     /// Semantic checks: both thresholds strict probabilities with the release no
-    /// higher than the onset (hysteresis), and a non-zero onset run.
+    /// higher than the onset (hysteresis), a non-zero onset run, and an onset no
+    /// lazier than the compiled barge-in sustain guard on either axis.
     pub fn validate(&self) -> Result<(), String> {
         for (field, value) in [
             ("onset_thresh", self.onset_thresh),
@@ -792,6 +795,23 @@ impl EndpointerConfig {
                     "endpointer.{field} {ms} must be at least 32 ms (one Silero chunk)"
                 ));
             }
+        }
+        // The barge-in sustain guard is compiled in and must stay lazier than the onset
+        // on both axes (the listener asserts it at construction); a value past it is
+        // refused here, where the key is still nameable, instead of panicking the
+        // daemon on its first pod connection.
+        let guard = BargeInConfig::default();
+        if self.onset_thresh > guard.sustain_thresh {
+            return Err(format!(
+                "endpointer.onset_thresh {} must not exceed the barge-in sustain threshold {} (compiled)",
+                self.onset_thresh, guard.sustain_thresh
+            ));
+        }
+        if self.onset_chunks > guard.sustain_chunks {
+            return Err(format!(
+                "endpointer.onset_chunks {} must not exceed the barge-in sustain run {} chunks (compiled)",
+                self.onset_chunks, guard.sustain_chunks
+            ));
         }
         Ok(())
     }
@@ -984,14 +1004,18 @@ pub struct BrennConfig {
     pub presence_stow_margin_ms: u64,
     /// The pose the head takes on a wake word and on a barge: what *listening*
     /// looks like. A name in the daemon's pose library, which this side cannot
-    /// resolve — it validates only wire constraints. Must be non-empty, no
-    /// longer than an asset name, and not the reserved `keep`.
+    /// resolve — it validates only wire constraints. Must be non-empty and no
+    /// longer than an asset name. May be the reserved `keep`, which holds the
+    /// head where it stands instead of moving it; a keep moves nothing on a
+    /// resting machine, so a deployment without an idle loop wants a pose. A
+    /// [`BrennConfig::presence_wake_move_ms`] set alongside `keep` has no effect.
     #[serde(default = "default_presence_wake_pose")]
     pub presence_wake_pose: String,
     /// The pose the head takes when an utterance goes to the brain: what
     /// *answering* looks like. Same library and same rules as
     /// [`BrennConfig::presence_wake_pose`]; equal to it means the two events
-    /// look alike and the head does not move between them.
+    /// look alike and the head does not move between them. May not be `keep`:
+    /// the turn pose is what raises a head a `keep` wake left where it was.
     #[serde(default = "default_presence_turn_pose")]
     pub presence_turn_pose: String,
     /// How long the move to [`BrennConfig::presence_wake_pose`] takes. Absent
@@ -1130,41 +1154,48 @@ impl BrennConfig {
                 ));
             }
         }
-        // A raise is a pose and a pace, and the step the scripter emits carries
-        // both: the pose the daemon resolves against its deployed library, which
-        // nothing here can do, and the pace as a `move_ms` on the wire. What
-        // this side can say is whether a script may carry the step at all — an
-        // empty name, one past the asset-name bound, the reserved `keep`, a pace
-        // of zero or one past the protocol's ceiling — and it asks the wire's
-        // own door with the step the scripter will build rather than restating
-        // either rule: the copies would sit in two repositories across a
-        // published pin, and a value this side admits but the wire rejects
-        // reaches an `expect` in `Scripter::emit` rather than an operator.
+        // The daemon resolves the pose against its deployed library, which
+        // nothing here can do; what this side checks is whether a script may
+        // carry the step at all. `Raise::check_carried` asks the wire's own
+        // validation rather than restating its rules, which would sit in two
+        // repositories across a published pin. A value admitted here must be
+        // one the wire accepts, since `Scripter::emit` relies on it.
+        //
+        // The turn pose passes `Raise::check_turn`, the same check a gaze passes
+        // at dispatch, so the two cannot come apart.
+        let uncarried = |keys: &[&str],
+                         raise: &crate::scripter::Raise,
+                         refusal: &motion_proto::ScriptError|
+         -> String {
+            let named: Vec<String> = keys.iter().map(|key| format!("brenn.{key}")).collect();
+            format!(
+                "{} state a raise to {:?} that no motion script may carry: {refusal}",
+                named.join(" and "),
+                raise.pose,
+            )
+        };
         let raises = self.script_raises();
+        raises.turn.check_turn().map_err(|refusal| match refusal {
+            crate::scripter::TurnRefusal::Keep => format!(
+                "brenn.presence_turn_pose may not be {:?}: the turn pose raises the head a `keep` wake leaves where it is",
+                motion_proto::KEEP_BASE
+            ),
+            crate::scripter::TurnRefusal::Uncarried(refusal) => uncarried(
+                &["presence_turn_pose", "presence_turn_move_ms"],
+                &raises.turn,
+                &refusal,
+            ),
+        })?;
         for (keys, raise) in [
             (
                 &["presence_wake_pose", "presence_wake_move_ms"][..],
                 &raises.wake,
             ),
-            (
-                &["presence_turn_pose", "presence_turn_move_ms"][..],
-                &raises.turn,
-            ),
             (&["presence_stow_move_ms"][..], &raises.stow),
         ] {
-            if let Err(refusal) = motion_proto::MotionScript::new(
-                "",
-                0,
-                vec![raise.step(0)],
-                motion_proto::MAX_TIMEOUT_MS,
-            ) {
-                let named: Vec<String> = keys.iter().map(|key| format!("brenn.{key}")).collect();
-                return Err(format!(
-                    "{} state a raise to {:?} that no motion script may carry: {refusal}",
-                    named.join(" and "),
-                    raise.pose,
-                ));
-            }
+            raise
+                .check_carried()
+                .map_err(|refusal| uncarried(keys, raise, &refusal))?;
         }
         Ok(())
     }
@@ -2045,7 +2076,7 @@ threshold = 0.7
             Config::parse("listen_addr = \"10.0.0.5:7380\"\npod_psk_file = \"/psk.toml\"\n[wake]\nmode = \"oww\"\nmelspectrogram = \"/m/mel.onnx\"\nembedding = \"/m/emb.onnx\"\nmodel = \"/m/wake.onnx\"")
                 .expect("parse");
         let wake = config.wake.as_ref().expect("wake table");
-        assert_eq!(wake.wake_tail_ms, 1_500);
+        assert_eq!(wake.wake_tail_ms, 500);
         assert_eq!(wake.command_wait_ms, 8_000);
         // The listener's samples are the single source; these are that value in ms.
         let listener = ListenerConfig::default();
@@ -2404,6 +2435,29 @@ threshold = 0.7
         .expect("parse");
         let err = config.validate().unwrap_err();
         assert!(err.contains("release_thresh"), "message: {err}");
+    }
+
+    /// An onset lazier than the compiled barge-in sustain guard would panic the
+    /// listener on its first pod connection, so it is refused at validation with
+    /// the key named; the guard's own values are lawful.
+    #[test]
+    fn an_onset_threshold_above_the_sustain_guard_is_refused_at_validate() {
+        let endpointer = |extra: &str| {
+            Config::parse(&with_addr(&format!(
+                "[endpointer]\nmodel = \"/m/s.onnx\"\n{extra}"
+            )))
+            .expect("parse")
+            .validate()
+        };
+        let err = endpointer("onset_thresh = 0.65\nrelease_thresh = 0.6").unwrap_err();
+        assert!(
+            err.contains("endpointer.onset_thresh") && err.contains("0.6"),
+            "message: {err}"
+        );
+        let err = endpointer("onset_chunks = 9").unwrap_err();
+        assert!(err.contains("endpointer.onset_chunks"), "message: {err}");
+        endpointer("onset_thresh = 0.6\nrelease_thresh = 0.6\nonset_chunks = 8")
+            .expect("the guard's own values validate");
     }
 
     #[test]
@@ -3432,12 +3486,12 @@ max_backoff_ms = 9000
             "a name lawful by characters and unlawful by bytes"
         );
         for key in ["presence_wake_pose", "presence_turn_pose"] {
-            for value in [
-                "".to_string(),
-                long.clone(),
-                wide.clone(),
-                motion_proto::KEEP_BASE.to_string(),
-            ] {
+            let mut refused = vec!["".to_string(), long.clone(), wide.clone()];
+            // Only the turn pose refuses `keep`; the wake pose holds the head on it.
+            if key == "presence_turn_pose" {
+                refused.push(motion_proto::KEEP_BASE.to_string());
+            }
+            for value in refused {
                 let err = Config::parse(&with_addr(&brenn_table(&format!("{key} = {value:?}"))))
                     .expect("parse")
                     .validate()
@@ -3455,6 +3509,77 @@ max_backoff_ms = 9000
             .expect("parse")
             .validate()
             .expect("a name of lawful length is a name this side accepts");
+        }
+    }
+
+    /// `keep` is a wake pose — the head holds where it stands — and never a turn
+    /// pose, which is what raises the head a `keep` wake left in place.
+    #[test]
+    fn keep_is_a_wake_pose_and_not_a_turn_pose() {
+        let config = Config::parse(&with_addr(&format!(
+            "{}{}",
+            brenn_mode_tables(),
+            brenn_table(&format!(
+                "presence_wake_pose = {:?}",
+                motion_proto::KEEP_BASE
+            ))
+        )))
+        .expect("parse");
+        config.validate().expect("a `keep` wake pose validates");
+        assert!(
+            config
+                .brenn
+                .as_ref()
+                .expect("brenn table")
+                .script_raises()
+                .wake
+                .is_keep()
+        );
+        let err = Config::parse(&with_addr(&format!(
+            "{}{}",
+            brenn_mode_tables(),
+            brenn_table(&format!(
+                "presence_turn_pose = {:?}",
+                motion_proto::KEEP_BASE
+            ))
+        )))
+        .expect("parse")
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("presence_turn_pose"), "message: {err}");
+    }
+
+    /// A configured turn pose and a gaze standing for it are held to one door:
+    /// the config validates exactly when the same raise passes `check_turn`.
+    #[test]
+    fn the_turn_pose_and_a_gaze_meet_one_door() {
+        for (pose, move_ms) in [
+            ("neutral", None),
+            (motion_proto::KEEP_BASE, None),
+            ("", None),
+            ("look_l30", Some(0)),
+            ("look_l30", Some(600)),
+        ] {
+            let mut body = format!("presence_turn_pose = {pose:?}");
+            if let Some(ms) = move_ms {
+                body.push_str(&format!("\npresence_turn_move_ms = {ms}"));
+            }
+            let config = Config::parse(&with_addr(&format!(
+                "{}{}",
+                brenn_mode_tables(),
+                brenn_table(&body)
+            )))
+            .expect("parse");
+            assert_eq!(
+                config.validate().is_ok(),
+                crate::scripter::Raise {
+                    pose: pose.into(),
+                    move_ms,
+                }
+                .check_turn()
+                .is_ok(),
+                "{pose:?} at {move_ms:?}"
+            );
         }
     }
 

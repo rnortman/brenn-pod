@@ -11,6 +11,7 @@ pub mod clip;
 pub mod config;
 mod console;
 pub mod exit;
+pub mod gaze;
 pub mod jsonl;
 pub mod pipeline;
 pub mod playback_router;
@@ -40,6 +41,8 @@ pub use config::{
     BrennConfig, Config, ConfigError, JsonlConfig, JsonlSink, PipelineConfig, PodConfig,
     RecordConfig, RoomLookup, UNMAPPED_ROOM,
 };
+/// The seam a composing process chooses where the head looks on a wake through.
+pub use gaze::{DoaSample, GazePose, WakeGaze};
 pub use jsonl::{JsonlHandle, emit_line, format_line};
 pub use prune::{PruneFailure, PruneHalt, PruneOutcome, PruneRequest, PruneTier, PrunedLog, prune};
 /// The link's TLS-PSK parameters, shared with the device clients.

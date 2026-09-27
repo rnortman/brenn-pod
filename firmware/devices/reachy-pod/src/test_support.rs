@@ -12,9 +12,10 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use xvf3800_ctrl::{ControlTransport, STATUS_DONE};
+use xvf3800_ctrl::{ControlTransport, STATUS_DONE, encode_f32x2};
 
 use crate::alsa_capture::PcmError;
+use crate::fixed_beams::BROADSIDE;
 use crate::run::PeriodSource;
 use crate::selftest::Outcome;
 
@@ -72,6 +73,19 @@ pub fn f32x4_bytes(values: [f32; 4]) -> Vec<u8> {
         payload.extend_from_slice(&v.to_le_bytes());
     }
     payload
+}
+
+/// The six reads a healthy `ctrl_fixedbeams` makes, in order: gating, the switch
+/// before, the switch on, both angle pairs as written, and the switch after release.
+pub fn fixed_beam_answers(gating: u8) -> Vec<(u8, Vec<u8>)> {
+    vec![
+        (STATUS_DONE, vec![gating]),
+        (STATUS_DONE, 0i32.to_le_bytes().to_vec()),
+        (STATUS_DONE, 1i32.to_le_bytes().to_vec()),
+        (STATUS_DONE, encode_f32x2(BROADSIDE.azimuth).to_vec()),
+        (STATUS_DONE, encode_f32x2(BROADSIDE.elevation).to_vec()),
+        (STATUS_DONE, 0i32.to_le_bytes().to_vec()),
+    ]
 }
 
 impl ControlTransport for Scripted {

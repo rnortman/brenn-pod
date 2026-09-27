@@ -20,7 +20,7 @@ pub use endpointer::{
     EndpointEvent, EndpointState, EndpointTransition, Endpointer, EndpointerConfig, TransitionCause,
 };
 pub use event::{
-    BargeCause, CarveTiming, CarvedUtterance, Feed, ListenerEvent, ListenerUtteranceId,
+    BargeCause, CarveTiming, CarvedUtterance, DoaSample, Feed, ListenerEvent, ListenerUtteranceId,
     StatsFlushCause, StatsModel, WakePolicy,
 };
 pub use oww_stream::{

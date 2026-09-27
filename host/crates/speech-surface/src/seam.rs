@@ -2,7 +2,7 @@
 //! dropping handoff whose sender needs no runtime and whose receiver lives
 //! inside [`Server::run`](crate::server::Server::run).
 //!
-//! The two seams in [`Sinks`](crate::server::Sinks) are things the server
+//! The seams in [`Sinks`](crate::server::Sinks) are things the server
 //! *calls*. These run the other way — the composing process has something to
 //! say and the thing that could say it is inside the run — so what crosses is a
 //! queue rather than a handle, and a refusal is a drop rather than a wait.

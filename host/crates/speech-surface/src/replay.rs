@@ -18,7 +18,7 @@ use std::sync::Arc;
 use audio_pipeline::wire::decode_frame;
 use pod_ingest::{
     CloseCause, FrameLogError, FrameLogReader, HostMicros, LogItem, ResumeLedger, SegmentClose,
-    SessionEvent, SessionFsm,
+    SessionEvent, SessionFsm, TelemetryKind,
 };
 use speech_pipeline::{
     BargeInConfig, Feed, ListenerConfig, ListenerEvent, ListenerState, OwwConfig, OwwModels, PodId,
@@ -40,8 +40,8 @@ pub(crate) fn feed_end_cause(close: &SegmentClose) -> SegmentEndCause {
 
 /// Map one [`SessionEvent`] to the listener [`Feed`] it feeds, tracking the pod
 /// identity across the connection. `HelloAccepted` establishes `pod` and opens a
-/// fresh epoch; audio and segment boundaries stream through; other events (
-/// telemetry, protocol errors) produce no feed. The single mapping shared by the
+/// fresh epoch; audio and segment boundaries stream through; azimuth telemetry
+/// becomes a `Feed::Doa`; other telemetry and protocol errors produce no feed. The single mapping shared by the
 /// live `tap_listener` and the offline replay engine, so the two can never drift.
 pub(crate) fn session_event_to_feed(
     ev: &SessionEvent,
@@ -80,6 +80,14 @@ pub(crate) fn session_event_to_feed(
         SessionEvent::SegmentClosed { close, host_rx, .. } => Some(Feed::SegmentClosed {
             end: feed_end_cause(close),
             host_rx: *host_rx,
+        }),
+        SessionEvent::Telemetry {
+            sample_offset,
+            kind: TelemetryKind::Azimuths { values },
+            ..
+        } => Some(Feed::Doa {
+            sample_offset: *sample_offset,
+            azimuths: *values,
         }),
         _ => None,
     }
@@ -358,7 +366,37 @@ fn drive(
 mod tests {
     use super::*;
     use crate::config::wake_table_toml;
+    use pod_ingest::DeviceMicros;
     use speech_pipeline::{BargeMode, WakePolicy};
+
+    /// Azimuth telemetry reaches the listener as a reading, with the offset and
+    /// values it arrived with; speech energy, which nothing reads, does not.
+    #[test]
+    fn azimuth_telemetry_feeds_the_listener_and_energy_does_not() {
+        let telemetry = |kind| SessionEvent::Telemetry {
+            segment_id: 3,
+            sample_offset: -40,
+            kind,
+            device_ts: DeviceMicros(1_000),
+            host_rx: HostMicros(2_000),
+        };
+        let values = [0.5, 1.25, f32::NAN, 0.5];
+        let mut pod = Some(PodId(String::from("pod-x")));
+        match session_event_to_feed(&telemetry(TelemetryKind::Azimuths { values }), &mut pod, 1) {
+            Some(Feed::Doa {
+                sample_offset,
+                azimuths,
+            }) => {
+                assert_eq!(sample_offset, -40);
+                assert_eq!(azimuths.map(f32::to_bits), values.map(f32::to_bits));
+            }
+            other => panic!("azimuths map to a reading: {other:?}"),
+        }
+        assert!(
+            session_event_to_feed(&telemetry(TelemetryKind::SpEnergy { values }), &mut pod, 1)
+                .is_none()
+        );
+    }
 
     /// Every knob the assembly sets lands in its own field. The two ms values are
     /// mutually distinguishable on purpose: the sample counts arrive as a tuple,

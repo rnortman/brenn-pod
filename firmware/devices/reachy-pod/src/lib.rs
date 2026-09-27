@@ -15,6 +15,7 @@ pub mod beam;
 pub mod chip;
 pub mod cli;
 pub mod config;
+pub mod fixed_beams;
 pub mod logging;
 pub mod playback;
 mod regs;

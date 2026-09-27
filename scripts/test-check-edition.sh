@@ -12,6 +12,11 @@
 
 set -euo pipefail
 
+# Git exports its own location to hooks, `rebase -x` and `bisect run`
+# (GIT_INDEX_FILE, GIT_DIR, GIT_WORK_TREE, …). Inherited here, `git add` in a
+# fixture repo would rewrite the caller's index instead of the fixture's.
+unset "${!GIT_@}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD="$SCRIPT_DIR/check-edition.sh"
 

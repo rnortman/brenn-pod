@@ -56,6 +56,13 @@ pub enum Feed {
         /// number is referenced to.
         host_rx: HostMicros,
     },
+    /// One azimuth reading from the array. `sample_offset` is relative to the open
+    /// segment's base, from the device timestamp (it may be negative). Lossy like
+    /// `Audio`: a reading is shed on a full channel, never waited for.
+    Doa {
+        sample_offset: i64,
+        azimuths: [f32; 4],
+    },
     /// Playback state for this pod changed. Fed by the surface's playback-event
     /// adapter; ordering relative to audio feeds is inherently fuzzy (independent
     /// tasks), which the ± `lead_ms` accuracy of the progress estimate already
@@ -92,6 +99,12 @@ pub enum Feed {
     /// returns with its original deadline ([`ListenerEvent::ListenRestored`]); any
     /// other id is a no-op.
     CandidateDeclined { id: ListenerUtteranceId },
+    /// The pipeline dispatched the candidate `id` as a turn. Dispatch is terminal
+    /// for the utterance: the listener ends its identity and returns the endpointer
+    /// to idle, so speech that resumes afterwards re-onsets fresh and must pass the
+    /// wake gate again (one command per wake). Sent before the brain is awaited.
+    /// A stale `id` — already closed, or from a prior epoch — is a no-op.
+    CandidateDispatched { id: ListenerUtteranceId },
     /// The transport segment closed (the authoritative outer boundary). Finalizes
     /// any in-progress utterance and clears the wake arm.
     SegmentClosed {
@@ -212,6 +225,19 @@ pub enum BargeCause {
     Wake,
 }
 
+/// One azimuth reading from the pod's microphone array, placed on the listener's
+/// absolute sample axis.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct DoaSample {
+    /// Absolute sample index the reading is stamped at (the segment base plus
+    /// the reading's device-timestamp offset), in the connection's index domain.
+    pub sample: u64,
+    /// The chip's four beam azimuths, radians, in its own convention
+    /// (`TelemetryKind::Azimuths`): angle from the array axis, NaN when a beam
+    /// tracks nothing.
+    pub azimuths: [f32; 4],
+}
+
 /// What the listener emits back to the pipeline.
 #[derive(Debug, Clone)]
 pub enum ListenerEvent {
@@ -225,6 +251,13 @@ pub enum ListenerEvent {
         epoch: u64,
         score: f32,
         wake_end_sample: u64,
+        /// The array's azimuth readings stamped within the last half second of the
+        /// phrase, plus one chunk of slack past the detector's end
+        /// (`[wake_end_sample − 8000, wake_end_sample + 1600]`), oldest first, in the
+        /// chip's convention. Empty means no reading arrived in that span. Says where
+        /// the array heard the phrase from, not where the talker is: turning that into
+        /// a bearing needs the array's attitude, which the listener does not have.
+        doa: Vec<DoaSample>,
     },
     /// A wake phrase crossed threshold and was discarded unheard, because the pod
     /// was muted — its own playback was sounding, or its tail had not yet passed.
@@ -270,7 +303,10 @@ pub enum ListenerEvent {
         pod: PodId,
         utterance_id: ListenerUtteranceId,
     },
-    /// The continuation window elapsed with no resume — the utterance is final.
+    /// The utterance is final: nothing more is carved under its id. Emitted when the
+    /// continuation window elapses with no resume, when the device closes the
+    /// segment, when a stream discontinuity abandons the utterance, and when the
+    /// pipeline reports it dispatched ([`Feed::CandidateDispatched`]).
     UtteranceClosed {
         pod: PodId,
         utterance_id: ListenerUtteranceId,

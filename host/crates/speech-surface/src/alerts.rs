@@ -1,7 +1,7 @@
 //! The operator-alert seam: a queue a composing process raises alerts on, and
 //! the half the server drains onto the bus attachment it already holds.
 //!
-//! The two seams in [`Sinks`](crate::server::Sinks) are things the server
+//! The seams in [`Sinks`](crate::server::Sinks) are things the server
 //! *calls*. This one runs the other way: the composing process has something to
 //! say and the attachment that could say it lives inside [`Server::run`]. What
 //! crosses is a queue rather than a handle, for two reasons — the raiser is not

@@ -79,7 +79,9 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use brenn_bridge::{BridgeHandle, PublishRequest, Urgency};
-use motion_proto::{MAX_TIMEOUT_MS, MotionScript, Play, STOW_POSE, SeqSource, Step, unix_millis};
+use motion_proto::{
+    MAX_TIMEOUT_MS, MotionScript, Play, STOW_POSE, ScriptError, SeqSource, Step, unix_millis,
+};
 use serde_json::json;
 use speech_pipeline::{PodId, TurnEnd, UtteranceId};
 use tokio::sync::{Notify, mpsc};
@@ -89,6 +91,7 @@ use tokio_util::sync::CancellationToken;
 use crate::barge::TurnAudio;
 use crate::brenn::publish_once;
 use crate::config::BrennConfig;
+use crate::gaze::GazePose;
 use crate::jsonl::JsonlHandle;
 use crate::time::due;
 
@@ -128,13 +131,70 @@ impl Raise {
         }
     }
 
-    /// This raise as a base step due `after_ms` past the script's arrival.
+    /// Whether this raise is the reserved `keep`: the head holds where it is
+    /// commanded now rather than moving to a pose.
+    pub(crate) fn is_keep(&self) -> bool {
+        self.pose.as_ref() == motion_proto::KEEP_BASE
+    }
+
+    /// This raise as a base step due `after_ms` past the script's arrival. A
+    /// `keep` is a keep step and its `move_ms` is ignored: a keep has no
+    /// destination, so no pace.
     pub(crate) fn step(&self, after_ms: u64) -> Step {
+        if self.is_keep() {
+            return Step::keep(after_ms);
+        }
         match self.move_ms {
             Some(move_ms) => Step::timed(after_ms, self.pose.as_ref(), move_ms),
             None => Step::new(after_ms, self.pose.as_ref()),
         }
     }
+
+    /// Whether some motion script may carry this raise's step, answered by the
+    /// wire's own door with the step the scripter builds.
+    ///
+    /// # Errors
+    ///
+    /// The wire's refusal of the step.
+    pub(crate) fn check_carried(&self) -> Result<(), ScriptError> {
+        MotionScript::new("", 0, vec![self.step(0)], MAX_TIMEOUT_MS).map(|_| ())
+    }
+
+    /// The one door for a raise that stands for the turn pose:
+    /// `BrennConfig::validate` holds the configured turn pose to it and
+    /// [`Raise::from_gaze`] holds a gaze to it.
+    ///
+    /// # Errors
+    ///
+    /// [`TurnRefusal::Keep`] for `keep`, [`TurnRefusal::Uncarried`] for a step
+    /// no motion script may carry.
+    pub(crate) fn check_turn(&self) -> Result<(), TurnRefusal> {
+        if self.is_keep() {
+            return Err(TurnRefusal::Keep);
+        }
+        self.check_carried().map_err(TurnRefusal::Uncarried)
+    }
+
+    /// A gaze as the raise a wake carries, or why it cannot be one. It stands in
+    /// for the turn pose at dispatch, so it is held to [`Raise::check_turn`].
+    pub(crate) fn from_gaze(gaze: GazePose) -> Result<Raise, TurnRefusal> {
+        let raise = Raise {
+            pose: gaze.name.as_str().into(),
+            move_ms: gaze.move_ms,
+        };
+        raise.check_turn().map(|()| raise)
+    }
+}
+
+/// Why a raise may not stand for the turn pose.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub(crate) enum TurnRefusal {
+    /// `keep`: the turn is what raises the head a `keep` wake left where it is.
+    #[error("the turn may not be `keep`: it raises the head a `keep` wake leaves where it is")]
+    Keep,
+    /// A step no motion script may carry.
+    #[error("no motion script may carry it: {0}")]
+    Uncarried(ScriptError),
 }
 
 /// The three moves this scripter ever asks for.
@@ -286,8 +346,16 @@ impl Now {
 // No `Eq`: a cue carries a speed, which is a float.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScriptInput {
-    /// A confirmed wake word. The head goes up.
-    Wake(PodId),
+    /// A confirmed wake word. The head goes up: to `gaze` when the wake carried
+    /// one, the pose the composing process chose from where the phrase was heard,
+    /// and otherwise to the configured wake pose. A gaze then stands in for the
+    /// turn pose until the head's stow is due or the next wake replaces it.
+    Wake {
+        /// Whose interaction.
+        pod: PodId,
+        /// The chosen raise, already screened (`Raise::from_gaze`).
+        gaze: Option<Raise>,
+    },
     /// Speech over live playback: interaction with no wake word in front of it.
     /// The head goes up and the turn being cut stops counting.
     Barge(PodId),
@@ -355,7 +423,7 @@ impl ScriptInput {
     #[must_use]
     pub fn pod(&self) -> &PodId {
         match self {
-            ScriptInput::Wake(pod)
+            ScriptInput::Wake { pod, .. }
             | ScriptInput::Barge(pod)
             | ScriptInput::TurnStarted { pod, .. }
             | ScriptInput::TurnEnded { pod, .. }
@@ -535,6 +603,10 @@ struct PodScript {
     running: Option<Running>,
     /// When the standing script is said again.
     refresh: Option<Instant>,
+    /// The raise the last wake chose, standing in for the configured turn pose.
+    /// Replaced by every wake (a wake without one clears it), untouched by a
+    /// barge, and dropped when the stow is due.
+    gaze: Option<Raise>,
 }
 
 impl PodScript {
@@ -587,7 +659,10 @@ impl Scripter {
             // which is also the reason the task's line carries, so the drop and
             // the narration are one decision.
             ref refused if self.refusal(refused).is_some() => None,
-            ScriptInput::Wake(_) => self.raise(&pod, now, Cause::Wake),
+            ScriptInput::Wake { gaze, .. } => {
+                self.pods.entry(pod.clone()).or_default().gaze = gaze;
+                self.raise(&pod, now, Cause::Wake)
+            }
             ScriptInput::Barge(_) => self.raise(&pod, now, Cause::Barge),
             ScriptInput::TurnStarted { turn, .. } => {
                 let publish = self.raise(&pod, now, Cause::Turn);
@@ -759,9 +834,15 @@ impl Scripter {
     /// three raises in a few seconds, and where two of them agree they are one
     /// hold script. Where they do not, the base retargets mid-hold — which is
     /// the whole point of naming a pose per event.
+    ///
+    /// A wake that carried a gaze raises to it, and the turn that follows raises
+    /// to the same gaze, so the head stays on the talker through the reply. A
+    /// barge takes the configured wake pose and leaves the gaze standing.
     fn raise(&mut self, pod: &PodId, now: Now, cause: Cause) -> Option<ScriptPublish> {
+        let gaze = self.pods.get(pod).and_then(|p| p.gaze.clone());
         let at = match cause {
-            Cause::Turn => self.turn.clone(),
+            Cause::Wake => gaze.unwrap_or_else(|| self.wake.clone()),
+            Cause::Turn => gaze.unwrap_or_else(|| self.turn.clone()),
             _ => self.wake.clone(),
         };
         // A raise is a person. Whatever the last reply asked the head to do,
@@ -1103,11 +1184,22 @@ impl Scripter {
             ));
         }
         let steps = match p.want.steps(now.at, &stow) {
-            Some(steps) => {
+            Some(mut steps) => {
                 p.refresh = Some(now.at + refresh);
+                // A keep-only script is refused at the edge, so a held keep carries
+                // a stow at the engagement ceiling. Every refresh re-dates it, so
+                // the head stays where it is while the hold is refreshed and comes
+                // down once it stops being.
+                if matches!(&p.want, Want::Hold { at } if at.is_keep()) {
+                    let stow_ms = floor_ms.min(MAX_TIMEOUT_MS.saturating_sub(stow_headroom_ms));
+                    steps.push(stow.step(stow_ms));
+                    stow_terminal = true;
+                }
                 steps
             }
             None => {
+                // The stow is due: the interaction the gaze belonged to is over.
+                p.gaze = None;
                 match &p.want {
                     // A stow already due when the want was born: this publish is
                     // its first, so it is owed the second that every other
@@ -1144,7 +1236,8 @@ impl Scripter {
         // finds the previous script standing; on a timeline ending at the stow
         // it is the stow's own stated pace when that is longer, so the closing
         // move fits inside the timeout the daemon measures it against. A hold
-        // script carries no stow, so it keeps the configured bound.
+        // script carries no stow, so it keeps the configured bound — a keep-led
+        // hold aside, whose stow at the bound is terminal.
         let headroom_ms = if stow_terminal {
             stow_headroom_ms
         } else {
@@ -1184,8 +1277,9 @@ impl Scripter {
         // window and neither reaches past the wire's bound. The two refusals a
         // step
         // carries are screened at the same door: every pose name here is either
-        // `STOW_POSE` or one config validation has already offered to this same
-        // constructor, and every stated pace is one it has bounded. A cued pose
+        // `STOW_POSE`, one config validation has already offered to this same
+        // constructor, or a gaze `Raise::from_gaze` has, and every stated pace
+        // is one it has bounded. A cued pose
         // or play is screened at the same door one step earlier — its name
         // against the library, its speed against the wire's own range and its
         // span against the wire's ceiling — before it ever reaches a want, and
@@ -1800,6 +1894,14 @@ mod tests {
         PodId("pod-kitchen".into())
     }
 
+    /// A wake that carried no gaze.
+    fn plain_wake() -> ScriptInput {
+        ScriptInput::Wake {
+            pod: pod(),
+            gaze: None,
+        }
+    }
+
     const TURN: UtteranceId = UtteranceId(7);
 
     /// A cmd accounting reading, spelled the way the tests below want to talk
@@ -1892,7 +1994,7 @@ mod tests {
 
         /// Raise the head and start a turn, the opening every conversation has.
         fn wake_and_dispatch(&mut self, offset: Duration) {
-            self.publish(ScriptInput::Wake(pod()), offset);
+            self.publish(plain_wake(), offset);
             self.apply(
                 ScriptInput::TurnStarted {
                     pod: pod(),
@@ -1974,12 +2076,45 @@ mod tests {
     #[test]
     fn a_wake_holds_the_head_up_under_the_ceiling() {
         let mut fx = fixture();
-        let publish = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        let publish = fx.publish(plain_wake(), ZERO);
         assert_eq!(steps(&publish), vec![(0, NEUTRAL)]);
         assert_eq!(publish.script.pod(), "pod-kitchen");
         assert_eq!(publish.script.timeout_ms(), 30_000);
         assert_eq!(publish.cause, Cause::Wake);
         assert!(publish.change, "the head moved");
+    }
+
+    /// A `keep` wake holds the head in place: a keep now, and the stow the edge
+    /// requires at the engagement ceiling.
+    #[test]
+    fn a_keep_wake_holds_in_place_and_stows_at_the_ceiling() {
+        let mut fx = Fx {
+            scripter: Scripter::new(
+                timing(),
+                ScriptRaises {
+                    wake: Raise::to(motion_proto::KEEP_BASE),
+                    ..ScriptRaises::default()
+                },
+            ),
+            t0: Instant::now(),
+        };
+        let publish = fx.publish(plain_wake(), ZERO);
+        let headroom_ms = fx.scripter.stow_headroom_ms();
+        let stow_at = millis(CEILING).min(MAX_TIMEOUT_MS - headroom_ms);
+        assert_eq!(
+            publish.script.steps(),
+            [Step::keep(0), Raise::to(STOW_POSE).step(stow_at)]
+        );
+    }
+
+    /// A keep has no destination, so the pace a `keep` raise states is ignored.
+    #[test]
+    fn a_keep_raise_ignores_its_pace() {
+        let raise = Raise {
+            pose: motion_proto::KEEP_BASE.into(),
+            move_ms: Some(600),
+        };
+        assert_eq!(raise.step(5), Step::keep(5));
     }
 
     /// A barge and a dispatch raise on their own account, and the raise a pod
@@ -2021,7 +2156,7 @@ mod tests {
     #[test]
     fn a_wake_peeks_and_the_dispatched_utterance_answers() {
         let mut fx = two_pose_fixture();
-        let wake = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        let wake = fx.publish(plain_wake(), ZERO);
         assert_eq!(steps(&wake), vec![(0, PEEK)]);
         let turn = fx.publish(
             ScriptInput::TurnStarted {
@@ -2041,7 +2176,7 @@ mod tests {
     /// pose when an utterance is dispatched.
     #[test]
     fn a_barge_and_a_second_wake_both_peek_again() {
-        for listening in [ScriptInput::Barge(pod()), ScriptInput::Wake(pod())] {
+        for listening in [ScriptInput::Barge(pod()), plain_wake()] {
             let mut fx = two_pose_fixture();
             fx.wake_and_dispatch(ZERO);
             assert_eq!(fx.want(), holding(NEUTRAL), "answering");
@@ -2059,21 +2194,122 @@ mod tests {
         }
     }
 
+    /// A wake that carried a gaze toward `look_l30`.
+    fn gaze_wake() -> ScriptInput {
+        ScriptInput::Wake {
+            pod: pod(),
+            gaze: Some(Raise::to("look_l30")),
+        }
+    }
+
+    /// A dispatch of the turn every case here runs.
+    fn turn_started() -> ScriptInput {
+        ScriptInput::TurnStarted {
+            pod: pod(),
+            turn: TURN,
+        }
+    }
+
+    /// The wake raises to the gaze, and the turn that follows raises to the same
+    /// gaze rather than the configured turn pose, so nothing new is said.
+    #[test]
+    fn a_gaze_raise_is_used_for_the_turn() {
+        let mut fx = fixture();
+        let wake = fx.publish(gaze_wake(), ZERO);
+        assert_eq!(steps(&wake)[0].1, "look_l30");
+        assert!(
+            fx.apply(turn_started(), ZERO).is_none(),
+            "the turn's want is the wake's"
+        );
+        assert_eq!(fx.want(), holding("look_l30"));
+    }
+
+    /// Every wake replaces the gaze, and one without a gaze clears it: the turn
+    /// after it takes the configured turn pose.
+    #[test]
+    fn a_wake_without_a_gaze_clears_the_last_one() {
+        let mut fx = two_pose_fixture();
+        fx.publish(gaze_wake(), ZERO);
+        fx.publish(plain_wake(), ZERO);
+        fx.apply(turn_started(), ZERO);
+        assert_eq!(fx.want(), holding(NEUTRAL));
+    }
+
+    /// A barge raises to the configured wake pose and leaves the gaze standing
+    /// for the turn it opens.
+    #[test]
+    fn a_barge_raise_leaves_the_gaze_standing() {
+        let mut fx = two_pose_fixture();
+        fx.publish(gaze_wake(), ZERO);
+        fx.publish(ScriptInput::Barge(pod()), ZERO);
+        assert_eq!(fx.want(), holding(PEEK));
+        fx.apply(turn_started(), ZERO);
+        assert_eq!(fx.want(), holding("look_l30"));
+    }
+
+    /// The gaze belongs to one interaction: once its stow is due, a later turn
+    /// takes the configured turn pose.
+    #[test]
+    fn the_gaze_clears_at_quiet() {
+        let mut fx = fixture();
+        fx.publish(gaze_wake(), ZERO);
+        fx.publish(ScriptInput::Unanswered(pod()), ZERO);
+        let mut at = LINGER;
+        while !matches!(fx.want(), Want::Stowing | Want::Quiet) {
+            assert!(at <= CEILING, "the stow comes due: {:?}", fx.want());
+            fx.tick(at);
+            at += REFRESH;
+        }
+        fx.apply(turn_started(), at);
+        assert_eq!(fx.want(), holding(NEUTRAL));
+    }
+
+    /// A gaze is held to the door the turn pose passes: no `keep`, and nothing a
+    /// motion script cannot carry.
+    #[test]
+    fn a_gaze_is_screened_at_the_turn_pose_s_door() {
+        let gaze = |name: &str, move_ms| GazePose {
+            name: name.into(),
+            move_ms,
+        };
+        assert_eq!(
+            Raise::from_gaze(gaze(motion_proto::KEEP_BASE, None)),
+            Err(TurnRefusal::Keep)
+        );
+        for uncarried in [gaze("", None), gaze("look_l30", Some(0))] {
+            assert!(
+                matches!(
+                    Raise::from_gaze(uncarried.clone()),
+                    Err(TurnRefusal::Uncarried(_))
+                ),
+                "{uncarried:?} is refused as uncarried"
+            );
+        }
+        assert_eq!(
+            Raise::from_gaze(gaze("look_l30", None)),
+            Ok(Raise::to("look_l30"))
+        );
+        assert_eq!(
+            Raise::from_gaze(gaze("look_l30", Some(600))),
+            Ok(Raise {
+                pose: "look_l30".into(),
+                move_ms: Some(600),
+            })
+        );
+    }
+
     /// A raise to the pose the head is already at says nothing: the same event
     /// always produces the same pose, so a wake over a peek is the standing
     /// script and the refresh cadence carries it.
     #[test]
     fn a_raise_to_the_standing_pose_publishes_nothing() {
         let mut fx = two_pose_fixture();
-        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.publish(plain_wake(), ZERO);
         assert!(
             fx.apply(ScriptInput::Barge(pod()), ZERO).is_none(),
             "already peeking"
         );
-        assert!(
-            fx.apply(ScriptInput::Wake(pod()), ZERO).is_none(),
-            "still peeking"
-        );
+        assert!(fx.apply(plain_wake(), ZERO).is_none(), "still peeking");
     }
 
     /// A closing script holds the pose the head is at, and never retargets: an
@@ -2082,7 +2318,7 @@ mod tests {
     #[test]
     fn a_closing_script_keeps_the_pose_the_hold_carried() {
         let mut fx = two_pose_fixture();
-        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.publish(plain_wake(), ZERO);
         let unanswered = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
         assert_eq!(steps(&unanswered), vec![(0, PEEK), (8_000, STOW_POSE)]);
 
@@ -2132,7 +2368,7 @@ mod tests {
             ),
             t0: Instant::now(),
         };
-        let wake = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        let wake = fx.publish(plain_wake(), ZERO);
         assert_eq!(paced(&wake), vec![(0, PEEK, Some(600))]);
         let turn = fx.publish(
             ScriptInput::TurnStarted {
@@ -2150,7 +2386,7 @@ mod tests {
         );
 
         let mut unpaced = fixture();
-        let wake = unpaced.publish(ScriptInput::Wake(pod()), ZERO);
+        let wake = unpaced.publish(plain_wake(), ZERO);
         assert_eq!(paced(&wake), vec![(0, NEUTRAL, None)], "the library's pace");
     }
 
@@ -2171,7 +2407,7 @@ mod tests {
             ),
             t0: Instant::now(),
         };
-        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.publish(plain_wake(), ZERO);
         fx.publish(ScriptInput::Unanswered(pod()), ZERO);
         let confirming = fx.tick(LINGER);
         assert_eq!(
@@ -2184,7 +2420,7 @@ mod tests {
     #[test]
     fn an_unanswered_raise_stows_at_the_linger() {
         let mut fx = fixture();
-        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.publish(plain_wake(), ZERO);
         let publish = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
         assert_eq!(steps(&publish), vec![(0, NEUTRAL), (8_000, STOW_POSE)]);
         assert_eq!(publish.cause, Cause::Unanswered);
@@ -2199,7 +2435,7 @@ mod tests {
     #[test]
     fn speech_inside_the_window_holds_the_head_to_the_ceiling() {
         let mut fx = two_pose_fixture();
-        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.publish(plain_wake(), ZERO);
         fx.apply(
             ScriptInput::TurnStarted {
                 pod: pod(),
@@ -2986,7 +3222,7 @@ mod tests {
     #[test]
     fn a_hold_script_is_re_emitted_while_the_timeline_is_unknown() {
         let mut fx = fixture();
-        let first = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        let first = fx.publish(plain_wake(), ZERO);
         let mut last = first.script.seq();
         for round in 1..=4 {
             let out = fx.tick(REFRESH * round);
@@ -3057,7 +3293,7 @@ mod tests {
             },
             ZERO,
         );
-        let raise = fx.publish(ScriptInput::Wake(pod()), Duration::from_secs(1));
+        let raise = fx.publish(plain_wake(), Duration::from_secs(1));
         assert_eq!(steps(&raise), vec![(0, NEUTRAL)], "back to a hold");
         assert!(
             fx.apply(
@@ -3127,8 +3363,14 @@ mod tests {
     fn each_pod_carries_its_own_script() {
         let other = PodId("pod-study".into());
         let mut fx = fixture();
-        let first = fx.publish(ScriptInput::Wake(pod()), ZERO);
-        let second = fx.publish(ScriptInput::Wake(other.clone()), Duration::from_secs(1));
+        let first = fx.publish(plain_wake(), ZERO);
+        let second = fx.publish(
+            ScriptInput::Wake {
+                pod: other.clone(),
+                gaze: None,
+            },
+            Duration::from_secs(1),
+        );
         assert_eq!(first.script.pod(), "pod-kitchen");
         assert_eq!(second.script.pod(), "pod-study");
         assert!(second.script.seq() > first.script.seq());
@@ -3259,7 +3501,7 @@ mod tests {
         );
         assert_eq!(fx.want(), Want::Stowing);
 
-        let raised = fx.publish(ScriptInput::Wake(pod()), late + Duration::from_millis(1));
+        let raised = fx.publish(plain_wake(), late + Duration::from_millis(1));
 
         assert_eq!(steps(&raised), vec![(0, NEUTRAL)]);
         assert_eq!(fx.want(), holding(NEUTRAL));
@@ -3286,7 +3528,7 @@ mod tests {
         );
         assert!(fx.scripter.pods.is_empty());
 
-        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.publish(plain_wake(), ZERO);
         fx.publish(ScriptInput::Unanswered(pod()), ZERO);
         fx.tick(LINGER + REFRESH);
         assert_eq!(fx.want(), Want::Quiet, "the linger has run");
@@ -3365,7 +3607,7 @@ mod tests {
             ),
             t0: Instant::now(),
         };
-        let hold = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        let hold = fx.publish(plain_wake(), ZERO);
         assert_eq!(paced(&hold), vec![(0, NEUTRAL, None)]);
         assert_eq!(
             hold.script.timeout_ms(),
@@ -3421,7 +3663,7 @@ mod tests {
     #[test]
     fn an_ordinary_turns_timeout_is_the_configured_ceiling() {
         let mut fx = fixture();
-        let hold = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        let hold = fx.publish(plain_wake(), ZERO);
         assert_eq!(hold.script.timeout_ms(), 30_000);
 
         let unanswered = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
@@ -3566,7 +3808,7 @@ mod tests {
                         timing.refresh, timing.max_engaged
                     );
                     let mut fx = fixture_with(timing);
-                    let mut seen = vec![fx.publish(ScriptInput::Wake(pod()), ZERO)];
+                    let mut seen = vec![fx.publish(plain_wake(), ZERO)];
                     fx.apply(
                         ScriptInput::TurnStarted {
                             pod: pod(),
@@ -3645,7 +3887,7 @@ mod tests {
             ZERO,
         );
         // The stow is due at 2.5 s; the wake lands at 3 s, before the refresh.
-        let raise = fx.publish(ScriptInput::Wake(pod()), Duration::from_secs(3));
+        let raise = fx.publish(plain_wake(), Duration::from_secs(3));
         assert_eq!(steps(&raise), vec![(0, NEUTRAL)]);
 
         let due = fx.tick(REFRESH + Duration::from_secs(3));
@@ -3660,7 +3902,7 @@ mod tests {
     #[test]
     fn sequence_numbers_are_wall_clock_and_strictly_increasing() {
         let mut fx = fixture();
-        let first = fx.publish(ScriptInput::Wake(pod()), ZERO);
+        let first = fx.publish(plain_wake(), ZERO);
         assert_eq!(first.script.seq(), 1_786_543_210_123);
         let second = fx.publish(ScriptInput::Unanswered(pod()), ZERO);
         assert_eq!(second.script.seq(), 1_786_543_210_124, "same millisecond");
@@ -3668,7 +3910,7 @@ mod tests {
         let mut restarted = Scripter::new(timing(), ScriptRaises::default());
         let after = restarted
             .apply(
-                ScriptInput::Wake(pod()),
+                plain_wake(),
                 Now {
                     at: fx.t0,
                     unix_ms: 1_786_543_215_000,
@@ -3683,7 +3925,7 @@ mod tests {
     #[test]
     fn a_quiet_pod_is_forgotten() {
         let mut fx = fixture();
-        fx.publish(ScriptInput::Wake(pod()), ZERO);
+        fx.publish(plain_wake(), ZERO);
         fx.publish(ScriptInput::Unanswered(pod()), ZERO);
         fx.tick(LINGER + REFRESH);
         assert!(fx.scripter.pods.is_empty(), "nothing standing anywhere");
@@ -3838,7 +4080,7 @@ mod tests {
         let mut peer = fx.peers.pop_front().expect("the script opens a socket");
         peer.handshake().await;
 
-        fx.send(ScriptInput::Wake(pod()));
+        fx.send(plain_wake());
         let published = peer.answer_publish("Ok").await;
         assert_eq!(published["channel"], "brenn:reachy.presence");
         assert_eq!(published["urgency"], "normal");
@@ -3867,7 +4109,7 @@ mod tests {
         let mut peer = fx.peers.pop_front().expect("the script opens a socket");
         peer.handshake().await;
 
-        fx.send(ScriptInput::Wake(pod()));
+        fx.send(plain_wake());
         let first = body_of(&peer.answer_publish("Ok").await);
         let again = body_of(&peer.answer_publish("Ok").await);
         assert_eq!(again["steps"], first["steps"], "the same ask, said again");
@@ -4093,13 +4335,16 @@ mod tests {
 
         // The peer sits on this one, so every decision behind it waits in the
         // publisher's map at once.
-        fx.send(ScriptInput::Wake(pod()));
+        fx.send(plain_wake());
         let stalled = peer.expect_frame("Publish").await;
         let held = body_of(&stalled)["seq"].as_u64().expect("a seq");
 
         let waiting = ["pod-hall", "pod-attic", "pod-study", "pod-porch"];
         for name in waiting {
-            fx.send(ScriptInput::Wake(PodId(name.into())));
+            fx.send(ScriptInput::Wake {
+                pod: PodId(name.into()),
+                gaze: None,
+            });
         }
         // Every one of them is decided — and so offered, which the line the
         // decision precedes proves — before the bus is let go, so what the
@@ -4143,12 +4388,12 @@ mod tests {
 
         // The first script reaches the socket and the peer sits on it: every
         // decision from here waits in the slot.
-        fx.send(ScriptInput::Wake(pod()));
+        fx.send(plain_wake());
         let stalled = peer.expect_frame("Publish").await;
         let held = body_of(&stalled)["seq"].as_u64().expect("a seq");
 
         fx.send(ScriptInput::Unanswered(pod()));
-        fx.send(ScriptInput::Wake(pod()));
+        fx.send(plain_wake());
         let superseded = expect_line(&fx.path, "script_publish_superseded").await;
         assert_eq!(superseded["pod"], "pod-kitchen");
         let dropped = superseded["seq"].as_u64().expect("a seq");
@@ -4189,7 +4434,7 @@ mod tests {
         let mut peer = fx.peers.pop_front().expect("the script opens a socket");
         peer.handshake().await;
 
-        fx.send(ScriptInput::Wake(pod()));
+        fx.send(plain_wake());
         let refused = body_of(&peer.answer_publish("RateLimited").await);
         let line = expect_line(&fx.path, "brenn_script_publish_failed").await;
         assert_eq!(line["channel"], "brenn:reachy.presence");
@@ -4206,7 +4451,10 @@ mod tests {
 
         // Still deciding: a fresh pod raises and publishes as if nothing had
         // happened.
-        fx.send(ScriptInput::Wake(PodId("pod-hall".into())));
+        fx.send(ScriptInput::Wake {
+            pod: PodId("pod-hall".into()),
+            gaze: None,
+        });
         assert_eq!(body_of(&peer.answer_publish("Ok").await)["pod"], "pod-hall");
         fx.stop().await;
     }
@@ -4267,7 +4515,7 @@ mod tests {
         let mut peer = fx.peers.pop_front().expect("the script opens a socket");
         peer.handshake().await;
 
-        fx.send(ScriptInput::Wake(pod()));
+        fx.send(plain_wake());
         for _ in 0..PUBLISH_ATTEMPTS {
             peer.answer_publish("Failed").await;
         }
@@ -4275,7 +4523,10 @@ mod tests {
         assert_eq!(failures.last().expect("a line")["retrying"], false);
 
         // And it stops there: a fresh decision is what next reaches the socket.
-        fx.send(ScriptInput::Wake(PodId("pod-hall".into())));
+        fx.send(ScriptInput::Wake {
+            pod: PodId("pod-hall".into()),
+            gaze: None,
+        });
         assert_eq!(body_of(&peer.answer_publish("Ok").await)["pod"], "pod-hall");
         fx.stop_and_flush().await;
         assert_eq!(
@@ -4311,14 +4562,14 @@ mod tests {
         let (handle, inbox) = channel(jsonl.clone());
 
         for _ in 0..SCRIPT_QUEUE_DEPTH {
-            handle.send(ScriptInput::Wake(pod()));
+            handle.send(plain_wake());
         }
         assert_eq!(handle.dropped(), 0, "the queue holds its stated depth");
-        handle.send(ScriptInput::Wake(pod()));
+        handle.send(plain_wake());
         assert_eq!(handle.dropped(), 1);
 
         drop(inbox);
-        handle.send(ScriptInput::Wake(pod()));
+        handle.send(plain_wake());
         assert_eq!(handle.dropped(), 2, "a departed scripter is not silence");
 
         drop(handle);
@@ -4453,7 +4704,7 @@ mod tests {
         let sink = Arc::new(Recorder::default());
         let (handle, teardown, join) = sink_fixture(sink.clone()).await;
 
-        handle.send(ScriptInput::Wake(pod()));
+        handle.send(plain_wake());
         let out = taken_at_least(&sink, 1).await.remove(0);
 
         let body: serde_json::Value = serde_json::from_str(&out.body).expect("the body is JSON");
@@ -4784,7 +5035,7 @@ mod tests {
         let mut fx = fixture();
         fx.wake_and_dispatch(ZERO);
         fx.publish(cued(vec![motion_cue("nod", 20_000)]), ZERO);
-        let publish = fx.publish(ScriptInput::Wake(pod()), Duration::from_secs(1));
+        let publish = fx.publish(plain_wake(), Duration::from_secs(1));
         assert_eq!(
             timeline(&publish),
             vec![(0, NEUTRAL.to_string())],

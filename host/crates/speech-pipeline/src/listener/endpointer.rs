@@ -16,6 +16,7 @@
 //! Speech --length >= max_utterance--> SoftEndpointed (emit SoftEndpoint, Capped)
 //! SoftEndpointed --P>=onset within continuation_window--> Speech (emit Superseded)
 //! SoftEndpointed --continuation_window elapses--> Idle (emit UtteranceClosed)
+//! Speech | SoftEndpointed --close() (the pipeline dispatched it)--> Idle
 //! ```
 //!
 //! The device's `SegmentClosed(VadRelease)` is the authoritative outer boundary,
@@ -90,6 +91,10 @@ pub enum TransitionCause {
     /// Any non-idle state `→ Idle`: a discontinuity/reconnect dropped the
     /// in-progress utterance.
     Reset,
+    /// `Speech`/`SoftEndpointed → Idle`: the pipeline dispatched the utterance as a
+    /// turn, so there is no speculative transcription left for a continuation to
+    /// supersede. Speech after it re-onsets as a fresh utterance with its own preroll.
+    Dispatched,
 }
 
 /// One FSM state transition, surfaced purely for observability (no PCM payload).
@@ -208,6 +213,27 @@ impl Endpointer {
         };
         if from != EndpointState::Idle {
             self.record(from, EndpointState::Idle, TransitionCause::Reset, at_sample);
+        }
+    }
+
+    /// End the utterance in progress because the pipeline dispatched it: return to
+    /// `Idle` from any state, dropping an open speech run, a continuation window, or a
+    /// building onset run, so later speech must confirm a fresh onset. Leaving
+    /// `Speech` or `SoftEndpointed` records a `Dispatched` transition at `at_sample`;
+    /// a close already in `Idle` records nothing.
+    pub fn close(&mut self, at_sample: u64) {
+        let from = self.state.label();
+        self.state = State::Idle {
+            onset_run: 0,
+            onset_start: 0,
+        };
+        if from != EndpointState::Idle {
+            self.record(
+                from,
+                EndpointState::Idle,
+                TransitionCause::Dispatched,
+                at_sample,
+            );
         }
     }
 
@@ -914,5 +940,95 @@ mod tests {
                 sample_offset: 7_777,
             }
         );
+    }
+
+    /// A close out of the continuation window ends the utterance: the FSM is idle,
+    /// the close is recorded as `Dispatched` at the given sample, and speech after it
+    /// is no longer a resume.
+    #[test]
+    fn close_from_soft_endpointed_goes_idle() {
+        let mut ep = Endpointer::new(test_config());
+        let events = feed(&mut ep, &[0.9, 0.9, 0.1, 0.1, 0.1]);
+        assert!(
+            matches!(events.as_slice(), [(4, EndpointEvent::SoftEndpoint { .. })]),
+            "one soft endpoint: {events:?}"
+        );
+        ep.drain_transitions();
+        ep.close(9_999);
+        assert!(!ep.utterance_in_progress());
+        assert!(ep.fully_idle());
+        assert_eq!(
+            ep.drain_transitions(),
+            vec![EndpointTransition {
+                from: EndpointState::SoftEndpointed,
+                to: EndpointState::Idle,
+                cause: TransitionCause::Dispatched,
+                sample_offset: 9_999,
+            }]
+        );
+        assert_eq!(
+            ep.push(0.9, 6 * CHUNK_SAMPLES),
+            None,
+            "no Superseded: a resume is no longer possible"
+        );
+    }
+
+    /// A close with speech open drops the run; speech after it must confirm a fresh
+    /// onset, and the utterance it carves starts at the fresh anchor.
+    #[test]
+    fn close_from_speech_drops_the_run_and_reonsets_fresh() {
+        let mut ep = Endpointer::new(test_config());
+        feed(&mut ep, &[0.9, 0.9, 0.9]);
+        ep.drain_transitions();
+        ep.close(3 * CHUNK_SAMPLES);
+        let t = ep.drain_transitions();
+        assert_eq!(
+            t,
+            vec![EndpointTransition {
+                from: EndpointState::Speech,
+                to: EndpointState::Idle,
+                cause: TransitionCause::Dispatched,
+                sample_offset: 3 * CHUNK_SAMPLES,
+            }]
+        );
+        assert_eq!(ep.push(0.9, 4 * CHUNK_SAMPLES), None);
+        assert!(ep.drain_transitions().is_empty(), "one chunk is no onset");
+        assert!(!ep.fully_idle(), "the fresh run is building");
+        assert_eq!(ep.push(0.9, 5 * CHUNK_SAMPLES), None);
+        let t = ep.drain_transitions();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].cause, TransitionCause::Onset);
+        let mut events = Vec::new();
+        for i in 5..8u64 {
+            events.extend(ep.push(0.1, (i + 1) * CHUNK_SAMPLES));
+        }
+        assert_eq!(
+            events,
+            vec![EndpointEvent::SoftEndpoint {
+                start_sample: 3 * CHUNK_SAMPLES - 100,
+                end_sample: 5 * CHUNK_SAMPLES,
+                cause: EndpointCause::SoftEndpoint,
+            }],
+            "the carve starts at the fresh anchor, not the pre-close start"
+        );
+    }
+
+    /// A close already in `Idle` records nothing, and drops a building onset run.
+    #[test]
+    fn transitions_cover_dispatched_close() {
+        let mut ep = Endpointer::new(test_config());
+        ep.close(100);
+        assert!(
+            ep.drain_transitions().is_empty(),
+            "a fresh idle close is a no-op"
+        );
+        ep.push(0.9, CHUNK_SAMPLES);
+        assert!(!ep.fully_idle());
+        ep.close(CHUNK_SAMPLES);
+        assert!(
+            ep.drain_transitions().is_empty(),
+            "a building onset run is still Idle"
+        );
+        assert!(ep.fully_idle(), "the building run is dropped");
     }
 }

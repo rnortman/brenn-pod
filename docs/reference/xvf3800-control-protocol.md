@@ -146,11 +146,16 @@ set; recorded so they aren't rediscovered:
 
 - `DOA_VALUE` (resid 20, cmd 18, 2× uint16): scalar integer-degree DoA +
   speech-detected flag, on the GPO/LED servicer. (research-step0.md:84-86)
-- `AEC_FIXEDBEAMSAZIMUTH_VALUES` (resid 33, cmd 81, 2 floats, **rw**) +
-  `AEC_FIXEDBEAMSONOFF` (resid 33, cmd 37): **pin** the two fixed beams to
-  commanded azimuths. Used by formatBCE's beam-lock feature; relevant only if
-  the design ever locks tracker positions rather than observing them — that is
-  **off-board tracker policy, out of firmware scope**. (research-multi-beam.md:89-93,259-274)
+- Fixed-beam mode: `AEC_FIXEDBEAMSONOFF` (resid 33, cmd 37, 1× int32),
+  `AEC_FIXEDBEAMSAZIMUTH_VALUES` (resid 33, cmd 81, 2× float, radians),
+  `AEC_FIXEDBEAMSELEVATION_VALUES` (resid 33, cmd 82, 2× float, radians) and
+  `AEC_FIXEDBEAMSGATING` (resid 33, cmd 83, 1× uint8), all **rw**: **pin** the
+  two focused beams to a commanded azimuth and elevation instead of letting
+  them track. Declared in `xvf3800-ctrl`. The reachy pod's unattended self-test
+  writes them and reads them back (`ctrl_fixedbeams`), and its bench registry
+  measures the chip's DoA under them (`fixed_beams_broadside`). No runtime path
+  writes them, and every value resets on chip reboot.
+  (research-multi-beam.md:89-93,259-274)
 - `VNR_VALUE` (CONFIGURATION_SERVICER resid 241, cmd 0): a single global
   voice-to-noise ratio exposed by the **I2S satellite** firmware variant — **not
   present** in the Flex `l16k6ch` USB build's parameter table.

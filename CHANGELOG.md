@@ -9,6 +9,20 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **A process composing the voice server can choose where the head looks when
+  the wake word is heard** — the hook behind "look at the talker". The new
+  `Sinks.gaze` seam (a `WakeGaze`) is asked once per wake with the microphone array's direction readings from the end of
+  the phrase, and names a library pose, with an optional pace, for the head to
+  raise to. The chosen pose is also the pose the head answers from, in place
+  of `presence_turn_pose`, until the head stows or the next wake. A `keep`, or
+  a name or pace no motion script may carry, is refused with a `gaze_refused`
+  line and the wake takes the configured pose; a seam supplied to a run with
+  no scripter is reported once as `gaze_seam_unused`. Without the seam nothing
+  changes.
+- **`presence_wake_pose = "keep"` freezes the head where it is on a wake**
+  instead of moving it to a pose. If nothing follows, the head stows at
+  `presence_max_engaged_ms`. `presence_turn_pose` may not be `keep`, and a
+  `presence_wake_move_ms` has no effect alongside it.
 - **The voice host now starts on a robot deployed from a brenn-os payload.**
   brenn-os unpacks a payload (the read-only bundle of binaries, configs and
   keys it fetches onto the device) world-readable, so the host refused its
@@ -47,9 +61,22 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   pod's own playback is active and for a short tail after it drops, so the
   robot never hears its own reply. The cost: under mute, no voice interruption
   is possible at all, wake word included. The default remains `"wake"`.
+- **The `wake_detected` line carries `doa_count` and `doa_last`**: how many of
+  the microphone array's direction readings arrived during the end of the
+  phrase, and the last of them.
+- **The reachy pod's self-test now checks the mic array's fixed-beam mode.**
+  `reachy-pod selftest` gains `ctrl_fixedbeams`, which points both of the
+  array's focused beams straight ahead, checks the settings read back exactly
+  and turns the mode off again. `selftest --manual` gains
+  `fixed_beams_broadside`, which asks you to speak from straight in front of the
+  array while the beams are fixed and checks it places you within 10° of
+  straight ahead. Nothing outside the self-test uses fixed-beam mode.
 
 ### Changed
 
+- **`[wake] wake_tail_ms` defaults to 500 (was 1500).** Short commands ("hey
+  cogsworth, tell me a joke") were held as a bare wake. A command under about
+  half a second said in one breath with the wake phrase is still held.
 - **The provisioning tool's status lines go to stderr.** The
   `provisioned — … points at …` and `appended … verbatim` lines join the key
   messages there, so stdout carries nothing but a composed file.
@@ -247,6 +274,20 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Fixed
 
+- **Under `[barge] mode = "wake"`, a wake word spoken over a reply no longer
+  raises the head twice.** The second raise could retarget a head already
+  moving.
+- **A command is answered once.** Speech that resumed within a second of a
+  dispatched command was re-transcribed and answered a second time. Dispatch
+  now ends the utterance, and speech after it needs the wake word again. A
+  resumed carve that raced the dispatch is logged as `carve_after_dispatch`.
+- **The head no longer drops while you are still talking after the wake
+  word.** The wall-clock release of a held wake (`wake_hold_released`) waits
+  while speech is being heard, and fires at its own time again if a gap in the
+  audio stream drops that speech.
+- **An `[endpointer] onset_thresh` above 0.60 (or `onset_chunks` above 8) is
+  refused at startup** with a message naming the key, instead of crashing on
+  the first pod connection.
 - **The wake-word detector no longer false-fires on silence after a stream
   reset.** Certain wake heads scored near 1.0 on the first chunk of every
   segment because the embedding window cold-started from zeros, an

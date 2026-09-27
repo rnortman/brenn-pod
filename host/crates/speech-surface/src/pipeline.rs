@@ -37,18 +37,20 @@ use pod_ingest::{HostMicros, SegmentRef};
 use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
-    AudioSpan, Brain, BrainEvent, BrainEventFn, BrainStats, CarveTiming, CarvedUtterance,
-    ConfidenceGate, Cue, CueTap, DoaTrack, EndpointCause, Feed, FlushRejected, GateReject,
-    InterruptProgress, ListenerEvent, ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment,
-    SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings, TrackingEvent, TranscribeError,
-    Transcriber, Transcript, TurnEnd, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation,
-    send_or_report, stage_delta_us, tracking_event, transcribe_pcm,
+    AudioSpan, BargeCause, Brain, BrainEvent, BrainEventFn, BrainStats, CarveTiming,
+    CarvedUtterance, ConfidenceGate, Cue, CueTap, DoaTrack, EndpointCause, EndpointState, Feed,
+    FlushRejected, GateReject, InterruptProgress, ListenerEvent, ListenerUtteranceId, PodId,
+    ResponseSink, RoomId, Segment, SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings,
+    TrackingEvent, TranscribeError, Transcriber, Transcript, TransitionCause, TurnEnd, Utterance,
+    UtteranceId, WakeCommandReason, WakeConfirmation, send_or_report, stage_delta_us,
+    tracking_event, transcribe_pcm,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::barge::TurnLedger;
 use crate::config::{CueLibrary, WakeWordInStt};
+use crate::gaze::WakeGaze;
 use crate::jsonl::JsonlHandle;
 use crate::playback_router::FeedFn;
 use crate::recorder::{
@@ -228,6 +230,12 @@ impl ListenWiring {
     pub(crate) async fn declined(&self, pod: PodId, id: ListenerUtteranceId) {
         (self.feed)(pod, Feed::CandidateDeclined { id }).await;
     }
+
+    /// Report that the candidate `id` was dispatched as a turn, so the listener
+    /// ends its identity and closes the endpointer. Said before the brain is awaited.
+    pub(crate) async fn dispatched(&self, pod: PodId, id: ListenerUtteranceId) {
+        (self.feed)(pod, Feed::CandidateDispatched { id }).await;
+    }
 }
 
 /// The clip the pipeline answers a failed wake transcription with.
@@ -265,6 +273,9 @@ pub struct PipelineCtx {
     /// `None` when no presence channel is configured. Every tap is a
     /// non-blocking send; nothing in this task waits on it.
     pub(crate) scripter: Option<ScriptHandle>,
+    /// Where a wake's raise is chosen from the array's readings, or `None` to take
+    /// the configured wake pose. Wired only beside a scripter.
+    pub(crate) gaze: Option<Arc<dyn WakeGaze>>,
     /// The poses and motions a reply may name, or `None` when the deployment
     /// configured no library — in which case no reply can move the head, since
     /// nothing here could tell an offered name from an invented one, and every
@@ -342,6 +353,12 @@ struct HoldRelease {
     at: tokio::time::Instant,
     /// The hold's own deadline, carried so the release line joins its `wake_held`.
     deadline_sample: u64,
+    /// The listener has confirmed speech since this was armed and the speech has
+    /// not ended: it ends in a carve that consumes or refreshes the hold, so the
+    /// release waits for that rather than firing under a command being spoken.
+    /// A discontinuity that drops the speech carves nothing and clears this, and
+    /// the release is due at `at` again.
+    speaking: bool,
 }
 
 /// Wall-clock fallback for a restored capture window, the [`HoldRelease`] of the
@@ -413,6 +430,10 @@ struct PodState {
     /// is somebody else's — speech inside it, a mint, a wake hold, or the
     /// listener's own expiry.
     listen_release: Option<ListenRelease>,
+    /// The listener utterances this pipeline dispatched as turns, most recent last
+    /// and bounded, so a carve of one of them that raced the listener's close is
+    /// recognised and dropped.
+    dispatched: VecDeque<ListenerUtteranceId>,
 }
 
 impl PodState {
@@ -436,6 +457,7 @@ impl PodState {
         if epoch > self.epoch {
             self.recent_segments.clear();
             self.recent_wakes.clear();
+            self.dispatched.clear();
             // The room and the log belonged to the connection that just went, and
             // the new one announces its own; keeping them would attribute a fresh
             // connection's first utterance to the old connection's log.
@@ -481,7 +503,10 @@ pub async fn run(
             .values()
             .flat_map(|s| {
                 [
-                    s.hold_release.as_ref().map(|h| h.at),
+                    s.hold_release
+                        .as_ref()
+                        .filter(|h| !h.speaking)
+                        .map(|h| h.at),
                     s.listen_release.as_ref().map(|l| l.at),
                 ]
             })
@@ -541,7 +566,7 @@ fn release_due(
 ) {
     let now = tokio::time::Instant::now();
     for (pod, state) in pods.iter_mut() {
-        if let Some(release) = state.hold_release.take_if(|r| r.at <= now) {
+        if let Some(release) = state.hold_release.take_if(|r| !r.speaking && r.at <= now) {
             // Distinguishable in the records from a head that came down on
             // `arm_expired`, and joined to its `wake_held` by the deadline.
             jsonl.emit(
@@ -711,7 +736,7 @@ async fn handle_listener(
     ctx: &PipelineCtx,
     jsonl: &JsonlHandle,
 ) {
-    // Destructured: six optional handles, and bare `None`s in positional
+    // Destructured: seven optional handles, and bare `None`s in positional
     // arguments are easy to swap silently.
     let PipelineCtx {
         record_dir,
@@ -720,15 +745,17 @@ async fn handle_listener(
         brain,
         barge,
         scripter,
+        gaze,
         ..
     } = ctx;
     let wake_word = *wake_word;
-    let (record_dir, transcriber, brain, barge, scripter) = (
+    let (record_dir, transcriber, brain, barge, scripter, gaze) = (
         record_dir.as_deref(),
         transcriber.as_ref(),
         brain.as_ref(),
         barge.as_ref(),
         scripter.as_ref(),
+        gaze.as_deref(),
     );
     match ev {
         ListenerEvent::WakeMuted {
@@ -752,10 +779,18 @@ async fn handle_listener(
             epoch,
             score,
             wake_end_sample,
+            doa,
         } => {
             jsonl.emit(
                 "wake_detected",
-                &json!({ "pod": pod.0, "epoch": epoch, "score": score, "wake_end_sample": wake_end_sample }),
+                &json!({
+                    "pod": pod.0,
+                    "epoch": epoch,
+                    "score": score,
+                    "wake_end_sample": wake_end_sample,
+                    "doa_count": doa.len(),
+                    "doa_last": doa.last(),
+                }),
             );
             let state = pods.entry(pod.clone()).or_default();
             if !state.adopt_epoch(epoch) {
@@ -770,9 +805,28 @@ async fn handle_listener(
             }
             // Past the epoch check for the same reason: a superseded
             // connection's wake is not an interaction, and it must not raise a
-            // head.
+            // head. The gaze is asked here, past the check, so a superseded
+            // connection's readings never choose a pose.
             if let Some(scripter) = scripter {
-                scripter.send(ScriptInput::Wake(pod.clone()));
+                let gaze = gaze
+                    .and_then(|g| g.choose(&pod, &doa, wake_end_sample))
+                    .and_then(|pose| {
+                        let name = pose.name.clone();
+                        match Raise::from_gaze(pose) {
+                            Ok(raise) => Some(raise),
+                            Err(reason) => {
+                                jsonl.emit(
+                                    "gaze_refused",
+                                    &json!({ "pod": pod.0, "pose": name, "reason": reason.to_string() }),
+                                );
+                                None
+                            }
+                        }
+                    });
+                scripter.send(ScriptInput::Wake {
+                    pod: pod.clone(),
+                    gaze,
+                });
             }
             push_bounded(&mut state.recent_wakes, wake_end_sample);
             // Upgrade any already-labeled segment this detection now lands in: the
@@ -807,6 +861,20 @@ async fn handle_listener(
             let state = pods.entry(pod.clone()).or_default();
             if !state.adopt_epoch(uid.epoch) {
                 return; // Stale: a reconnect superseded this epoch.
+            }
+            if state.dispatched.contains(&uid) {
+                // A carve arrived for a listener utterance this pipeline already
+                // dispatched as a turn: the listener resumed and re-carved it
+                // before it heard of the dispatch. The carve is not transcribed
+                // and no utterance is minted. A reader may conclude that speech
+                // continued past the dispatched command inside the continuation
+                // window and was deliberately not answered. `utterance_id` joins
+                // this line to the dispatched carve's own lines.
+                jsonl.emit(
+                    "carve_after_dispatch",
+                    &json!({ "pod": pod.0, "utterance_id": uid }),
+                );
+                return;
             }
             // Nothing is minted under a hold, so a carve on this pod is either the
             // hold consumed or a fresh wake's own: the wait the head is waiting out
@@ -884,12 +952,32 @@ async fn handle_listener(
             epoch,
             transition,
         } => {
-            // Pure observability: the endpointer's timing is what the tuning rig
-            // and a live-latency investigation read. No per-pod state effect.
+            // The endpointer's timing is what the tuning rig and a live-latency
+            // investigation read.
             jsonl.emit(
                 "endpointer_transition",
                 &event_line(json!({ "pod": pod.0, "epoch": epoch }), &transition),
             );
+            // Speech the listener has confirmed — an onset, or a resume inside the
+            // continuation window — ends in a soft endpoint of some cause, which
+            // consumes a standing hold (its carve publishes) or refreshes it (a new
+            // `WakeHeld` re-arms the release). So while speech runs the release
+            // waits, and the listener's sample-domain deadline governs the hold.
+            // The one exit from speech that carves nothing is a discontinuity's
+            // reset, which drops the run and leaves a hold inside its wait
+            // standing; the release is then due at its own instant again, because
+            // the quiet room it exists for may follow. No other transition touches
+            // it: one out of speech toward a carve is followed by that carve, and
+            // resuming the clock ahead of it could fire it under a command that ran
+            // past it.
+            let speaking = transition.to == EndpointState::Speech;
+            if (speaking || transition.cause == TransitionCause::Reset)
+                && let Some(state) = pods.get_mut(&pod)
+                && state.adopt_epoch(epoch)
+                && let Some(release) = state.hold_release.as_mut()
+            {
+                release.speaking = speaking;
+            }
         }
         ListenerEvent::BargeIn {
             pod,
@@ -911,10 +999,14 @@ async fn handle_listener(
                     "host_rx_us": host_rx.0,
                 }),
             );
-            // Ahead of the playback wiring, like the line above: somebody spoke
-            // over the pod, which is a live interaction whether or not there is
-            // anything left to cut.
-            if let Some(scripter) = scripter {
+            // A speech barge is an interaction with no wake word in front of it, so it
+            // raises the head here, ahead of the playback wiring. A wake barge does not:
+            // the listener reported the same detection as a `WakeDetected` first, and the
+            // `Wake` sent there is this barge's raise. A second raise would retarget a gaze
+            // move to the configured wake pose partway.
+            if cause != BargeCause::Wake
+                && let Some(scripter) = scripter
+            {
                 scripter.send(ScriptInput::Barge(pod.clone()));
             }
             let Some(barge) = barge else {
@@ -1140,6 +1232,7 @@ async fn handle_listener(
                 state.hold_release = Some(HoldRelease {
                     at: tokio::time::Instant::now() + wait,
                     deadline_sample,
+                    speaking: false,
                 });
             }
         }
@@ -1523,6 +1616,17 @@ async fn handle_stt_done(
         listen
             .declined(utterance.pod.clone(), done.carve.id.clone())
             .await;
+    }
+    // A turn — a dispatch or the offline reply — is terminal for the listener
+    // utterance it came from. Recorded before the brain is awaited, so a
+    // same-id carve the listener made before hearing of it is dropped on arrival.
+    if matches!(gate, GateOutcome::Dispatch | GateOutcome::OfflineReply(_)) {
+        push_bounded(&mut state.dispatched, done.carve.id.clone());
+        if let Some(listen) = listen {
+            listen
+                .dispatched(utterance.pod.clone(), done.carve.id.clone())
+                .await;
+        }
     }
     match gate {
         GateOutcome::DeclineEmpty(from) => match from {
@@ -2192,10 +2296,19 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::config::JsonlSink;
+    use crate::gaze::{DoaSample, GazePose};
     use crate::test_support::segment as build_segment;
 
     fn pod() -> PodId {
         PodId("pod-x".into())
+    }
+
+    /// A wake that carried no gaze.
+    fn plain_wake() -> ScriptInput {
+        ScriptInput::Wake {
+            pod: pod(),
+            gaze: None,
+        }
     }
 
     /// A `pod-x` segment (id, `samples`-long ramp PCM) based at `base_sample_index`.
@@ -2327,11 +2440,17 @@ mod tests {
     }
 
     fn wake_detected(epoch: u64, wake_end_sample: u64) -> PipelineItem {
+        wake_detected_with(epoch, wake_end_sample, Vec::new())
+    }
+
+    /// [`wake_detected`], carrying the array's readings `doa`.
+    fn wake_detected_with(epoch: u64, wake_end_sample: u64, doa: Vec<DoaSample>) -> PipelineItem {
         PipelineItem::Listener(ListenerEvent::WakeDetected {
             pod: pod(),
             epoch,
             score: 0.9,
             wake_end_sample,
+            doa,
         })
     }
 
@@ -2373,10 +2492,16 @@ mod tests {
         /// The movements this brain's reply asks for, handed to the cue tap
         /// ahead of the speech as a real reply's are.
         cues: Vec<Cue>,
+        /// Called first thing in `handle`, so a case can read what had already
+        /// happened by the time the brain was reached.
+        on_handle: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl Brain for RecordingBrain {
         fn handle(&self, u: Utterance, out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
+            if let Some(f) = &self.on_handle {
+                f();
+            }
             let (pod, id) = (u.pod.clone(), u.id);
             if !self.cues.is_empty() {
                 out.cue(self.cues.clone());
@@ -2474,11 +2599,13 @@ mod tests {
         wake_word: WakeWordInStt,
         nudges: Arc<Mutex<NudgeLog>>,
         scripter: Option<ScriptHandle>,
+        gaze: Option<Arc<dyn WakeGaze>>,
         cues: Option<Arc<CueLibrary>>,
         reply_cues: Vec<Cue>,
         turn_end: TurnEnd,
         queue_depth: usize,
         unreachable_clip: Option<UnreachableClip>,
+        on_handle: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl Harness {
@@ -2497,11 +2624,18 @@ mod tests {
                 nudges: Arc::new(Mutex::new(NudgeLog::default())),
                 turn_end: TurnEnd::Closed,
                 scripter: None,
+                gaze: None,
                 cues: None,
                 reply_cues: Vec::new(),
                 queue_depth: 32,
                 unreachable_clip: None,
+                on_handle: None,
             }
+        }
+        /// Run `f` first thing whenever the brain is handed a turn.
+        fn on_handle(mut self, f: Arc<dyn Fn() + Send + Sync>) -> Harness {
+            self.on_handle = Some(f);
+            self
         }
         /// Answer a failed wake transcription with `pcm`, configured under the
         /// path `clips/offline.wav`.
@@ -2537,6 +2671,11 @@ mod tests {
         /// interaction lifecycle as the scripter receives it.
         fn scripter(mut self, handle: ScriptHandle) -> Harness {
             self.scripter = Some(handle);
+            self
+        }
+        /// Ask `gaze` where the head looks on each wake.
+        fn gaze(mut self, gaze: Arc<dyn WakeGaze>) -> Harness {
+            self.gaze = Some(gaze);
             self
         }
         /// Give the run a cue vocabulary, so a reply's movements resolve into
@@ -2615,6 +2754,7 @@ mod tests {
                         end: self.turn_end,
                         settle_first: self.settle_first.clone(),
                         cues: self.reply_cues.clone(),
+                        on_handle: self.on_handle.clone(),
                     }),
                     speak_tx,
                     events,
@@ -2644,6 +2784,7 @@ mod tests {
                     .map(|(ledger, flush)| BargeWiring { ledger, flush }),
                 listen: self.listen.map(Arc::new),
                 scripter: self.scripter.clone(),
+                gaze: self.gaze.clone(),
                 unreachable_clip: self.unreachable_clip.clone(),
             };
             let loop_jsonl = jsonl.clone();
@@ -2974,7 +3115,7 @@ mod tests {
         assert_eq!(
             script_inputs(handle, rx).await,
             vec![
-                ScriptInput::Wake(pod()),
+                plain_wake(),
                 ScriptInput::TurnStarted {
                     pod: pod(),
                     turn: UtteranceId(1),
@@ -3082,7 +3223,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())]
+            vec![plain_wake(), ScriptInput::Unanswered(pod())]
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -3260,6 +3401,7 @@ mod tests {
             barge: None,
             listen: None,
             scripter: None,
+            gaze: None,
             cues: None,
             unreachable_clip: None,
         };
@@ -3817,6 +3959,14 @@ mod tests {
             "the listener is not told it was declined: {:?}",
             fed.lock().unwrap()
         );
+        assert!(
+            matches!(
+                fed.lock().unwrap().as_slice(),
+                [Feed::CandidateDispatched { id }] if *id == uid(1)
+            ),
+            "the listener hears the clip's turn was dispatched: {:?}",
+            fed.lock().unwrap()
+        );
         drop(jsonl);
         writer.await.unwrap();
     }
@@ -4336,7 +4486,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())]
+            vec![plain_wake(), ScriptInput::Unanswered(pod())]
         );
         let released: Vec<&Value> = lines
             .iter()
@@ -4381,7 +4531,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())]
+            vec![plain_wake(), ScriptInput::Unanswered(pod())]
         );
         assert!(
             !lines.iter().any(|l| l["event"] == "wake_hold_released"),
@@ -4450,10 +4600,7 @@ mod tests {
         let (lines, _) = run.finish().await;
 
         seen.extend(script_inputs(handle, rx).await);
-        assert_eq!(
-            seen,
-            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())]
-        );
+        assert_eq!(seen, vec![plain_wake(), ScriptInput::Unanswered(pod())]);
         assert_eq!(
             lines
                 .iter()
@@ -4497,10 +4644,7 @@ mod tests {
         run.advance(Duration::from_millis(600)).await;
         let (lines, _) = run.finish().await;
 
-        assert_eq!(
-            script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod())]
-        );
+        assert_eq!(script_inputs(handle, rx).await, vec![plain_wake()]);
         assert!(
             !lines.iter().any(|l| l["event"] == "wake_hold_released"),
             "{lines:?}"
@@ -4534,10 +4678,7 @@ mod tests {
             ])
             .await;
 
-        assert_eq!(
-            script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod())]
-        );
+        assert_eq!(script_inputs(handle, rx).await, vec![plain_wake()]);
         assert!(
             !lines.iter().any(|l| l["event"] == "wake_hold_released"),
             "{lines:?}"
@@ -4773,13 +4914,176 @@ mod tests {
                 trigger_sample: 4_800,
                 host_rx: HostMicros(2_000_000),
             });
-            let (lines, _) = Harness::new().run(vec![event]).await;
+            let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+            let (handle, rx) = crate::scripter::channel(jsonl.clone());
+            let (lines, _) = Harness::new()
+                .scripter(handle.clone())
+                .run(vec![event])
+                .await;
             let barge = lines
                 .iter()
                 .find(|v| v["event"] == "barge_in")
                 .expect("a barge_in line");
             assert_eq!(barge["cause"], name);
+            // Only a speech barge raises: a wake barge's raise is the `Wake` its
+            // detection already sent.
+            let expected = match cause {
+                BargeCause::Speech => vec![ScriptInput::Barge(pod())],
+                BargeCause::Wake => Vec::new(),
+            };
+            assert_eq!(script_inputs(handle, rx).await, expected, "{name}");
+            drop(jsonl);
+            writer.await.unwrap();
         }
+    }
+
+    /// A gaze that answers every wake with `answer`, and records what it was asked.
+    struct RecordingGaze {
+        answer: Option<GazePose>,
+        asked: Mutex<Vec<(PodId, Vec<DoaSample>, u64)>>,
+    }
+
+    impl RecordingGaze {
+        fn answering(name: &str, move_ms: Option<u64>) -> Arc<RecordingGaze> {
+            Arc::new(RecordingGaze {
+                answer: Some(GazePose {
+                    name: name.into(),
+                    move_ms,
+                }),
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl WakeGaze for RecordingGaze {
+        fn choose(&self, pod: &PodId, doa: &[DoaSample], wake_end_sample: u64) -> Option<GazePose> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((pod.clone(), doa.to_vec(), wake_end_sample));
+            self.answer.clone()
+        }
+    }
+
+    /// One reading at sample 7 000, inside a wake ending at 8 000.
+    fn one_reading() -> Vec<DoaSample> {
+        vec![DoaSample {
+            sample: 7_000,
+            azimuths: [0.5, 1.2, 2.0, 0.5],
+        }]
+    }
+
+    /// The raise a `look_l30` gaze at 600 ms becomes.
+    fn look_l30_wake() -> ScriptInput {
+        ScriptInput::Wake {
+            pod: pod(),
+            gaze: Some(Raise {
+                pose: "look_l30".into(),
+                move_ms: Some(600),
+            }),
+        }
+    }
+
+    /// The gaze is asked with the detection's pod, readings and end, and what it
+    /// chooses rides the wake to the scripter; the line carries the readings.
+    #[tokio::test]
+    async fn a_gaze_rides_the_wake_input() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let gaze = RecordingGaze::answering("look_l30", Some(600));
+        let (lines, _) = Harness::new()
+            .scripter(handle.clone())
+            .gaze(gaze.clone())
+            .run(vec![wake_detected_with(1, 8_000, one_reading())])
+            .await;
+
+        assert_eq!(script_inputs(handle, rx).await, vec![look_l30_wake()]);
+        assert_eq!(
+            *gaze.asked.lock().unwrap(),
+            vec![(pod(), one_reading(), 8_000)]
+        );
+        let wake = lines
+            .iter()
+            .find(|v| v["event"] == "wake_detected")
+            .expect("a wake_detected line");
+        assert_eq!(wake["doa_count"], 1);
+        assert_eq!(wake["doa_last"]["sample"], 7_000);
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// No gaze seam: the wake is the plain one, and the line says no reading came.
+    #[tokio::test]
+    async fn no_gaze_sink_sends_a_plain_wake() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _) = Harness::new()
+            .scripter(handle.clone())
+            .run(vec![wake_detected(1, 8_000)])
+            .await;
+
+        assert_eq!(script_inputs(handle, rx).await, vec![plain_wake()]);
+        let wake = lines
+            .iter()
+            .find(|v| v["event"] == "wake_detected")
+            .expect("a wake_detected line");
+        assert_eq!(wake["doa_count"], 0);
+        assert!(wake["doa_last"].is_null(), "{wake}");
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A gaze naming `keep` cannot stand in for the turn pose: it is refused with
+    /// a line, and the wake takes the configured pose.
+    #[tokio::test]
+    async fn a_keep_gaze_is_refused_and_the_wake_takes_the_configured_pose() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _) = Harness::new()
+            .scripter(handle.clone())
+            .gaze(RecordingGaze::answering(motion_proto::KEEP_BASE, None))
+            .run(vec![wake_detected_with(1, 8_000, one_reading())])
+            .await;
+
+        assert_eq!(script_inputs(handle, rx).await, vec![plain_wake()]);
+        let refused = lines
+            .iter()
+            .find(|v| v["event"] == "gaze_refused")
+            .expect("a gaze_refused line");
+        assert_eq!(refused["pose"], "keep");
+        assert_eq!(
+            refused["reason"],
+            crate::scripter::TurnRefusal::Keep.to_string()
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A wake over a reply is a detection and then a wake-cause barge; only the
+    /// detection raises, so the gaze it chose is not retargeted.
+    #[tokio::test]
+    async fn a_wake_barge_sends_no_second_raise() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _) = Harness::new()
+            .scripter(handle.clone())
+            .gaze(RecordingGaze::answering("look_l30", Some(600)))
+            .run(vec![
+                wake_detected_with(1, 8_000, one_reading()),
+                PipelineItem::Listener(ListenerEvent::BargeIn {
+                    pod: pod(),
+                    epoch: 1,
+                    cause: BargeCause::Wake,
+                    trigger_sample: 8_000,
+                    host_rx: HostMicros(2_000_000),
+                }),
+            ])
+            .await;
+
+        assert_eq!(script_inputs(handle, rx).await, vec![look_l30_wake()]);
+        assert!(lines.iter().any(|v| v["event"] == "barge_in"), "{lines:?}");
+        drop(jsonl);
+        writer.await.unwrap();
     }
 
     #[tokio::test]
@@ -5218,7 +5522,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod())],
+            vec![plain_wake()],
             "the live epoch's wake raises, the superseded one does not"
         );
         drop(jsonl);
@@ -5266,11 +5570,14 @@ mod tests {
         assert!(
             matches!(
                 fed.as_slice(),
-                [Feed::Listen {
-                    window_samples: TEST_LISTEN_WINDOW
-                }]
+                [
+                    Feed::CandidateDispatched { id },
+                    Feed::Listen {
+                        window_samples: TEST_LISTEN_WINDOW
+                    }
+                ] if *id == uid(1)
             ),
-            "one window, as long as the configuration says: {fed:?}",
+            "the dispatch, then one window as long as the configuration says: {fed:?}",
         );
     }
 
@@ -5293,7 +5600,347 @@ mod tests {
             ])
             .await;
 
-        assert!(fed.lock().unwrap().is_empty(), "the reply said nothing");
+        assert!(
+            matches!(
+                fed.lock().unwrap().as_slice(),
+                [Feed::CandidateDispatched { id }] if *id == uid(1)
+            ),
+            "the listener hears of the dispatch and nothing else: {:?}",
+            fed.lock().unwrap()
+        );
+    }
+
+    /// The listener hears of a dispatch before the brain is reached, so a resume it
+    /// would otherwise carve under the answered id starts fresh instead.
+    #[tokio::test]
+    async fn dispatch_sends_candidate_dispatched_before_the_brain() {
+        let (feed, fed) = spy_listen_feed();
+        let seen: Arc<Mutex<Option<Vec<Feed>>>> = Arc::new(Mutex::new(None));
+        let (log, snapshot) = (Arc::clone(&fed), Arc::clone(&seen));
+        Harness::new()
+            .transcriber(FakeTranscriber(Some(("what's the weather".into(), None))))
+            .brain()
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .on_handle(Arc::new(move || {
+                *snapshot.lock().unwrap() = Some(log.lock().unwrap().clone());
+            }))
+            .run(vec![soft_endpoint(carved(1, 0, 16, offline_wake()))])
+            .await;
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            matches!(
+                seen.as_deref(),
+                Some([Feed::CandidateDispatched { id }]) if *id == uid(1)
+            ),
+            "the dispatch was fed before the brain ran: {seen:?}"
+        );
+        assert!(
+            matches!(
+                fed.lock().unwrap().as_slice(),
+                [Feed::CandidateDispatched { id }] if *id == uid(1)
+            ),
+            "a closed turn opens no window: {:?}",
+            fed.lock().unwrap()
+        );
+    }
+
+    /// Run a dispatched carve of seq 1, then feed `second` once the dispatch is
+    /// done, returning the run's lines, the replies, and what the listener was fed.
+    async fn dispatch_then(second: CarvedUtterance) -> (Vec<Value>, Vec<SpeakCmd>, Vec<Feed>) {
+        let (feed, fed) = spy_listen_feed();
+        let mut run = Harness::new()
+            .transcriber(FakeTranscriber(Some(("what's the weather".into(), None))))
+            .brain()
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .start(vec![soft_endpoint(carved(1, 0, 16, offline_wake()))])
+            .await;
+        for _ in 0..4 {
+            run.settle().await;
+        }
+        run.feed(soft_endpoint(second)).await;
+        let (lines, cmds) = run.finish().await;
+        let fed = fed.lock().unwrap().clone();
+        (lines, cmds, fed)
+    }
+
+    /// A carve of a listener utterance already dispatched — the listener resumed
+    /// and re-carved it before it heard of the dispatch — is dropped and traced,
+    /// never transcribed or answered a second time.
+    #[tokio::test]
+    async fn a_same_id_soft_endpoint_after_dispatch_is_dropped() {
+        let (lines, cmds, fed) = dispatch_then(carved(1, 0, 64, offline_wake())).await;
+        let names = events(&lines);
+        let count = |name: &str| names.iter().filter(|e| **e == name).count();
+        assert_eq!(count("utterance"), 1, "{names:?}");
+        assert_eq!(count("brain_dispatched"), 1, "{names:?}");
+        assert_eq!(count("stt_started"), 1, "{names:?}");
+        assert_eq!(cmds.len(), 1, "answered once: {cmds:?}");
+        let dropped: Vec<&Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "carve_after_dispatch")
+            .collect();
+        assert_eq!(dropped.len(), 1, "{names:?}");
+        assert_eq!(dropped[0]["pod"], "pod-x");
+        assert_eq!(dropped[0]["utterance_id"]["seq"], 1);
+        let dispatched = names.iter().position(|e| *e == "brain_dispatched");
+        let after = names.iter().position(|e| *e == "carve_after_dispatch");
+        assert!(
+            matches!((dispatched, after), (Some(d), Some(a)) if d < a),
+            "the second carve arrived after the dispatch: {names:?}"
+        );
+        assert!(
+            matches!(fed.as_slice(), [Feed::CandidateDispatched { id }] if *id == uid(1)),
+            "{fed:?}"
+        );
+    }
+
+    /// The ring matches on the listener utterance, not the pod: a new id after a
+    /// dispatch is an ordinary carve.
+    #[tokio::test]
+    async fn a_carve_of_a_new_id_after_dispatch_is_transcribed() {
+        let (lines, _, _) = dispatch_then(carved(2, 64, 128, offline_wake())).await;
+        let names = events(&lines);
+        assert_eq!(
+            names.iter().filter(|e| **e == "utterance").count(),
+            2,
+            "{names:?}"
+        );
+        assert!(!names.contains(&"carve_after_dispatch"), "{names:?}");
+    }
+
+    /// An endpointer transition for epoch 1, as the listener reports it.
+    fn transition(from: EndpointState, to: EndpointState, cause: TransitionCause) -> PipelineItem {
+        PipelineItem::Listener(ListenerEvent::EndpointerTransition {
+            pod: pod(),
+            epoch: 1,
+            transition: EndpointTransition {
+                from,
+                to,
+                cause,
+                sample_offset: 16_000,
+            },
+        })
+    }
+
+    /// A held wake with a 500 ms wait, then `t` 100 ms in and 600 ms of clock, so
+    /// the wall-clock release would have fired had nothing cancelled it. Returns
+    /// the running pipeline and the scripter's inbox.
+    async fn hold_then(
+        t: PipelineItem,
+        brain: bool,
+    ) -> (
+        RunningPipeline,
+        ScriptHandle,
+        crate::scripter::ScriptInbox,
+        JsonlHandle,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut h = Harness::new()
+            .scripter(handle.clone())
+            .transcriber(FakeTranscriber(Some(("what's the weather".into(), None))));
+        if brain {
+            h = h.brain();
+        }
+        let mut run = h
+            .start(vec![wake_detected(1, 15_360), wake_held(1, 15_360, 23_360)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(100)).await;
+        run.feed(t).await;
+        run.advance(Duration::from_millis(600)).await;
+        (run, handle, rx, jsonl, writer)
+    }
+
+    /// Speech onsetting under a hold ends in a soft endpoint that consumes or
+    /// refreshes it, so the wall-clock release stands down: the head stays up
+    /// while the command is spoken, and the command is answered.
+    #[tokio::test(start_paused = true)]
+    async fn speech_onset_under_a_hold_cancels_the_release() {
+        let (mut run, handle, rx, jsonl, writer) = hold_then(
+            transition(
+                EndpointState::Idle,
+                EndpointState::Speech,
+                TransitionCause::Onset,
+            ),
+            true,
+        )
+        .await;
+        run.feed(soft_endpoint(carved(1, 0, 16, offline_wake())))
+            .await;
+        let (lines, _) = run.finish().await;
+
+        let names = events(&lines);
+        assert!(!names.contains(&"wake_hold_released"), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|e| **e == "brain_dispatched").count(),
+            1,
+            "{names:?}"
+        );
+        let inputs = script_inputs(handle, rx).await;
+        assert!(
+            matches!(
+                inputs.as_slice(),
+                [
+                    ScriptInput::Wake { .. },
+                    ScriptInput::TurnStarted { .. },
+                    ..
+                ]
+            ),
+            "{inputs:?}"
+        );
+        assert!(
+            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            "{inputs:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A resume inside the continuation window is speech running exactly as an
+    /// onset is: the release stands down for it too.
+    #[tokio::test(start_paused = true)]
+    async fn resumed_speech_under_a_hold_cancels_the_release() {
+        let (run, handle, rx, jsonl, writer) = hold_then(
+            transition(
+                EndpointState::SoftEndpointed,
+                EndpointState::Speech,
+                TransitionCause::Continuation,
+            ),
+            false,
+        )
+        .await;
+        let (lines, _) = run.finish().await;
+
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "{lines:?}"
+        );
+        let inputs = script_inputs(handle, rx).await;
+        assert!(
+            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            "{inputs:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A discontinuity that drops the speech carves nothing, so nothing consumes
+    /// or refreshes the hold: the release is due at its own instant again.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_that_drops_the_speech_lets_the_release_fire() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .transcriber(FakeTranscriber(Some(("what's the weather".into(), None))))
+            .start(vec![wake_detected(1, 15_360), wake_held(1, 15_360, 23_360)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(100)).await;
+        run.feed(transition(
+            EndpointState::Idle,
+            EndpointState::Speech,
+            TransitionCause::Onset,
+        ))
+        .await;
+        run.advance(Duration::from_millis(100)).await;
+        run.feed(transition(
+            EndpointState::Speech,
+            EndpointState::Idle,
+            TransitionCause::Reset,
+        ))
+        .await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+
+        let released: Vec<_> = lines
+            .iter()
+            .filter(|l| l["event"] == "wake_hold_released")
+            .collect();
+        assert_eq!(released.len(), 1, "{lines:?}");
+        assert_eq!(released[0]["deadline_sample"], 23_360, "{lines:?}");
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![plain_wake(), ScriptInput::Unanswered(pod())]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// Speech ending toward a carve leaves the hold to that carve: only a reset
+    /// resumes the wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn speech_ending_toward_a_carve_leaves_the_release_to_the_carve() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .transcriber(FakeTranscriber(Some(("what's the weather".into(), None))))
+            .start(vec![wake_detected(1, 15_360), wake_held(1, 15_360, 23_360)])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(100)).await;
+        run.feed(transition(
+            EndpointState::Idle,
+            EndpointState::Speech,
+            TransitionCause::Onset,
+        ))
+        .await;
+        run.advance(Duration::from_millis(200)).await;
+        run.feed(transition(
+            EndpointState::Speech,
+            EndpointState::SoftEndpointed,
+            TransitionCause::SoftEndpoint,
+        ))
+        .await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "{lines:?}"
+        );
+        let inputs = script_inputs(handle, rx).await;
+        assert!(
+            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            "{inputs:?}"
+        );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// Speech ending is no reason to stand the release down: the quiet room after
+    /// it is exactly what the release is for.
+    #[tokio::test(start_paused = true)]
+    async fn a_transition_out_of_speech_leaves_the_release_standing() {
+        let (run, handle, rx, jsonl, writer) = hold_then(
+            transition(
+                EndpointState::Speech,
+                EndpointState::SoftEndpointed,
+                TransitionCause::SoftEndpoint,
+            ),
+            false,
+        )
+        .await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l["event"] == "wake_hold_released")
+                .count(),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![plain_wake(), ScriptInput::Unanswered(pod())]
+        );
+        drop(jsonl);
+        writer.await.unwrap();
     }
 
     /// Speech heard inside the window reaches the head, so its ending is moved
@@ -5380,7 +6027,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod())],
+            vec![plain_wake()],
             "the live epoch's wake raises; the superseded window moves nothing",
         );
         drop(jsonl);
@@ -5431,7 +6078,7 @@ mod tests {
         );
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod())],
+            vec![plain_wake()],
             "the live epoch's wake raises; the window's lines move no head",
         );
         drop(jsonl);
@@ -5603,7 +6250,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Wake(pod()), ScriptInput::Unanswered(pod())],
+            vec![plain_wake(), ScriptInput::Unanswered(pod())],
             "the hold's own ending, and nothing from the window",
         );
         assert!(
@@ -5896,7 +6543,13 @@ mod tests {
                     assert_eq!(cmds.len(), 1, "a barge that said something is answered");
                     assert!(dispatched, "and dispatched as one: {lines:?}");
                     assert_eq!(cut_notices, 0, "nothing was declined to report");
-                    assert!(handed_back.is_empty(), "{handed_back:?}");
+                    assert!(
+                        matches!(
+                            handed_back.as_slice(),
+                            [Feed::CandidateDispatched { id }] if *id == uid(1)
+                        ),
+                        "{handed_back:?}"
+                    );
                     // This carve's provenance is `Barge`, which the settle rule
                     // names; only the dispatch keeps the head off the settle.
                     // A barge that said something is answered, so the turn owns
@@ -6435,7 +7088,10 @@ mod tests {
         )
         .await;
 
-        assert!(fed.is_empty(), "the turn keeps the window: {fed:?}");
+        assert!(
+            matches!(fed.as_slice(), [Feed::CandidateDispatched { id }] if *id == uid(1)),
+            "the turn keeps the window; the listener hears only of the dispatch: {fed:?}"
+        );
     }
 
     // --- the cue tap ------------------------------------------------------

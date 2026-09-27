@@ -56,6 +56,7 @@ use crate::brenn::BridgeLink;
 use crate::brenn::driver::{BridgeDriver, DriverIo, IntentSink};
 use crate::clip::{ClipError, load_clip};
 use crate::config::{BrainMode, Config, CueLibrary, PskTable, SttBackend, SttConfig, TtsBackend};
+use crate::gaze::WakeGaze;
 use crate::iso8601_ms;
 use crate::jsonl::JsonlHandle;
 use crate::pipeline::{BargeWiring, BrainWiring, ListenWiring, PipelineFatal, UnreachableClip};
@@ -348,7 +349,7 @@ impl PruneCoordinator {
 
 /// The seams a process composing this server fills in place of the bus.
 ///
-/// Both are `None` for the pod daemon, which is the deployment this server was
+/// All are `None` for the pod daemon, which is the deployment this server was
 /// written for: its scripter publishes motion intent on the bus and it hears
 /// none. A process that holds a body of its own on the same machine as the
 /// scripter — the robot's voice host — supplies them instead, and the two sides
@@ -372,6 +373,11 @@ pub struct Sinks {
     /// without one is reported (`brenn_motion_intents_unwired`) rather than
     /// left silently dead.
     pub intents: Option<Arc<dyn IntentSink>>,
+    /// Chooses where the head looks on a wake, from the array's readings. Consulted
+    /// only when this run scripts a head; supplied to a run that does not, it is
+    /// unused and says so (`gaze_seam_unused`). `None`: every wake takes the
+    /// configured wake pose.
+    pub gaze: Option<Arc<dyn WakeGaze>>,
 }
 
 /// A bound TCP listener plus the shared config and observability sink. Split
@@ -718,6 +724,16 @@ impl Server {
 
         let scripter = build_scripter(&config, &jsonl, sinks.scripts.clone());
         let script_handle = scripter.as_ref().map(|scripter| scripter.handle.clone());
+        // A gaze with no scripter has no raise to choose; said once, like an unused
+        // script sink, rather than left silently dead.
+        let gaze = match (&sinks.gaze, &script_handle) {
+            (Some(gaze), Some(_)) => Some(Arc::clone(gaze)),
+            (Some(_), None) => {
+                jsonl.emit("gaze_seam_unused", &json!({ "reason": "no scripter" }));
+                None
+            }
+            (None, _) => None,
+        };
 
         // How both openers open a `<listen/>` reply's capture window: built once
         // and shared, so the window's length cannot depend on which of them
@@ -1060,6 +1076,7 @@ impl Server {
                     },
                 }),
                 scripter: script_handle.clone(),
+                gaze,
                 cues: cue_library.clone(),
                 unreachable_clip,
             },
@@ -4477,6 +4494,7 @@ mod tests {
             Sinks {
                 scripts: Some(sink.clone()),
                 intents: None,
+                gaze: None,
             },
             handle.clone(),
         )
@@ -4522,6 +4540,7 @@ mod tests {
             Sinks {
                 scripts: Some(sink.clone()),
                 intents: None,
+                gaze: None,
             },
             handle.clone(),
         )
@@ -4557,6 +4576,7 @@ mod tests {
             Sinks {
                 scripts: None,
                 intents: Some(sink.clone()),
+                gaze: None,
             },
             handle.clone(),
         )
@@ -4775,6 +4795,60 @@ mod tests {
         let lines = read_lines(&path);
         assert_eq!(
             events_named(&lines, "alert_seam_unused").len(),
+            1,
+            "said once: {lines:?}"
+        );
+    }
+
+    /// A gaze that is never asked: it has no reason to be.
+    struct SilentGaze;
+
+    impl WakeGaze for SilentGaze {
+        fn choose(
+            &self,
+            _pod: &PodId,
+            _doa: &[crate::gaze::DoaSample],
+            _wake_end_sample: u64,
+        ) -> Option<crate::gaze::GazePose> {
+            None
+        }
+    }
+
+    /// A gaze supplied to a run that scripts no head has no raise to choose, and
+    /// the composer is told once rather than left believing it steers the head.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gaze_seam_without_a_scripter_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let cfg = config(&dir.path().join("store"), false);
+        let (server, _addr, stop_tx, stop_rx) = bind_with_stop(cfg, handle.clone(), None).await;
+        let server = server.with_sinks(Sinks {
+            gaze: Some(Arc::new(SilentGaze)),
+            ..Sinks::default()
+        });
+        let run = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+        });
+
+        let said = wait_for_event(&path, "the unused gaze seam", |v| {
+            v["event"] == "gaze_seam_unused"
+        })
+        .await;
+        assert_eq!(said["reason"], "no scripter");
+
+        stop_tx.send(()).unwrap();
+        run.await.unwrap().expect("a requested stop");
+        drop(handle);
+        join.await.unwrap();
+
+        let lines = read_lines(&path);
+        assert_eq!(
+            events_named(&lines, "gaze_seam_unused").len(),
             1,
             "said once: {lines:?}"
         );
@@ -5678,9 +5752,10 @@ mod tests {
         );
         let run = tokio::spawn(task.run(teardown.clone()));
 
-        taps.send(crate::scripter::ScriptInput::Wake(PodId(String::from(
-            "pod-srv",
-        ))));
+        taps.send(crate::scripter::ScriptInput::Wake {
+            pod: PodId(String::from("pod-srv")),
+            gaze: None,
+        });
 
         let out = poll_until("the wake's script reaches the sink", || {
             sink.scripts
@@ -5721,6 +5796,7 @@ mod tests {
             Sinks {
                 scripts: Some(sink.clone()),
                 intents: Some(sink.clone()),
+                gaze: None,
             },
             handle.clone(),
         )
@@ -8214,6 +8290,7 @@ mod tests {
                     epoch: 1,
                     score: 0.9,
                     wake_end_sample: i,
+                    doa: Vec::new(),
                 },
             ));
         }
@@ -8298,6 +8375,7 @@ mod tests {
                 epoch: 1,
                 score: 0.9,
                 wake_end_sample: 8,
+                doa: Vec::new(),
             },
         ));
 

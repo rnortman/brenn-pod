@@ -804,3 +804,24 @@ against it), or `wake::oww` and its three re-exports are deleted and the batch p
 
 See `TODO(batch-wake-gate-fate)` at the module header in
 `host/crates/speech-pipeline/src/wake/oww.rs`.
+
+## `fixed-beams-runtime` — DEFERRED as of 2026-09-27 (needs the bench answer from `fixed_beams_broadside`, then a design cycle)
+
+The reachy pod's self-test registry can fix the XVF3800's two focused beams at a commanded
+direction (`ctrl_fixedbeams`, `fixed_beams_broadside`), but nothing at runtime does. The runtime
+path is a typed server → device frame carrying on/off and both beams' azimuth and elevation, as a
+new `StreamFrame` variant. On the pod it is routed to the worker that owns the chip's control
+handle; `pod-ingest` gets a send beside `EndOfAudio`; and the speech pipeline sends "on" when the
+host has turned the head toward a talker, and "off" when the utterance is dispatched, when the wake
+arm expires, and on reconnect. The chip reboot at attach already guarantees a new session never
+inherits a fixed beam.
+
+It waits because whether the chip places a talker at broadside under fixed beams, and whether the
+captured audio is better for it, are what the bench case answers. The frame's shape and the moments
+it is sent are a design question that starts from that answer.
+
+Done = the frame exists end to end, the pipeline sends it at the moments above, and a test pins
+that a session ends with the beams released.
+
+See `TODO(fixed-beams-runtime)` above the `EndOfAudio` variant in
+`firmware/crates/audio-pipeline/src/wire.rs`.

@@ -38,7 +38,7 @@ pub use http::{
     TtsStats, TtsStatsSnapshot, Url,
 };
 pub use listener::{
-    BargeCause, BargeInConfig, BargeMode, CarveTiming, CarvedUtterance, EndpointEvent,
+    BargeCause, BargeInConfig, BargeMode, CarveTiming, CarvedUtterance, DoaSample, EndpointEvent,
     EndpointState, EndpointTransition, Endpointer, EndpointerConfig, Feed, FeedSender, Listener,
     ListenerConfig, ListenerEvent, ListenerHandle, ListenerState, ListenerStats,
     ListenerStatsSnapshot, ListenerUtteranceId, MODEL_STATS_FLUSH_CHUNKS, OwwModels, OwwStream,

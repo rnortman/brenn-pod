@@ -74,6 +74,8 @@ pub enum StreamFrame {
     /// plays out whatever is still banked, then mutes (see the device-side mute
     /// policy).  Empty body today; struct-typed so fields can be appended later
     /// without re-tagging.
+    // TODO(fixed-beams-runtime): a server → device frame that fixes or frees the
+    // chip's focused beams would be a variant here.
     EndOfAudio(EndOfAudio),
     /// Server → device: discard everything banked and go silent immediately
     /// (flush/stop, for barge-in).  Empty body today; struct-typed so fields can
@@ -209,9 +211,19 @@ pub struct Telemetry {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum TelemetryKind {
-    /// AEC_AZIMUTH_VALUES (resid 33, cmd 75): four tracked beam azimuths in radians.
-    /// Indices: 0=focused-A, 1=focused-B, 2=free-running, 3=auto-select winner.
-    /// NaN is valid on indices 0, 1, 3 when no beam is tracked.
+    /// AEC_AZIMUTH_VALUES (resid 33, cmd 75): four beam azimuths in radians.
+    ///
+    /// `[0]` and `[1]` are the focused (slow) beams, `[2]` is free-running, and
+    /// `[3]` is the auto-select: a copy of whichever of the other three the chip
+    /// picks.
+    ///
+    /// An azimuth `α ∈ [0, π]` is the angle between the source direction and the
+    /// array axis. It defines a cone about that axis, with broadside at `π/2`;
+    /// front/back and up/down are folded together, and elevation is never
+    /// reported. NaN is valid on indices 0, 1 and 3 when nothing is tracked.
+    ///
+    /// Polled at 10 Hz on the device, and sent only while a device-VAD segment
+    /// is open.
     Azimuths { values: [f32; 4] },
     /// AEC_SPENERGY_VALUES (resid 33, cmd 80): four beam speech-energy readings.
     SpEnergy { values: [f32; 4] },

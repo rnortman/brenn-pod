@@ -98,6 +98,10 @@ RECORD=""
 # registration, and a git checkout with one commit — which is the tree the record
 # is about.
 new_tree() {
+	# Git exports its own location to hooks, `rebase -x` and `bisect run`
+	# (GIT_INDEX_FILE, GIT_DIR, GIT_WORK_TREE, …). Inherited here, `git add` in a
+	# fixture repo would rewrite the caller's index instead of the fixture's.
+	unset "${!GIT_@}"
 	treenum=$((treenum + 1))
 	TREE="$WORK/tree-$treenum"
 	BINFMT="$TREE/binfmt"
@@ -235,5 +239,15 @@ expect_die "a-build-without-git-is-refused" "git is not installed"
 says "the-refusal-says-what-reads-the-record" "brenn-reachy"
 check "a-build-without-git-compiles-nothing" \
 	"$(yes_no [ ! -s "$PODMAN_ARGV" ])" "podman was asked: $(cat -- "$PODMAN_ARGV")"
+
+# ── the fixture ignores the caller's git ──────────────────────────────────────
+
+# Under a `git commit -a` pre-commit hook GIT_INDEX_FILE is the absolute path of
+# the commit's index; a fixture that inherited it would rewrite the commit.
+export GIT_INDEX_FILE="$WORK/poison-index"
+new_tree
+check "the-fixture-repo-ignores-an-inherited-index" \
+	"$(yes_no [ ! -e "$WORK/poison-index" ])" "the fixture wrote the caller's index"
+unset GIT_INDEX_FILE
 
 test_summary build-reachy-pod.test.sh

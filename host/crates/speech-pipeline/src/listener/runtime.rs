@@ -24,7 +24,7 @@
 //!   (`Capped`/`DeviceVadRelease`) and the continuation-window close return to a
 //!   no-utterance state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -39,7 +39,7 @@ use super::endpointer::{
     EndpointCause, EndpointEvent, Endpointer, EndpointerConfig, TransitionCause,
 };
 use super::event::{
-    BargeCause, CarveTiming, CarvedUtterance, Feed, ListenerEvent, ListenerUtteranceId,
+    BargeCause, CarveTiming, CarvedUtterance, DoaSample, Feed, ListenerEvent, ListenerUtteranceId,
     StatsFlushCause, StatsModel, WakePolicy,
 };
 use super::oww_stream::{OwwModels, OwwStream};
@@ -61,6 +61,16 @@ const FEED_CHANNEL_DEPTH: usize = 512;
 /// connection task.
 const MARKER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Azimuth readings the listener keeps: about 3 s at the device's 10 Hz poll.
+const DOA_RING_CAPACITY: usize = 32;
+
+/// How far before a wake's end a reading still counts as heard during the phrase:
+/// its last half second.
+const WAKE_DOA_LEAD_SAMPLES: u64 = 8_000;
+
+/// How far past a wake's end a reading still counts: one 100 ms chunk of slack.
+const WAKE_DOA_SLACK_SAMPLES: u64 = 1_600;
+
 /// Per-pod listener knobs. `Copy` so the thread hands a fresh copy to each new pod.
 #[derive(Debug, Clone, Copy)]
 pub struct ListenerConfig {
@@ -75,8 +85,9 @@ pub struct ListenerConfig {
     pub stt_margin_samples: usize,
     /// A wake-gated utterance whose speech ends within this many samples of the
     /// wake end carried the wake word and nothing else, so it is held rather than
-    /// published. The wake detector fires before the phrase finishes, so this has
-    /// to cover the phrase's own tail; a real command cannot end inside it.
+    /// published. The wake detector reports the wake end at or just past the
+    /// phrase's end, so the tail is the margin between a bare wake's end and the
+    /// shortest command's.
     pub wake_tail_samples: u64,
     /// How long after a held wake-only carve's speech end a new onset may still
     /// claim the arm. The utterance that onsets inside the wait carves from the
@@ -108,15 +119,17 @@ impl Default for ListenerConfig {
             endpointer: EndpointerConfig::default(),
             arm_slack_samples: 16_000,
             stt_margin_samples: 3_200,
-            // 1500 ms and 8000 ms. The wake tail covers the detector's early fire
-            // (observed up to ~700 ms before the phrase ends) and the short
-            // re-onset that follows it, which extends the wake-only carve to about
-            // 1.1 s past the wake end; 1500 ms puts the observed extents well
-            // inside the tail. The wait covers a speaker who wakes the robot and
+            // 500 ms and 8000 ms. On live speech the detector's wake end lands
+            // 0–150 ms after the phrase ends (the openWakeWord lag plus one chunk),
+            // so a bare wake's speech ends within ~150 ms of it, while even a
+            // 0.7 s command ends ~700 ms past it; 500 ms separates the two. A
+            // command shorter than ~0.5 s spoken in one breath with the phrase is
+            // held as a bare wake, and is lost at `arm_expired` if nothing
+            // follows. The wait covers a speaker who wakes the robot and
             // then thinks — observed to 4.1 s. The wait costs a real turn nothing
             // — the command's onset ends it — and only delays the "wake, no
             // command" accounting for a bare wake.
-            wake_tail_samples: 24_000,
+            wake_tail_samples: 8_000,
             command_wait_samples: 128_000,
             default_policy: WakePolicy::WakeGated,
             barge_in: BargeInConfig::default(),
@@ -485,6 +498,10 @@ pub struct ListenerState {
     /// OWW wake-head scores since the last flush. Empty (and so silent) on a pod
     /// fed synthetic probabilities, which performs no OWW pushes.
     oww_stats: ScoreStats,
+    /// Recent azimuth readings on the absolute sample axis, bounded at
+    /// `DOA_RING_CAPACITY`; cleared with the connection, since indexes are per
+    /// connection.
+    doa: VecDeque<DoaSample>,
 }
 
 impl ListenerState {
@@ -535,6 +552,7 @@ impl ListenerState {
             overlap_trimmed: 0,
             silero_stats: ScoreStats::default(),
             oww_stats: ScoreStats::default(),
+            doa: VecDeque::with_capacity(DOA_RING_CAPACITY),
         }
     }
 
@@ -627,6 +645,24 @@ impl ListenerState {
                 oww_models,
                 silero_model,
             ),
+            Feed::Doa {
+                sample_offset,
+                azimuths,
+            } => {
+                // No open segment means no base to stamp against (a dropped
+                // `SegmentOpened`); an offset reaching below index 0 names no sample.
+                if let Some(sample) = self
+                    .segment
+                    .as_ref()
+                    .and_then(|seg| seg.base_sample_index.checked_add_signed(sample_offset))
+                {
+                    if self.doa.len() == DOA_RING_CAPACITY {
+                        self.doa.pop_front();
+                    }
+                    self.doa.push_back(DoaSample { sample, azimuths });
+                }
+                Ok(Vec::new())
+            }
             Feed::PlaybackState {
                 active,
                 interruptible,
@@ -684,6 +720,11 @@ impl ListenerState {
                 self.restore_listen(pod, &id, &mut events);
                 Ok(events)
             }
+            Feed::CandidateDispatched { id } => {
+                let mut events = Vec::new();
+                self.close_dispatched(pod, &id, &mut events);
+                Ok(events)
+            }
             Feed::SegmentClosed { host_rx, .. } => self.handle_close(pod, host_rx),
         }
     }
@@ -718,6 +759,7 @@ impl ListenerState {
         self.current_onset_rx = None;
         self.current_wake_rx = None;
         self.current_anchor = None;
+        self.doa.clear();
     }
 
     /// Reset the rolling inference state (OWW/Silero windows, endpointer, Silero
@@ -1012,6 +1054,29 @@ impl ListenerState {
         self.close_listen(pod, events);
     }
 
+    /// The pipeline dispatched `id`: end that utterance here. Its identity, wake
+    /// provenance and stamps go (`clear_utterance`), and the endpointer closes to
+    /// idle so a resume inside the continuation window is a fresh onset rather than
+    /// a re-carve of speech already answered. Anything but the current id is stale
+    /// and changes nothing.
+    fn close_dispatched(
+        &mut self,
+        pod: &PodId,
+        id: &ListenerUtteranceId,
+        events: &mut Vec<ListenerEvent>,
+    ) {
+        if self.current_id.as_ref() != Some(id) {
+            return;
+        }
+        self.clear_utterance();
+        self.endpointer.close(self.silero_cursor);
+        self.drain_transitions(pod, None, events);
+        events.push(ListenerEvent::UtteranceClosed {
+            pod: pod.clone(),
+            utterance_id: id.clone(),
+        });
+    }
+
     /// Give back the capture window the candidate `id` spent, because the gate
     /// declined it: no turn came of it, so it cost the window nothing. The deadline
     /// is the one the window opened with — a decline never re-dates it, which is
@@ -1290,11 +1355,20 @@ impl ListenerState {
             wake_end_sample,
             detected_rx: Some(host_rx),
         });
+        let lo = wake_end_sample.saturating_sub(WAKE_DOA_LEAD_SAMPLES);
+        let hi = wake_end_sample.saturating_add(WAKE_DOA_SLACK_SAMPLES);
+        let doa: Vec<DoaSample> = self
+            .doa
+            .iter()
+            .copied()
+            .filter(|d| (lo..=hi).contains(&d.sample))
+            .collect();
         events.push(ListenerEvent::WakeDetected {
             pod: pod.clone(),
             epoch: self.epoch,
             score,
             wake_end_sample,
+            doa,
         });
         self.wake_barge(pod, wake_end_sample, host_rx, events);
     }
@@ -2005,7 +2079,7 @@ pub struct ListenerStats {
     channel_closed: AtomicU64,
     /// Markers abandoned after waiting `MARKER_SEND_TIMEOUT` for channel room —
     /// the listener is wedged, not merely loaded. Counted apart from `dropped`
-    /// (audio overflow, expected under load) because a non-zero value here means
+    /// (audio and azimuth overflow, expected under load) because a non-zero value here means
     /// listener state has been corrupted, not just thinned.
     marker_send_timeouts: AtomicU64,
     wakes: AtomicU64,
@@ -2233,9 +2307,11 @@ impl FeedSender {
 
     /// Forward one [`Feed`] for `pod`, with delivery semantics split by variant.
     ///
-    /// `Audio` is lossy and non-blocking: a full channel drops the chunk and
-    /// counts it (`dropped`), since a gap self-heals via the discontinuity check
-    /// and audio priority belongs to recording, a separate path.
+    /// `Audio` and `Doa` are lossy and non-blocking: a full channel drops the item
+    /// and counts it (`dropped`, which counts both), since a gap self-heals via the
+    /// discontinuity check and audio priority belongs to recording, a separate
+    /// path. A shed reading costs one 100 ms sample of the array's direction, which
+    /// a wake reads a window of.
     ///
     /// Every other variant is a control marker whose loss corrupts listener state
     /// (a stale epoch, a missed segment re-anchor or fallback carve, a stale
@@ -2249,7 +2325,7 @@ impl FeedSender {
     /// (`channel_closed`) so a dead listener is distinguishable from load drops;
     /// the caller keeps running in every case.
     pub async fn feed(&self, pod: PodId, feed: Feed) {
-        if matches!(feed, Feed::Audio { .. }) {
+        if matches!(feed, Feed::Audio { .. } | Feed::Doa { .. }) {
             match self.tx.try_send((pod, feed)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
@@ -2693,6 +2769,139 @@ mod tests {
             "and the arm gated that carve rather than going unused"
         );
         assert!(state.wake.is_none(), "the carve consumed the arm");
+    }
+
+    /// One azimuth reading at `sample_offset` into the open segment.
+    fn doa_feed(sample_offset: i64, azimuths: [f32; 4]) -> Feed {
+        Feed::Doa {
+            sample_offset,
+            azimuths,
+        }
+    }
+
+    /// The first `WakeDetected`'s readings in `events`.
+    fn first_wake_doa(events: &[ListenerEvent]) -> Vec<DoaSample> {
+        events
+            .iter()
+            .find_map(|e| match e {
+                ListenerEvent::WakeDetected { doa, .. } => Some(doa.clone()),
+                _ => None,
+            })
+            .expect("the phrase is detected")
+    }
+
+    /// Readings every 100 ms across and past the phrase fill the ring, and the
+    /// detection carries exactly those the ring still holds whose stamp lies in the
+    /// last half second of the phrase plus one chunk past its end, oldest first.
+    #[test]
+    fn doa_feeds_fill_the_ring_and_a_wake_carries_the_last_half_second() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
+        open(&mut state, 0, &mut oww, &mut silero);
+        let audio = primed_wake_pcm();
+        let last_offset = audio.len() as i64 + 3_200;
+        let mut fed = Vec::new();
+        for (k, offset) in (0..=last_offset).step_by(1_600).enumerate() {
+            let azimuths = [k as f32, 0.0, 0.0, 0.0];
+            let events = state
+                .handle(&pod(), doa_feed(offset, azimuths), &mut oww, &mut silero)
+                .unwrap();
+            assert!(events.is_empty(), "a reading emits nothing: {events:?}");
+            fed.push(DoaSample {
+                sample: offset as u64,
+                azimuths,
+            });
+        }
+        let events = feed_audio_chunkwise(&mut state, 0, &audio, &mut oww, &mut silero);
+        let wake_end = events
+            .iter()
+            .find_map(|e| match e {
+                ListenerEvent::WakeDetected {
+                    wake_end_sample, ..
+                } => Some(*wake_end_sample),
+                _ => None,
+            })
+            .expect("the phrase is detected");
+        let retained = &fed[fed.len().saturating_sub(DOA_RING_CAPACITY)..];
+        let expected: Vec<DoaSample> = retained
+            .iter()
+            .copied()
+            .filter(|d| (wake_end.saturating_sub(8_000)..=wake_end + 1_600).contains(&d.sample))
+            .collect();
+        let doa = first_wake_doa(&events);
+        assert_eq!(doa, expected, "wake end {wake_end}");
+        assert!(
+            !doa.is_empty(),
+            "readings lie in the span: wake end {wake_end}"
+        );
+        assert!(
+            doa.len() < fed.len(),
+            "readings outside the span are left out"
+        );
+    }
+
+    /// A reading stamped nowhere near the phrase is not carried by its detection.
+    #[test]
+    fn a_wake_with_no_doa_in_span_carries_none() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
+        open(&mut state, 0, &mut oww, &mut silero);
+        let audio = primed_wake_pcm();
+        state
+            .handle(
+                &pod(),
+                doa_feed(audio.len() as i64 + 100_000, [1.0, 1.0, 1.0, 1.0]),
+                &mut oww,
+                &mut silero,
+            )
+            .unwrap();
+        let events = feed_audio_chunkwise(&mut state, 0, &audio, &mut oww, &mut silero);
+        assert!(first_wake_doa(&events).is_empty());
+    }
+
+    /// The ring keeps the newest `DOA_RING_CAPACITY` readings, goes with the
+    /// connection, and stamps a reading only against an open segment and only at a
+    /// sample index that exists.
+    #[test]
+    fn the_doa_ring_is_bounded_and_goes_with_the_connection() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
+        open(&mut state, 0, &mut oww, &mut silero);
+        for k in 0..40_i64 {
+            state
+                .handle(&pod(), doa_feed(k * 1_600, [0.0; 4]), &mut oww, &mut silero)
+                .unwrap();
+        }
+        assert_eq!(state.doa.len(), 32);
+        assert_eq!(state.doa.front().map(|d| d.sample), Some(8 * 1_600));
+
+        state
+            .handle(&pod(), Feed::Connected { epoch: 2 }, &mut oww, &mut silero)
+            .unwrap();
+        assert!(state.doa.is_empty(), "the reconnect clears the ring");
+        state
+            .handle(&pod(), doa_feed(0, [0.0; 4]), &mut oww, &mut silero)
+            .unwrap();
+        assert!(
+            state.doa.is_empty(),
+            "no segment is open, so there is no base to stamp against"
+        );
+
+        open_segment(&mut state, 100, 0, &mut oww, &mut silero);
+        state
+            .handle(&pod(), doa_feed(-200, [0.0; 4]), &mut oww, &mut silero)
+            .unwrap();
+        assert!(state.doa.is_empty(), "an offset below index 0 is dropped");
+        state
+            .handle(&pod(), doa_feed(-50, [0.0; 4]), &mut oww, &mut silero)
+            .unwrap();
+        assert_eq!(
+            state.doa.iter().map(|d| d.sample).collect::<Vec<_>>(),
+            vec![50]
+        );
     }
 
     /// The natural path, end to end, on real models and real audio: no synthetic
@@ -4161,6 +4370,145 @@ mod tests {
                 silero,
             )
             .expect("decline feed")
+    }
+
+    /// Report that the pipeline dispatched `id` with the stream at `cursor`, the
+    /// "now" the endpointer's close is dated at.
+    fn dispatch_at(
+        state: &mut ListenerState,
+        cursor: u64,
+        id: &ListenerUtteranceId,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> Vec<ListenerEvent> {
+        state.silero_cursor = cursor;
+        state
+            .handle(
+                &pod(),
+                Feed::CandidateDispatched { id: id.clone() },
+                oww,
+                silero,
+            )
+            .expect("dispatch feed")
+    }
+
+    /// A synthetic listener under `policy` that has carved one utterance (seq 1,
+    /// wake-confirmed when gated) and sits in its continuation window. Returns the state,
+    /// the cursor, and the carve's id.
+    fn state_with_a_carved_candidate(
+        policy: WakePolicy,
+    ) -> (ListenerState, u64, ListenerUtteranceId) {
+        let mut state = ListenerState::new(synth_config(policy));
+        state.push_ring_for_test(0, &vec![3_i16; 16_384]);
+        state.arm_wake_for_test(0.9, 400);
+        let mut cursor = 0u64;
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "one soft endpoint: {events:?}");
+        assert_eq!(carved[0].utterance_id.seq, 1);
+        if policy == WakePolicy::WakeGated {
+            assert!(
+                carved[0].wake.is_some(),
+                "the gated carve is wake-confirmed"
+            );
+        }
+        let id = carved[0].utterance_id.clone();
+        (state, cursor, id)
+    }
+
+    /// Dispatch is terminal for the utterance: the identity ends, the endpointer
+    /// closes, and speech inside what was the continuation window is a fresh onset.
+    /// Gated, that speech has no wake and is dropped; under bypass it publishes as a
+    /// new utterance with its own preroll.
+    #[test]
+    fn a_dispatched_candidate_ends_the_identity() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+
+        let (mut state, mut cursor, id) = state_with_a_carved_candidate(WakePolicy::WakeGated);
+        let closed = dispatch_at(&mut state, cursor, &id, &mut oww, &mut silero);
+        let closes: Vec<_> = closed
+            .iter()
+            .filter_map(|e| match e {
+                ListenerEvent::UtteranceClosed { utterance_id, .. } => Some(utterance_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closes, [&id], "the dispatched id closes: {closed:?}");
+        assert_eq!(
+            transitions(&closed),
+            [(TransitionCause::Dispatched, cursor, 0)],
+            "the close is recorded as a dispatch: {closed:?}"
+        );
+        assert!(state.current_id.is_none());
+        let mut after = drive(&mut state, 0.9, 2, &mut cursor);
+        after.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert!(
+            !after
+                .iter()
+                .any(|e| matches!(e, ListenerEvent::Superseded { .. })),
+            "nothing is superseded: {after:?}"
+        );
+        assert!(
+            transitions(&after)
+                .iter()
+                .any(|(cause, _, _)| *cause == TransitionCause::Onset),
+            "the resumed speech onsets fresh: {after:?}"
+        );
+        assert!(
+            soft_endpoints(&after).is_empty(),
+            "with no wake it is dropped at the gate: {after:?}"
+        );
+        assert!(state.current_id.is_none());
+
+        let (mut state, mut cursor, id) = state_with_a_carved_candidate(WakePolicy::Bypass);
+        dispatch_at(&mut state, cursor, &id, &mut oww, &mut silero);
+        let resumed_at = cursor;
+        let mut after = drive(&mut state, 0.9, 2, &mut cursor);
+        after.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&after);
+        assert_eq!(carved.len(), 1, "the resumed speech publishes: {after:?}");
+        assert_eq!(carved[0].utterance_id.seq, 2, "as a new utterance");
+        assert!(carved[0].wake.is_none());
+        assert_eq!(
+            carved[0].start_sample,
+            resumed_at - 100,
+            "a fresh onset with its own preroll, not the pre-dispatch start"
+        );
+    }
+
+    /// A dispatch naming anything but the current id changes nothing, and a
+    /// dispatch already acted on is a no-op the second time.
+    #[test]
+    fn a_stale_candidate_dispatched_is_ignored() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, id) = state_with_a_carved_candidate(WakePolicy::WakeGated);
+        let other_seq = ListenerUtteranceId {
+            seq: 99,
+            ..id.clone()
+        };
+        let other_epoch = ListenerUtteranceId {
+            epoch: id.epoch + 1,
+            ..id.clone()
+        };
+        for stale in [&other_seq, &other_epoch] {
+            let events = dispatch_at(&mut state, cursor, stale, &mut oww, &mut silero);
+            assert!(events.is_empty(), "{stale:?} is stale: {events:?}");
+            assert_eq!(state.current_id.as_ref(), Some(&id));
+        }
+        let resumed = drive(&mut state, 0.9, 1, &mut cursor);
+        assert!(
+            resumed.iter().any(|e| matches!(
+                e,
+                ListenerEvent::Superseded { utterance_id, .. } if *utterance_id == id
+            )),
+            "the continuation still works: {resumed:?}"
+        );
+        assert!(!dispatch_at(&mut state, cursor, &id, &mut oww, &mut silero).is_empty());
+        let again = dispatch_at(&mut state, cursor, &id, &mut oww, &mut silero);
+        assert!(again.is_empty(), "a second dispatch is stale: {again:?}");
     }
 
     /// The deadline of every window restored in `events`.
@@ -6302,13 +6650,80 @@ mod tests {
         }
     }
 
-    /// Production knobs with the hold at its shipped defaults — for the real-model
-    /// tests whose subject is the hold itself.
+    /// The wake tail the espeak wake-phrase fixture needs. On that synthetic voice
+    /// the detector fires inside the phrase, up to ~700 ms before it ends, and the
+    /// re-onset after it carries the wake-only carve to ~1.1 s past the wake end —
+    /// unlike live speech, where the shipped default is measured. The real-audio hold
+    /// tests are about the hold, so they state this rather than inherit the default.
+    const FIXTURE_WAKE_TAIL_SAMPLES: u64 = 24_000;
+
+    /// Production knobs, with the tail the fixture needs — for the real-model tests
+    /// whose subject is the hold itself.
     fn real_hold_config(policy: WakePolicy) -> ListenerConfig {
         ListenerConfig {
             default_policy: policy,
+            wake_tail_samples: FIXTURE_WAKE_TAIL_SAMPLES,
             ..ListenerConfig::default()
         }
+    }
+
+    /// [`synth_config`] with the shipped wake tail and a hold wait, and a length
+    /// bound long enough for a 24-chunk command: the default's own boundary
+    /// between a bare wake and a short command, on synthetic speech.
+    fn default_tail_config() -> ListenerConfig {
+        let synth = synth_config(WakePolicy::WakeGated);
+        ListenerConfig {
+            endpointer: EndpointerConfig {
+                max_utterance_samples: 64 * 512,
+                ..synth.endpointer
+            },
+            wake_tail_samples: ListenerConfig::default().wake_tail_samples,
+            command_wait_samples: 4_096,
+            ..synth
+        }
+    }
+
+    /// `chunks` of speech from sample 0 with the wake end `offset` samples before
+    /// the speech ends, then a soft endpoint, under [`default_tail_config`].
+    fn speak_past_the_wake(chunks: usize, offset: u64) -> Vec<ListenerEvent> {
+        let mut state = ListenerState::new(default_tail_config());
+        state.push_ring_for_test(0, &vec![3_i16; 32_768]);
+        let speech_end = chunks as u64 * 512;
+        state.arm_wake_for_test(0.9, speech_end - offset);
+        let mut cursor = 0u64;
+        let mut events = drive(&mut state, 0.9, chunks, &mut cursor);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        events
+    }
+
+    /// A 0.7 s command ending past the shipped 500 ms tail publishes with its
+    /// wake; the boundary itself publishes too (the rule is `>=`).
+    #[test]
+    fn a_wake_and_a_short_command_ending_past_the_tail_publish() {
+        assert_eq!(ListenerConfig::default().wake_tail_samples, 8_000);
+        for offset in [11_200, 8_000] {
+            let events = speak_past_the_wake(24, offset);
+            let carved = soft_endpoints(&events);
+            assert_eq!(carved.len(), 1, "offset {offset} publishes: {events:?}");
+            assert!(carved[0].wake.is_some());
+            assert!(
+                wake_helds(&events).is_empty(),
+                "offset {offset} is not held"
+            );
+        }
+    }
+
+    /// A bare wake whose speech ends 150 ms past the wake end — the live-speech
+    /// case — is inside the shipped tail and held.
+    #[test]
+    fn a_bare_wake_ending_inside_the_tail_holds() {
+        assert_eq!(ListenerConfig::default().wake_tail_samples, 8_000);
+        let events = speak_past_the_wake(5, 2_400);
+        assert_eq!(wake_helds(&events).len(), 1, "held: {events:?}");
+        assert!(
+            soft_endpoints(&events).is_empty(),
+            "not published: {events:?}"
+        );
     }
 
     /// The `(start, end, wake_end, deadline)` of every `WakeHeld` in `events`.

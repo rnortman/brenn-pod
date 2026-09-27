@@ -37,6 +37,7 @@ use crate::alsa_capture::{
 use crate::beam::beam_energy_speech;
 use crate::chip::{self, Routing};
 use crate::config::CHANNELS;
+use crate::fixed_beams::{ctrl_fixedbeams, fixed_beams_broadside};
 use crate::playback::{AlsaOut, PlaybackFault, StereoOut, expand_mono_to_stereo, open_playback_on};
 use crate::regs::read_register;
 use crate::run::PeriodSource;
@@ -55,8 +56,15 @@ pub const REACHY_FIRMWARE_EXPECTED_VERSION: (u8, u8, u8) = (2, 1, 2);
 /// The control-plane cases, in the order they run. Named so a run that never opened
 /// the board can still account for each of them.
 /// These two arrays are the sole statement of run order.
-pub const CONTROL_PLANE_CASES: [&str; 4] =
-    ["ctrl_version", "ctrl_spenergy", "ctrl_doa", "ctrl_routing"];
+/// `ctrl_fixedbeams` runs last, so `ctrl_doa` reads the beams tracking, as they
+/// normally do.
+pub const CONTROL_PLANE_CASES: [&str; 5] = [
+    "ctrl_version",
+    "ctrl_spenergy",
+    "ctrl_doa",
+    "ctrl_routing",
+    "ctrl_fixedbeams",
+];
 
 /// The audio-plane cases, in the order they run. Same rule as the control-plane
 /// list: a run that never opened the card still accounts for each of them.
@@ -773,6 +781,8 @@ where
             report.record(out, CONTROL_PLANE_CASES[2], doa)?;
             let routing = ctrl_routing(transport);
             report.record(out, CONTROL_PLANE_CASES[3], routing)?;
+            let fixed = ctrl_fixedbeams(transport);
+            report.record(out, CONTROL_PLANE_CASES[4], fixed)?;
         }
         None => {
             for name in CONTROL_PLANE_CASES {
@@ -791,10 +801,11 @@ where
 /// Kept out of [`run`] rather than skipped inside it: a case that needs someone to
 /// speak would otherwise fail on an unattended device for a reason that says
 /// nothing about the hardware, and a registry whose green depends on who is in the
-/// room is a registry nobody trusts.
-pub const MANUAL_CASES: [&str; 1] = ["beam_energy_speech"];
+/// room is a registry nobody trusts. The fixed-beam case runs second, so the
+/// tracking reading is taken before any beam is fixed.
+pub const MANUAL_CASES: [&str; 2] = ["beam_energy_speech", "fixed_beams_broadside"];
 
-/// Run the bench registry: the two opens the bench case needs, then the case.
+/// Run the bench registry: the two opens the bench cases need, then the cases.
 ///
 /// The presence cases are recorded rather than merely performed, because a bench
 /// run that could not open one of the two interfaces has to say which one before it
@@ -833,7 +844,7 @@ pub fn run_manual(out: &mut dyn io::Write) -> io::Result<Report> {
 
 /// Record [`MANUAL_CASES`], in order.
 ///
-/// The bench case is the one that needs both interfaces at once — the chip's own
+/// Both bench cases need both interfaces at once — the chip's own
 /// reading of the room and the audio the stream delivered — so unlike the audio
 /// plane there is nothing to run when either is missing, and which one it was is
 /// the reason recorded.
@@ -847,21 +858,33 @@ pub fn run_manual_plane<T: ControlTransport, S: PeriodSource>(
 where
     T::Error: fmt::Display,
 {
-    let outcome = match (board, source) {
-        (Ok(transport), Ok(source)) => beam_energy_speech(transport, source, out, now)?,
-        (Err(why), _) => Outcome::NotRun(why),
-        (_, Err(why)) => Outcome::NotRun(why),
-    };
-    report.record(out, MANUAL_CASES[0], outcome)
+    match (board, source) {
+        (Ok(transport), Ok(source)) => {
+            let energy = beam_energy_speech(transport, source, out, now)?;
+            report.record(out, MANUAL_CASES[0], energy)?;
+            let fixed = fixed_beams_broadside(transport, source, out, now)?;
+            report.record(out, MANUAL_CASES[1], fixed)
+        }
+        (Err(why), _) | (_, Err(why)) => {
+            for name in MANUAL_CASES {
+                report.record(out, name, Outcome::NotRun(why.clone()))?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chip::ASR_ROUTE;
-    use crate::test_support::{Clock, Scripted, ScriptedCard, detail, f32x4_bytes};
+    use crate::test_support::{
+        Clock, Scripted, ScriptedCard, detail, f32x4_bytes, fixed_beam_answers,
+    };
     use xvf3800_ctrl::{
-        AEC_ASROUTONOFF_CMD, AUDIO_MGR_OP_L_CMD, AUDIO_MGR_OP_R_CMD, AUDIO_MGR_RESID, STATUS_RETRY,
+        AEC_ASROUTONOFF_CMD, AEC_FIXEDBEAMSAZIMUTH_VALUES_CMD, AEC_FIXEDBEAMSELEVATION_VALUES_CMD,
+        AEC_FIXEDBEAMSGATING_CMD, AEC_FIXEDBEAMSONOFF_CMD, AUDIO_MGR_OP_L_CMD, AUDIO_MGR_OP_R_CMD,
+        AUDIO_MGR_RESID, STATUS_RETRY,
     };
 
     // ── ctrl_version ──────────────────────────────────────────────────────────
@@ -1021,14 +1044,17 @@ mod tests {
     #[test]
     fn the_control_plane_runs_every_case_in_order_against_its_own_register() {
         let (major, minor, patch) = REACHY_FIRMWARE_EXPECTED_VERSION;
-        let mut t = Scripted::sequenced(vec![
+        let script = vec![
             (STATUS_DONE, vec![major, minor, patch]),
             (STATUS_DONE, f32x4_bytes([0.1, 0.2, 0.3, 0.4])),
             (STATUS_DONE, f32x4_bytes([0.0, 1.0, -1.0, f32::NAN])),
             (STATUS_DONE, ASR_ROUTE.to_vec()),
             (STATUS_DONE, 1_i32.to_le_bytes().to_vec()),
             (STATUS_DONE, vec![0, 0]),
-        ]);
+        ];
+        let mut script = script;
+        script.extend(fixed_beam_answers(0));
+        let mut t = Scripted::sequenced(script);
         let mut out = Vec::new();
         let mut report = Report::default();
         run_control_plane(
@@ -1052,6 +1078,12 @@ mod tests {
                 (AUDIO_MGR_RESID, AUDIO_MGR_OP_R_CMD),
                 (AEC_RESID, AEC_ASROUTONOFF_CMD),
                 (AUDIO_MGR_RESID, AUDIO_MGR_OP_L_CMD),
+                (AEC_RESID, AEC_FIXEDBEAMSGATING_CMD),
+                (AEC_RESID, AEC_FIXEDBEAMSONOFF_CMD),
+                (AEC_RESID, AEC_FIXEDBEAMSONOFF_CMD),
+                (AEC_RESID, AEC_FIXEDBEAMSAZIMUTH_VALUES_CMD),
+                (AEC_RESID, AEC_FIXEDBEAMSELEVATION_VALUES_CMD),
+                (AEC_RESID, AEC_FIXEDBEAMSONOFF_CMD),
             ],
             "each case must read the register its name promises"
         );
@@ -1076,6 +1108,11 @@ mod tests {
             detail(&report.cases[3].outcome).contains("ASROUTONOFF 1"),
             "{}",
             detail(&report.cases[3].outcome)
+        );
+        assert!(
+            detail(&report.cases[4].outcome).contains("GATING 0"),
+            "{}",
+            detail(&report.cases[4].outcome)
         );
     }
 
@@ -1517,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bench_plane_records_its_case_when_both_interfaces_are_there() {
+    fn the_bench_plane_records_both_cases_when_both_interfaces_are_there() {
         let mut board = bench_board();
         let mut card = ScriptedCard::stalled();
         let mut report = Report::default();
@@ -1538,6 +1575,14 @@ mod tests {
             ),
             other => panic!("the bench case must have run, got {other:?}"),
         }
+        match &report.cases[1].outcome {
+            Outcome::Fail(lines) => assert!(
+                lines[0].contains("the card delivered"),
+                "{:?}",
+                report.cases[1].outcome
+            ),
+            other => panic!("the fixed-beam case must have run, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1552,9 +1597,11 @@ mod tests {
 
         let names: Vec<&str> = report.cases.iter().map(|c| c.name).collect();
         assert_eq!(names, MANUAL_CASES);
-        match &report.cases[0].outcome {
-            Outcome::NotRun(reason) => assert!(reason.contains("board"), "{reason}"),
-            other => panic!("the bench case must be recorded NotRun, got {other:?}"),
+        for case in &report.cases {
+            match &case.outcome {
+                Outcome::NotRun(reason) => assert!(reason.contains("board"), "{reason}"),
+                other => panic!("{} must be recorded NotRun, got {other:?}", case.name),
+            }
         }
         assert_eq!(
             card.waits.len(),
@@ -1578,11 +1625,17 @@ mod tests {
 
         let names: Vec<&str> = report.cases.iter().map(|c| c.name).collect();
         assert_eq!(names, MANUAL_CASES);
-        match &report.cases[0].outcome {
-            Outcome::NotRun(reason) => assert_eq!(reason, NO_CAPTURE_STREAM),
-            other => panic!("the bench case must be recorded NotRun, got {other:?}"),
+        for case in &report.cases {
+            match &case.outcome {
+                Outcome::NotRun(reason) => assert_eq!(reason, NO_CAPTURE_STREAM),
+                other => panic!("{} must be recorded NotRun, got {other:?}", case.name),
+            }
         }
         assert_eq!(board.reads, 0, "nor is the board asked for a reading");
+        assert!(
+            board.writes.is_empty(),
+            "nothing is fixed when the bench cannot run"
+        );
     }
 
     // ── collect_window ────────────────────────────────────────────────────────
