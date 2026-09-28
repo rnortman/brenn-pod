@@ -18,7 +18,7 @@ use serde_json::json;
 
 use speech_pipeline::{EndpointCause, ListenerEvent};
 use speech_surface::config::Config;
-use speech_surface::pipeline::event_line;
+use speech_surface::pipeline::{ArmExpiredLine, WakeHeldLine, WakeRestoredLine, event_line};
 use speech_surface::replay::{ReplayError, ReplayListener, StopReason, replay_framelog};
 use speech_surface::{emit_line as emit, exit};
 
@@ -188,36 +188,68 @@ fn replay_log(path: &Path, listener: &mut ReplayListener) -> Result<LogCounts, R
                     json!({ "log": log_name, "seq": utterance_id.seq }),
                 );
             }
+            // The wake's grant, on the daemon's line builders: a hold diagnosed on
+            // replay reads the same fields the daemon's log carries.
             ListenerEvent::WakeHeld {
                 start_sample,
                 end_sample,
+                wake_end_sample,
                 deadline_sample,
+                speaking,
                 ..
             } => {
                 emit(
                     "wake_held",
-                    json!({
-                        "log": log_name,
-                        "start_sample": start_sample,
-                        "end_sample": end_sample,
-                        "deadline_sample": deadline_sample,
-                    }),
+                    event_line(
+                        json!({ "log": log_name }),
+                        &WakeHeldLine {
+                            start_sample: *start_sample,
+                            end_sample: *end_sample,
+                            wake_end_sample: *wake_end_sample,
+                            deadline_sample: *deadline_sample,
+                            speaking: *speaking,
+                        },
+                    ),
+                );
+            }
+            ListenerEvent::WakeRestored {
+                deadline_sample,
+                at_sample,
+                speaking,
+                ..
+            } => {
+                emit(
+                    "wake_restored",
+                    event_line(
+                        json!({ "log": log_name }),
+                        &WakeRestoredLine {
+                            deadline_sample: *deadline_sample,
+                            at_sample: *at_sample,
+                            speaking: *speaking,
+                        },
+                    ),
                 );
             }
             ListenerEvent::ArmExpired {
                 wake,
                 start_sample,
                 end_sample,
+                candidate_minted,
+                cause,
                 ..
             } => {
                 emit(
                     "arm_expired",
-                    json!({
-                        "log": log_name,
-                        "score": wake.score,
-                        "start_sample": start_sample,
-                        "end_sample": end_sample,
-                    }),
+                    event_line(
+                        json!({ "log": log_name }),
+                        &ArmExpiredLine {
+                            score: wake.score,
+                            start_sample: *start_sample,
+                            end_sample: *end_sample,
+                            candidate_minted: *candidate_minted,
+                            cause: *cause,
+                        },
+                    ),
                 );
             }
             ListenerEvent::EndpointerTransition { transition, .. } => {

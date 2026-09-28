@@ -96,14 +96,18 @@ pub enum Feed {
     /// involved — the listener is what decides whether a decline reopens anything.
     ///
     /// When `id` is the candidate whose mint closed a capture window, the window
-    /// returns with its original deadline ([`ListenerEvent::ListenRestored`]); any
-    /// other id is a no-op.
+    /// returns with its original deadline ([`ListenerEvent::ListenRestored`]).
+    /// When `id` is the candidate whose mint spent a wake's grant, the grant
+    /// returns with the deadline it was spent with
+    /// ([`ListenerEvent::WakeRestored`]). Any other id is a no-op.
     CandidateDeclined { id: ListenerUtteranceId },
     /// The pipeline dispatched the candidate `id` as a turn. Dispatch is terminal
     /// for the utterance: the listener ends its identity and returns the endpointer
     /// to idle, so speech that resumes afterwards re-onsets fresh and must pass the
-    /// wake gate again (one command per wake). Sent before the brain is awaited.
-    /// A stale `id` — already closed, or from a prior epoch — is a no-op.
+    /// wake gate again (one command per wake). A wake grant spent on any candidate
+    /// ends here, unreported: the turn is its answer. Sent before the brain is
+    /// awaited. A stale `id` — already closed, or from a prior epoch — ends no
+    /// utterance.
     CandidateDispatched { id: ListenerUtteranceId },
     /// The transport segment closed (the authoritative outer boundary). Finalizes
     /// any in-progress utterance and clears the wake arm.
@@ -207,6 +211,13 @@ pub struct CarvedUtterance {
     /// window rather than on a wake arm, so `wake` is `None` and nothing is
     /// trimmed (there is no wake word to trim).
     pub follow_up: bool,
+    /// This candidate holds its wake's grant: it was minted on a held wake, or
+    /// is a continuation of the candidate that was and whose grant has not yet
+    /// retired. A decline of it gives the grant back with a
+    /// [`ListenerEvent::WakeRestored`], and that grant's own ending is the wake's
+    /// ending. `false` for a wake candidate means the wake's arm was consumed at
+    /// the mint and a decline gets nothing back.
+    pub grant_spent: bool,
     /// Host-receipt stamps for this utterance's audio, from t0 to the carve.
     pub timing: CarveTiming,
 }
@@ -311,35 +322,76 @@ pub enum ListenerEvent {
         pod: PodId,
         utterance_id: ListenerUtteranceId,
     },
-    /// A wake-gated utterance ended within a wake-tail of the wake end, so it held
-    /// the wake word and nothing else: it is not published, the arm is kept, and the
-    /// listener waits until `deadline_sample` for the command to onset. The
-    /// utterance that follows inside the wait is carved from `start_sample`, so one
-    /// utterance carries wake word, pause and command.
+    /// A wake-gated wake is waiting for its command: the listener accepts the next
+    /// speech as that wake's command until `deadline_sample`, and the utterance
+    /// that follows is carved from `start_sample`, so one utterance carries wake
+    /// word, pause and command. Emitted at the detection, and again whenever a
+    /// carve that held the wake word alone — speech ending within a wake-tail of
+    /// the wake end — re-dates the wait; that carve is not published.
     ///
     /// Purely the accounting for that decision — the interaction is still open, so
-    /// nothing downstream acts on it. A hold resolves either into an ordinary
-    /// `SoftEndpoint` or into [`ListenerEvent::ArmExpired`].
+    /// nothing downstream acts on it beyond timing the head's own fallback from
+    /// it. A `SoftEndpoint` minted on the hold *spends* it rather than ending it:
+    /// the hold is resolved by an `utterance` that dispatches, an
+    /// [`ListenerEvent::ArmExpired`], a `wake_hold_released`, or a later
+    /// `wake_detected`, and a decline of the spent candidate brings it back as
+    /// [`ListenerEvent::WakeRestored`].
     WakeHeld {
         pod: PodId,
         epoch: u64,
         /// Absolute start of the held (and of the eventual coalesced) carve.
         start_sample: u64,
-        /// Absolute end of the held carve's speech.
+        /// Absolute end of the held speech: the wake end at the detection, the
+        /// held carve's speech end at a re-dating.
         end_sample: u64,
         /// Absolute index one past the wake phrase, as the arm recorded it.
         wake_end_sample: u64,
         /// `end_sample` plus the command wait: past this, with the endpointer idle,
         /// the wake was a bare wake.
         deadline_sample: u64,
+        /// Whether the endpointer was in confirmed speech at the emission. A
+        /// detection usually lands mid-phrase, and a wall-clock fallback dated
+        /// from this line must not fire under speech the carve will take.
+        speaking: bool,
     },
-    /// An armed wake was cleared without any utterance passing the policy — a
-    /// "wake, no follow": the wake fired but no command followed (the transport
-    /// segment closed, a fresh wake replaced the arm, or the connection reset).
-    /// Carries the fallback audio span `[wake_end − preroll_pad, expiry]` and the
-    /// wake provenance so the pipeline emits the same `WakeCommandAbsent`
+    /// A wake's grant is back: the pipeline's gate declined the candidate minted
+    /// on it, and the listener again accepts a command for that wake, without the
+    /// wake word, until `deadline_sample` — the deadline the grant was spent
+    /// with, never re-dated by a decline. The next carve starts where the
+    /// declined candidate ended.
+    ///
+    /// Resolved by an `utterance` that dispatches, an [`ListenerEvent::ArmExpired`],
+    /// a `wake_hold_released`, or a later `wake_detected`.
+    WakeRestored {
+        pod: PodId,
+        epoch: u64,
+        /// The grant's deadline, as it was spent.
+        deadline_sample: u64,
+        /// The listener's cursor at the restore, in `deadline_sample`'s index
+        /// domain: `deadline_sample − at_sample` is what is left of the grant, and
+        /// the surface dates the head's own fallback from it.
+        at_sample: u64,
+        /// Whether the endpointer is in confirmed speech at the restore (not a
+        /// pause awaiting continuation: that closes with no carve), so a
+        /// wall-clock fallback dated from this line does not fire under a
+        /// command being spoken.
+        speaking: bool,
+    },
+    /// A wake's grant ended without a command being answered — a "wake, no
+    /// follow". Carries the fallback audio span `[wake_end − preroll_pad, expiry]`
+    /// and the wake provenance so the pipeline emits the same `WakeCommandAbsent`
     /// accounting an empty/low-confidence command produces. `wake`'s offsets are
     /// relative to `start_sample`.
+    ///
+    /// `cause` says which ending this was, and a reader is entitled to treat every
+    /// cause but [`ArmExpiryCause::FreshWake`] as the end of the head's hold for
+    /// this wake; after `FreshWake` the `wake_detected` that follows is.
+    /// `candidate_minted` says a candidate was minted from this wake and handed to
+    /// the pipeline; its verdict — a decline already reported, or one still in
+    /// flight — is then the wake's record, and this event is the head's ending
+    /// only. A verdict in flight lands only if its STT runs to completion: one
+    /// aborted by a reconnect, or by a later candidate's mint, never lands, and
+    /// such a wake has no record beyond this line.
     ArmExpired {
         pod: PodId,
         wake: WakeConfirmation,
@@ -347,6 +399,10 @@ pub enum ListenerEvent {
         start_sample: u64,
         /// Absolute span end (the expiry point, never before `wake_end`).
         end_sample: u64,
+        /// A candidate was minted from this wake before it ended.
+        candidate_minted: bool,
+        /// Which ending this was.
+        cause: ArmExpiryCause,
     },
     /// A host-endpointer FSM state transition, surfaced purely for timing
     /// observability (no utterance payload). Carries the pod, the connection
@@ -460,6 +516,24 @@ pub enum StatsFlushCause {
     /// The stream was re-anchored (reconnect, discontinuity, or a new segment's
     /// base). Chunks scored before the reset must not vanish silently.
     Reset,
+}
+
+/// Which ending a [`ListenerEvent::ArmExpired`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmExpiryCause {
+    /// The wait for the command ran out with the endpointer idle.
+    Deadline,
+    /// The transport segment closed with a bare arm (no wait configured, or the
+    /// `Bypass` policy) that no utterance took.
+    SegmentClosed,
+    /// A fresh wake detection replaced this one; its own `WakeDetected` follows
+    /// in the same batch.
+    FreshWake,
+    /// The connection was replaced.
+    Reconnect,
+    /// The stream jumped backward and the audio the wait coalesces from is gone.
+    Discontinuity,
 }
 
 /// Which utterances the listener forwards to STT. The policy seam: layered

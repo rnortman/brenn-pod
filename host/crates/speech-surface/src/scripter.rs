@@ -305,9 +305,9 @@ pub struct ScriptTiming {
     /// than this sets that headroom instead, because that last step's own move
     /// has to fit inside the timeout too. Must not exceed [`MAX_TIMEOUT_MS`].
     pub refresh: Duration,
-    /// How long the head stays up after a raise that produced no turn at all,
-    /// and the schedule a turn that asked to keep listening ends on while
-    /// nobody speaks into its window. Dated the same as the capture window's
+    /// How long the head stays up after a declined barge or a declined carve
+    /// under a bypassed wake gate, and the schedule a turn that asked to keep
+    /// listening ends on while nobody speaks into its window. Dated the same as the capture window's
     /// own deadline, from one configured key.
     pub linger: Duration,
     /// The *floor* under the timeout every emitted script carries: the daemon
@@ -419,9 +419,9 @@ pub enum ScriptInput {
         /// out a linger rather than a margin.
         end: TurnEnd,
     },
-    /// A raise produced no turn: the wake arm expired with no command, or the
-    /// gate declined what was said with no capture window to hand the head to.
-    /// The head folds a linger from here.
+    /// A raise produced no turn and nothing else will end it: the gate declined
+    /// a barge, or declined what a bypassed wake gate heard. The head folds a
+    /// linger from here.
     Unanswered(PodId),
     /// Speech was heard inside an open `<listen/>` capture window. The head
     /// keeps waiting where it stands, out to the engagement ceiling, because
@@ -434,6 +434,12 @@ pub enum ScriptInput {
     /// never crosses. The head comes down, unless the pod holds a turn whose own
     /// schedule owns the ending instead.
     ListenExpired(PodId),
+    /// The wake's grant is over: its wait for a command ran out with nothing
+    /// answered, on the listener's clock or the surface's, or the gate declined
+    /// a wake's command with no grant for the listener to give back. The
+    /// microphone is wake-gated again, so the head comes down now, unless the
+    /// pod holds a turn whose own schedule owns the ending instead.
+    WakeExpired(PodId),
     /// A reply asked the head to move. The movements of one response message,
     /// in the order the reply named them; the last pose and the last motion in
     /// the batch are the ones that take effect.
@@ -472,6 +478,7 @@ impl ScriptInput {
             | ScriptInput::Unanswered(pod)
             | ScriptInput::Heard(pod)
             | ScriptInput::ListenExpired(pod)
+            | ScriptInput::WakeExpired(pod)
             | ScriptInput::Cues { pod, .. }
             | ScriptInput::Audio { pod, .. } => pod,
         }
@@ -494,6 +501,8 @@ pub enum Cause {
     Heard,
     /// The capture window that was holding the head up closed.
     ListenExpired,
+    /// The wake's grant that was holding the head up ended with no command.
+    WakeExpired,
     /// A reply asked the head to move.
     Cue,
     /// A cued motion's own span ran out, so the standing want is said plainly
@@ -516,6 +525,7 @@ impl Cause {
             Cause::Unanswered => "unanswered",
             Cause::Heard => "heard",
             Cause::ListenExpired => "listen_expired",
+            Cause::WakeExpired => "wake_expired",
             Cause::Cue => "cue",
             Cause::MotionEnded => "motion_ended",
             Cause::Closing => "closing",
@@ -723,7 +733,8 @@ impl Scripter {
             }
             ScriptInput::Unanswered(_) => self.wait_out_linger(&pod, now),
             ScriptInput::Heard(_) => self.heard(&pod, now),
-            ScriptInput::ListenExpired(_) => self.listen_expired(&pod, now),
+            ScriptInput::ListenExpired(_) => self.grant_expired(&pod, now, Cause::ListenExpired),
+            ScriptInput::WakeExpired(_) => self.grant_expired(&pod, now, Cause::WakeExpired),
             ScriptInput::Cues { cues, .. } => self.cue(&pod, now, cues),
             ScriptInput::Audio { turn, audio, .. } => {
                 let p = self.pods.entry(pod.clone()).or_default();
@@ -754,19 +765,21 @@ impl Scripter {
     /// never gives cannot be logged.
     ///
     /// The head being down or on its way is such a reason: this pod's script has
-    /// run, or it never had one. Both tap sites can fire twice about the same
-    /// raise — the confidence gate declines and the arm then expires — and
-    /// raising the head to lower it again is not what either means. A `Heard`
-    /// and a `Cues` are refused for the same reason and one more: content never
-    /// raises a head that is at rest. A `ListenExpired` is refused because an
-    /// ending it would schedule has already happened — a window closing over a
-    /// head that is down has nothing left to bring down.
+    /// run, or it never had one. Two tap sites can fire about the same raise —
+    /// the surface's wall-clock release of a wake hold and the listener's own
+    /// expiry of it cross — and raising the head to lower it again is not what
+    /// either means. A `Heard` and a `Cues` are refused for the same reason and
+    /// one more: content never raises a head that is at rest. A `ListenExpired`
+    /// and a `WakeExpired` are refused because an ending they would schedule has
+    /// already happened — a grant ending over a head that is down has nothing
+    /// left to bring down.
     #[must_use]
     pub fn refusal(&self, input: &ScriptInput) -> Option<&'static str> {
         match input {
             ScriptInput::Unanswered(pod)
             | ScriptInput::Heard(pod)
             | ScriptInput::ListenExpired(pod)
+            | ScriptInput::WakeExpired(pod)
             | ScriptInput::Cues { pod, .. }
                 if !self.engaged(pod) =>
             {
@@ -981,8 +994,10 @@ impl Scripter {
     }
 
     /// Keep the head where it stands and re-date its ending to a linger from
-    /// now: a raise produced no turn, and nothing else is going to end this
-    /// engagement, so the settle starts here.
+    /// now: a declined barge, or a declined carve under a bypassed wake gate,
+    /// produced no turn, and nothing else is going to end this engagement, so the
+    /// settle starts here. A turn that asked to keep listening lingers too, on its
+    /// own schedule.
     ///
     /// The turn's facts are dropped first. A `TurnEnded` or `Audio` about the
     /// turn that just finished, arriving after this, would otherwise reconsider
@@ -1042,28 +1057,30 @@ impl Scripter {
         self.set(pod, now, Want::Closing { at, stow_at }, Cause::Heard, None)
     }
 
-    /// The capture window closed, so the head comes down now.
+    /// A grant the head was up for ended — the capture window closed, or the
+    /// wake's wait ran out with no command — so the head comes down now. `cause`
+    /// is which of the two.
     ///
     /// Only for a pod holding no turn. A pod holding one is on that turn's
     /// schedule, and that schedule already ends the head — the stow margin after
     /// a closed turn, the linger after an open one, which is the window's own
-    /// deadline by the shared configured key. The window's end has nothing to add
+    /// deadline by the shared configured key. The grant's end has nothing to add
     /// there, and acting on it would stow the head over a reply: the turn's end
     /// is known the moment the brain returns, before its words are synthesised
-    /// and long before they sound, so a window ending anywhere in that stretch —
-    /// the connection going, the stream re-anchoring — would cut the answer the
-    /// person is waiting for.
+    /// and long before they sound, so a grant ending anywhere in that stretch —
+    /// the connection going, the stream re-anchoring, a dispatch and the wake's
+    /// expiry crossing — would cut the answer the person is waiting for.
     ///
     /// What this ends is the engagement a [`ScriptInput::Heard`] left standing
-    /// after it cleared the turn's facts, which is the one engagement with no
-    /// other ending.
+    /// after it cleared the turn's facts, or the raise a wake made that no turn
+    /// took over — the engagements with no other ending.
     ///
     /// A stow that is already due goes out through the same path every other
     /// already-due stow takes, so the daemon is told once and confirmed once.
     ///
     /// Callers must have refused every want that holds the head nowhere: a
-    /// window closing over a head that is already down ends nothing.
-    fn listen_expired(&mut self, pod: &PodId, now: Now) -> Option<ScriptPublish> {
+    /// grant ending over a head that is already down ends nothing.
+    fn grant_expired(&mut self, pod: &PodId, now: Now, cause: Cause) -> Option<ScriptPublish> {
         let at = {
             let p = self.pods.get(pod)?;
             if p.turn.is_some() {
@@ -1072,7 +1089,7 @@ impl Scripter {
             p.want.at()?.clone()
         };
         let (want, clamped) = self.closing(pod, now, at, now.at);
-        self.set(pod, now, want, Cause::ListenExpired, clamped)
+        self.set(pod, now, want, cause, clamped)
     }
 
     /// Decide whether the turn in flight can be scheduled to its end yet, and
@@ -2729,6 +2746,43 @@ mod tests {
             fx.apply(ScriptInput::ListenExpired(pod()), Duration::from_secs(2))
                 .is_none(),
             "the reply's start closed the window; the turn owns the ending",
+        );
+        assert_eq!(fx.want(), want, "and the head is still up for the answer");
+    }
+
+    /// A wake's grant ending with no command brings the head down now, not a
+    /// linger later: the microphone is wake-gated again, so holding the raise
+    /// would be holding for nothing.
+    #[test]
+    fn a_wakes_end_stows_the_head_now() {
+        let mut fx = fixture();
+        fx.publish(plain_wake(), ZERO);
+        let expired = fx.publish(ScriptInput::WakeExpired(pod()), Duration::from_secs(2));
+        assert_eq!(expired.cause, Cause::WakeExpired);
+        assert_eq!(expired.cause.as_str(), "wake_expired");
+        assert_eq!(steps(&expired), vec![(0, STOW_POSE)], "the stow is due now");
+        assert!(expired.change);
+        assert_eq!(fx.want(), Want::Stowing);
+    }
+
+    /// A wake's end over a head that is down ends nothing, and a pod holding a
+    /// turn is on that turn's schedule — a dispatch and the grant's expiry can
+    /// cross, and the expiry must not stow the head over the answer.
+    #[test]
+    fn a_wakes_end_is_refused_at_rest_and_ignored_under_a_turn() {
+        let mut fx = fixture();
+        assert_eq!(
+            fx.scripter.refusal(&ScriptInput::WakeExpired(pod())),
+            Some("head_at_rest"),
+        );
+        assert!(fx.apply(ScriptInput::WakeExpired(pod()), ZERO).is_none());
+
+        fx.wake_and_dispatch(ZERO);
+        let want = fx.want();
+        assert!(
+            fx.apply(ScriptInput::WakeExpired(pod()), Duration::from_secs(1))
+                .is_none(),
+            "the turn owns the ending"
         );
         assert_eq!(fx.want(), want, "and the head is still up for the answer");
     }

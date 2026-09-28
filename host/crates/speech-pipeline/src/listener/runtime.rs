@@ -39,8 +39,8 @@ use super::endpointer::{
     EndpointCause, EndpointEvent, Endpointer, EndpointerConfig, TransitionCause,
 };
 use super::event::{
-    BargeCause, CarveTiming, CarvedUtterance, DoaSample, Feed, ListenerEvent, ListenerUtteranceId,
-    StatsFlushCause, StatsModel, WakePolicy,
+    ArmExpiryCause, BargeCause, CarveTiming, CarvedUtterance, DoaSample, Feed, ListenerEvent,
+    ListenerUtteranceId, StatsFlushCause, StatsModel, WakePolicy,
 };
 use super::oww_stream::{OwwModels, OwwStream};
 use super::ring::PcmRing;
@@ -89,10 +89,14 @@ pub struct ListenerConfig {
     /// phrase's end, so the tail is the margin between a bare wake's end and the
     /// shortest command's.
     pub wake_tail_samples: u64,
-    /// How long after a held wake-only carve's speech end a new onset may still
-    /// claim the arm. The utterance that onsets inside the wait carves from the
-    /// held start, so wake word, pause and command reach STT as one utterance.
-    /// `0` disables the hold: every wake-gated carve publishes on its own.
+    /// How long a wake-gated wake waits for its command to start: measured from
+    /// the detection, re-dated by the end of the wake word's own carve and by the
+    /// end of the first command, and, after a command the gate declined, how long
+    /// a repeat may still be spoken without the wake word. The utterance that
+    /// onsets inside the wait carves from the held start, so wake word, pause and
+    /// command reach STT as one utterance. `0` disables the hold: every
+    /// wake-gated carve publishes on its own, and a command must begin within
+    /// `arm_slack_samples` of the wake end.
     ///
     /// The effective wait is never shorter than the endpointer's continuation
     /// window (`endpointer.continuation_chunks`): the wait only ends with the
@@ -127,8 +131,8 @@ impl Default for ListenerConfig {
             // held as a bare wake, and is lost at `arm_expired` if nothing
             // follows. The wait covers a speaker who wakes the robot and
             // then thinks — observed to 4.1 s. The wait costs a real turn nothing
-            // — the command's onset ends it — and only delays the "wake, no
-            // command" accounting for a bare wake.
+            // — a dispatch ends it — and only delays the "wake, no command"
+            // accounting for a bare wake.
             wake_tail_samples: 8_000,
             command_wait_samples: 128_000,
             default_policy: WakePolicy::WakeGated,
@@ -252,26 +256,29 @@ struct WakeArm {
     detected_rx: Option<HostMicros>,
 }
 
-/// A wake arm kept alive past the carve that would have consumed it, because that
-/// carve held the wake word alone. The next onset inside the wait takes the arm and
-/// carves from `start_sample`, so one utterance covers wake word, pause and command.
+/// A wake-gated wake waiting for its command. Installed at the detection whenever
+/// a wait is configured; the next carve takes the arm with no timing test and
+/// carves from `start_sample`, so one utterance covers wake word, pause and
+/// command. A carve that holds the wake word alone re-dates it instead.
 ///
 /// Not scoped to the transport segment: a device-VAD release between the wake word
 /// and the command closes the segment without ending the wait. The ring is keyed on
 /// the pod-absolute sample index and carves the inter-segment hole as silence at the
 /// right indexes, so the coalesced PCM is wake word, pause, hole, command. Only the
 /// timing stamp is per segment, and `anchor` freezes it at the segment the carve's
-/// start lies in. A hold ends at its deadline, at being consumed, at a fresh wake,
-/// at a backward-jump discontinuity, or at a connection reset.
+/// start lies in. A hold ends at its deadline, at being spent on a candidate, at a
+/// fresh wake, at a backward-jump discontinuity, or at a connection reset.
 #[derive(Debug, Clone, Copy)]
 struct WakeHold {
-    /// The wake-only carve's start, preroll-padded — where the coalesced carve
-    /// begins.
+    /// Where the coalesced carve begins: the running speech's start, or the wake
+    /// back allowance before the wake end, preroll-padded; after a decline, the
+    /// declined candidate's end.
     start_sample: u64,
-    /// The wake-only carve's speech end.
+    /// The held speech's end: the wake end at the detection, a wake-only carve's
+    /// speech end at a re-dating, the spent candidate's end once spent.
     end_sample: u64,
-    /// `end_sample + command_wait_samples`: past this, with the endpointer idle,
-    /// the wake was a bare wake.
+    /// Past this, with the endpointer idle, the wait is over and no command
+    /// followed the wake.
     deadline_sample: u64,
     /// The barge trigger the wake-only carve consumed. The trigger is one-shot per
     /// playback session, so it cannot fire again for the command; it rides here and
@@ -282,6 +289,53 @@ struct WakeHold {
     /// segment is stamped with that segment's receipt rather than the current
     /// segment's. Kept, not recomputed, on a refresh: the start is the same start.
     anchor: CarveAnchor,
+    /// Some carve has taken or refreshed this hold. An unseen hold is one whose
+    /// phrase the endpointer may never have onset on, so a segment close still
+    /// carves the missed-onset fallback for it.
+    seen: bool,
+    /// This hold came back from a declined candidate. A candidate minted from it
+    /// keeps the deadline it came back with, and its expiry reports that a
+    /// candidate was minted from the wake.
+    restored: bool,
+}
+
+/// What this pod's wake gate is holding for the last wake-gated detection, as one
+/// value: nothing, a hold waiting for the command, or a hold spent on the candidate
+/// minted from it until the pipeline says what became of that candidate. The
+/// wake's shape of [`Capture`].
+#[derive(Debug, Clone)]
+enum WakeGrant {
+    /// No hold: the wake gate is closed, or holds only a bare arm.
+    None,
+    /// Waiting for the command until the hold's deadline.
+    Standing(WakeHold),
+    /// Spent at the mint of `on`. A decline of that candidate restores it;
+    /// a dispatch, a fresh wake, or a reconnect discards it.
+    Spent {
+        on: ListenerUtteranceId,
+        arm: WakeArm,
+        hold: WakeHold,
+    },
+}
+
+impl WakeGrant {
+    /// The hold only while it stands — for the rules that ask whether the wake
+    /// gate accepts a command right now.
+    fn standing(&self) -> Option<WakeHold> {
+        match self {
+            WakeGrant::Standing(hold) => Some(*hold),
+            WakeGrant::None | WakeGrant::Spent { .. } => None,
+        }
+    }
+
+    /// The hold, standing or spent — for the rules that ask about a deadline
+    /// whatever the pipeline still owes a verdict on.
+    fn hold(&self) -> Option<WakeHold> {
+        match self {
+            WakeGrant::None => None,
+            WakeGrant::Standing(hold) | WakeGrant::Spent { hold, .. } => Some(*hold),
+        }
+    }
 }
 
 /// An open capture window: the surface asked the listener to hear the next thing
@@ -426,8 +480,9 @@ pub struct ListenerState {
     expected_next: Option<u64>,
     /// The armed wake, if any (consumed by the gated utterance).
     wake: Option<WakeArm>,
-    /// A wake-only carve whose arm is being kept for the command that follows.
-    hold: Option<WakeHold>,
+    /// The hold the last wake-gated detection installed, standing or spent on
+    /// the candidate minted from it.
+    grant: WakeGrant,
     /// The utterance currently accumulating (a continuation reuses it).
     current_id: Option<ListenerUtteranceId>,
     /// Where the current utterance's audio begins. A continuation re-carves from
@@ -530,7 +585,7 @@ impl ListenerState {
             oww_base: 0,
             expected_next: None,
             wake: None,
-            hold: None,
+            grant: WakeGrant::None,
             current_id: None,
             current_start: None,
             current_wake: None,
@@ -575,11 +630,11 @@ impl ListenerState {
     ) -> Result<Vec<ListenerEvent>, WakeError> {
         match feed {
             Feed::Connected { epoch } => {
-                // A pending arm the prior connection never resolved into a command
-                // expires with the connection.
+                // A pending arm or grant the prior connection never resolved into
+                // a turn expires with the connection.
                 let mut events = Vec::new();
                 let expiry = self.expected_next.unwrap_or(self.silero_cursor);
-                self.expire_unconsumed_arm(pod, expiry, &mut events);
+                self.expire_unconsumed_arm(pod, expiry, ArmExpiryCause::Reconnect, &mut events);
                 // Flushes the models' scores under the old epoch (`full_reset` →
                 // `reset_stream`), which is the only epoch they mean anything in.
                 // Anchored at the teardown position, not the new stream's 0: the
@@ -716,7 +771,11 @@ impl ListenerState {
                 }])
             }
             Feed::CandidateDeclined { id } => {
+                // The wake first: a grant standing again keeps a window restored
+                // beside it past its deadline, and a grant that expires in the
+                // same call leaves the window's own expiry check free to run.
                 let mut events = Vec::new();
+                self.restore_wake(pod, &id, &mut events);
                 self.restore_listen(pod, &id, &mut events);
                 Ok(events)
             }
@@ -737,7 +796,7 @@ impl ListenerState {
         self.reset_stream(pod, anchor, events);
         self.ring.reset();
         self.wake = None;
-        self.hold = None;
+        self.grant = WakeGrant::None;
         self.current_id = None;
         self.current_start = None;
         self.current_wake = None;
@@ -844,14 +903,17 @@ impl ListenerState {
                     utterance_id: id,
                 });
             }
-            // A backward jump can't index the ring; drop it, and with it a held
-            // wake whose audio the reset just discarded. A forward gap keeps its
-            // runs — the ring carves the hole as silence — so a hold still inside
-            // its wait survives one and its coalesced carve has a silent hole
-            // where the chunk was.
+            // A backward jump can't index the ring; drop it, and with it a wake
+            // grant whose audio the reset just discarded — standing or spent, it
+            // is reported, because the head needs an ending. A forward gap keeps
+            // its runs — the ring carves the hole as silence — so a hold still
+            // inside its wait survives one and its coalesced carve has a silent
+            // hole where the chunk was.
             if matches!(self.expected_next, Some(e) if first_sample_index < e) {
                 self.ring.reset();
-                self.hold = None;
+                if let Some(hold) = self.grant.hold() {
+                    self.retire_hold(pod, hold, ArmExpiryCause::Discontinuity, &mut events);
+                }
             }
             self.reset_stream(pod, first_sample_index, &mut events);
             self.drain_transitions(pod, None, &mut events);
@@ -1005,24 +1067,32 @@ impl ListenerState {
         self.check_listen_expiry(pod, chunk_end_sample, events);
     }
 
-    /// Retire a hold whose wait elapsed with nothing following the wake word: the
-    /// wake was a bare wake, and is reported as one. Checked per Silero chunk
-    /// against that chunk's own end index, after the endpointer has seen it, so
-    /// speech that began before the deadline —
-    /// even speech still building its onset run — holds the wait open under it.
+    /// Retire a grant whose wait elapsed with no command answered: the wake was a
+    /// bare wake, or every candidate minted from it was declined, and it is
+    /// reported as over. Checked per Silero chunk against that chunk's own end
+    /// index, after the endpointer has seen it, so speech that began before the
+    /// deadline — even speech still building its onset run — holds the wait open
+    /// under it.
+    ///
+    /// A spent grant retires on the same rule, whether or not its candidate's
+    /// verdict has come back: this is what bounds a grant whose verdict never
+    /// arrives on the listener's clock. The head comes down at that retirement
+    /// even with STT still in flight; a dispatch landing after it raises the head
+    /// again for the turn, and a decline landing after it finds nothing to
+    /// restore.
     fn check_hold_expiry(
         &mut self,
         pod: &PodId,
         chunk_end_sample: u64,
         events: &mut Vec<ListenerEvent>,
     ) {
-        let Some(hold) = self.hold else {
+        let Some(hold) = self.grant.hold() else {
             return;
         };
         if !self.endpointer.fully_idle() || chunk_end_sample < hold.deadline_sample {
             return;
         }
-        self.retire_hold(pod, hold, events);
+        self.retire_hold(pod, hold, ArmExpiryCause::Deadline, events);
     }
 
     /// Close a capture window whose deadline has passed with nothing said inside
@@ -1030,12 +1100,12 @@ impl ListenerState {
     /// hold's own — speech that began before the deadline is still carved at its
     /// endpoint after it, however long it runs.
     ///
-    /// A standing hold keeps the window too. The wake word was said and the
-    /// listener is waiting for the command it gates; the microphone is not
-    /// wake-gated again while that wait stands, so the line would be untrue and
-    /// the head it stows was just raised by that wake. The per-chunk order runs
-    /// the hold's own expiry first, so the chunk that retires a hold is the chunk
-    /// the window may expire on.
+    /// A wake grant, standing or spent, keeps the window too. The wake word was
+    /// said and the listener is waiting for the command it gates, or for the
+    /// verdict on one; the microphone is not wake-gated again while that stands,
+    /// so the line would be untrue and the head it stows was just raised by that
+    /// wake. The per-chunk order runs the grant's own expiry first, so the chunk
+    /// that retires a grant is the chunk the window may expire on.
     fn check_listen_expiry(
         &mut self,
         pod: &PodId,
@@ -1045,7 +1115,7 @@ impl ListenerState {
         let Some(window) = self.capture.open() else {
             return;
         };
-        if self.hold.is_some()
+        if !matches!(self.grant, WakeGrant::None)
             || !self.endpointer.fully_idle()
             || chunk_end_sample < window.deadline_sample
         {
@@ -1058,13 +1128,20 @@ impl ListenerState {
     /// provenance and stamps go (`clear_utterance`), and the endpointer closes to
     /// idle so a resume inside the continuation window is a fresh onset rather than
     /// a re-carve of speech already answered. Anything but the current id is stale
-    /// and changes nothing.
+    /// and ends no utterance.
+    ///
+    /// A spent wake grant ends here silently, whichever candidate spent it: a
+    /// dispatch on this pod is the answer to the wake it was waiting on, and the
+    /// head is on the turn's schedule from here.
     fn close_dispatched(
         &mut self,
         pod: &PodId,
         id: &ListenerUtteranceId,
         events: &mut Vec<ListenerEvent>,
     ) {
+        if matches!(self.grant, WakeGrant::Spent { .. }) {
+            self.grant = WakeGrant::None;
+        }
         if self.current_id.as_ref() != Some(id) {
             return;
         }
@@ -1075,6 +1152,57 @@ impl ListenerState {
             pod: pod.clone(),
             utterance_id: id.clone(),
         });
+    }
+
+    /// Give back the wake grant the candidate `id` spent, because the gate declined
+    /// it: no turn came of it, so the wake is not over. The deadline is the one the
+    /// grant was spent with — a decline never re-dates it, which is what bounds
+    /// how many retries one wake absorbs by `command_wait_samples`.
+    ///
+    /// The declined candidate's identity is detached without closing the
+    /// endpointer. Speech running at the verdict is the retry: left under the
+    /// declined id, a resume would re-carve it on the continuation path, which
+    /// never touches the grant, and that verdict would find nothing to restore;
+    /// closed to idle, it would re-onset a chunk later and lose what came before
+    /// the preroll. Detached, it carves on the gated path at its end, takes the
+    /// restored grant, and starts at the grant's start.
+    ///
+    /// The expiry check runs at the listener's own cursor, because the STT round
+    /// trip may have outlived the deadline — the grant then comes back and ends
+    /// in the same call. Speech in progress holds the expiry off as on the
+    /// per-chunk path, and needs no announcement: the carve that ends it takes
+    /// the standing grant with no timing test.
+    ///
+    /// A decline naming anything but the spender is a no-op.
+    fn restore_wake(
+        &mut self,
+        pod: &PodId,
+        id: &ListenerUtteranceId,
+        events: &mut Vec<ListenerEvent>,
+    ) {
+        let WakeGrant::Spent { on, arm, hold } = &self.grant else {
+            return;
+        };
+        if on != id {
+            return;
+        }
+        let (arm, hold) = (*arm, *hold);
+        if self.current_id.as_ref() == Some(id) {
+            self.clear_utterance();
+        }
+        self.wake = Some(arm);
+        self.grant = WakeGrant::Standing(WakeHold {
+            restored: true,
+            ..hold
+        });
+        events.push(ListenerEvent::WakeRestored {
+            pod: pod.clone(),
+            epoch: self.epoch,
+            deadline_sample: hold.deadline_sample,
+            at_sample: self.silero_cursor,
+            speaking: self.endpointer.speech_start().is_some(),
+        });
+        self.check_hold_expiry(pod, self.silero_cursor, events);
     }
 
     /// Give back the capture window the candidate `id` spent, because the gate
@@ -1186,16 +1314,25 @@ impl ListenerState {
         anchor_sample: u64,
         events: &mut Vec<ListenerEvent>,
     ) {
-        if let Some(hold) = self.hold.filter(|h| anchor_sample >= h.deadline_sample) {
-            self.retire_hold(pod, hold, events);
+        if let Some(hold) = self
+            .grant
+            .hold()
+            .filter(|h| anchor_sample >= h.deadline_sample)
+        {
+            self.retire_hold(pod, hold, ArmExpiryCause::Deadline, events);
         }
     }
 
-    /// End a hold whose wait is over: the arm it was keeping expires at the held
-    /// speech end, and the bare wake is accounted for there.
-    fn retire_hold(&mut self, pod: &PodId, hold: WakeHold, events: &mut Vec<ListenerEvent>) {
-        self.hold = None;
-        self.expire_unconsumed_arm(pod, hold.end_sample, events);
+    /// End a grant, standing or spent: the arm it was keeping expires at the held
+    /// speech end, and the wake is accounted for there.
+    fn retire_hold(
+        &mut self,
+        pod: &PodId,
+        hold: WakeHold,
+        cause: ArmExpiryCause,
+        events: &mut Vec<ListenerEvent>,
+    ) {
+        self.expire_unconsumed_arm(pod, hold.end_sample, cause, events);
     }
 
     /// Adopt a new playback state. **The floor is per turn.** A fresh start, or a
@@ -1318,8 +1455,15 @@ impl ListenerState {
         self.current_over_playback = true;
     }
 
-    /// Handle a fresh wake detection: expire a prior arm, install this one, report
-    /// it, and cut an audible reply if the floor is open.
+    /// Handle a fresh wake detection: expire a prior arm or grant, install this
+    /// one, report it, and cut an audible reply if the floor is open.
+    ///
+    /// Under [`WakePolicy::WakeGated`] with a wait configured, the hold goes in
+    /// here rather than at the phrase's own carve, so the wake accepts a command
+    /// from the moment the head goes up for it — whether or not the endpointer
+    /// carves the phrase, or carves it before the detection surfaces. Its start is
+    /// the one [`hold_wake_only`](Self::hold_wake_only) would give the phrase: the
+    /// running speech's start, pulled forward to the back allowance.
     fn on_wake_detection(
         &mut self,
         pod: &PodId,
@@ -1346,15 +1490,15 @@ impl ListenerState {
             return;
         }
         // A prior unconsumed arm is superseded by this fresh wake — it fired with
-        // no command in between. A hold waiting on that arm goes with it: the
-        // repeated wake word starts the turn over.
-        self.hold = None;
-        self.expire_unconsumed_arm(pod, wake_end_sample, events);
-        self.wake = Some(WakeArm {
+        // no command answered in between. A grant waiting on that arm, standing
+        // or spent, goes with it: the repeated wake word starts the turn over.
+        self.expire_unconsumed_arm(pod, wake_end_sample, ArmExpiryCause::FreshWake, events);
+        let arm = WakeArm {
             score,
             wake_end_sample,
             detected_rx: Some(host_rx),
-        });
+        };
+        self.wake = Some(arm);
         let lo = wake_end_sample.saturating_sub(WAKE_DOA_LEAD_SAMPLES);
         let hi = wake_end_sample.saturating_add(WAKE_DOA_SLACK_SAMPLES);
         let doa: Vec<DoaSample> = self
@@ -1370,6 +1514,41 @@ impl ListenerState {
             wake_end_sample,
             doa,
         });
+        if self.policy == WakePolicy::WakeGated && self.config.command_wait_samples != 0 {
+            // A detection inside a minted utterance's continuation starts the turn
+            // over, as a decline's restore does: the identity is detached without
+            // closing the endpointer, so the running speech carves on the gated
+            // path at its end and takes this hold. Left attached, it would re-carve
+            // on the continuation path, which never takes a hold, and the hold
+            // would outlive every verdict with nothing to end it.
+            if self.current_id.is_some() {
+                self.clear_utterance();
+            }
+            let start_sample = self
+                .endpointer
+                .speech_start()
+                .unwrap_or(0)
+                .max(wake_end_sample.saturating_sub(wake_back_allowance(&self.config)));
+            let deadline_sample = wake_end_sample.saturating_add(self.config.command_wait_samples);
+            self.grant = WakeGrant::Standing(WakeHold {
+                start_sample,
+                end_sample: wake_end_sample,
+                deadline_sample,
+                barge: false,
+                anchor: self.carve_anchor(start_sample),
+                seen: false,
+                restored: false,
+            });
+            events.push(ListenerEvent::WakeHeld {
+                pod: pod.clone(),
+                epoch: self.epoch,
+                start_sample,
+                end_sample: wake_end_sample,
+                wake_end_sample,
+                deadline_sample,
+                speaking: self.endpointer.speech_start().is_some(),
+            });
+        }
         self.wake_barge(pod, wake_end_sample, host_rx, events);
     }
 
@@ -1421,15 +1600,19 @@ impl ListenerState {
         self.flush_model_stats(pod, StatsFlushCause::SegmentClose, &mut events);
         let close_sample = self.expected_next.unwrap_or(self.silero_cursor);
         // The `Idle` fallback carve is for a wake whose onset the endpointer
-        // missed. A held wake was seen, carved and judged wake-only, so it gets no
-        // second carve — it is reported below as the bare wake it turned out to be.
-        // Under `Bypass` there is no gate for the fallback to rescue an utterance
-        // from: the endpointer alone decides what is speech, and carving audio it
-        // judged silent because the wake model fired would mint an utterance out
-        // of a false positive. The arm is reported as the bare detection instead.
-        let armed_wake_end = match (self.policy, self.hold) {
-            (WakePolicy::Bypass, _) | (_, Some(_)) => None,
-            (_, None) => self.wake.map(|a| a.wake_end_sample),
+        // missed: a bare arm, or a hold no carve has taken or refreshed yet, whose
+        // phrase the endpointer may never have onset on. A hold a carve has seen
+        // was carved and judged wake-only, so it gets no second carve, and a spent
+        // grant is waiting on a verdict rather than on audio. Under `Bypass` there
+        // is no gate for the fallback to rescue an utterance from: the endpointer
+        // alone decides what is speech, and carving audio it judged silent because
+        // the wake model fired would mint an utterance out of a false positive.
+        // The arm is reported as the bare detection instead.
+        let armed_wake_end = match (self.policy, &self.grant) {
+            (WakePolicy::Bypass, _) => None,
+            (_, WakeGrant::None) => self.wake.map(|a| a.wake_end_sample),
+            (_, WakeGrant::Standing(hold)) if !hold.seen => self.wake.map(|a| a.wake_end_sample),
+            (_, WakeGrant::Standing(_) | WakeGrant::Spent { .. }) => None,
         };
         let ev = self
             .endpointer
@@ -1440,17 +1623,22 @@ impl ListenerState {
             // stamp.
             self.apply_endpoint_event(pod, ev, host_rx, &mut events);
         }
-        // With no hold standing the device boundary ends the arm's life: an arm the
+        // With no grant the device boundary ends a bare arm's life: an arm the
         // missed-onset fallback carve above did not consume expired with the
-        // segment — the wake got no command. A hold the close finds still standing
-        // outlives the segment; only its own deadline retires it, so the command
-        // that follows a device-VAD release in the pause still coalesces. Any
-        // utterance identity that survived a wake-gated-drop was never minted, so
-        // nothing to emit for it (the terminal event above already closed a minted
-        // one), and nothing minted under a hold means `clear_utterance` clears
-        // nothing the hold needs.
-        if self.hold.is_none() {
-            self.expire_unconsumed_arm(pod, close_sample, &mut events);
+        // segment — the wake got no command. A grant the close finds standing or
+        // spent outlives the segment; only its own deadline or a verdict ends it,
+        // so the command that follows a device-VAD release in the pause still
+        // coalesces. Any utterance identity that survived a wake-gated-drop was
+        // never minted, so nothing to emit for it (the terminal event above
+        // already closed a minted one), and nothing minted under a hold means
+        // `clear_utterance` clears nothing the hold needs.
+        if matches!(self.grant, WakeGrant::None) {
+            self.expire_unconsumed_arm(
+                pod,
+                close_sample,
+                ArmExpiryCause::SegmentClosed,
+                &mut events,
+            );
         }
         // The one moment the listener's clock advances without a scored chunk, and
         // the only one a window whose deadline is already behind the close would
@@ -1517,9 +1705,9 @@ impl ListenerState {
 
     /// Judge a wake-gated carve that has just taken `arm`: `true` when its speech
     /// ends within `wake_tail_samples` of the wake end, which makes it the wake word
-    /// alone. Such a carve publishes nothing and mints nothing — it installs (or
-    /// refreshes) the hold that keeps the arm for the command, and emits
-    /// [`ListenerEvent::WakeHeld`].
+    /// alone. Such a carve publishes nothing and mints nothing — it refreshes the
+    /// hold that keeps the arm for the command (the detection installed it), and
+    /// emits [`ListenerEvent::WakeHeld`].
     ///
     /// A hold already standing carries its barge mark into the refreshed one; the
     /// caller has already moved `start` to its origin. `command_wait_samples` of `0`
@@ -1548,8 +1736,8 @@ impl ListenerState {
             arm.wake_end_sample
                 .saturating_sub(wake_back_allowance(&self.config)),
         );
-        let standing = self.hold;
-        self.hold = Some(WakeHold {
+        let standing = self.grant.standing();
+        self.grant = WakeGrant::Standing(WakeHold {
             start_sample: start,
             end_sample: end,
             deadline_sample,
@@ -1562,7 +1750,10 @@ impl ListenerState {
                 Some(h) => h.anchor,
                 None => self.carve_anchor(start),
             },
+            seen: true,
+            restored: standing.is_some_and(|h| h.restored),
         });
+        // The carve has just ended, so no speech is running under this line.
         events.push(ListenerEvent::WakeHeld {
             pod: pod.clone(),
             epoch: self.epoch,
@@ -1570,6 +1761,7 @@ impl ListenerState {
             end_sample: end,
             wake_end_sample: arm.wake_end_sample,
             deadline_sample,
+            speaking: false,
         });
         true
     }
@@ -1590,8 +1782,28 @@ impl ListenerState {
         host_rx: HostMicros,
         events: &mut Vec<ListenerEvent>,
     ) -> Option<CarvedUtterance> {
-        let (id, wake, start) = match self.current_id.clone() {
-            Some(id) => (id, self.current_wake, self.current_start.unwrap_or(start)),
+        let (id, wake, start, grant_spent) = match self.current_id.clone() {
+            Some(id) => {
+                // A continuation re-carve is a new candidate under the id that
+                // spent the grant, and its verdict is the one that settles it: the
+                // grant is re-dated from this end, as the first carve dated it.
+                let respent = match &self.grant {
+                    WakeGrant::Spent { on, hold, .. } if *on == id => {
+                        Some(self.spent_hold(*hold, end))
+                    }
+                    _ => None,
+                };
+                let grant_spent = respent.is_some();
+                if let (Some(respent), WakeGrant::Spent { hold, .. }) = (respent, &mut self.grant) {
+                    *hold = respent;
+                }
+                (
+                    id,
+                    self.current_wake,
+                    self.current_start.unwrap_or(start),
+                    grant_spent,
+                )
+            }
             None => {
                 // A fired trigger is consumed by the utterance that passes on it,
                 // exactly as a wake arm is. Taken before the gate so it cannot leak
@@ -1600,6 +1812,9 @@ impl ListenerState {
                 self.pending_from_wake = false;
                 let mut start = start;
                 let mut follow_up = false;
+                // The hold this carve spends, set once the carve is known to be
+                // minted on it; the grant is held against the id minted below.
+                let mut spend: Option<(WakeArm, WakeHold)> = None;
                 let wake = match self.policy {
                     // An arm the utterance covers is consumed here as it is under
                     // gating, even though it attaches to nothing: an utterance
@@ -1620,7 +1835,7 @@ impl ListenerState {
                         None
                     }
                     WakePolicy::WakeGated => {
-                        let hold = self.hold;
+                        let hold = self.grant.standing();
                         // A hold attaches its arm with no window check: the window
                         // is what a long pause fails, and the hold is the statement
                         // that this arm is waiting for whatever speaks next.
@@ -1651,9 +1866,10 @@ impl ListenerState {
                                 // frozen there, not the open segment's.
                                 if let Some(hold) = hold {
                                     self.current_anchor = Some(hold.anchor);
+                                    spend = Some((arm, self.spent_hold(hold, end)));
                                 }
                                 self.wake = None;
-                                self.hold = None;
+                                self.grant = WakeGrant::None;
                                 // The arm's receipt travels with the provenance it
                                 // belongs to, so a continuation re-carving under the
                                 // same id still reports when the wake was actually
@@ -1702,6 +1918,14 @@ impl ListenerState {
                     epoch: self.epoch,
                     seq: self.utterance_seq,
                 };
+                let grant_spent = spend.is_some();
+                if let Some((arm, hold)) = spend {
+                    self.grant = WakeGrant::Spent {
+                        on: id.clone(),
+                        arm,
+                        hold,
+                    };
+                }
                 self.current_id = Some(id.clone());
                 self.current_start = Some(start);
                 self.current_wake = wake;
@@ -1731,7 +1955,7 @@ impl ListenerState {
                 // playback, even when the endpointer's onset came after the floor
                 // closed and the per-chunk latch never saw it open.
                 self.current_over_playback |= barge;
-                (id, wake, start)
+                (id, wake, start, grant_spent)
             }
         };
         let pcm = self.ring.carve(start, end);
@@ -1769,6 +1993,7 @@ impl ListenerState {
             barge_in: self.current_barge,
             over_playback: self.current_over_playback,
             follow_up: self.current_follow_up,
+            grant_spent,
             timing: CarveTiming {
                 first_audio_rx: anchor.first_audio_rx,
                 t0_projected: anchor.t0_projected,
@@ -1778,6 +2003,33 @@ impl ListenerState {
                 vad_high_est: anchor.vad_high_est,
             },
         })
+    }
+
+    /// What a hold becomes when the candidate ending at `end` is minted on it: the
+    /// grant a decline of that candidate gives back. A continuation re-carve of
+    /// that candidate applies it again to the spent hold, with the later end.
+    ///
+    /// The first command's end dates the grant, the way the wake's own end does;
+    /// a hold that already came back from a decline keeps the deadline it came
+    /// back with, so a decline never re-dates it and one wake absorbs only the
+    /// retries that fit in the wait after its first command. A retry is carved
+    /// from where the declined attempt ended: that audio was judged to hold
+    /// nothing usable, and the wake word is not in the retry's clip. The end is
+    /// the candidate's, so an expiry reports the span in which the wake got no
+    /// answer. The barge trigger rode this candidate.
+    fn spent_hold(&self, hold: WakeHold, end: u64) -> WakeHold {
+        WakeHold {
+            start_sample: end,
+            end_sample: end,
+            deadline_sample: match hold.restored {
+                true => hold.deadline_sample,
+                false => end.saturating_add(self.config.command_wait_samples),
+            },
+            barge: false,
+            anchor: self.carve_anchor(end),
+            seen: true,
+            restored: hold.restored,
+        }
     }
 
     /// The axis origin for a carve starting at `start`, read off the open segment.
@@ -1825,18 +2077,34 @@ impl ListenerState {
     }
 
     /// Emit the "wake, no follow" accounting ([`ListenerEvent::ArmExpired`]) when
-    /// an armed wake is dropped without any utterance consuming it. A consumed arm
-    /// (`self.wake` already `None`, cleared by [`carve_utterance`]) is a no-op.
-    /// `expiry_sample` bounds the fallback span's end. The wake offsets are made
-    /// relative to the span start (`wake_end − preroll_pad`), the same framing a
-    /// carved utterance uses.
+    /// a wake is dropped with no command answered: an arm no utterance consumed,
+    /// or a grant — standing or spent — that ended. The grant goes with it. A
+    /// consumed bare arm (`self.wake` already `None`, cleared by
+    /// [`carve_utterance`], with no grant) is a no-op. `expiry_sample` bounds the
+    /// fallback span's end. The wake offsets are made relative to the span start
+    /// (`wake_end − preroll_pad`), the same framing a carved utterance uses.
+    ///
+    /// `candidate_minted` is read off where the arm came from: a spent grant, or
+    /// a standing one a decline gave back, had a candidate minted from it.
     fn expire_unconsumed_arm(
         &mut self,
         pod: &PodId,
         expiry_sample: u64,
+        cause: ArmExpiryCause,
         events: &mut Vec<ListenerEvent>,
     ) {
-        let Some(arm) = self.wake.take() else {
+        let (arm, candidate_minted) = match std::mem::replace(&mut self.grant, WakeGrant::None) {
+            WakeGrant::Spent { arm, .. } => {
+                debug_assert!(
+                    self.wake.is_none(),
+                    "a spent grant's arm was consumed at the mint"
+                );
+                (Some(arm), true)
+            }
+            WakeGrant::Standing(hold) => (self.wake.take(), hold.restored),
+            WakeGrant::None => (self.wake.take(), false),
+        };
+        let Some(arm) = arm else {
             return;
         };
         // The cut this arm made stands, but its mark goes with the arm: no carve
@@ -1859,6 +2127,8 @@ impl ListenerState {
             },
             start_sample: start,
             end_sample: expiry_sample.max(arm.wake_end_sample),
+            candidate_minted,
+            cause,
         });
     }
 
@@ -1968,10 +2238,10 @@ impl ListenerState {
         self.current_anchor = None;
     }
 
-    /// One wake detection through the production path — the arm, the report and
-    /// the barge it may cut, minus the model call. [`arm_wake_for_test`] below
-    /// installs an arm and nothing else, which is what a test about the wake
-    /// *gate* wants; this is what a test about the wake *barge* wants.
+    /// One wake detection through the production path — the arm, the hold, the
+    /// report and the barge it may cut, minus the model call. This is what a test
+    /// about the wake's *events* wants; [`arm_wake_for_test`] below is the same
+    /// install without them.
     ///
     /// [`arm_wake_for_test`]: Self::arm_wake_for_test
     #[cfg(test)]
@@ -1992,13 +2262,14 @@ impl ListenerState {
         events
     }
 
+    /// Install what a detection installs under this config — the arm, and under
+    /// [`WakePolicy::WakeGated`] with a wait configured the hold — without the
+    /// report: the events [`detect_wake_for_test`](Self::detect_wake_for_test)
+    /// returns are discarded, along with any barge they cut.
     #[cfg(test)]
     fn arm_wake_for_test(&mut self, score: f32, wake_end_sample: u64) {
-        self.wake = Some(WakeArm {
-            score,
-            wake_end_sample,
-            detected_rx: Some(rx_at(wake_end_sample)),
-        });
+        let pod = PodId("pod-x".into());
+        let _ = self.detect_wake_for_test(&pod, score, wake_end_sample);
     }
 
     /// Store audio directly in the ring at an absolute index, so a synthetic-`P`
@@ -2086,10 +2357,8 @@ pub struct ListenerStats {
     utterances: AtomicU64,
     superseded: AtomicU64,
     closed: AtomicU64,
-    /// Wake-only carves held for the command that follows. A held wake resolves
-    /// either into a published utterance or into the "wake, no follow" accounting,
-    /// so a rate here far above the `wake_command_absent` rate is the hold doing
-    /// its job, and one that tracks it is a room saying the wake word to nobody.
+    /// Wake holds reported: one at every wake-gated detection with a wait
+    /// configured, and one more for each wake-only carve that re-dated the wait.
     held: AtomicU64,
     /// Duplicate samples the ring trimmed from overlapping pushes. Segment preroll
     /// re-sends already-retained audio, so this climbs at a steady, explainable
@@ -2157,6 +2426,7 @@ impl ListenerStats {
                 | ListenerEvent::ModelStats { .. }
                 | ListenerEvent::ListenOpened { .. }
                 | ListenerEvent::ListenRestored { .. }
+                | ListenerEvent::WakeRestored { .. }
                 | ListenerEvent::ListenHeard { .. }
                 | ListenerEvent::ListenExpired { .. } => {}
             }
@@ -4738,6 +5008,12 @@ mod tests {
         let back = decline_at(&mut state, cursor, &id, &mut oww, &mut silero);
         assert_eq!(restored_deadlines(&back), [4_096], "given back: {back:?}");
         assert!(state.capture.open().is_some());
+        assert_eq!(
+            wake_restores(&back).len(),
+            1,
+            "and so is the wake's grant, which the same mint spent: {back:?}"
+        );
+        assert!(state.grant.standing().is_some());
     }
 
     /// Two endings that drop a spent window without a word: a second candidate,
@@ -6504,12 +6780,17 @@ mod tests {
         );
     }
 
-    /// A segment closing with an armed wake the fallback carve cannot consume (its
-    /// end sits past the close, so the missed-onset span is inverted and dropped)
-    /// expires the arm as "wake, no follow", spanning `[wake_end − preroll, close]`.
+    /// A segment closing with a bare armed wake the fallback carve cannot consume
+    /// (its end sits past the close, so the missed-onset span is inverted and
+    /// dropped) expires the arm as "wake, no follow", spanning
+    /// `[wake_end − preroll, close]`. A bare arm is what a detection installs with
+    /// no wait configured.
     #[test]
     fn unconsumed_arm_expires_on_segment_close() {
-        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        let mut state = ListenerState::new(ListenerConfig {
+            command_wait_samples: 0,
+            ..synth_config(WakePolicy::WakeGated)
+        });
         state.arm_wake_for_test(0.8, 5_000);
         state.silero_cursor = 1_000; // close_sample source (expected_next is None)
         let events = state.handle_close(&pod(), rx_at(1_000)).unwrap();
@@ -6536,6 +6817,33 @@ mod tests {
         assert_eq!(wake.score, 0.8);
         assert_eq!(wake.wake_end_sample, 100, "wake end is span-relative");
         assert!(state.wake.is_none(), "the arm is cleared");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ListenerEvent::ArmExpired {
+                    cause: ArmExpiryCause::SegmentClosed,
+                    candidate_minted: false,
+                    ..
+                }
+            )),
+            "reported as the segment's ending of a wake nothing was minted from: {events:?}"
+        );
+    }
+
+    /// With a wait configured the same detection installs a hold, and a segment
+    /// close does not end a hold: it stands, the arm with it, and nothing expires.
+    #[test]
+    fn a_hold_outlives_the_segment_close() {
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state.arm_wake_for_test(0.8, 5_000);
+        state.silero_cursor = 1_000;
+        let events = state.handle_close(&pod(), rx_at(1_000)).unwrap();
+        assert!(
+            arm_expiries(&events).is_empty(),
+            "the hold's own deadline ends it, not the close: {events:?}"
+        );
+        assert!(state.grant.standing().is_some(), "the hold stands");
+        assert!(state.wake.is_some(), "and keeps its arm");
     }
 
     /// A fresh wake detection expires a prior unconsumed arm before arming the new
@@ -6612,12 +6920,16 @@ mod tests {
         );
     }
 
-    /// A wake armed but *outside* the arm window (its end sits past the soft
+    /// A bare wake armed but *outside* the arm window (its end sits past the soft
     /// endpoint) fails the gate: nothing carves and the arm is not consumed — the
-    /// rejection half of the wake-gating boundary against non-command speech.
+    /// rejection half of the wake-gating boundary against non-command speech. A
+    /// bare arm is what a detection installs with no wait configured.
     #[test]
     fn wakegated_arm_outside_window_drops_and_keeps_arm() {
-        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        let mut state = ListenerState::new(ListenerConfig {
+            command_wait_samples: 0,
+            ..synth_config(WakePolicy::WakeGated)
+        });
         state.push_ring_for_test(0, &vec![1_i16; 8192]);
         // The soft endpoint lands near sample ~2560; an arm ending far past it is
         // out of window (`wake_end <= end` fails).
@@ -6634,6 +6946,64 @@ mod tests {
             "the out-of-window arm is not consumed",
         );
         assert!(state.current_id.is_none(), "no utterance identity minted");
+    }
+
+    /// With a wait configured the detection holds the wake, and the hold is
+    /// bounded: idle chunks past `wake_end + command_wait` retire it with the
+    /// grant's ending, and speech after that finds no wake to attach to.
+    #[test]
+    fn a_command_past_the_wait_finds_no_wake() {
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![1_i16; 16_384]);
+        state.arm_wake_for_test(0.9, 1_024);
+        let mut cursor = 0u64;
+        let quiet = drive(&mut state, 0.1, 6, &mut cursor);
+        assert_eq!(cursor, 1_024 + 2_048, "driven to the deadline");
+        assert_eq!(
+            arm_causes(&quiet),
+            [(ArmExpiryCause::Deadline, false)],
+            "the wait ran out with nothing minted: {quiet:?}"
+        );
+        assert!(state.wake.is_none() && matches!(state.grant, WakeGrant::None));
+
+        let mut late = drive(&mut state, 0.9, 2, &mut cursor);
+        late.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert!(
+            soft_endpoints(&late).is_empty(),
+            "the late command is a wake-gated drop: {late:?}"
+        );
+        assert!(state.current_id.is_none());
+    }
+
+    /// A command whose onset lies well past the arm slack — which a bare arm's
+    /// window would refuse — but inside the wait takes the wake: one utterance
+    /// with wake provenance, carved from the hold's start.
+    #[test]
+    fn a_command_onsetting_late_inside_the_wait_takes_the_wake() {
+        let mut state = ListenerState::new(ListenerConfig {
+            arm_slack_samples: 512,
+            ..synth_config(WakePolicy::WakeGated)
+        });
+        state.push_ring_for_test(0, &vec![1_i16; 16_384]);
+        let installed = state.detect_wake_for_test(&pod(), 0.9, 1_024);
+        let held = wake_helds(&installed);
+        assert_eq!(held.len(), 1, "the detection holds the wake: {installed:?}");
+        let (held_start, _, _, deadline) = held[0];
+
+        let mut cursor = 0u64;
+        let mut events = drive(&mut state, 0.1, 4, &mut cursor); // the pause: 2048
+        events.extend(drive(&mut state, 0.9, 2, &mut cursor)); // onset from 1948
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let onset = 2_048 - 100;
+        assert!(
+            onset > 1_024 + 512,
+            "the onset is past the arm slack a bare arm allows"
+        );
+        assert!(onset < deadline, "and inside the wait");
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "one utterance: {events:?}");
+        assert!(carved[0].wake.is_some(), "with wake provenance");
+        assert_eq!(carved[0].start_sample, held_start, "from the hold's start");
     }
 
     /// [`synth_config`] with the wake-command hold wide open: a 2000-sample tail
@@ -6748,6 +7118,37 @@ mod tests {
             .collect()
     }
 
+    /// The `(cause, candidate_minted)` of every `ArmExpired` in `events`.
+    fn arm_causes(events: &[ListenerEvent]) -> Vec<(ArmExpiryCause, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ListenerEvent::ArmExpired {
+                    cause,
+                    candidate_minted,
+                    ..
+                } => Some((*cause, *candidate_minted)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `(deadline, at, speaking)` of every `WakeRestored` in `events`.
+    fn wake_restores(events: &[ListenerEvent]) -> Vec<(u64, u64, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ListenerEvent::WakeRestored {
+                    deadline_sample,
+                    at_sample,
+                    speaking,
+                    ..
+                } => Some((*deadline_sample, *at_sample, *speaking)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The `(start, end)` span of every `ArmExpired` in `events`.
     fn arm_expiries(events: &[ListenerEvent]) -> Vec<(u64, u64)> {
         events
@@ -6840,7 +7241,10 @@ mod tests {
             wake.stt_trim_samples,
             utt.pcm.len()
         );
-        assert!(state.hold.is_none(), "the hold was consumed with the arm");
+        assert!(
+            state.grant.standing().is_none(),
+            "the hold was consumed with the arm"
+        );
 
         // The ordinary continuation of a coalesced utterance: the endpointer's start
         // is now the command's onset, and the re-carve must still not lose the wake.
@@ -6905,7 +7309,7 @@ mod tests {
             "and no audio is sent to STT: {quiet:?}"
         );
         assert!(state.wake.is_none(), "the arm is gone");
-        assert!(state.hold.is_none(), "and so is the hold");
+        assert!(state.grant.standing().is_none(), "and so is the hold");
 
         let late = {
             let mut evs = drive(&mut state, 0.9, 2, &mut cursor);
@@ -6937,8 +7341,10 @@ mod tests {
     fn a_barge_taken_by_a_held_carve_lands_on_the_command() {
         let mut state = ListenerState::new(hold_barge_config());
         state.push_ring_for_test(0, &vec![5_i16; 16_384]);
-        play(&mut state, true, true);
+        // Detected before the reply is audible, so the wake cuts nothing and the
+        // trigger is the speech rule's.
         state.arm_wake_for_test(0.9, 1_024);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
         let mut events = drive(&mut state, 0.9, 3, &mut cursor); // barges at 1536
         events.extend(drive(&mut state, 0.1, 3, &mut cursor)); // held at 3072
@@ -6999,7 +7405,7 @@ mod tests {
             "the wake word is held: {events:?}"
         );
         assert!(
-            state.hold.is_some_and(|h| h.barge),
+            state.grant.standing().is_some_and(|h| h.barge),
             "and the hold carries the mark"
         );
         assert!(!state.barge_pending, "which is no longer parked");
@@ -7025,8 +7431,10 @@ mod tests {
     fn a_barge_on_an_expiring_hold_is_dropped_with_it() {
         let mut state = ListenerState::new(hold_barge_config());
         state.push_ring_for_test(0, &vec![5_i16; 16_384]);
-        play(&mut state, true, true);
+        // Detected before the reply is audible, so the wake cuts nothing and the
+        // trigger is the speech rule's.
         state.arm_wake_for_test(0.9, 1_024);
+        play(&mut state, true, true);
         let mut cursor = 0u64;
         let mut events = drive(&mut state, 0.9, 3, &mut cursor);
         events.extend(drive(&mut state, 0.1, 3, &mut cursor)); // held at 3072, deadline 5632
@@ -7034,7 +7442,7 @@ mod tests {
 
         let quiet = drive(&mut state, 0.1, 5, &mut cursor); // out at 5632
         assert_eq!(arm_expiries(&quiet).len(), 1, "the wait ran out: {quiet:?}");
-        assert!(state.hold.is_none(), "the hold is gone");
+        assert!(state.grant.standing().is_none(), "the hold is gone");
         assert!(!state.barge_pending, "and took the parked trigger with it");
         assert!(!state.current_barge, "nothing is marked as barging");
     }
@@ -7066,7 +7474,7 @@ mod tests {
             arm_expiries(&onset).is_empty(),
             "speech on the deadline holds the wait open: {onset:?}"
         );
-        assert!(state.hold.is_some(), "the hold stands under it");
+        assert!(state.grant.standing().is_some(), "the hold stands under it");
 
         let mut command = drive(&mut state, 0.9, 2, &mut cursor);
         command.extend(drive(&mut state, 0.1, 3, &mut cursor));
@@ -7146,7 +7554,10 @@ mod tests {
         let gap_at = 4_096u64;
         assert!(gap_at < deadline, "the gap is inside the wait");
         feed_audio(&mut state, gap_at, &vec![9_i16; 512], &mut oww, &mut silero);
-        assert!(state.hold.is_some(), "the hold survived the hole");
+        assert!(
+            state.grant.standing().is_some(),
+            "the hold survived the hole"
+        );
 
         state.push_ring_for_test(gap_at + 512, &vec![9_i16; 2_048]);
         let mut cursor = gap_at + 512;
@@ -7205,7 +7616,7 @@ mod tests {
             vec![(1_024 - 100, held_end)],
             "the bare wake is reported at the hole, spanning [wake_end − preroll, held end]: {after_gap:?}"
         );
-        assert!(state.hold.is_none(), "the hold is retired");
+        assert!(state.grant.standing().is_none(), "the hold is retired");
         assert!(state.wake.is_none(), "and the arm with it");
 
         state.push_ring_for_test(gap_at + 256, &vec![9_i16; 2_048]);
@@ -7219,10 +7630,11 @@ mod tests {
     }
 
     /// A backward index jump resets the ring, so the held audio is gone with it and
-    /// the hold cannot be honoured. The arm survives to be claimed on the window or
-    /// to expire.
+    /// the hold cannot be honoured. It is reported as the grant's ending, with the
+    /// arm, because the head it was holding up needs one; speech after the jump
+    /// has no wake to attach to.
     #[test]
-    fn a_backward_jump_drops_the_hold_whose_audio_it_discards() {
+    fn a_backward_jump_reports_the_hold_it_drops() {
         let mut oww = oww_models();
         let mut silero = silero_model();
         let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
@@ -7235,24 +7647,34 @@ mod tests {
         assert_eq!(wake_helds(&events).len(), 1, "held: {events:?}");
         let held_start = wake_helds(&events)[0].0;
 
-        // Behind the fed stream: the ring cannot index it, so it resets.
-        feed_audio(&mut state, 1_024, &vec![0_i16; 512], &mut oww, &mut silero);
-        assert!(state.hold.is_none(), "the hold did not survive the reset");
-        assert!(
-            state.wake.is_some(),
-            "the arm did, to be claimed or to expire"
-        );
+        let (_, held_end, _, _) = wake_helds(&events)[0];
 
-        // Speech after the jump is judged on the arm window, from its own start.
+        // Behind the fed stream: the ring cannot index it, so it resets.
+        let jumped = feed_audio(&mut state, 1_024, &vec![0_i16; 512], &mut oww, &mut silero);
+        assert_eq!(
+            arm_causes(&jumped),
+            [(ArmExpiryCause::Discontinuity, false)],
+            "the dropped hold is reported: {jumped:?}"
+        );
+        assert_eq!(
+            arm_expiries(&jumped),
+            [(9_216 - 100, held_end)],
+            "over the span the wake got no command in: {jumped:?}"
+        );
+        assert!(
+            matches!(state.grant, WakeGrant::None),
+            "the hold did not survive the reset"
+        );
+        assert!(state.wake.is_none(), "and the arm went with it");
+
+        // Speech after the jump is unwaked.
         let mut cursor = 1_536u64;
         let mut after = drive(&mut state, 0.9, 2, &mut cursor);
         after.extend(drive(&mut state, 0.1, 3, &mut cursor));
-        for utt in soft_endpoints(&after) {
-            assert_ne!(
-                utt.start_sample, held_start,
-                "never carved from the pre-jump start: {after:?}"
-            );
-        }
+        assert!(
+            soft_endpoints(&after).is_empty(),
+            "never carved on the pre-jump wake: {after:?} (held from {held_start})"
+        );
     }
 
     /// A reconnect re-anchors the whole stream, so the hold's sample indexes stop
@@ -7274,7 +7696,10 @@ mod tests {
         let reconnect = state
             .handle(&pod(), Feed::Connected { epoch: 7 }, &mut oww, &mut silero)
             .expect("reconnect");
-        assert!(state.hold.is_none(), "the hold is gone with the connection");
+        assert!(
+            state.grant.standing().is_none(),
+            "the hold is gone with the connection"
+        );
         assert!(state.wake.is_none(), "and so is the arm");
         assert_eq!(
             arm_expiries(&reconnect).len(),
@@ -7349,7 +7774,7 @@ mod tests {
             "nothing was held: {events:?}"
         );
         assert!(state.wake.is_none(), "the carve consumed the arm");
-        assert!(state.hold.is_none());
+        assert!(state.grant.standing().is_none());
     }
 
     /// A command that arrives inside the *continuation* window after a wake-only
@@ -7387,8 +7812,13 @@ mod tests {
         let first_audio = primed_wake_pcm();
 
         let events = feed_audio_chunkwise(&mut state, 0, &first_audio, &mut oww, &mut silero);
-        let held = wake_helds(&events);
-        assert_eq!(held.len(), 1, "the phrase alone is held: {events:?}");
+        let mut held = wake_helds(&events);
+        assert_eq!(
+            held.len(),
+            2,
+            "held at the detection, then re-dated by the phrase alone: {events:?}"
+        );
+        let held = held.split_off(1);
         assert!(
             soft_endpoints(&events).is_empty(),
             "and nothing is sent to STT: {events:?}"
@@ -7428,6 +7858,11 @@ mod tests {
             .iter()
             .position(|e| matches!(e, ListenerEvent::ArmExpired { .. }))
             .expect("the held arm expired");
+        assert_eq!(
+            arm_causes(&again),
+            [(ArmExpiryCause::FreshWake, false)],
+            "as the fresh wake's ending of a hold nothing was minted from: {again:?}"
+        );
         let detected = again
             .iter()
             .position(|e| matches!(e, ListenerEvent::WakeDetected { .. }))
@@ -7442,12 +7877,675 @@ mod tests {
         );
     }
 
-    /// The device boundary does not end the wait: a close that finds a hold standing
-    /// leaves it standing, carves no missed-onset fallback (the wake was seen,
+    /// A detection under a wait installs the hold at once and says so, in the same
+    /// batch as the detection: the wake accepts a command from the moment the head
+    /// goes up for it. With the endpointer idle the hold starts the back allowance
+    /// before the wake end and nothing is being spoken; with speech running it
+    /// starts at that speech, and the line says it is being spoken.
+    #[test]
+    fn wake_detection_installs_the_hold_and_reports_it() {
+        let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
+        let idle = state.detect_wake_for_test(&pod(), 0.9, 1_024);
+        let detected = idle
+            .iter()
+            .position(|e| matches!(e, ListenerEvent::WakeDetected { .. }))
+            .expect("detected");
+        let held_at = idle
+            .iter()
+            .position(|e| matches!(e, ListenerEvent::WakeHeld { .. }))
+            .expect("held");
+        assert_eq!(
+            held_at,
+            detected + 1,
+            "the hold follows the detection: {idle:?}"
+        );
+        assert!(
+            matches!(
+                idle[held_at],
+                ListenerEvent::WakeHeld {
+                    start_sample: 0,
+                    end_sample: 1_024,
+                    wake_end_sample: 1_024,
+                    deadline_sample: 5_120,
+                    speaking: false,
+                    ..
+                }
+            ),
+            "{idle:?}"
+        );
+        assert!(state.grant.standing().is_some_and(|h| !h.seen));
+
+        let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        let mut cursor = 0u64;
+        drive(&mut state, 0.1, 4, &mut cursor);
+        drive(&mut state, 0.9, 2, &mut cursor); // onset from 2048, speech from 1948
+        let running = state.detect_wake_for_test(&pod(), 0.9, 3_072);
+        assert!(
+            matches!(
+                running
+                    .iter()
+                    .find(|e| matches!(e, ListenerEvent::WakeHeld { .. })),
+                Some(ListenerEvent::WakeHeld {
+                    start_sample: 1_948,
+                    end_sample: 3_072,
+                    deadline_sample: 7_168,
+                    speaking: true,
+                    ..
+                })
+            ),
+            "{running:?}"
+        );
+    }
+
+    /// A wake the endpointer never onset on, in a room that stays quiet, is bounded
+    /// by its own wait: the idle chunk reaching `wake_end + command_wait` retires
+    /// it over `[wake_end − preroll, wake_end]`, nothing having been minted.
+    #[test]
+    fn a_wake_the_endpointer_never_onset_on_expires_at_its_deadline() {
+        let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
+        state.arm_wake_for_test(0.9, 1_024);
+        let mut cursor = 0u64;
+        let before = drive(&mut state, 0.1, 9, &mut cursor);
+        assert!(arm_expiries(&before).is_empty(), "not yet: {before:?}");
+        let at = drive(&mut state, 0.1, 1, &mut cursor);
+        assert_eq!(cursor, 5_120);
+        assert_eq!(arm_expiries(&at), [(1_024 - 100, 1_024)], "{at:?}");
+        assert_eq!(arm_causes(&at), [(ArmExpiryCause::Deadline, false)]);
+    }
+
+    /// The fallback for an unseen hold is bounded by the wait: once idle chunks
+    /// have retired the hold, a close that follows has no wake to carve for.
+    #[test]
+    fn an_unseen_hold_past_its_wait_carves_no_fallback_at_the_close() {
+        let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        state.arm_wake_for_test(0.9, 1_024);
+        let mut cursor = 0u64;
+        let quiet = drive(&mut state, 0.1, 12, &mut cursor);
+        assert_eq!(
+            arm_expiries(&quiet).len(),
+            1,
+            "retired in the wait: {quiet:?}"
+        );
+
+        state.expected_next = Some(cursor);
+        let closed = state.handle_close(&pod(), rx_at(cursor)).expect("close");
+        assert!(
+            soft_endpoints(&closed).is_empty(),
+            "nothing carved: {closed:?}"
+        );
+        assert!(
+            arm_expiries(&closed).is_empty(),
+            "nothing left to report: {closed:?}"
+        );
+    }
+
+    /// A hold no carve has seen may be a wake the endpointer never onset on, so a
+    /// close inside the wait still carves the missed-onset fallback for it. The
+    /// fallback takes the hold like any carve, from the hold's start.
+    #[test]
+    fn a_segment_close_carves_the_fallback_for_an_unseen_hold() {
+        let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
+        state.push_ring_for_test(0, &vec![5_i16; 16_384]);
+        let installed = state.detect_wake_for_test(&pod(), 0.9, 1_024);
+        let (held_start, _, _, deadline) = wake_helds(&installed)[0];
+        let mut cursor = 0u64;
+        drive(&mut state, 0.1, 7, &mut cursor); // quiet to 3584, inside the wait
+        assert!(cursor < deadline);
+
+        state.expected_next = Some(cursor);
+        let closed = state.handle_close(&pod(), rx_at(cursor)).expect("close");
+        let carved = soft_endpoints(&closed);
+        assert_eq!(carved.len(), 1, "the fallback carves: {closed:?}");
+        assert_eq!(carved[0].cause, EndpointCause::DeviceVadRelease);
+        assert!(carved[0].wake.is_some(), "on the held wake");
+        assert_eq!(carved[0].start_sample, held_start, "from the hold's start");
+        assert_eq!(carved[0].end_sample, cursor, "to the close");
+        assert!(
+            arm_expiries(&closed).is_empty(),
+            "consumed, not expired: {closed:?}"
+        );
+        assert!(state.wake.is_none(), "the fallback took the arm");
+    }
+
+    /// [`hold_config`] with a wait long enough for a declined command's retry to
+    /// land inside it.
+    fn grant_config() -> ListenerConfig {
+        ListenerConfig {
+            command_wait_samples: 8_192,
+            ..hold_config(WakePolicy::WakeGated)
+        }
+    }
+
+    /// A wake detected at 1024 whose command — speech to 3072, past the tail — has
+    /// been minted, spending the grant with a deadline of `3072 + 8192`. The
+    /// endpointer sits at that carve's soft endpoint (4608), in its continuation
+    /// window. Answers the state, the cursor and the carve.
+    fn state_with_a_spent_grant() -> (ListenerState, u64, CarvedUtterance) {
+        let mut state = ListenerState::new(grant_config());
+        state.push_ring_for_test(0, &vec![5_i16; 32_768]);
+        state.arm_wake_for_test(0.9, 1_024);
+        let mut cursor = 0u64;
+        let mut events = drive(&mut state, 0.9, 6, &mut cursor);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "the command is minted: {events:?}");
+        assert_eq!(carved[0].end_sample, 3_072);
+        assert!(
+            carved[0].grant_spent,
+            "the candidate says it holds the grant"
+        );
+        let utt = carved[0].clone();
+        assert!(
+            matches!(&state.grant, WakeGrant::Spent { on, hold, .. }
+                if *on == utt.utterance_id && hold.deadline_sample == 11_264),
+            "spent on the candidate, dated from its end: {:?}",
+            state.grant
+        );
+        assert!(state.wake.is_none(), "the arm travels with the spent grant");
+        (state, cursor, utt)
+    }
+
+    /// The gate declining a wake's command gives the wake back: the next carve is
+    /// taken with wake provenance, starts where the declined attempt ended, and
+    /// carries no wake word to trim. The grant keeps the deadline it was spent
+    /// with.
+    #[test]
+    fn a_declined_wake_candidate_gives_the_wake_back() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, first) = state_with_a_spent_grant();
+        drive(&mut state, 0.1, 4, &mut cursor); // the continuation window closes: 6656
+
+        let back = decline_at(
+            &mut state,
+            cursor,
+            &first.utterance_id,
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(wake_restores(&back), [(11_264, 6_656, false)], "{back:?}");
+        assert!(arm_expiries(&back).is_empty(), "the grant stands: {back:?}");
+        assert!(state.wake.is_some());
+
+        let mut retry = drive(&mut state, 0.9, 2, &mut cursor);
+        retry.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&retry);
+        assert_eq!(carved.len(), 1, "the retry is minted: {retry:?}");
+        assert_ne!(
+            carved[0].utterance_id, first.utterance_id,
+            "as a new candidate"
+        );
+        assert_eq!(
+            carved[0].start_sample, 3_072,
+            "from the declined attempt's end"
+        );
+        let wake = carved[0].wake.expect("with wake provenance");
+        assert_eq!(wake.wake_end_sample, 0, "the wake word is not in this clip");
+        assert_eq!(wake.stt_trim_samples, 0, "so nothing is trimmed");
+        assert!(
+            matches!(&state.grant, WakeGrant::Spent { hold, .. } if hold.deadline_sample == 11_264),
+            "spent again at the deadline it came back with: {:?}",
+            state.grant
+        );
+    }
+
+    /// Declines never move the deadline: the second candidate is spent at the
+    /// first one's deadline, and when its verdict lands past that deadline in a
+    /// quiet room the grant comes back and ends in the same call, reporting that a
+    /// candidate was minted.
+    #[test]
+    fn a_decline_never_re_dates_the_wake() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, first) = state_with_a_spent_grant();
+        drive(&mut state, 0.1, 4, &mut cursor);
+        decline_at(
+            &mut state,
+            cursor,
+            &first.utterance_id,
+            &mut oww,
+            &mut silero,
+        );
+        let mut retry = drive(&mut state, 0.9, 2, &mut cursor);
+        retry.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let second = soft_endpoints(&retry)[0].utterance_id.clone();
+        assert!(
+            matches!(&state.grant, WakeGrant::Spent { hold, .. } if hold.deadline_sample == 11_264)
+        );
+
+        // The device closes the segment in the pause, so no chunk carries the
+        // listener's clock past the deadline before the verdict does.
+        drive(&mut state, 0.1, 2, &mut cursor);
+        state.expected_next = Some(cursor);
+        let closed = state.handle_close(&pod(), rx_at(cursor)).expect("close");
+        assert!(
+            arm_expiries(&closed).is_empty(),
+            "a spent grant outlives a close"
+        );
+
+        let back = decline_at(&mut state, 11_264, &second, &mut oww, &mut silero);
+        assert_eq!(wake_restores(&back), [(11_264, 11_264, false)], "{back:?}");
+        assert_eq!(
+            arm_causes(&back),
+            [(ArmExpiryCause::Deadline, true)],
+            "and expired in the same call: {back:?}"
+        );
+        assert!(matches!(state.grant, WakeGrant::None));
+    }
+
+    /// A dispatch is the answer the wake was waiting for: the spent grant ends
+    /// silently, and later speech has no wake to attach to.
+    #[test]
+    fn a_dispatched_wake_candidate_ends_the_grant() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+        let dispatched = dispatch_at(&mut state, cursor, &utt.utterance_id, &mut oww, &mut silero);
+        assert!(
+            arm_expiries(&dispatched).is_empty(),
+            "silently: {dispatched:?}"
+        );
+        assert!(matches!(state.grant, WakeGrant::None));
+
+        let mut after = drive(&mut state, 0.1, 4, &mut cursor);
+        after.extend(drive(&mut state, 0.9, 2, &mut cursor));
+        after.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert!(
+            soft_endpoints(&after).is_empty(),
+            "dropped as unwaked: {after:?}"
+        );
+        assert!(
+            arm_expiries(&after).is_empty(),
+            "with nothing left to expire"
+        );
+    }
+
+    /// The id match is the whole test a wake restore runs: a later candidate and a
+    /// superseded connection's candidate restore nothing, and the spender's own
+    /// decline still does.
+    #[test]
+    fn a_decline_that_names_another_candidate_restores_no_wake() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, cursor, utt) = state_with_a_spent_grant();
+        let id = utt.utterance_id;
+        let later = ListenerUtteranceId {
+            seq: id.seq + 1,
+            ..id.clone()
+        };
+        let stale = ListenerUtteranceId {
+            epoch: id.epoch + 1,
+            ..id.clone()
+        };
+        for other in [later, stale] {
+            let events = decline_at(&mut state, cursor, &other, &mut oww, &mut silero);
+            assert!(events.is_empty(), "not the spender: {other:?} {events:?}");
+            assert!(
+                matches!(state.grant, WakeGrant::Spent { .. }),
+                "still spent"
+            );
+        }
+        let back = decline_at(&mut state, cursor, &id, &mut oww, &mut silero);
+        assert_eq!(wake_restores(&back).len(), 1, "{back:?}");
+    }
+
+    /// A fresh wake while a grant is spent reports the old grant before it arms,
+    /// as having had a candidate minted from it, and then holds the new wake.
+    #[test]
+    fn a_fresh_wake_reports_a_spent_grant() {
+        let (mut state, cursor, _) = state_with_a_spent_grant();
+        let events = state.detect_wake_for_test(&pod(), 0.9, cursor);
+        assert_eq!(
+            arm_causes(&events),
+            [(ArmExpiryCause::FreshWake, true)],
+            "{events:?}"
+        );
+        assert_eq!(
+            arm_expiries(&events),
+            [(1_024 - 100, cursor)],
+            "spanning to the superseding detection, as a superseded arm does: {events:?}"
+        );
+        let expired = events
+            .iter()
+            .position(|e| matches!(e, ListenerEvent::ArmExpired { .. }))
+            .unwrap();
+        let detected = events
+            .iter()
+            .position(|e| matches!(e, ListenerEvent::WakeDetected { .. }))
+            .unwrap();
+        assert!(expired < detected, "the old grant goes first: {events:?}");
+        assert_eq!(wake_helds(&events).len(), 1, "and the new wake is held");
+    }
+
+    /// A reconnect reports a spent grant like a standing one.
+    #[test]
+    fn a_reconnect_reports_a_spent_grant() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, _, _) = state_with_a_spent_grant();
+        let events = state
+            .handle(&pod(), Feed::Connected { epoch: 3 }, &mut oww, &mut silero)
+            .expect("reconnect");
+        assert_eq!(
+            arm_causes(&events),
+            [(ArmExpiryCause::Reconnect, true)],
+            "{events:?}"
+        );
+        assert!(matches!(state.grant, WakeGrant::None));
+    }
+
+    /// A spent grant whose verdict never comes still ends on the listener's clock:
+    /// the idle chunk reaching its deadline retires it over the span the wake got
+    /// no answer in, and a verdict arriving after that restores nothing.
+    #[test]
+    fn a_spent_grant_past_its_deadline_retires_on_the_chunk_clock() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+        let before = drive(&mut state, 0.1, 12, &mut cursor);
+        assert!(arm_expiries(&before).is_empty(), "not yet: {before:?}");
+        let at = drive(&mut state, 0.1, 1, &mut cursor);
+        assert_eq!(cursor, 11_264);
+        assert_eq!(
+            arm_causes(&at),
+            [(ArmExpiryCause::Deadline, true)],
+            "{at:?}"
+        );
+        assert_eq!(arm_expiries(&at), [(1_024 - 100, 3_072)]);
+
+        let late = decline_at(&mut state, cursor, &utt.utterance_id, &mut oww, &mut silero);
+        assert!(late.is_empty(), "nothing to give back: {late:?}");
+    }
+
+    /// Whether a candidate was minted from a wake is read off the grant it
+    /// expires from: a grant a decline gave back says so, a hold nothing was
+    /// minted from does not.
+    #[test]
+    fn a_restored_grant_that_expires_says_a_candidate_was_minted() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+        drive(&mut state, 0.1, 4, &mut cursor);
+        decline_at(&mut state, cursor, &utt.utterance_id, &mut oww, &mut silero);
+        let quiet = drive(&mut state, 0.1, 9, &mut cursor);
+        assert_eq!(cursor, 11_264);
+        assert_eq!(
+            arm_causes(&quiet),
+            [(ArmExpiryCause::Deadline, true)],
+            "{quiet:?}"
+        );
+
+        let mut state = ListenerState::new(grant_config());
+        state.arm_wake_for_test(0.9, 1_024);
+        let mut cursor = 0u64;
+        let quiet = drive(&mut state, 0.1, 18, &mut cursor);
+        assert_eq!(cursor, 9_216);
+        assert_eq!(
+            arm_causes(&quiet),
+            [(ArmExpiryCause::Deadline, false)],
+            "{quiet:?}"
+        );
+    }
+
+    /// `WakeRestored.speaking` is confirmed speech only: a restore landing in the
+    /// continuation window's pause says nothing is being spoken, one landing in a
+    /// fresh run of speech says it is.
+    #[test]
+    fn a_restore_with_speech_running_says_so() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, cursor, utt) = state_with_a_spent_grant();
+        let paused = decline_at(&mut state, cursor, &utt.utterance_id, &mut oww, &mut silero);
+        assert_eq!(
+            wake_restores(&paused),
+            [(11_264, cursor, false)],
+            "{paused:?}"
+        );
+
+        let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+        drive(&mut state, 0.1, 4, &mut cursor);
+        drive(&mut state, 0.9, 2, &mut cursor);
+        let talking = decline_at(&mut state, cursor, &utt.utterance_id, &mut oww, &mut silero);
+        assert_eq!(
+            wake_restores(&talking),
+            [(11_264, cursor, true)],
+            "{talking:?}"
+        );
+    }
+
+    /// A decline landing in the declined candidate's continuation window detaches
+    /// that identity without closing the endpointer, so the retry that resumes
+    /// there carves on the gated path at its end: a new candidate on the restored
+    /// grant, from the declined end, with the speech kept whole — and nothing more
+    /// said about the declined id.
+    #[test]
+    fn a_restore_detaches_the_declined_identity_and_keeps_the_retry_whole() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+        let back = decline_at(&mut state, cursor, &utt.utterance_id, &mut oww, &mut silero);
+        assert_eq!(wake_restores(&back).len(), 1, "{back:?}");
+        assert!(
+            state.current_id.is_none(),
+            "the declined identity is detached"
+        );
+        assert!(
+            transitions(&back).is_empty(),
+            "and the endpointer left as it was"
+        );
+
+        let mut retry = drive(&mut state, 0.9, 3, &mut cursor); // resumes: 5120..6144
+        retry.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&retry);
+        assert_eq!(carved.len(), 1, "one carve: {retry:?}");
+        assert_ne!(carved[0].utterance_id, utt.utterance_id, "under a new id");
+        assert_eq!(carved[0].start_sample, 3_072, "from the declined end");
+        assert_eq!(carved[0].end_sample, 6_144, "through the whole retry");
+        assert!(carved[0].wake.is_some(), "on the restored grant");
+        assert!(
+            !retry.iter().any(|e| matches!(
+                e,
+                ListenerEvent::Superseded { utterance_id, .. }
+                    | ListenerEvent::UtteranceClosed { utterance_id, .. }
+                    if *utterance_id == utt.utterance_id
+            )),
+            "nothing further about the declined id: {retry:?}"
+        );
+        assert!(
+            transitions(&retry).iter().all(|(c, _, _)| !matches!(
+                c,
+                TransitionCause::Dispatched | TransitionCause::Reset
+            )),
+            "the speech was never closed out from under the retry: {retry:?}"
+        );
+        assert!(
+            transitions(&retry)
+                .iter()
+                .any(|(c, _, _)| *c == TransitionCause::Continuation),
+            "it resumed as the same run of speech: {retry:?}"
+        );
+    }
+
+    /// A wake detected inside a minted candidate's continuation starts the turn
+    /// over: the running speech carves as a new candidate on the new wake's hold,
+    /// not as a re-carve of the old id, so the hold is spent and the new
+    /// candidate's verdict settles it.
+    #[test]
+    fn a_wake_inside_a_continuation_is_taken_by_the_speech_it_interrupts() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, first) = state_with_a_spent_grant();
+        let mut resumed = drive(&mut state, 0.9, 1, &mut cursor); // resumes at 5120
+        let detected = state.detect_wake_for_test(&pod(), 0.9, cursor);
+        assert_eq!(
+            arm_causes(&detected),
+            [(ArmExpiryCause::FreshWake, true)],
+            "{detected:?}"
+        );
+        let held = wake_helds(&detected);
+        assert_eq!(held.len(), 1, "{detected:?}");
+        assert!(state.current_id.is_none(), "the old identity is detached");
+        resumed.extend(drive(&mut state, 0.9, 4, &mut cursor)); // speech to 7168
+        resumed.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&resumed);
+        assert_eq!(carved.len(), 1, "one carve: {resumed:?}");
+        assert_ne!(
+            carved[0].utterance_id, first.utterance_id,
+            "as a new candidate"
+        );
+        assert_eq!(
+            carved[0].start_sample, held[0].0,
+            "from the new hold's start"
+        );
+        assert_eq!(carved[0].end_sample, 7_168);
+        assert!(carved[0].wake.is_some(), "on the new wake");
+        assert!(
+            matches!(&state.grant, WakeGrant::Spent { on, .. } if *on == carved[0].utterance_id),
+            "the new hold is spent on it: {:?}",
+            state.grant
+        );
+
+        let back = decline_at(
+            &mut state,
+            cursor,
+            &carved[0].utterance_id,
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(
+            wake_restores(&back).len(),
+            1,
+            "its verdict settles the grant: {back:?}"
+        );
+    }
+
+    /// A continuation re-carve of the candidate that spent the grant re-dates the
+    /// grant from the re-carve's end: the deadline runs from there, and a decline
+    /// gives back a grant whose retry starts where the re-carved attempt ended.
+    #[test]
+    fn a_continuation_re_carve_re_dates_the_spent_grant() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, first) = state_with_a_spent_grant();
+        let mut resumed = drive(&mut state, 0.9, 3, &mut cursor); // speech to 6144
+        resumed.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&resumed);
+        assert_eq!(carved.len(), 1, "{resumed:?}");
+        assert_eq!(carved[0].utterance_id, first.utterance_id, "a re-carve");
+        assert_eq!(carved[0].end_sample, 6_144);
+        assert!(
+            carved[0].grant_spent,
+            "the spender's re-carve holds the grant"
+        );
+        assert!(
+            matches!(&state.grant, WakeGrant::Spent { on, hold, .. }
+                if *on == first.utterance_id
+                    && hold.start_sample == 6_144
+                    && hold.end_sample == 6_144
+                    && hold.deadline_sample == 6_144 + 8_192),
+            "re-dated from the re-carve's end: {:?}",
+            state.grant
+        );
+
+        let quiet = drive(&mut state, 0.1, 8, &mut cursor);
+        assert!(cursor > 11_264, "past the first carve's deadline");
+        assert!(
+            arm_expiries(&quiet).is_empty(),
+            "the grant stands: {quiet:?}"
+        );
+
+        let back = decline_at(
+            &mut state,
+            cursor,
+            &first.utterance_id,
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(wake_restores(&back), [(14_336, cursor, false)], "{back:?}");
+        let mut retry = drive(&mut state, 0.9, 2, &mut cursor);
+        retry.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&retry);
+        assert_eq!(carved.len(), 1, "the retry is minted: {retry:?}");
+        assert_eq!(
+            carved[0].start_sample, 6_144,
+            "from the re-carved attempt's end"
+        );
+    }
+
+    /// A wake grant spent on a candidate keeps a capture window past its deadline
+    /// as a standing hold does, and so does the grant a decline gives back: the
+    /// window ends with the grant, on the chunk that retires it.
+    #[test]
+    fn a_wake_spent_keeps_the_window_past_its_deadline() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+        open_listen(&mut state, cursor, 1_024, &mut oww, &mut silero); // deadline 5632
+        let spent = drive(&mut state, 0.1, 4, &mut cursor);
+        assert_eq!(cursor, 6_656, "idle, past the window's deadline");
+        assert_eq!(expiries(&spent), 0, "kept by the spent grant: {spent:?}");
+
+        decline_at(&mut state, cursor, &utt.utterance_id, &mut oww, &mut silero);
+        let restored = drive(&mut state, 0.1, 8, &mut cursor);
+        assert_eq!(
+            expiries(&restored),
+            0,
+            "and by the restored one: {restored:?}"
+        );
+        assert!(state.capture.open().is_some());
+
+        let ended = drive(&mut state, 0.1, 1, &mut cursor);
+        assert_eq!(cursor, 11_264);
+        assert_eq!(arm_expiries(&ended).len(), 1, "the grant ends: {ended:?}");
+        assert_eq!(expiries(&ended), 1, "and the window with it: {ended:?}");
+    }
+
+    /// The fresh-wake expiry a bare arm gets, for a detection-time hold.
+    #[test]
+    fn a_fresh_wake_expires_a_detection_time_hold() {
+        let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
+        state.arm_wake_for_test(0.5, 1_024);
+        let events = state.detect_wake_for_test(&pod(), 0.9, 4_096);
+        assert_eq!(
+            arm_causes(&events),
+            [(ArmExpiryCause::FreshWake, false)],
+            "{events:?}"
+        );
+        assert_eq!(
+            arm_expiries(&events),
+            [(1_024 - 100, 4_096)],
+            "spanning to the superseding detection, as a superseded arm does"
+        );
+        assert_eq!(wake_helds(&events).len(), 1, "the new wake is held");
+    }
+
+    /// The reconnect expiry a bare arm gets, for a detection-time hold.
+    #[test]
+    fn a_reconnect_expires_a_detection_time_hold() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
+        state.arm_wake_for_test(0.9, 1_024);
+        state.silero_cursor = 2_000;
+        let events = state
+            .handle(&pod(), Feed::Connected { epoch: 2 }, &mut oww, &mut silero)
+            .unwrap();
+        assert_eq!(
+            arm_causes(&events),
+            [(ArmExpiryCause::Reconnect, false)],
+            "{events:?}"
+        );
+        assert!(state.wake.is_none() && matches!(state.grant, WakeGrant::None));
+    }
+
+    /// The device boundary does not end the wait: a close that finds a seen hold
+    /// standing leaves it standing, carves no missed-onset fallback (the wake was
     /// carved and judged), and reports nothing. Only the hold's own deadline
     /// retires it.
     #[test]
-    fn a_segment_close_leaves_a_standing_hold_standing() {
+    fn a_segment_close_leaves_a_seen_hold_standing() {
         let mut state = ListenerState::new(hold_config(WakePolicy::WakeGated));
         state.push_ring_for_test(0, &vec![5_i16; 16_384]);
         state.arm_wake_for_test(0.9, 1_024);
@@ -7468,7 +8566,10 @@ mod tests {
             arm_expiries(&closed).is_empty(),
             "and no bare-wake accounting yet — the wait is still open: {closed:?}"
         );
-        assert!(state.hold.is_some(), "the hold outlived the segment");
+        assert!(
+            state.grant.standing().is_some(),
+            "the hold outlived the segment"
+        );
         assert!(state.wake.is_some(), "and so did the arm it is keeping");
     }
 
@@ -7622,10 +8723,11 @@ mod tests {
 
     /// A refresh keeps the anchor the hold was installed with. The held start does
     /// not move on a refresh, but the segment's clock-offset estimate keeps
-    /// narrowing, so re-deriving the origin at the second wake-only carve would
-    /// move the axis of the utterance the hold eventually publishes — the drift the
-    /// freeze exists to stop, and one that is invisible in the events because the
-    /// stamp stays plausible.
+    /// narrowing, so re-deriving the origin at a wake-only carve would move the
+    /// axis of the utterance the hold eventually publishes — the drift the freeze
+    /// exists to stop, and one that is invisible in the events because the stamp
+    /// stays plausible. The detection lands mid-phrase, so the hold starts at the
+    /// running speech and its origin is projected.
     #[test]
     fn a_refreshed_hold_keeps_the_origin_it_was_installed_with() {
         let mut oww = oww_models();
@@ -7658,20 +8760,25 @@ mod tests {
             &mut silero,
         );
         state.push_ring_for_test(1_024, &vec![5_i16; 1_536]);
-        state.arm_wake_for_test(0.9, 1_536);
 
-        // The wake word alone: the hold is installed, its origin frozen here.
+        // The phrase onsets, and the detection lands inside it: the hold is
+        // installed from the running speech, its origin frozen here.
         let mut cursor = 1_024u64;
-        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
-        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
-        assert_eq!(wake_helds(&events).len(), 1, "installed: {events:?}");
-        let held_start = wake_helds(&events)[0].0;
+        drive(&mut state, 0.9, 2, &mut cursor);
+        let detected = state.detect_wake_for_test(&pod(), 0.9, 1_536);
+        assert_eq!(wake_helds(&detected).len(), 1, "installed: {detected:?}");
+        let held_start = wake_helds(&detected)[0].0;
         assert!(
             held_start > 512,
             "past the preroll, so the origin is projected"
         );
-        let installed = state.hold.expect("standing").anchor;
+        let installed = state.grant.standing().expect("standing").anchor;
         assert!(installed.t0_projected, "projected off the offset estimate");
+
+        // The wake word alone ends: the first refresh, from the same start.
+        let events = drive(&mut state, 0.1, 3, &mut cursor);
+        assert_eq!(wake_helds(&events).len(), 1, "refreshed: {events:?}");
+        assert_eq!(wake_helds(&events)[0].0, held_start, "from the same start");
 
         // Two frames arriving far less late: the min filter narrows sharply.
         state.expected_next = Some(2_560);
@@ -7748,7 +8855,7 @@ mod tests {
             vec![(1_536 - 100, held_end)],
             "the bare wake is reported at the open, spanning [wake_end − preroll, held end]: {opened:?}"
         );
-        assert!(state.hold.is_none(), "the hold is retired");
+        assert!(state.grant.standing().is_none(), "the hold is retired");
         assert!(state.wake.is_none(), "and the arm with it");
 
         // B's first chunk is speech: without the open-time check this would have
@@ -7898,10 +9005,16 @@ mod tests {
         let mut cursor = 0u64;
         let mut events = drive(&mut state, 0.9, 2, &mut cursor);
         events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
         assert_eq!(
-            soft_endpoints(&events).len(),
+            carved.len(),
             1,
             "the wake word alone goes to STT: {events:?}"
+        );
+        assert!(carved[0].wake.is_some());
+        assert!(
+            !carved[0].grant_spent,
+            "the arm is consumed, so a decline gets nothing back"
         );
         assert!(wake_helds(&events).is_empty(), "nothing held: {events:?}");
 

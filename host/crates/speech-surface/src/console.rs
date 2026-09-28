@@ -80,6 +80,10 @@ const CONSOLE_INFO: &[&str] = &[
     "utterance_superseded",
     "utterance_closed",
     "arm_expired",
+    // The wake's grant: when the listener started waiting for the command, and
+    // each time a declined candidate gave it back.
+    "wake_held",
+    "wake_restored",
     // The capture window a `<listen/>` reply opens: when it opened, each time
     // speech was heard inside it, each time a declined candidate gave it back,
     // and its expiry. At most a handful per reply.
@@ -3279,7 +3283,9 @@ mod tests {
         ("wake_command_absent", Class::Calm),
         ("wake_decision", Class::Loud),
         ("wake_detected", Class::Calm),
+        ("wake_held", Class::Calm),
         ("wake_muted", Class::Calm),
+        ("wake_restored", Class::Calm),
         ("wake_sidecar_error", Class::Loud),
         ("wake_sidecar_skipped", Class::Loud),
         ("wake_stage_panicked", Class::Loud),

@@ -37,13 +37,13 @@ use pod_ingest::{HostMicros, SegmentRef};
 use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
-    AudioSpan, BargeCause, Brain, BrainEvent, BrainEventFn, BrainStats, CarveTiming,
-    CarvedUtterance, ConfidenceGate, Cue, CueTap, DoaTrack, EndpointCause, EndpointState, Feed,
-    FlushRejected, GateReject, InterruptProgress, ListenerEvent, ListenerUtteranceId, PodId,
-    ResponseSink, RoomId, Segment, SegmentTelemetry, SpeakBody, SpeakCmd, StageTimings,
-    TrackingEvent, TranscribeError, Transcriber, Transcript, TransitionCause, TurnEnd, Utterance,
-    UtteranceId, WakeCommandReason, WakeConfirmation, send_or_report, stage_delta_us,
-    tracking_event, transcribe_pcm,
+    ArmExpiryCause, AudioSpan, BargeCause, Brain, BrainEvent, BrainEventFn, BrainStats,
+    CarveTiming, CarvedUtterance, ConfidenceGate, Cue, CueTap, DoaTrack, EndpointCause,
+    EndpointState, Feed, FlushRejected, GateReject, InterruptProgress, ListenerEvent,
+    ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment, SegmentTelemetry, SpeakBody,
+    SpeakCmd, StageTimings, TrackingEvent, TranscribeError, Transcriber, Transcript,
+    TransitionCause, TurnEnd, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation,
+    send_or_report, stage_delta_us, tracking_event, transcribe_pcm,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -127,6 +127,7 @@ impl PipelineItem {
                 | Superseded { pod, .. }
                 | UtteranceClosed { pod, .. }
                 | WakeHeld { pod, .. }
+                | WakeRestored { pod, .. }
                 | ArmExpired { pod, .. }
                 | EndpointerTransition { pod, .. }
                 | ModelStats { pod, .. }
@@ -157,6 +158,7 @@ impl PipelineItem {
                 Superseded { .. } => "superseded",
                 UtteranceClosed { .. } => "utterance_closed",
                 WakeHeld { .. } => "wake_held",
+                WakeRestored { .. } => "wake_restored",
                 ArmExpired { .. } => "arm_expired",
                 EndpointerTransition { .. } => "endpointer_transition",
                 ModelStats { .. } => "model_stats",
@@ -311,6 +313,9 @@ struct Carve {
     /// `barge_in` when that speech went on to cut a reply; the gate reads the
     /// barge first.
     follow_up: bool,
+    /// This carve holds its wake's grant, so a decline of it gets the grant back
+    /// from the listener and the grant's own ending brings the head down.
+    grant_spent: bool,
     /// The listener's host-receipt stamps for this utterance's audio, from t0 to
     /// the carve. Copied onto the minted `Utterance`'s `StageTimings`.
     timing: CarveTiming,
@@ -353,9 +358,10 @@ struct HoldRelease {
     at: tokio::time::Instant,
     /// The hold's own deadline, carried so the release line joins its `wake_held`.
     deadline_sample: u64,
-    /// The listener has confirmed speech since this was armed and the speech has
-    /// not ended: it ends in a carve that consumes or refreshes the hold, so the
-    /// release waits for that rather than firing under a command being spoken.
+    /// Speech is running under this hold, as of the arm or of a confirmed onset
+    /// since, and has not ended: it ends in a carve that consumes or refreshes the
+    /// hold, so the release waits for that rather than firing under a command
+    /// being spoken.
     /// A discontinuity that drops the speech carves nothing and clears this, and
     /// the release is due at `at` again.
     speaking: bool,
@@ -374,6 +380,20 @@ struct ListenRelease {
     /// The window's deadline, carried so the release line joins its
     /// `listen_restored`.
     deadline_sample: u64,
+}
+
+/// The wall-clock instant a listener deadline lands at, dated from now as the
+/// listener's `from_sample`: what is left of the wait, in wall time. `None` with
+/// no time left. The one dating rule for the head's wall-clock releases.
+///
+/// Receipt lands a soft hangover plus transport latency after the listener's
+/// cursor, so this instant is later than the listener's own deadline: where audio
+/// keeps arriving, the listener's own expiry fires first and cancels the release.
+fn wall_clock_after(deadline_sample: u64, from_sample: u64) -> Option<tokio::time::Instant> {
+    (deadline_sample > from_sample).then(|| {
+        tokio::time::Instant::now()
+            + Duration::from_millis((deadline_sample - from_sample) / crate::config::SAMPLES_PER_MS)
+    })
 }
 
 /// A recently-assembled segment, retained so a listener utterance carved across it
@@ -423,7 +443,8 @@ struct PodState {
     /// Per-pod spawn nonce mint.
     spawn_seq: u64,
     /// The head's release for a wake hold standing on this pod, armed on
-    /// `WakeHeld` and cancelled when the listener resolves the hold either way.
+    /// `WakeHeld` and `WakeRestored` and cancelled when the listener resolves the
+    /// hold either way.
     hold_release: Option<HoldRelease>,
     /// The head's release for a capture window restored on this pod, armed on
     /// `ListenRestored` and cancelled by anything that says the window's ending
@@ -574,7 +595,7 @@ fn release_due(
                 &json!({ "pod": pod.0, "deadline_sample": release.deadline_sample }),
             );
             if let Some(scripter) = scripter {
-                scripter.send(ScriptInput::Unanswered(pod.clone()));
+                scripter.send(ScriptInput::WakeExpired(pod.clone()));
             }
         }
         if let Some(release) = state.listen_release.take_if(|r| r.at <= now) {
@@ -705,6 +726,40 @@ async fn handle_segment(
         )
         .await;
     }
+}
+
+/// The `wake_held` line's payload, field for field the
+/// [`ListenerEvent::WakeHeld`] it reports. Built by the daemon and the replay rig
+/// alike through [`event_line`], so the two print one schema.
+#[derive(Serialize)]
+pub struct WakeHeldLine {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub wake_end_sample: u64,
+    pub deadline_sample: u64,
+    pub speaking: bool,
+}
+
+/// The `wake_restored` line's payload, field for field the
+/// [`ListenerEvent::WakeRestored`] it reports. Shared with the replay rig, as
+/// [`WakeHeldLine`] is.
+#[derive(Serialize)]
+pub struct WakeRestoredLine {
+    pub deadline_sample: u64,
+    pub at_sample: u64,
+    pub speaking: bool,
+}
+
+/// The `arm_expired` line's payload: the [`ListenerEvent::ArmExpired`] it reports,
+/// with the wake's score for its confirmation. Shared with the replay rig, as
+/// [`WakeHeldLine`] is.
+#[derive(Serialize)]
+pub struct ArmExpiredLine {
+    pub score: f32,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub candidate_minted: bool,
+    pub cause: ArmExpiryCause,
 }
 
 /// Build a listener-event payload: `envelope`'s caller context (the daemon stamps
@@ -878,9 +933,9 @@ async fn handle_listener(
                 );
                 return;
             }
-            // Nothing is minted under a hold, so a carve on this pod is either the
-            // hold consumed or a fresh wake's own: the wait the head is waiting out
-            // is over either way. A mint also spends whatever window this pod had,
+            // Nothing is minted under a hold without spending it, so a carve on this
+            // pod is the hold spent: a verdict follows, and a decline re-arms this
+            // from the restore. A mint also spends whatever window this pod had,
             // so the window's own wall-clock release is over with it — a decline
             // re-arms it from the restore.
             state.hold_release = None;
@@ -1098,10 +1153,7 @@ async fn handle_listener(
             // The head's wall-clock deadline for what is left of the window. Armed
             // under the hold's rules and for the hold's reasons: with no scripter
             // there is no head to bring down and a timer over a replay faster than
-            // real time would be a fiction, and the cursor lags the wall clock by
-            // the hangover and transport latency, so this instant lands after the
-            // listener's own deadline — where audio keeps arriving the listener's
-            // `ListenExpired` gets there first and cancels it.
+            // real time would be a fiction.
             //
             // Nothing is armed with no time left: the listener ran its own expiry
             // check at this restore and kept the window, so the room is not idle —
@@ -1109,12 +1161,12 @@ async fn handle_listener(
             // stow the head now over an onset run or a resumed answer the carve
             // will accept. Nothing is armed under a standing hold either: the head
             // is on the hold's schedule, which has an ending of its own.
-            if scripter.is_some() && state.hold_release.is_none() && deadline_sample > at_sample {
-                let wait = Duration::from_millis(
-                    (deadline_sample - at_sample) / crate::config::SAMPLES_PER_MS,
-                );
+            if scripter.is_some()
+                && state.hold_release.is_none()
+                && let Some(at) = wall_clock_after(deadline_sample, at_sample)
+            {
                 state.listen_release = Some(ListenRelease {
-                    at: tokio::time::Instant::now() + wait,
+                    at,
                     deadline_sample,
                 });
             }
@@ -1196,19 +1248,25 @@ async fn handle_listener(
             end_sample,
             wake_end_sample,
             deadline_sample,
+            speaking,
         } => {
             // The wake word arrived without its command yet and the listener is
             // waiting. Nothing is dispatched and no brain hears of it — the turn is
             // still open, and resolves as a published utterance or as `arm_expired`.
+            // `speaking` says the endpointer was in confirmed speech at the line:
+            // the head's fallback below waits under it.
             jsonl.emit(
                 "wake_held",
-                &json!({
-                    "pod": pod.0,
-                    "start_sample": start_sample,
-                    "end_sample": end_sample,
-                    "wake_end_sample": wake_end_sample,
-                    "deadline_sample": deadline_sample,
-                }),
+                &event_line(
+                    json!({ "pod": pod.0 }),
+                    &WakeHeldLine {
+                        start_sample,
+                        end_sample,
+                        wake_end_sample,
+                        deadline_sample,
+                        speaking,
+                    },
+                ),
             );
             let state = pods.entry(pod.clone()).or_default();
             if !state.adopt_epoch(epoch) {
@@ -1218,23 +1276,65 @@ async fn handle_listener(
             // window release's own arm rule, which stands down under a hold.
             state.listen_release = None;
             // Past the epoch check because the arm touches per-pod state and the
-            // `Unanswered` it eventually sends is not a no-op against a live turn.
+            // `WakeExpired` it eventually sends moves the head.
             // With no scripter wired (replay, brainless tuning) nothing is armed:
             // there is no head to release, and a wall-clock timer over a replay that
             // runs faster than real time would be a fiction.
-            if scripter.is_some() {
-                let wait = Duration::from_millis(
-                    deadline_sample.saturating_sub(end_sample) / crate::config::SAMPLES_PER_MS,
-                );
-                // Receipt lands a soft hangover plus transport latency after
-                // `end_sample`, so this instant is later than the listener's own
-                // deadline: where audio keeps arriving, `ArmExpired` fires first and
-                // cancels it. A refreshed hold overwrites the entry with its later
-                // deadline.
+            // Dated from `end_sample`, the point the wait runs from. A refreshed
+            // hold overwrites the entry with its later deadline. A detection-time
+            // hold usually arrives with the phrase still running, and the release
+            // waits under it as it waits under any speech, until the carve
+            // refreshes or takes the hold.
+            if scripter.is_some()
+                && let Some(at) = wall_clock_after(deadline_sample, end_sample)
+            {
                 state.hold_release = Some(HoldRelease {
-                    at: tokio::time::Instant::now() + wait,
+                    at,
                     deadline_sample,
-                    speaking: false,
+                    speaking,
+                });
+            }
+        }
+        ListenerEvent::WakeRestored {
+            pod,
+            epoch,
+            deadline_sample,
+            at_sample,
+            speaking,
+        } => {
+            // The gate declined the wake's candidate and the wake is back: until
+            // `deadline_sample` this pod hears a command for it with no wake word.
+            // A reader is entitled to conclude the wake is not over, and that the
+            // head stays up for it until an `utterance` that dispatches, an
+            // `arm_expired`, a `wake_hold_released`, or a later `wake_detected`.
+            jsonl.emit(
+                "wake_restored",
+                &event_line(
+                    json!({ "pod": pod.0 }),
+                    &WakeRestoredLine {
+                        deadline_sample,
+                        at_sample,
+                        speaking,
+                    },
+                ),
+            );
+            let state = pods.entry(pod.clone()).or_default();
+            if !state.adopt_epoch(epoch) {
+                return; // Stale: a reconnect superseded this epoch.
+            }
+            // The restored grant owns the head's ending, as a hold does.
+            state.listen_release = None;
+            // Dated from what is left of the grant at the listener's cursor.
+            // Nothing is armed with no time left: the listener ran its own expiry
+            // check at the restore and kept the grant, so speech is running and the
+            // carve will take it.
+            if scripter.is_some()
+                && let Some(at) = wall_clock_after(deadline_sample, at_sample)
+            {
+                state.hold_release = Some(HoldRelease {
+                    at,
+                    deadline_sample,
+                    speaking,
                 });
             }
         }
@@ -1243,33 +1343,54 @@ async fn handle_listener(
             wake,
             start_sample,
             end_sample,
+            candidate_minted,
+            cause,
         } => {
             // Emitted ahead of the brain gate below: a brainless run — the tuning
             // and replay setting — otherwise leaves arm expiry with no trace at all.
+            // `cause` is which ending this was; `candidate_minted` says a candidate
+            // was minted from this wake, whose verdict is then the wake's record.
             jsonl.emit(
                 "arm_expired",
-                &json!({
-                    "pod": pod.0,
-                    "score": wake.score,
-                    "start_sample": start_sample,
-                    "end_sample": end_sample,
-                }),
+                &event_line(
+                    json!({ "pod": pod.0 }),
+                    &ArmExpiredLine {
+                        score: wake.score,
+                        start_sample,
+                        end_sample,
+                        candidate_minted,
+                        cause,
+                    },
+                ),
             );
             // The hold resolved on the listener's clock, so the head's wall-clock
-            // release is not needed: the `Unanswered` below is the one it gets.
+            // release is not needed: the `WakeExpired` below is the one it gets.
             if let Some(state) = pods.get_mut(&pod) {
                 state.hold_release = None;
             }
-            // The usual false-positive-wake path: the head goes back down a
-            // linger after this, and it does so with or without a brain wired.
-            if let Some(scripter) = scripter {
-                scripter.send(ScriptInput::Unanswered(pod.clone()));
+            // The head comes down now: the grant was the hold, and with or without
+            // a brain wired nothing accepts a command for this wake any more. Not
+            // for a fresh wake: its `WakeDetected` follows in this same batch and
+            // its raise is the head's next fact, so a close sent ahead of it would
+            // begin a stow the raise replaces.
+            if cause != ArmExpiryCause::FreshWake
+                && let Some(scripter) = scripter
+            {
+                scripter.send(ScriptInput::WakeExpired(pod.clone()));
             }
             // "Wake, no follow": the wake fired but no command followed. Accounted
             // for through the same `WakeCommandAbsent` vocabulary as an empty or
             // low-confidence command — only meaningful with a brain wired (the
             // event sink + counter), the same as the confidence-gate decline. STT
-            // never ran, so there is no transcript to attach.
+            // never ran, so there is no transcript to attach. A wake a candidate
+            // was minted from already has its record: each declined candidate is
+            // one `wake_command_absent` with its own audio, and a verdict still in
+            // flight at a superseding wake reports itself if it lands. One whose
+            // STT a reconnect or a later mint aborts never lands, and that wake
+            // goes unrecorded. So the count is per candidate, not per wake.
+            if candidate_minted {
+                return;
+            }
             let Some(wiring) = brain else {
                 return;
             };
@@ -1322,6 +1443,7 @@ fn spawn_stt(
         barge_in,
         over_playback,
         follow_up,
+        grant_spent,
         timing,
     } = utterance;
     let carve = Carve {
@@ -1335,6 +1457,7 @@ fn spawn_stt(
         barge_in,
         over_playback,
         follow_up,
+        grant_spent,
         timing,
         sent_from,
     };
@@ -1580,32 +1703,43 @@ async fn handle_stt_done(
             (Provenance::OverPlayback, Some(reject)) => GateOutcome::DeclineEcho(reject),
         }
     };
-    // Whether the head starts its settle is one read of the one classification.
-    // A declined wake or barge is a raise that produced no turn: the head is up
-    // and nothing will follow, so the settle starts here rather than waiting for
-    // the engagement's ceiling. A carve in a quiet room that said nothing is the
+    // What the head is told of a decline is one read of the one classification.
+    // A declined barge is a raise that produced no turn: the head is up and
+    // nothing will follow, so the settle starts here rather than waiting for the
+    // engagement's ceiling. A carve in a quiet room that said nothing is the
     // same: under a bypassed wake gate nothing else will end the engagement, so
-    // the settle starts here too. A declined follow-up is not — its capture
-    // window is handed back below and owns the head until it expires, and folding
-    // a linger from here would date the head's ending off noise instead of off
-    // the window. A decline over the pod's own voice is not a raise either:
-    // nobody raised, and `Unanswered` clears the pod's current turn, which would
-    // cut short the script of the very reply the echo came from.
+    // the settle starts here too. A declined wake command that holds its grant is
+    // not: the decline reported below gives the grant back, and the grant's own
+    // ending — its `arm_expired`, or the head's wall-clock release — brings the
+    // head down. A wake command with no grant to give back leaves the microphone
+    // wake-gated again, so the head comes down now. A declined follow-up says
+    // nothing either — its capture window is handed back below and owns the head
+    // until it expires, and folding a linger from here would date the head's
+    // ending off noise instead of off the window. A decline over the pod's own
+    // voice is not a raise at all: nobody raised, and `Unanswered` clears the
+    // pod's current turn, which would cut short the script of the very reply the
+    // echo came from.
     //
     // A turn — a dispatch or the offline reply — is not a decline, and ends the
     // head's engagement through its own script.
     //
     // Both declines answer this off the value they were classified under, so no
     // decline's head response can drift from its report.
-    let starts_the_settle = !matches!(gate, GateOutcome::Dispatch | GateOutcome::OfflineReply(_))
-        && matches!(
-            from,
-            Provenance::Wake(_) | Provenance::Barge | Provenance::Bypassed
-        );
+    let declined = !matches!(gate, GateOutcome::Dispatch | GateOutcome::OfflineReply(_));
+    let wake_restores = done.carve.grant_spent && listen.is_some();
+    let settle = match from {
+        _ if !declined => None,
+        Provenance::Barge | Provenance::Bypassed => {
+            Some(ScriptInput::Unanswered(utterance.pod.clone()))
+        }
+        Provenance::Wake(_) if wake_restores => None,
+        Provenance::Wake(_) => Some(ScriptInput::WakeExpired(utterance.pod.clone())),
+        Provenance::FollowUp | Provenance::OverPlayback => None,
+    };
     if let Some(scripter) = scripter
-        && starts_the_settle
+        && let Some(settle) = settle
     {
-        scripter.send(ScriptInput::Unanswered(utterance.pod.clone()));
+        scripter.send(settle);
     }
     // Every decline, uniformly and whatever its reason: this candidate produced no
     // turn. A dispatch or the offline reply is a turn, so neither is reported
@@ -2335,6 +2469,7 @@ mod tests {
     }
 
     /// A carved utterance over `[start, end)` with the given id and optional wake.
+    /// A wake carve holds its grant.
     fn carved(seq: u64, start: u64, end: u64, wake: Option<WakeConfirmation>) -> CarvedUtterance {
         let len = (end - start) as usize;
         CarvedUtterance {
@@ -2347,6 +2482,7 @@ mod tests {
             barge_in: false,
             over_playback: false,
             follow_up: false,
+            grant_spent: wake.is_some(),
             timing: CarveTiming::default(),
         }
     }
@@ -3219,13 +3355,15 @@ mod tests {
                     },
                     start_sample: 0,
                     end_sample: 16,
+                    candidate_minted: false,
+                    cause: ArmExpiryCause::Deadline,
                 }),
             ])
             .await;
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![plain_wake(), ScriptInput::Unanswered(pod())]
+            vec![plain_wake(), ScriptInput::WakeExpired(pod())]
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -3259,7 +3397,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Unanswered(pod())]
+            vec![ScriptInput::WakeExpired(pod())]
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -3384,6 +3522,7 @@ mod tests {
                 barge_in: false,
                 over_playback: false,
                 follow_up: false,
+                grant_spent: false,
                 timing: CarveTiming::default(),
                 sent_from: Some(0),
             },
@@ -3605,6 +3744,8 @@ mod tests {
                     wake,
                     start_sample: 0,
                     end_sample: 16,
+                    candidate_minted: false,
+                    cause: ArmExpiryCause::Deadline,
                 }),
                 "arm_expired",
             ),
@@ -3676,6 +3817,7 @@ mod tests {
             barge_in: false,
             over_playback: false,
             follow_up: false,
+            grant_spent: false,
             timing: CarveTiming::default(),
             sent_from: Some(0),
         };
@@ -3908,7 +4050,8 @@ mod tests {
 
         let inputs = script_inputs(handle, rx).await;
         assert!(
-            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            !inputs.contains(&ScriptInput::Unanswered(pod()))
+                && !inputs.contains(&ScriptInput::WakeExpired(pod())),
             "a turn, not a decline: {inputs:?}"
         );
         let [
@@ -3992,7 +4135,7 @@ mod tests {
         assert!(cmds.is_empty(), "{cmds:?}");
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Unanswered(pod())]
+            vec![ScriptInput::WakeExpired(pod())]
         );
         assert_eq!(stats.snapshot().wake_command_absent, 1);
         assert!(!events(&lines).contains(&"stt_unreachable_reply"));
@@ -4070,7 +4213,7 @@ mod tests {
         assert!(!events(&lines).contains(&"stt_unreachable_reply"));
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Unanswered(pod())]
+            vec![ScriptInput::WakeExpired(pod())]
         );
         assert_eq!(stats.snapshot().wake_command_absent, 1);
         drop(jsonl);
@@ -4336,6 +4479,8 @@ mod tests {
                 wake,
                 start_sample: 0,
                 end_sample: 16_000,
+                candidate_minted: false,
+                cause: ArmExpiryCause::Deadline,
             })])
             .await;
         assert!(cmds.is_empty(), "a wake-no-follow dispatches nothing");
@@ -4373,6 +4518,8 @@ mod tests {
                 },
                 start_sample: 0,
                 end_sample: 16_000,
+                candidate_minted: false,
+                cause: ArmExpiryCause::Deadline,
             }),
         ])
         .await;
@@ -4403,6 +4550,8 @@ mod tests {
             },
             start_sample: 0,
             end_sample: 16_000,
+            candidate_minted: false,
+            cause: ArmExpiryCause::Deadline,
         })])
         .await;
         let evs = events_seen.lock().unwrap();
@@ -4427,6 +4576,8 @@ mod tests {
                 },
                 start_sample: 0,
                 end_sample: 16,
+                candidate_minted: false,
+                cause: ArmExpiryCause::Deadline,
             })])
             .await;
         assert!(cmds.is_empty(), "a wake-no-follow dispatches nothing");
@@ -4448,6 +4599,7 @@ mod tests {
             end_sample,
             wake_end_sample: end_sample,
             deadline_sample,
+            speaking: false,
         })
     }
 
@@ -4488,7 +4640,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![plain_wake(), ScriptInput::Unanswered(pod())]
+            vec![plain_wake(), ScriptInput::WakeExpired(pod())]
         );
         let released: Vec<&Value> = lines
             .iter()
@@ -4526,6 +4678,8 @@ mod tests {
             },
             start_sample: 7_360,
             end_sample: 15_360,
+            candidate_minted: false,
+            cause: ArmExpiryCause::Deadline,
         }))
         .await;
         run.advance(Duration::from_millis(600)).await;
@@ -4533,12 +4687,271 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![plain_wake(), ScriptInput::Unanswered(pod())]
+            vec![plain_wake(), ScriptInput::WakeExpired(pod())]
         );
         assert!(
             !lines.iter().any(|l| l["event"] == "wake_hold_released"),
             "the listener answered first: {lines:?}"
         );
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// An `ArmExpired` for a wake held at 15_360, with its two new fields.
+    fn arm_expired(candidate_minted: bool, cause: ArmExpiryCause) -> PipelineItem {
+        PipelineItem::Listener(ListenerEvent::ArmExpired {
+            pod: pod(),
+            wake: WakeConfirmation {
+                score: 0.8,
+                wake_end_sample: 8_000,
+                stt_trim_samples: 4_800,
+            },
+            start_sample: 7_360,
+            end_sample: 15_360,
+            candidate_minted,
+            cause,
+        })
+    }
+
+    /// A `WakeRestored` on epoch 1.
+    fn wake_restored(deadline_sample: u64, at_sample: u64, speaking: bool) -> PipelineItem {
+        PipelineItem::Listener(ListenerEvent::WakeRestored {
+            pod: pod(),
+            epoch: 1,
+            deadline_sample,
+            at_sample,
+            speaking,
+        })
+    }
+
+    /// A hold reported with speech already running — the detection landed
+    /// mid-phrase — arms a release that waits under that speech rather than
+    /// firing at its instant.
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_held_under_speech_waits_for_the_carve() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![
+                wake_detected(1, 15_360),
+                PipelineItem::Listener(ListenerEvent::WakeHeld {
+                    pod: pod(),
+                    epoch: 1,
+                    start_sample: 7_360,
+                    end_sample: 15_360,
+                    wake_end_sample: 15_360,
+                    deadline_sample: 23_360,
+                    speaking: true,
+                }),
+            ])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(600)).await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(script_inputs(handle, rx).await, vec![plain_wake()]);
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "frozen under the speech: {lines:?}"
+        );
+        let held = lines.iter().find(|l| l["event"] == "wake_held").unwrap();
+        assert_eq!(held["speaking"], true, "the line says so: {held}");
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A restored grant arms the head's release for what is left of it, dated
+    /// from the listener's cursor at the restore; when it fires, the head comes
+    /// down now.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_wake_arms_its_release_from_what_is_left() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, mut rx) = crate::scripter::channel(jsonl.clone());
+        // 8_000 samples left: 500 ms.
+        let mut run = Harness::new()
+            .scripter(handle.clone())
+            .start(vec![
+                wake_detected(1, 15_360),
+                wake_restored(40_000, 32_000, false),
+            ])
+            .await;
+        run.settle().await;
+        run.advance(Duration::from_millis(400)).await;
+        let early: Vec<ScriptInput> = std::iter::from_fn(|| rx.try_recv()).collect();
+        assert_eq!(early, vec![plain_wake()], "not yet: {early:?}");
+        run.advance(Duration::from_millis(200)).await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![ScriptInput::WakeExpired(pod())]
+        );
+        let restored = lines
+            .iter()
+            .find(|l| l["event"] == "wake_restored")
+            .unwrap();
+        assert_eq!(restored["pod"], "pod-x");
+        assert_eq!(restored["deadline_sample"], 40_000);
+        assert_eq!(restored["at_sample"], 32_000);
+        assert_eq!(restored["speaking"], false);
+        let released: Vec<&Value> = lines
+            .iter()
+            .filter(|l| l["event"] == "wake_hold_released")
+            .collect();
+        assert_eq!(released.len(), 1, "{lines:?}");
+        assert_eq!(released[0]["deadline_sample"], 40_000);
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A restore with speech running arms a release that waits under it, and one
+    /// with no time left arms nothing: the listener kept the grant only because
+    /// speech is running, which the carve will take.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_under_speech_or_out_of_time_does_not_fire() {
+        for restore in [
+            wake_restored(40_000, 32_000, true),
+            wake_restored(40_000, 40_000, false),
+        ] {
+            let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+            let (handle, rx) = crate::scripter::channel(jsonl.clone());
+            let mut run = Harness::new()
+                .scripter(handle.clone())
+                .start(vec![wake_detected(1, 15_360), restore])
+                .await;
+            run.settle().await;
+            run.advance(Duration::from_millis(1_000)).await;
+            let (lines, _) = run.finish().await;
+            assert_eq!(script_inputs(handle, rx).await, vec![plain_wake()]);
+            assert!(
+                !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+                "{lines:?}"
+            );
+            drop(jsonl);
+            writer.await.unwrap();
+        }
+    }
+
+    /// A declined wake command that holds its grant leaves the head to the grant
+    /// the listener gives back: the decline sends it nothing. One that spent no
+    /// grant is the wake's end, and the head comes down now. A declined carve
+    /// under a bypassed gate still folds a linger.
+    #[tokio::test]
+    async fn a_declined_wake_command_leaves_the_head_to_the_grant() {
+        let wake = WakeConfirmation {
+            score: 0.9,
+            wake_end_sample: 0,
+            stt_trim_samples: 0,
+        };
+        for (grant_spent, carve, expected) in [
+            (true, carved(1, 0, 16, Some(wake)), vec![]),
+            (
+                false,
+                carved(1, 0, 16, Some(wake)),
+                vec![ScriptInput::WakeExpired(pod())],
+            ),
+            (
+                false,
+                carved(1, 0, 16, None),
+                vec![ScriptInput::Unanswered(pod())],
+            ),
+        ] {
+            let carve = CarvedUtterance {
+                grant_spent,
+                ..carve
+            };
+            let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+            let (handle, rx) = crate::scripter::channel(jsonl.clone());
+            let (feed, fed) = spy_listen_feed();
+            let h = Harness::new()
+                .transcriber(says("", None))
+                .brain()
+                .scripter(handle.clone())
+                .listen(feed, TEST_LISTEN_WINDOW);
+            let stats = h.stats.clone();
+            let (_lines, cmds) = h.run(vec![soft_endpoint(carve)]).await;
+            assert!(cmds.is_empty());
+            assert_eq!(
+                script_inputs(handle, rx).await,
+                expected,
+                "grant_spent: {grant_spent}"
+            );
+            assert!(
+                matches!(
+                    fed.lock().unwrap().as_slice(),
+                    [Feed::CandidateDeclined { .. }]
+                ),
+                "the listener hears of the decline either way: {:?}",
+                fed.lock().unwrap()
+            );
+            // The decline's own record is unchanged by the grant coming back.
+            assert_eq!(
+                stats.snapshot().wake_command_absent + stats.snapshot().no_transcript,
+                1
+            );
+            drop(jsonl);
+            writer.await.unwrap();
+        }
+    }
+
+    /// An expiry for a wake a candidate was minted from ends the head's hold and
+    /// clears its release, but the wake already has its record — the candidate's
+    /// verdict — so no second `wake_command_absent` is made. The line carries both
+    /// new fields.
+    #[tokio::test(start_paused = true)]
+    async fn an_expiry_after_a_minted_candidate_is_the_heads_ending_only() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let h = Harness::new().brain().scripter(handle.clone());
+        let events_seen = h.events.clone();
+        let stats = h.stats.clone();
+        let mut run = h
+            .start(vec![
+                wake_detected(1, 15_360),
+                wake_restored(40_000, 32_000, false),
+            ])
+            .await;
+        run.settle().await;
+        run.feed(arm_expired(true, ArmExpiryCause::Deadline)).await;
+        run.advance(Duration::from_millis(1_000)).await;
+        let (lines, _) = run.finish().await;
+
+        assert_eq!(
+            script_inputs(handle, rx).await,
+            vec![plain_wake(), ScriptInput::WakeExpired(pod())]
+        );
+        assert!(
+            !lines.iter().any(|l| l["event"] == "wake_hold_released"),
+            "the release was cleared: {lines:?}"
+        );
+        assert!(events_seen.lock().unwrap().is_empty(), "no brain record");
+        assert_eq!(stats.snapshot().wake_command_absent, 0, "and no count");
+        let expired = lines.iter().find(|l| l["event"] == "arm_expired").unwrap();
+        assert_eq!(expired["candidate_minted"], true);
+        assert_eq!(expired["cause"], "deadline");
+        drop(jsonl);
+        writer.await.unwrap();
+    }
+
+    /// A fresh wake's expiry of the grant before it sends the head nothing: the
+    /// detection that follows in the same batch raises it, and that raise is the
+    /// only head input.
+    #[tokio::test]
+    async fn a_fresh_wake_expiry_leaves_the_head_to_the_raise() {
+        let (jsonl, writer) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let (handle, rx) = crate::scripter::channel(jsonl.clone());
+        let (lines, _) = Harness::new()
+            .scripter(handle.clone())
+            .run(vec![
+                arm_expired(false, ArmExpiryCause::FreshWake),
+                wake_detected(1, 30_720),
+            ])
+            .await;
+        assert_eq!(script_inputs(handle, rx).await, vec![plain_wake()]);
+        let expired = lines.iter().find(|l| l["event"] == "arm_expired").unwrap();
+        assert_eq!(expired["cause"], "fresh_wake");
+        assert_eq!(expired["candidate_minted"], false);
         drop(jsonl);
         writer.await.unwrap();
     }
@@ -4562,7 +4975,7 @@ mod tests {
 
         let inputs = script_inputs(handle, rx).await;
         assert!(
-            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            !inputs.contains(&ScriptInput::WakeExpired(pod())),
             "the wake was answered: {inputs:?}"
         );
         assert!(
@@ -4595,14 +5008,14 @@ mod tests {
             seen.push(input);
         }
         assert!(
-            !seen.contains(&ScriptInput::Unanswered(pod())),
+            !seen.contains(&ScriptInput::WakeExpired(pod())),
             "past the first deadline, which no longer governs: {seen:?}"
         );
         run.advance(Duration::from_millis(1_000)).await;
         let (lines, _) = run.finish().await;
 
         seen.extend(script_inputs(handle, rx).await);
-        assert_eq!(seen, vec![plain_wake(), ScriptInput::Unanswered(pod())]);
+        assert_eq!(seen, vec![plain_wake(), ScriptInput::WakeExpired(pod())]);
         assert_eq!(
             lines
                 .iter()
@@ -4632,7 +5045,7 @@ mod tests {
     }
 
     /// A straggler from a superseded connection: its release would send an
-    /// `Unanswered` against whatever the live connection is doing, so it arms
+    /// `WakeExpired` against whatever the live connection is doing, so it arms
     /// nothing. The line it writes is accounting, and stays.
     #[tokio::test(start_paused = true)]
     async fn a_stale_wake_held_arms_nothing() {
@@ -5802,7 +6215,7 @@ mod tests {
             "{inputs:?}"
         );
         assert!(
-            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            !inputs.contains(&ScriptInput::WakeExpired(pod())),
             "{inputs:?}"
         );
         drop(jsonl);
@@ -5830,7 +6243,7 @@ mod tests {
         );
         let inputs = script_inputs(handle, rx).await;
         assert!(
-            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            !inputs.contains(&ScriptInput::WakeExpired(pod())),
             "{inputs:?}"
         );
         drop(jsonl);
@@ -5874,7 +6287,7 @@ mod tests {
         assert_eq!(released[0]["deadline_sample"], 23_360, "{lines:?}");
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![plain_wake(), ScriptInput::Unanswered(pod())]
+            vec![plain_wake(), ScriptInput::WakeExpired(pod())]
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -5915,7 +6328,7 @@ mod tests {
         );
         let inputs = script_inputs(handle, rx).await;
         assert!(
-            !inputs.contains(&ScriptInput::Unanswered(pod())),
+            !inputs.contains(&ScriptInput::WakeExpired(pod())),
             "{inputs:?}"
         );
         drop(jsonl);
@@ -5947,7 +6360,7 @@ mod tests {
         );
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![plain_wake(), ScriptInput::Unanswered(pod())]
+            vec![plain_wake(), ScriptInput::WakeExpired(pod())]
         );
         drop(jsonl);
         writer.await.unwrap();
@@ -6260,7 +6673,7 @@ mod tests {
 
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![plain_wake(), ScriptInput::Unanswered(pod())],
+            vec![plain_wake(), ScriptInput::WakeExpired(pod())],
             "the hold's own ending, and nothing from the window",
         );
         assert!(
@@ -6765,8 +7178,8 @@ mod tests {
         assert_eq!(stats.snapshot().no_transcript, 0);
         assert_eq!(
             script_inputs(handle, rx).await,
-            vec![ScriptInput::Unanswered(pod())],
-            "a raise that produced no turn folds a linger from here",
+            vec![ScriptInput::WakeExpired(pod())],
+            "with no grant for the listener to give back, the head comes down now",
         );
         drop(jsonl);
         writer.await.unwrap();

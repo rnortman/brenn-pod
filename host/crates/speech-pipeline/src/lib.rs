@@ -38,13 +38,13 @@ pub use http::{
     TtsStats, TtsStatsSnapshot, Url,
 };
 pub use listener::{
-    BargeCause, BargeInConfig, BargeMode, CarveTiming, CarvedUtterance, DoaSample, EndpointEvent,
-    EndpointState, EndpointTransition, Endpointer, EndpointerConfig, Feed, FeedSender, Listener,
-    ListenerConfig, ListenerEvent, ListenerHandle, ListenerState, ListenerStats,
-    ListenerStatsSnapshot, ListenerUtteranceId, MODEL_STATS_FLUSH_CHUNKS, OwwModels, OwwStream,
-    PcmRing, PushReport, ScoreDistribution, ScoreStats, ScoreSummary, ScoredChunk, SileroConfig,
-    SileroModel, SileroVad, StatsFlushCause, StatsModel, TransitionCause, UnscoredRun,
-    WAKE_READINESS_SAMPLES, WakeDetected, WakePolicy,
+    ArmExpiryCause, BargeCause, BargeInConfig, BargeMode, CarveTiming, CarvedUtterance, DoaSample,
+    EndpointEvent, EndpointState, EndpointTransition, Endpointer, EndpointerConfig, Feed,
+    FeedSender, Listener, ListenerConfig, ListenerEvent, ListenerHandle, ListenerState,
+    ListenerStats, ListenerStatsSnapshot, ListenerUtteranceId, MODEL_STATS_FLUSH_CHUNKS, OwwModels,
+    OwwStream, PcmRing, PushReport, ScoreDistribution, ScoreStats, ScoreSummary, ScoredChunk,
+    SileroConfig, SileroModel, SileroVad, StatsFlushCause, StatsModel, TransitionCause,
+    UnscoredRun, WAKE_READINESS_SAMPLES, WakeDetected, WakePolicy,
 };
 pub use playback::{
     AbortReason, AudibleJob, FRAME_MS, FlushRejected, PacerConfig, PlayRejected, PlaybackEvent,

@@ -274,6 +274,18 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Fixed
 
+- **After the wake word, the robot no longer holds its head up while ignoring
+  what you say.** Sometimes the head stayed in its listening pose for a long
+  time after a wake while every repeat of the command was dropped — when the
+  wake phrase itself wasn't cleanly picked out of the audio, or when the
+  command was heard but judged too unclear to act on. Now a wake stays open
+  for commands for `[wake] command_wait_ms` after the wake word; if a command
+  is judged too unclear you can simply repeat it within that time, without
+  saying the wake word again; and the head comes down as soon as that window
+  closes. Log changes: new `wake_restored` and `wake_expired` lines;
+  `wake_held` is logged on every wake and gains `speaking`; `arm_expired`
+  gains `candidate_minted` and `cause`. No configuration changes.
+
 - **Under `[barge] mode = "wake"`, a wake word spoken over a reply no longer
   raises the head twice.** The second raise could retarget a head already
   moving.

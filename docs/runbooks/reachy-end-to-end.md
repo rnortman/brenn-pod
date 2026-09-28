@@ -316,7 +316,7 @@ whichever `speech-surface` config the daemon is actually started with (`SPEECH_C
 |---|---|---|---|
 | `presence_channel` | `[brenn]` | unset | The channel scripts are published on. Unset means no scripts and a head that never moves (`presence_absent` at startup) |
 | `presence_refresh_ms` | `[brenn]` | 5000 | How often the standing script is said again. A script lost in transit is repaired within one of these |
-| `presence_linger_ms` | `[brenn]` | 8000 | How long the head stays up after a turn that asked to keep listening, and after a wake that produced no turn at all |
+| `presence_linger_ms` | `[brenn]` | 8000 | How long the head stays up after a turn that asked to keep listening, and after a declined barge; a wake with no command comes down when `[wake] command_wait_ms` runs out |
 | `presence_max_engaged_ms` | `[brenn]` | 30000 | The floor under the timeout every script carries: the daemon stows this long after receipt whatever else happens. The bound that matters while the brain is still thinking. A turn whose speech reaches further carries a timeout sized from its own timeline instead — a script's timeout is a ceiling on that timeline, never shorter than it. Capped at 600000 (the protocol's own ceiling); a config past that is refused at startup |
 | `presence_stow_margin_ms` | `[brenn]` | 500 | How long after the estimated end of the speech the head starts down. Absorbs playback jitter |
 | `presence_wake_pose` | `[brenn]` | `neutral` | The pose the head takes on a wake word and on a barge: what listening looks like. A name in the daemon's pose library; one no library holds is refused there, and named by `reachy_host --check` in the preflight |

@@ -717,3 +717,103 @@ fn a_wake_and_a_command_in_two_device_segments_coalesce() {
         "the samples the device never sent carve as silence at their true indexes"
     );
 }
+
+/// Gain on the wake phrase at which openWakeWord still detects it and Silero,
+/// under the deployed 0.60 onset and release thresholds, never onsets on it:
+/// measured on the committed clips, where 0.008 onsets and 0.001 still detects.
+const UNHEARD_PHRASE_GAIN: f32 = 0.003;
+
+/// The wake phrase at [`UNHEARD_PHRASE_GAIN`], 3 s of silence, then the command
+/// at full gain, as a frame log in `dir`. Answers the log and the phrase's
+/// length.
+fn quiet_wake_then_command_framelog(dir: &Path) -> (PathBuf, usize) {
+    let command = cached_clip(&COMMAND_CLIP, common::COMMAND_PHRASE_WAV);
+    let mut pcm: Vec<i16> = common::primed_wake_pcm()
+        .iter()
+        .map(|s| (f32::from(*s) * UNHEARD_PHRASE_GAIN) as i16)
+        .collect();
+    let wake_len = pcm.len();
+    pcm.extend(std::iter::repeat_n(0_i16, 48_000));
+    pcm.extend_from_slice(&command);
+    let wav = dir.join("quiet-wake-command.wav");
+    speech_pipeline::write_spine_wav(&wav, &pcm).expect("write spine wav");
+    (common::import_wav_to_framelog(dir, &wav, 1), wake_len)
+}
+
+/// Production knobs with the deployed endpointer thresholds.
+fn deployed_threshold_config(command_wait_samples: u64) -> ListenerConfig {
+    ListenerConfig {
+        endpointer: speech_pipeline::EndpointerConfig {
+            onset_thresh: 0.60,
+            release_thresh: 0.60,
+            ..speech_pipeline::EndpointerConfig::default()
+        },
+        command_wait_samples,
+        ..fixture_config()
+    }
+}
+
+/// A wake the endpointer never heard as speech still gets its command. The
+/// detection holds the wake from the moment it fires, so a command beginning
+/// seconds later — far past the arm slack a bare arm allows — is one utterance
+/// with wake provenance covering it. With no wait the same audio loses the
+/// command, which is the shape of the defect this guards.
+#[test]
+fn a_wake_the_endpointer_never_heard_still_takes_the_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (framelog, wake_len) = quiet_wake_then_command_framelog(dir.path());
+    let command_at = (wake_len + 48_000) as u64;
+
+    let mut listener = committed_listener_with(deployed_threshold_config(
+        ListenerConfig::default().command_wait_samples,
+    ));
+    let summary = replay_framelog(&framelog, &mut listener, 1).expect("replay");
+    let wake_end = summary
+        .events
+        .iter()
+        .find_map(|e| match e {
+            ListenerEvent::WakeDetected {
+                wake_end_sample, ..
+            } => Some(*wake_end_sample),
+            _ => None,
+        })
+        .expect("openWakeWord detects the quiet phrase");
+    let onsets: Vec<u64> = summary
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            ListenerEvent::EndpointerTransition { transition, .. }
+                if transition.cause == speech_pipeline::TransitionCause::Onset =>
+            {
+                Some(transition.sample_offset)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        onsets.iter().all(|o| *o > wake_len as u64),
+        "the premise: Silero never onsets on the phrase: {onsets:?}"
+    );
+    assert!(
+        onsets.iter().any(|o| *o > command_at),
+        "and does onset on the command: {onsets:?}"
+    );
+
+    let carves = wake_carves(&summary.events);
+    assert!(!carves.is_empty(), "the command is published");
+    let last = carves.last().expect("a carve");
+    assert!(
+        last.start_sample < wake_end && last.end_sample > command_at,
+        "one utterance from the held wake through the command: [{}, {}) around wake end \
+         {wake_end} and command {command_at}",
+        last.start_sample,
+        last.end_sample
+    );
+
+    let mut bare = committed_listener_with(deployed_threshold_config(0));
+    let unheld = replay_framelog(&framelog, &mut bare, 1).expect("replay");
+    assert!(
+        wake_carves(&unheld.events).is_empty(),
+        "a bare arm drops the late command"
+    );
+}

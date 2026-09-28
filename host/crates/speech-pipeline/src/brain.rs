@@ -158,7 +158,8 @@ pub enum WakeCommandReason {
     /// The wake armed but its window closed with no utterance passing the policy —
     /// a "wake, no follow": the transport segment ended, a fresh wake replaced the
     /// arm, or the connection reset, with no command to act on. There is no
-    /// transcript at all (STT never ran).
+    /// transcript at all (STT never ran). Never emitted for a wake a candidate
+    /// was minted from: that candidate's verdict is the wake's record.
     ArmExpired,
 }
 

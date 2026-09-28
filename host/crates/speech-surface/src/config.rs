@@ -604,10 +604,15 @@ pub struct WakeConfig {
     /// the phrase is held as a bare wake.
     #[serde(default = "default_wake_tail_ms")]
     pub wake_tail_ms: u32,
-    /// How long the wake waits, after a wake-only utterance, for the command to
-    /// start. The command is then transcribed together with the wake word and the
-    /// pause, as one utterance. `0` turns the wait off: a wake-only utterance goes
-    /// to STT on its own and a command after the pause is dropped as unwaked.
+    /// How long after the wake the command may start: measured from the
+    /// detection, re-dated by the end of the wake word's own utterance and by the
+    /// end of the first command, and, after a command the confidence gate
+    /// declined, how long a repeat may still be spoken without the wake word. The
+    /// command is transcribed together with the wake word and the pause, as one
+    /// utterance. The head stays up for the wake exactly this long, and comes
+    /// down when it runs out with no command answered. `0` turns the wait off: a
+    /// wake-only utterance goes to STT on its own and a command after the pause
+    /// is dropped as unwaked.
     ///
     /// The effective wait is never shorter than `[endpointer] continuation_window_ms`:
     /// the wait ends only once the endpointer has gone fully idle, which that window
@@ -980,9 +985,11 @@ pub struct BrennConfig {
     #[serde(default = "default_presence_refresh_ms")]
     pub presence_refresh_ms: u64,
     /// How long the head stays up after a turn that asked to keep listening, and
-    /// after a raise that produced no turn at all. Long enough to bridge the gap
-    /// between turns of one exchange, so a conversation that continues never
-    /// stows and re-raises between answers. Must be greater than zero.
+    /// after a declined barge or a declined carve under a bypassed wake gate. Long
+    /// enough to bridge the gap between turns of one exchange, so a conversation
+    /// that continues never stows and re-raises between answers. A wake that gets
+    /// no command does not linger: the head comes down when its `[wake]
+    /// command_wait_ms` runs out. Must be greater than zero.
     #[serde(default = "default_presence_linger_ms")]
     pub presence_linger_ms: u64,
     /// The floor under the timeout every emitted script carries: the daemon
