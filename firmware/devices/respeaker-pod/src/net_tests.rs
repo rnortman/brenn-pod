@@ -579,7 +579,7 @@ struct BpSubcaseResult {
 }
 
 /// Cap on warm-up sends. The lwIP send buffer (`CONFIG_LWIP_TCP_SND_BUF_DEFAULT`,
-/// 2880 B) plus the host's clamped receive window hold only a handful of ~664 B
+/// 5760 B) plus the host's clamped receive window hold only a handful of ~664 B
 /// TLS records, so the boundary must appear well within this bound.
 #[cfg(target_os = "espidf")]
 const BP_MAX_WARMUP_FRAMES: u32 = 200;
@@ -1363,8 +1363,7 @@ fn rtd_run_one_segment(
     use crate::netpoll::EspPoll;
     use audio_pipeline::ring::{PREROLL_SAMPLES, RING_CAPACITY_SAMPLES, RingIndex};
     use audio_pipeline::wire::{
-        AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, ChannelSource, Hello, SegmentStart,
-        StreamFrame,
+        AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, Hello, SegmentStart, StreamFrame,
     };
     use pod_streamer::segment::{SegmentDeps, StreamerMsg, run_segment};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1390,9 +1389,7 @@ fn rtd_run_one_segment(
         let r = guard.as_mut().expect("CAPTURE_RING not initialized");
         let onset_write_head = r.write_head + PREROLL_SAMPLES;
         for _ in 0..PREROLL_SAMPLES {
-            let slot = ridx.slot(r.write_head);
-            r.samples[slot] = (r.write_head % 4096) as i16;
-            r.write_head += 1;
+            rtd_commit_sample(r, &ridx);
         }
         r.anchor_sample = r.write_head.saturating_sub(1);
         r.anchor_ts_us = now_us();
@@ -1432,9 +1429,9 @@ fn rtd_run_one_segment(
         pod_id: heapless::String::new(),
         sample_rate_hz: crate::DEVICE_PLAYBACK_FORMAT.sample_rate_hz,
         bits_per_sample: crate::DEVICE_PLAYBACK_FORMAT.bits_per_sample,
-        channels: crate::DEVICE_PLAYBACK_FORMAT.channels,
+        channels: crate::streamer::ESP_CAPTURE_FORMAT.channels,
         codec: crate::DEVICE_PLAYBACK_FORMAT.codec,
-        channel_source: ChannelSource::CommunicationBeam,
+        channel_source: crate::streamer::ESP_CAPTURE_FORMAT.channel_source,
     });
     rtd_send_blocking(&mut socket, &hello, &mut *io.scratch, "Hello")?;
     let seg_start = StreamFrame::SegmentStart(SegmentStart {
@@ -1503,9 +1500,7 @@ fn rtd_run_one_segment(
                 let r = guard.as_mut().expect("CAPTURE_RING not initialized");
                 while frames_committed < frames_due {
                     for _ in 0..frame_samples {
-                        let slot = ridx.slot(r.write_head);
-                        r.samples[slot] = (r.write_head % 4096) as i16;
-                        r.write_head += 1;
+                        rtd_commit_sample(r, &ridx);
                     }
                     frames_committed += 1;
                 }
@@ -1580,6 +1575,20 @@ fn rtd_run_one_segment(
             want_subs: socket.want_substitutions(),
         },
     ))
+}
+
+/// Commit one synthetic sample index to the borrowed capture ring: a 4096-periodic ramp
+/// on the left channel and its bitwise complement on the right, so a stereo stream
+/// carries two distinct channels at the full payload size.
+#[cfg(target_os = "espidf")]
+fn rtd_commit_sample(r: &mut crate::capture::CaptureRing, ridx: &audio_pipeline::ring::RingIndex) {
+    let slot = ridx.slot(r.write_head);
+    let left = (r.write_head % 4096) as i16;
+    r.samples[slot] = left;
+    if let Some(aux) = r.aux.as_mut() {
+        aux[slot] = !left;
+    }
+    r.write_head += 1;
 }
 
 /// Send one onset frame through the tunnel with `send_frame_bp`'s poll-driven

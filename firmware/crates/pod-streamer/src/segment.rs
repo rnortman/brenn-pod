@@ -184,8 +184,15 @@ pub(crate) fn frame_ts_us(anchor_sample: u64, anchor_ts_us: u64, first_index: u6
     }
 }
 
-/// Append `count` samples starting at absolute index `first_index` to `pcm` as
-/// little-endian `i16` pairs.
+/// How many channels each `AudioFrame` built from `ring` interleaves: two when it
+/// carries `aux`, one otherwise — the count [`push_pcm_samples`] writes per index.
+pub(crate) fn frame_channels<B: Deref<Target = [i16]>>(ring: &CaptureRing<B>) -> u8 {
+    1 + u8::from(ring.aux.is_some())
+}
+
+/// Append `count` per-channel samples starting at absolute index `first_index` to
+/// `pcm` as little-endian `i16`s: `samples[i]` alone for a mono ring, or
+/// `samples[i], aux[i]` interleaved per index when the ring carries `aux`.
 ///
 /// The caller holds the ring lock and has already re-checked overrun under it, so
 /// the samples read here are the ones the overrun check cleared.
@@ -196,11 +203,16 @@ fn push_pcm_samples<B: Deref<Target = [i16]>>(
     count: usize,
     pcm: &mut heapless::Vec<u8, MAX_AUDIO_PAYLOAD>,
 ) {
+    let mut push = |sample: i16| {
+        pcm.extend_from_slice(&sample.to_le_bytes())
+            .expect("pcm push overflow");
+    };
     for i in 0..count {
         let slot = ridx.slot(first_index + i as u64);
-        let bytes = ring.samples[slot].to_le_bytes();
-        pcm.push(bytes[0]).expect("pcm push overflow");
-        pcm.push(bytes[1]).expect("pcm push overflow");
+        push(ring.samples[slot]);
+        if let Some(aux) = ring.aux.as_deref() {
+            push(aux[slot]);
+        }
     }
 }
 
@@ -983,6 +995,93 @@ mod tests {
             }
             other => panic!("expected SegmentEnd, got {other:?}"),
         }
+    }
+
+    /// A ring carrying `aux` interleaves `samples[i], aux[i]` per index: a full frame is
+    /// 1280 B, the partial residual interleaves too, and the per-channel counts
+    /// (`first_sample_index`, `samples_sent`) are unchanged by the second channel.
+    #[test]
+    fn a_ring_with_aux_streams_interleaved_stereo_frames() {
+        let samples = AUDIO_SAMPLES_PER_FRAME as u64 + 100;
+        let ring = ring_with(samples, 2_000_000);
+        {
+            let mut guard = ring.lock().unwrap();
+            let r = guard.as_mut().unwrap();
+            let aux: Box<[i16]> = r.samples.iter().map(|s| s.wrapping_neg() - 1).collect();
+            r.aux = Some(aux);
+        }
+        let (_tx, rx) = std::sync::mpsc::channel::<StreamerMsg>();
+        let mut h = Harness::new();
+        h.vad_closed.store(true, Ordering::Release);
+        let poll = FakePoll::always_writable();
+
+        let out = run(&mut h, &ring, &rx, &poll, &free_running_clock(), 0);
+
+        assert_eq!(
+            frame_channels(ring.lock().unwrap().as_ref().unwrap()),
+            2,
+            "a ring with aux declares the two channels its frames interleave"
+        );
+        assert_eq!(out.exit, SegmentExit::Completed);
+        assert_eq!(out.frames.len(), 3, "full frame, partial frame, SegmentEnd");
+        let expect = |first: u64, count: u64| -> Vec<u8> {
+            (first..first + count)
+                .flat_map(|i| {
+                    let left = (i % 4096) as i16;
+                    let right = left.wrapping_neg() - 1;
+                    [left.to_le_bytes(), right.to_le_bytes()]
+                })
+                .flatten()
+                .collect()
+        };
+        match &out.frames[0] {
+            StreamFrame::Audio(a) => {
+                assert_eq!(a.first_sample_index, 0);
+                assert_eq!(
+                    a.pcm.len(),
+                    MAX_AUDIO_PAYLOAD,
+                    "a full stereo frame is 1280 B"
+                );
+                assert_eq!(&a.pcm[..], &expect(0, AUDIO_SAMPLES_PER_FRAME as u64)[..]);
+            }
+            other => panic!("expected a full AudioFrame, got {other:?}"),
+        }
+        match &out.frames[1] {
+            StreamFrame::Audio(a) => {
+                assert_eq!(a.first_sample_index, AUDIO_SAMPLES_PER_FRAME as u64);
+                assert_eq!(a.pcm.len(), 100 * 2 * 2);
+                assert_eq!(&a.pcm[..], &expect(AUDIO_SAMPLES_PER_FRAME as u64, 100)[..]);
+            }
+            other => panic!("expected a partial AudioFrame, got {other:?}"),
+        }
+        match &out.frames[2] {
+            StreamFrame::SegmentEnd(e) => {
+                assert_eq!(e.frames_sent, 2);
+                assert_eq!(e.samples_sent, AUDIO_SAMPLES_PER_FRAME as u64 + 100);
+            }
+            other => panic!("expected SegmentEnd, got {other:?}"),
+        }
+    }
+
+    /// A mono ring's frame is exactly its samples, little-endian, nothing interleaved.
+    #[test]
+    fn a_ring_without_aux_streams_the_samples_alone() {
+        let ring = ring_with(AUDIO_SAMPLES_PER_FRAME as u64, 2_000_000);
+        let (_tx, rx) = std::sync::mpsc::channel::<StreamerMsg>();
+        let mut h = Harness::new();
+        h.vad_closed.store(true, Ordering::Release);
+        let poll = FakePoll::always_writable();
+
+        let out = run(&mut h, &ring, &rx, &poll, &free_running_clock(), 0);
+
+        let StreamFrame::Audio(a) = &out.frames[0] else {
+            panic!("expected an AudioFrame, got {:?}", out.frames[0]);
+        };
+        let expect: Vec<u8> = (0..AUDIO_SAMPLES_PER_FRAME as u64)
+            .flat_map(|i| ((i % 4096) as i16).to_le_bytes())
+            .collect();
+        assert_eq!(&a.pcm[..], &expect[..]);
+        assert_eq!(frame_channels(ring.lock().unwrap().as_ref().unwrap()), 1);
     }
 
     /// The closing `SegmentEnd`'s `device_ts_us` comes from the injected clock.

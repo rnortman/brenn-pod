@@ -48,8 +48,8 @@ impl StageError for TranscribeError {
 }
 
 /// Everything `HttpTranscriber::new` needs from config: the base URL, the model
-/// the operator's speaches install serves, an optional language hint, and the
-/// per-request time budgets.
+/// the operator's speaches install serves, the optional language hint and
+/// decoder priming text, and the per-request time budgets.
 #[derive(Debug, Clone)]
 pub struct SttParams {
     /// Base URL of the speaches container, e.g. `http://10.0.0.5:8000`.
@@ -58,6 +58,12 @@ pub struct SttParams {
     pub model: String,
     /// Optional language hint; omitted from the request when absent.
     pub language: Option<String>,
+    /// Optional Whisper `prompt` (preceding-context text); sent verbatim as the
+    /// multipart `prompt` field, omitted when absent.
+    pub prompt: Option<String>,
+    /// Optional faster-whisper `hotwords` boost; sent verbatim as the multipart
+    /// `hotwords` field, omitted when absent.
+    pub hotwords: Option<String>,
     /// Total per-request budget (connect + upload + response).
     pub timeout: Duration,
     /// Connect budget, so a down container fails fast rather than at `timeout`.
@@ -220,8 +226,32 @@ pub struct HttpTranscriber {
     client: reqwest::Client,
     endpoint: reqwest::Url,
     model: String,
-    language: Option<String>,
+    hints: FormHints,
     stats: Arc<SttStats>,
+}
+
+/// The optional text fields of a transcription request, each appended to the
+/// multipart form only when `Some`.
+#[derive(Debug, Clone, Default)]
+struct FormHints {
+    language: Option<String>,
+    prompt: Option<String>,
+    hotwords: Option<String>,
+}
+
+impl FormHints {
+    fn append_to(&self, mut form: reqwest::multipart::Form) -> reqwest::multipart::Form {
+        for (name, value) in [
+            ("language", &self.language),
+            ("prompt", &self.prompt),
+            ("hotwords", &self.hotwords),
+        ] {
+            if let Some(v) = value {
+                form = form.text(name, v.clone());
+            }
+        }
+        form
+    }
 }
 
 impl HttpTranscriber {
@@ -239,7 +269,11 @@ impl HttpTranscriber {
             client,
             endpoint,
             model: params.model,
-            language: params.language,
+            hints: FormHints {
+                language: params.language,
+                prompt: params.prompt,
+                hotwords: params.hotwords,
+            },
             stats,
         })
     }
@@ -253,13 +287,13 @@ impl Transcriber for HttpTranscriber {
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let model = self.model.clone();
-        let language = self.language.clone();
+        let hints = self.hints.clone();
         let stats = Arc::clone(&self.stats);
         // One request → one item: exactly one final event, or one terminal `Err`,
         // matching the stream contract on the trait.
         stream::once(async move {
             stats.0.start();
-            let result = request(&client, endpoint, &model, language.as_deref(), &audio).await;
+            let result = request(&client, endpoint, &model, &hints, &audio).await;
             stats.record_outcome(&result);
             result
         })
@@ -272,21 +306,19 @@ async fn request(
     client: &reqwest::Client,
     endpoint: reqwest::Url,
     model: &str,
-    language: Option<&str>,
+    hints: &FormHints,
     audio: &SegmentAudio,
 ) -> Result<TranscriptEvent, TranscribeError> {
     let wav = encode_wav(audio).map_err(|e| TranscribeError::Decode(format!("wav encode: {e}")))?;
     let file = reqwest::multipart::Part::bytes(wav).file_name("segment.wav");
-    let mut form = reqwest::multipart::Form::new()
+    let form = reqwest::multipart::Form::new()
         .part("file", file)
         .text("model", model.to_string())
         // verbose_json returns the per-segment quality fields we summarize;
         // temperature=0 makes decoding deterministic and reduces hallucination.
         .text("response_format", "verbose_json")
         .text("temperature", "0");
-    if let Some(lang) = language {
-        form = form.text("language", lang.to_string());
-    }
+    let form = hints.append_to(form);
 
     let resp = client
         .post(endpoint)
@@ -378,6 +410,8 @@ mod tests {
             url,
             model: "faster-whisper-small".into(),
             language: Some("en".into()),
+            prompt: None,
+            hotwords: None,
             timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(2),
         }
@@ -594,6 +628,31 @@ mod tests {
         let _ = t.transcribe(sample_audio()).next().await.unwrap().unwrap();
         let req = String::from_utf8_lossy(&server.await.unwrap()).into_owned();
         assert!(!req.contains(r#"name="language""#));
+    }
+
+    #[tokio::test]
+    async fn prompt_and_hotwords_sent_when_set() {
+        let (url, server) = spawn_server(json_ok(r#"{"text":"ok"}"#)).await;
+        let mut p = params(url);
+        p.prompt = Some("Hey Jarvis.".into());
+        p.hotwords = Some("Jarvis".into());
+        let t = HttpTranscriber::new(p, Arc::new(SttStats::default())).unwrap();
+
+        let _ = t.transcribe(sample_audio()).next().await.unwrap().unwrap();
+        let req = String::from_utf8_lossy(&server.await.unwrap()).into_owned();
+        assert!(req.contains("name=\"prompt\"\r\n\r\nHey Jarvis.\r\n"));
+        assert!(req.contains("name=\"hotwords\"\r\n\r\nJarvis\r\n"));
+    }
+
+    #[tokio::test]
+    async fn prompt_and_hotwords_omitted_when_absent() {
+        let (url, server) = spawn_server(json_ok(r#"{"text":"ok"}"#)).await;
+        let t = HttpTranscriber::new(params(url), Arc::new(SttStats::default())).unwrap();
+
+        let _ = t.transcribe(sample_audio()).next().await.unwrap().unwrap();
+        let req = String::from_utf8_lossy(&server.await.unwrap()).into_owned();
+        assert!(!req.contains(r#"name="prompt""#));
+        assert!(!req.contains(r#"name="hotwords""#));
     }
 
     #[tokio::test]

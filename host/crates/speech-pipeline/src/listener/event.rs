@@ -16,7 +16,10 @@ use serde::Serialize;
 
 use super::endpointer::{EndpointCause, EndpointTransition};
 use super::stats::ScoreSummary;
-use crate::types::{PodId, SegmentEndCause, UtteranceId, WakeConfirmation};
+use crate::level::FrameLevel;
+use crate::types::{
+    LevelSource, PodId, SegmentEndCause, UtteranceId, UtteranceLevel, WakeConfirmation,
+};
 
 /// One item the connection task forwards to the listener for a pod. Sample indexes
 /// are absolute (the `SessionEvent::Audio.first_sample_index` domain); the listener
@@ -32,7 +35,12 @@ pub enum Feed {
     /// A new connection for this pod — reset all per-pod state and adopt `epoch`
     /// (stamped onto every utterance id so stale events from a prior connection are
     /// droppable downstream).
-    Connected { epoch: u64 },
+    Connected {
+        epoch: u64,
+        /// What this connection's [`Feed::Audio`] levels are measured on: the
+        /// raw microphone of a beam + raw-mic session, the beam otherwise.
+        level_source: LevelSource,
+    },
     /// A transport segment opened at `base_sample_index`. Segments are separated by
     /// real device-VAD silence, so this re-anchors the streaming inference state.
     SegmentOpened {
@@ -55,6 +63,8 @@ pub enum Feed {
         /// Host receipt of this frame — the measurement every downstream latency
         /// number is referenced to.
         host_rx: HostMicros,
+        /// This frame's level, on the connection's level source.
+        level: FrameLevel,
     },
     /// One azimuth reading from the array. `sample_offset` is relative to the open
     /// segment's base, from the device timestamp (it may be negative). Lossy like
@@ -196,6 +206,13 @@ pub struct CarvedUtterance {
     pub end_sample: u64,
     /// Wake provenance for a wake-gated utterance; `None` under `Bypass`.
     pub wake: Option<WakeConfirmation>,
+    /// The level the utterance was addressed at: the wake phrase's (the same
+    /// value `wake.level` carries) for a wake-gated utterance, the utterance's
+    /// own speech from its onset to its end otherwise — a barge, a follow-up, or
+    /// any carve under `Bypass`. The ambient half is the room as last heard with
+    /// the pod silent and nobody speaking. `None` when no live frame covered the
+    /// speech. Measured at the first carve; a continuation keeps it.
+    pub level: Option<UtteranceLevel>,
     /// Why this utterance's audio ends where it does.
     pub cause: EndpointCause,
     /// This utterance is the speech that barged in on active playback: it passed
@@ -269,6 +286,9 @@ pub enum ListenerEvent {
         /// the array heard the phrase from, not where the talker is: turning that into
         /// a bearing needs the array's attitude, which the listener does not have.
         doa: Vec<DoaSample>,
+        /// How loudly the phrase was spoken and how loud the room was before it;
+        /// `None` when the level ring holds no live reading of the phrase.
+        level: Option<UtteranceLevel>,
     },
     /// A wake phrase crossed threshold and was discarded unheard, because the pod
     /// was muted — its own playback was sounding, or its tail had not yet passed.

@@ -6,7 +6,9 @@ pub mod assembler;
 pub mod brain;
 pub mod brenn_brain;
 pub mod echo_brain;
+pub mod gain;
 pub mod http;
+pub mod level;
 pub mod listener;
 pub mod playback;
 pub mod queue;
@@ -19,6 +21,7 @@ pub mod test_support;
 pub mod tracking;
 pub mod traits;
 pub mod types;
+pub mod volume;
 pub mod wake;
 pub mod wav;
 pub mod wav_brain;
@@ -37,6 +40,7 @@ pub use http::{
     BuildError, HttpSynthesizer, HttpTranscriber, SttParams, SttStats, SttStatsSnapshot, TtsParams,
     TtsStats, TtsStatsSnapshot, Url,
 };
+pub use level::{DEAD_CHANNEL_DBFS, FrameLevel, LEVEL_FLOOR_DBFS};
 pub use listener::{
     ArmExpiryCause, BargeCause, BargeInConfig, BargeMode, CarveTiming, CarvedUtterance, DoaSample,
     EndpointEvent, EndpointState, EndpointTransition, Endpointer, EndpointerConfig, Feed,
@@ -55,15 +59,19 @@ pub use queue::{DropOldestQueue, QueueStats, Receiver, Sender, StatsHandle};
 pub use tracking::tracking_event;
 pub use traits::{
     Brain, CueTap, PcmChunk, ResponseSink, SegmentAudio, SynthesisError, Synthesizer,
-    TranscribeError, Transcriber, TranscriptEvent, TurnEnd, transcribe_pcm,
+    TranscribeError, Transcriber, TranscriptEvent, TurnEnd, VolumeTap, transcribe_pcm,
 };
 pub use types::{
     AudioSpan, BargeInContext, Codec, ConfidenceGate, ContextSegment, Cue, DoaTrack, EndpointCause,
-    GateReject, InterruptProgress, MAX_CONTEXT_SEGMENTS, MAX_RESOLVE_SAMPLES, PodId,
+    GateReject, InterruptProgress, LevelSource, MAX_CONTEXT_SEGMENTS, MAX_RESOLVE_SAMPLES, PodId,
     ResolvedSpanAudio, RoomId, SPINE_FORMAT, Segment, SegmentEndCause, SegmentEndInfo,
     SegmentTelemetry, SpanResolveError, SpeakBody, SpeakCmd, SpeakerId, StageTimings,
-    TrackingEvent, Transcript, TranscriptConfidence, Utterance, UtteranceId, WakeConfirmation,
-    signed_offset_us, stage_delta_us,
+    TrackingEvent, Transcript, TranscriptConfidence, Utterance, UtteranceId, UtteranceLevel,
+    WakeConfirmation, signed_offset_us, stage_delta_us,
+};
+pub use volume::{
+    AutoPolicy, AutoStatus, GainBaselines, GainResolution, LevelAdmission, OperatorBounds,
+    VolumeBook, VolumeCommand, VolumeRefusal, VolumeState, resolve_shared,
 };
 pub use wake::{OwwConfig, OwwGate, UnscoredReason, WakeError, WakeOutcome};
 pub use wav::{SpineFormatViolation, check_spine_format, write_spine_wav};

@@ -9,6 +9,35 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **Spoken replies now have a volume control, up to answering at the volume
+  you spoke.** Every sound the pod plays — brain replies, announcements, the
+  offline "can't hear you" clip — passes through one gain stage, set in
+  decibels (perceived loudness, not a linear multiplier). Layers, all optional:
+  - a new `[volume]` table: `gain_db` (baseline, also settable per pod), and
+    `min_db` / `max_db`, hard bounds nothing can exceed;
+  - the brenn brain can send a `<volume/>` marker: `db` for one reply,
+    `hold` to keep a level until changed (or the voice host restarts), and
+    `auto`, the automatic gain's tuning knobs and its swing limits;
+  - automatic gain (`[volume.auto]`, off by default): louder when you speak
+    loudly, quieter when you whisper, optionally raised in a noisy room, with
+    a conversion factor, reference levels and min/max swing.
+  Each played reply logs a `reply_gain` line saying what was applied and why;
+  brain changes log `volume_set` or `volume_refused`. The brain also sees the
+  pod's current volume state and how loudly it was addressed on every
+  utterance. Without the new keys and markers nothing changes.
+- **The reSpeaker pod now streams two audio channels.** Next to the processed
+  speech beam, the pod routes one raw microphone (no AGC, noise suppression
+  or beamforming) to the second I2S slot at boot and streams both. The host
+  uses the raw channel to measure speech and room levels for automatic gain;
+  speech recognition still uses the beam only. This also corrects our
+  reference docs: the stock I2S firmware does give raw-mic access. New
+  hardware self-tests (`Xvf3800OutputRouting`, `I2sRightSlotSanity`) guard
+  the routing.
+- **The transcriber can be primed for the wake word.** New `[stt] prompt` and
+  `[stt] hotwords` keys are passed verbatim to the speech-to-text service —
+  useful with the `keep` wake-word mode, where the wake phrase stays in the
+  audio. A prompt can occasionally make Whisper echo it on near-silent clips;
+  shorten it if that happens.
 - **A process composing the voice server can choose where the head looks when
   the wake word is heard** — the hook behind "look at the talker". The new
   `Sinks.gaze` seam (a `WakeGaze`) is asked once per wake with the microphone array's direction readings from the end of

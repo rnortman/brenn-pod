@@ -536,6 +536,7 @@ pub fn append_channels(interleaved: &[i16], out: &mut [Vec<i16>; CHANNELS]) -> u
 pub fn new_ring() -> CaptureRing<Box<[i16]>> {
     CaptureRing {
         samples: vec![0i16; RING_CAPACITY_SAMPLES].into_boxed_slice(),
+        aux: None,
         write_head: 0,
         anchor_sample: 0,
         anchor_ts_us: 0,

@@ -18,7 +18,7 @@ use audio_pipeline::playback::{
     expand_run_in_place,
 };
 #[cfg(target_os = "espidf")]
-use audio_pipeline::ring::{RING_CAPACITY_SAMPLES, RingIndex, WaveformAccum};
+use audio_pipeline::ring::{RAW_MIC_GUARDS, RING_CAPACITY_SAMPLES, RingIndex, WaveformAccum};
 #[cfg(target_os = "espidf")]
 use device_protocol::{Payload, Status, log_tokens};
 #[cfg(target_os = "espidf")]
@@ -467,8 +467,15 @@ pub(crate) fn spawn_capture_thread(
                 .dma_buffer_count(I2S_DMA_DESC_NUM)
                 .frames_per_buffer(I2S_DMA_FRAME_NUM);
             let clk_cfg = StdClkConfig::from_sample_rate_hz(I2S_SAMPLE_RATE_HZ);
-            // 32-bit slots: XVF3800 frames 16-bit audio MSB-aligned in 32-bit slots.
-            // Left = communication beam (auto-select, NS on). Right = silence.
+            // 32-bit slots. The XVF3800 drives each slot with a sample wider than the
+            // 16 bits kept, left-justified: the low half is precision the top-16
+            // extraction discards, not padding (on the right slot in a quiet room the
+            // low bits carried data on every run), and the alignment is measured by
+            // voice (raw-mic speech reached -46 dBFS in top-16 terms, which a
+            // right-justified sample of 24 bits or fewer cannot produce).
+            // Left = communication beam (auto-select, NS on). Right = whatever
+            // `AUDIO_MGR_OP_R` routes there — raw microphone 0 once the boot routing
+            // write has landed, silence (the chip's default) otherwise.
             let slot_cfg =
                 StdSlotConfig::philips_slot_default(DataBitWidth::Bits32, SlotMode::Stereo);
             let std_cfg = StdConfig::new(
@@ -1210,7 +1217,7 @@ pub(crate) fn spawn_capture_thread(
                     );
                 }
 
-                // 32-bit stereo: 8 B/frame. Left-slot top-16 at [base+2, base+3].
+                // 32-bit stereo: 8 B/frame, split by `slot_pair`.
                 let frames = bytes_read / 8;
                 // Accumulate uncapped frame count before the .min(320) cap. This feeds the
                 // per-window `rx_deficit_frames` telemetry (design §3.6): a shortfall against the
@@ -1223,7 +1230,7 @@ pub(crate) fn spawn_capture_thread(
 
                 let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
 
-                // Write mono samples into the capture ring, unless a HIL test has
+                // Write both slots into the capture ring, unless a HIL test has
                 // quiesced capture and owns the ring. The flag is checked under the
                 // lock so that once the test has set it and taken the lock for its
                 // pre-fill, no later mic chunk can land; the whole commit body —
@@ -1241,9 +1248,13 @@ pub(crate) fn spawn_capture_thread(
 
                         for i in 0..frames {
                             let base = i * 8;
-                            let sample = i16::from_le_bytes([dma_buf[base + 2], dma_buf[base + 3]]);
+                            let frame = &dma_buf[base..base + 8];
+                            let (left, right) = slot_pair(frame);
                             let slot = ridx.slot(ring.write_head);
-                            ring.samples[slot] = sample;
+                            ring.samples[slot] = left;
+                            if let Some(aux) = ring.aux.as_mut() {
+                                aux[slot] = right;
+                            }
                             ring.write_head += 1;
                         }
 
@@ -1267,6 +1278,20 @@ pub(crate) fn spawn_capture_thread(
     }
 }
 
+/// Split one 8-byte I2S frame (two 32-bit little-endian slots) into its `(left, right)`
+/// samples: the top 16 bits of each slot. The XVF3800's sample is wider than 16 bits and
+/// left-justified in its 32-bit slot, so the low 16 bits are precision this discards, not
+/// padding (measured on the right slot: the low bits carry data in a quiet room, and
+/// raw-mic speech reaches -46 dBFS in top-16 terms, beyond any right-justified sample of
+/// 24 bits or fewer).
+#[cfg(any(target_os = "espidf", test))]
+fn slot_pair(frame: &[u8]) -> (i16, i16) {
+    (
+        i16::from_le_bytes([frame[2], frame[3]]),
+        i16::from_le_bytes([frame[6], frame[7]]),
+    )
+}
+
 /// I2S waveform sanity test.
 ///
 /// Waits for the capture ring to fill, then checks that the audio is correlated
@@ -1274,37 +1299,12 @@ pub(crate) fn spawn_capture_thread(
 /// saturated. No minimum-loudness floor — a quiet room passes.
 #[cfg(target_os = "espidf")]
 pub(crate) fn run_i2s_waveform_sanity() -> (Status, Payload) {
-    // ── Wait for ring to fill ──────────────────────────────────────────────────
-    let poll_t0_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-    loop {
-        let held_now = {
-            let guard = CAPTURE_RING
-                .lock()
-                .unwrap_or_else(|_| panic!("CAPTURE_RING mutex poisoned (ring-fill poll)"));
-            match guard.as_ref() {
-                None => {
-                    return test_report_fail(
-                        "FAIL src=ring capture ring not initialized — firmware bug",
-                    );
-                }
-                Some(r) => RingIndex::new(RING_CAPACITY_SAMPLES).held(r.write_head) as usize,
-            }
-        };
-        if held_now >= I2S_WAVEFORM_SANITY_SAMPLES {
-            break;
-        }
-        let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
-        if now_us.saturating_sub(poll_t0_us) >= I2S_WAVEFORM_SANITY_RING_FILL_TIMEOUT_US {
-            return test_report_fail_fmt(format_args!(
-                "FAIL src=ring reason=ring-not-filled samples={} needed={}",
-                held_now, I2S_WAVEFORM_SANITY_SAMPLES,
-            ));
-        }
-        FreeRtos::delay_ms(10);
+    if let Some(fail) = await_sanity_window() {
+        return fail;
     }
 
     // ── Compute waveform stats under the lock ──────────────────────────────────
-    // The accumulation, the five thresholds and the defect precedence all belong to
+    // The accumulation, the beam's guard set and the defect precedence all belong to
     // `audio_pipeline::ring`; the window is fed to it a sample at a time because a
     // window read out of the wrapping ring is not contiguous.
     let mut accum = WaveformAccum::new();
@@ -1363,11 +1363,123 @@ pub(crate) fn run_i2s_waveform_sanity() -> (Status, Payload) {
     }
 }
 
+/// Wait until the capture ring holds an [`I2S_WAVEFORM_SANITY_SAMPLES`] window. Returns
+/// `None` once it does, or the failure report for a ring that is missing or does not
+/// fill in time.
+#[cfg(target_os = "espidf")]
+fn await_sanity_window() -> Option<(Status, Payload)> {
+    let poll_t0_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+    loop {
+        let held_now = {
+            let guard = CAPTURE_RING
+                .lock()
+                .unwrap_or_else(|_| panic!("CAPTURE_RING mutex poisoned (ring-fill poll)"));
+            match guard.as_ref() {
+                None => {
+                    return Some(test_report_fail(
+                        "FAIL src=ring capture ring not initialized — firmware bug",
+                    ));
+                }
+                Some(r) => RingIndex::new(RING_CAPACITY_SAMPLES).held(r.write_head) as usize,
+            }
+        };
+        if held_now >= I2S_WAVEFORM_SANITY_SAMPLES {
+            return None;
+        }
+        let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+        if now_us.saturating_sub(poll_t0_us) >= I2S_WAVEFORM_SANITY_RING_FILL_TIMEOUT_US {
+            return Some(test_report_fail_fmt(format_args!(
+                "FAIL src=ring reason=ring-not-filled samples={} needed={}",
+                held_now, I2S_WAVEFORM_SANITY_SAMPLES,
+            )));
+        }
+        FreeRtos::delay_ms(10);
+    }
+}
+
+/// I2S right-slot sanity test.
+///
+/// Waits for the capture ring to fill, then summarizes the newest window of the right
+/// slot (`aux`) with the same accumulator [`run_i2s_waveform_sanity`] uses for the left,
+/// the shared saturation and autocorrelation gates and the raw-mic level guards
+/// (`RAW_MIC_GUARDS`: the raw mic is a ~10× quieter line than the AGC'd beam), and
+/// counts the indices in that window whose left and right samples differ. Fails on a
+/// defective right window (a silent slot reads as dead) and on a right slot identical
+/// to the left (the chip copying the beam to both).
+#[cfg(target_os = "espidf")]
+pub(crate) fn run_i2s_right_slot_sanity() -> (Status, Payload) {
+    if let Some(fail) = await_sanity_window() {
+        return fail;
+    }
+
+    let mut accum = WaveformAccum::new();
+    let mut differing: u32 = 0;
+    {
+        let guard = CAPTURE_RING
+            .lock()
+            .unwrap_or_else(|_| panic!("CAPTURE_RING mutex poisoned"));
+        let Some(ring) = guard.as_ref() else {
+            return test_report_fail("FAIL src=ring capture ring not initialized — firmware bug");
+        };
+        let Some(aux) = ring.aux.as_ref() else {
+            return test_report_fail("FAIL src=ring capture ring has no right-slot buffer");
+        };
+        let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
+        let n_samples = (ridx.held(ring.write_head) as usize).min(I2S_WAVEFORM_SANITY_SAMPLES);
+        let start = ring.write_head - n_samples as u64;
+        for i in 0..n_samples {
+            let slot = ridx.slot(start + i as u64);
+            accum.push(aux[slot]);
+            if aux[slot] != ring.samples[slot] {
+                differing += 1;
+            }
+        }
+    }
+
+    let stats = accum.finish();
+    let sat_pct = (stats.saturated_fraction * 100.0) as u32;
+    let ac1_milli = (stats.autocorr_lag1 * 1000.0 + 0.5) as i32;
+    let rms = stats.rms() as i32;
+
+    if let Some(reason) = stats.defect_under(&RAW_MIC_GUARDS) {
+        return test_report_fail_fmt(format_args!(
+            "FAIL src=ring reason={} ch=right min={} max={} rms={} sat={}% samples={} ac1={} differing={}",
+            reason, stats.min, stats.max, rms, sat_pct, stats.samples, ac1_milli, differing,
+        ));
+    }
+    if differing == 0 {
+        return test_report_fail_fmt(format_args!(
+            "FAIL src=ring reason=right-equals-left ch=right min={} max={} rms={} samples={}",
+            stats.min, stats.max, rms, stats.samples,
+        ));
+    }
+    test_report_ok(TestData::I2sRightSlot {
+        min: stats.min,
+        max: stats.max,
+        rms,
+        sat_pct,
+        samples: stats.samples as u32,
+        ac1: ac1_milli,
+        differing,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use audio_pipeline::playback::PLAYBACK_PREROLL_TARGET_BYTES;
 
-    use super::{PrerollGate, TxStager, on_end_of_audio_boundary};
+    use super::{PrerollGate, TxStager, on_end_of_audio_boundary, slot_pair};
+
+    /// Each slot's sample is its top 16 bits; the low 16 bits (precision of the XVF3800's
+    /// wider, left-justified sample, not padding) are discarded, and the two slots are
+    /// never crossed.
+    #[test]
+    fn slot_pair_takes_the_top_half_of_each_slot() {
+        // left slot = 0x8001_FFFF, right slot = 0x7FFE_0001, both little-endian.
+        let frame = [0xFF, 0xFF, 0x01, 0x80, 0x01, 0x00, 0xFE, 0x7F];
+        assert_eq!(slot_pair(&frame), (i16::MIN + 1, i16::MAX - 1));
+        assert_eq!(slot_pair(&[0, 0, 0x34, 0x12, 0, 0, 0, 0]), (0x1234, 0));
+    }
 
     // ── on_end_of_audio_boundary ───────────────────────────────────────────────
     //

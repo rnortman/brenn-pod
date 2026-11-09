@@ -438,12 +438,14 @@ fn run_suite(
             // operator's ear; and it carries no amp-enable field, the amp being always-on
             // hardware.)
             TestName::I2sWaveformSanity
+            | TestName::I2sRightSlotSanity
             | TestName::SpeakerOutput
             | TestName::I2cBusScan
             | TestName::PsramIdentity
             | TestName::Xvf3800RegRead
             | TestName::Xvf3800DoAPlausibility
             | TestName::Xvf3800SpEnergy
+            | TestName::Xvf3800OutputRouting
             | TestName::AmpAlwaysOnGpoInert => {
                 let (pred, criterion) = check4_typed_gate_for(test_name)
                     .expect("these test names always have a typed check-4 gate");
@@ -1641,6 +1643,22 @@ fn check4_typed_gate_for(test_name: &TestName) -> Option<Check4TypedGate> {
                  max_abs > {I2S_HOST_ZERO_ABS_THRESHOLD}, spread > {I2S_HOST_SPREAD_FLOOR})"
             ),
         )),
+        TestName::I2sRightSlotSanity => Some((
+            eval_i2s_right_slot_pass as fn(&TestData) -> bool,
+            format!(
+                "right slot must be live (ac1 > {I2S_HOST_AUTOCORR_FLOOR}, \
+                 max_abs > {I2S_HOST_RAW_MIC_ZERO_ABS_THRESHOLD}, \
+                 spread > {I2S_HOST_RAW_MIC_SPREAD_FLOOR}, \
+                 sat_pct < {I2S_HOST_SATURATED_PCT}) and differ from the left"
+            ),
+        )),
+        TestName::Xvf3800OutputRouting => Some((
+            eval_xvf3800_output_routing_pass as fn(&TestData) -> bool,
+            format!(
+                "must report the OP_R write accepted (0x00), right={XVF3800_RIGHT_SLOT_ROUTE:?} \
+                 and left={XVF3800_LEFT_SLOT_EXPECTED:?}"
+            ),
+        )),
         TestName::SpeakerOutput => Some((
             eval_speaker_pass as fn(&TestData) -> bool,
             "must report codec_ok".to_string(),
@@ -1903,6 +1921,8 @@ fn run_deser_error_check(harness: &mut Harness) -> Result<(), ()> {
         &mut logs_b,
     ) {
         Ok(r) => r,
+        // TODO(deser-flood-ping-stall-sample): this timeout fired once on the bench after the
+        // flood; whether the device or the host side stalled is not identified.
         Err(HarnessError::Timeout) => {
             eprintln!(
                 "FAIL [deser-error]: Ping timed out after a {FLOOD_N}-frame corrupt flood — \
@@ -2194,6 +2214,15 @@ const I2S_HOST_ZERO_ABS_THRESHOLD: i32 = audio_pipeline::ring::ZERO_ABS_THRESHOL
 /// from a frozen / 1-bit line (≈ 0).
 const I2S_HOST_SPREAD_FLOOR: i32 = audio_pipeline::ring::STUCK_SPREAD_FLOOR;
 
+/// Dead-line guard for the raw-microphone right slot: minimum absolute peak, the raw-mic
+/// set's (a ~10× quieter line than the AGC'd beam). Taken from the shared calibration
+/// like the beam's.
+const I2S_HOST_RAW_MIC_ZERO_ABS_THRESHOLD: i32 = audio_pipeline::ring::RAW_MIC_ZERO_ABS_THRESHOLD;
+
+/// Frozen-line guard for the raw-microphone right slot: minimum spread, separating the
+/// quiet room (≥ 20) from a frozen / 1-bit line (≈ 0). Taken from the shared calibration.
+const I2S_HOST_RAW_MIC_SPREAD_FLOOR: i32 = audio_pipeline::ring::RAW_MIC_STUCK_SPREAD_FLOOR;
+
 /// Lag-1 autocorrelation floor — the PRIMARY health gate — in the milli-units the device
 /// reports `ac1=` in (r1 × 1000, rounded the same way the device rounds it). RNG noise has
 /// ac1 ≈ 0; confirmed quiet-room acoustic audio has ac1 0.41–0.97.
@@ -2239,6 +2268,77 @@ fn eval_i2s_waveform_pass(data: &TestData) -> bool {
         return false;
     }
     true
+}
+
+/// Saturation gate in the whole percent the device reports `sat_pct` in: a window with
+/// this share or more of its samples clipped is saturated.
+const I2S_HOST_SATURATED_PCT: u32 = (audio_pipeline::ring::SATURATION_FRAC_MAX * 100.0) as u32;
+
+/// Host-side gate for `I2sRightSlotSanity`: the right window passes every liveness gate
+/// `audio_pipeline::ring::WaveformStats::defect_under(&RAW_MIC_GUARDS)` applies (not
+/// empty; not dead under `I2S_HOST_RAW_MIC_ZERO_ABS_THRESHOLD`; not frozen under
+/// `I2S_HOST_RAW_MIC_SPREAD_FLOOR`; not saturated; correlated), and at least one index
+/// holds different left and right samples. The device fails both cases itself; this
+/// re-derives them from the typed data so a `Status::Ok` with a dead or copied slot cannot
+/// pass.
+fn eval_i2s_right_slot_pass(data: &TestData) -> bool {
+    let TestData::I2sRightSlot {
+        min,
+        max,
+        rms: _,
+        sat_pct,
+        samples,
+        ac1,
+        differing,
+    } = data
+    else {
+        return false;
+    };
+    let max_abs = i64::from(min.unsigned_abs().max(max.unsigned_abs()));
+    let spread = i64::from(*max) - i64::from(*min);
+    let live = *samples > 0
+        && *ac1 > I2S_HOST_AUTOCORR_FLOOR
+        && max_abs > i64::from(I2S_HOST_RAW_MIC_ZERO_ABS_THRESHOLD)
+        && spread > i64::from(I2S_HOST_RAW_MIC_SPREAD_FLOOR)
+        && *sat_pct < I2S_HOST_SATURATED_PCT;
+    if !live {
+        eprintln!(
+            "FAIL [threshold]: I2S right-slot data does not meet host criteria \
+             (samples={samples} ac1={ac1} max_abs={max_abs} spread={spread} sat_pct={sat_pct})"
+        );
+        return false;
+    }
+    if *differing == 0 {
+        eprintln!("FAIL [threshold]: I2S right slot is identical to the left over the window");
+        return false;
+    }
+    true
+}
+
+/// The right I2S slot's expected route as the XVF3800 reports it: category 3 (amplified
+/// microphone data with system delay), microphone 0. Mirrors the device's
+/// `RIGHT_SLOT_ROUTE`.
+const XVF3800_RIGHT_SLOT_ROUTE: [u8; 2] = [3, 0];
+
+/// The left I2S slot's expected route: category 8 (auto-select beam), source 0 — the
+/// chip's documented default, never written. Mirrors the device's `LEFT_SLOT_EXPECTED`.
+const XVF3800_LEFT_SLOT_EXPECTED: [u8; 2] = [8, 0];
+
+/// Host-side gate for `Xvf3800OutputRouting`: the boot `OP_R` write returned DONE, the
+/// right slot reads back as raw microphone 0, and the left slot still carries the beam.
+fn eval_xvf3800_output_routing_pass(data: &TestData) -> bool {
+    match data {
+        TestData::Xvf3800OutputRouting {
+            write_status,
+            left,
+            right,
+        } => {
+            *write_status == 0x00
+                && *right == XVF3800_RIGHT_SLOT_ROUTE
+                && *left == XVF3800_LEFT_SLOT_EXPECTED
+        }
+        _ => false,
+    }
 }
 
 /// Environment variable naming the WiFi network to provision and to look for in a
@@ -2506,7 +2606,9 @@ const fn test_meta(t: &TestName) -> TestMeta {
         | TestName::Xvf3800SpEnergy
         | TestName::SpeakerOutput
         | TestName::AmpAlwaysOnGpoInert
-        | TestName::PsramIdentity => TestMeta {
+        | TestName::PsramIdentity
+        | TestName::Xvf3800OutputRouting
+        | TestName::I2sRightSlotSanity => TestMeta {
             phase: TestPhase::Generic,
             timeout: RESPONSE_TIMEOUT,
         },
@@ -2584,6 +2686,8 @@ const RTD_PRODUCER_FRAMES: u64 = 250;
 /// `SegmentStart`. Slow-loop discrimination scales with the pre-roll frame count. At the
 /// product 50-frame pre-roll the paced drain is ~250 ms and a one-frame-per-wake loop needs
 /// ≥ ~500 ms, which this 350 ms ceiling cleanly separates.
+// TODO(rtd-flake-sample): the measured burst sits near this ceiling and crosses it on some
+// runs with catch-up held; the mechanism is not identified.
 const RTD_BURST_DRAIN_MAX_MS: u64 = 350;
 /// Catch-up ceiling (ms): `SegmentStart`→`SegmentEnd` wall clock — the ~5 s real-time
 /// segment plus 500 ms of drain/RTT margin. Initial estimate — tuned on the first hardware run.
@@ -2629,8 +2733,8 @@ const BACKPRESSURE_SATURATE_MS: u64 = 300;
 /// 128 KiB autotuned receive buffer, which the device's whole warm-up volume barely
 /// reaches, so whether the device ever sees a write boundary depends on the environment.
 /// Linux roughly doubles the request and advertises about half of the result as window, so
-/// 4096 lands near a 4 KiB window; with the device's 2880 B `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`
-/// the end-to-end pipe saturates within ~10 records.  The accepted socket's effective value
+/// 4096 lands near a 4 KiB window; with the device's 5760 B `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`
+/// the end-to-end pipe saturates within ~15 records.  The accepted socket's effective value
 /// is logged at accept — kernel rounding is not contractual.
 const BACKPRESSURE_RCVBUF_BYTES: usize = 4096;
 
@@ -3973,7 +4077,7 @@ fn backpressure_stoppable_sleep(dur: Duration, stop_bp: &Arc<Mutex<bool>>) -> bo
 ///
 /// First fill the end-to-end pipe: the clamped receive buffer
 /// (`BACKPRESSURE_RCVBUF_BYTES`) plus the withhold closes the TCP window, the device's
-/// 2880 B lwIP send buffer fills behind it, and mbedTLS returns `WANT_WRITE` on the
+/// 5760 B lwIP send buffer fills behind it, and mbedTLS returns `WANT_WRITE` on the
 /// boundary frame.  Then resume draining at line rate so the device's same-bytes retry
 /// after `poll(POLLOUT)` accepts the record and the frame reaches `Sent` well inside the
 /// device's 1.0 s per-frame ceiling (→ device `bp_outcome=resumed`, `resume_cycles ≥ 1`).
@@ -4041,10 +4145,14 @@ struct RtdObservation {
     segment_start_seen: bool,
     /// `preroll_samples` declared in the `SegmentStart` frame (the burst-drain target).
     declared_preroll: u32,
+    /// `channels` declared by the device's outbound `Hello`. `None` until it arrives;
+    /// an `Audio` frame before it is a stream error.
+    hello_channels: Option<u8>,
     /// ms from `SegmentStart` receipt to the moment cumulative received audio first reached
     /// `declared_preroll` samples. `None` if the pre-roll never fully drained.
     burst_drain_ms: Option<u64>,
-    /// Total audio samples received across all `Audio` frames.
+    /// Total per-channel audio samples received across all `Audio` frames (one per
+    /// sample index, however many channels the `Hello` declared).
     total_samples: u64,
     /// Total `Audio` frames received.
     audio_frames: u32,
@@ -4262,8 +4370,20 @@ fn rtd_serve(
                 o.segment_start_seen = true;
                 o.declared_preroll = s.preroll_samples;
             }
+            Ok(StreamFrame::Hello(h)) => {
+                o.hello_channels = Some(h.channels);
+            }
             Ok(StreamFrame::Audio(a)) => {
-                o.total_samples += (a.pcm.len() / 2) as u64;
+                let channels = match o.hello_channels {
+                    Some(c) if c > 0 => usize::from(c),
+                    other => {
+                        o.error = Some(format!(
+                            "Audio frame with no usable Hello channel count ({other:?})"
+                        ));
+                        break;
+                    }
+                };
+                o.total_samples += (a.pcm.len() / 2 / channels) as u64;
                 o.audio_frames += 1;
                 if o.burst_drain_ms.is_none()
                     && o.declared_preroll > 0
@@ -4280,7 +4400,7 @@ fn rtd_serve(
                 }
                 break;
             }
-            Ok(_) => {} // Hello / Telemetry / control — not timed here.
+            Ok(_) => {} // Telemetry / control — not timed here.
             Err(e) => {
                 o.error = Some(format!("decode: {e:?}"));
                 break;
@@ -5138,8 +5258,13 @@ fn eval_tls_psk_wrong_key_rejected(data: &TestData) -> Result<(), String> {
     Ok(())
 }
 
-/// Expected total received sample count for `StreamRealtimeDuplex` Scenario A: the
-/// pre-roll plus the synthetic producer's 5 s of real-time capture. The synthetic producer
+/// Channels the device's `StreamRealtimeDuplex` `Hello` declares: the pod streams the
+/// beam and the raw-mic channel interleaved.
+const RTD_CAPTURE_CHANNELS: u8 = 2;
+
+/// Expected total received per-channel sample count for `StreamRealtimeDuplex`: the
+/// pre-roll plus the synthetic producer's 5 s of real-time capture. Counted per sample
+/// index, so a stereo stream's expectation is the mono one. The synthetic producer
 /// commits an exact frame count so this is deterministic (design Scenario A integrity).
 fn rtd_expected_samples() -> u64 {
     use audio_pipeline::ring::PREROLL_SAMPLES;
@@ -5188,6 +5313,13 @@ fn eval_rtd_outbound(data: &TestData, obs: &RtdObservation) -> Result<(u64, u64)
         return Err(
             "StreamRealtimeDuplex: no SegmentStart received — segment never opened".to_string(),
         );
+    }
+    if obs.hello_channels != Some(RTD_CAPTURE_CHANNELS) {
+        return Err(format!(
+            "StreamRealtimeDuplex: device Hello declared channels={:?}, expected \
+             {RTD_CAPTURE_CHANNELS} (beam + raw mic)",
+            obs.hello_channels
+        ));
     }
 
     // Exact-count integrity. The device borrows the boot-allocated CAPTURE_RING and
@@ -5591,6 +5723,8 @@ fn eval_playback_drain_rate(data: &TestData, logs: &[String]) -> Result<(), Stri
     // ── 2. Parse every production periodic line. A line that carries the prefix but is
     // missing a token is a format drift — fail loudly, do not silently skip (design §5). ──
     let mut windows: Vec<DrainWindow> = Vec::new();
+    // 0 or 1: whether the collection opened on the tail of a summary whose tx line it missed.
+    let mut leading_obs_dropped: u32 = 0;
     for line in logs
         .iter()
         .filter(|l| l.contains(CAPTURE_TX_LINE) || l.contains(CAPTURE_OBS_LINE))
@@ -5600,6 +5734,26 @@ fn eval_playback_drain_rate(data: &TestData, logs: &[String]) -> Result<(), Stri
         // here by order: the firmware emits the tx/obs pair adjacently from one thread, so each
         // obs line belongs to the most recent window still awaiting its obs. Unrelated lines may
         // interleave, but tx/obs pairs cannot reorder or nest.
+        //
+        // The tokens are parsed before the line is paired, so a malformed obs line fails
+        // whatever its position. Pairing then has three cases:
+        //
+        // 1. A window awaits its obs: the line attaches to the most recent such window.
+        // 2. No tx line has been collected yet and no leading obs has been dropped: the line is
+        //    the tail of a summary whose tx line the device wrote before this collection
+        //    opened. The collection boundary is the host's — it opens after the previous
+        //    command's response frame, which the device's protocol task can write between the
+        //    capture thread's two lines. The line belongs to no collected window, so it is
+        //    dropped and counted. At most one such line exists: the next summary begins with
+        //    its tx line at least one emit window (≥ 1 s) later.
+        // 3. Anything else — a second leading obs, or an orphan after the first tx — means the
+        //    emit order/contract has drifted. Guessing an attachment would silently
+        //    mis-classify windows, so the eval fails loudly.
+        //
+        // Residual case 2 accepts: a device that reversed its emit order would present as one
+        // leading obs plus a trailing tx with no obs, the same shape as a summary straddling
+        // each end of the collection. The guard against that is the emit site itself — the two
+        // lines are adjacent calls under one gate in one function.
         if line.contains(CAPTURE_OBS_LINE) {
             let preroll_waits = parse_token_u64(line, PREROLL_WAITS).ok_or_else(|| {
                 format!("PlaybackDrainRate: '{CAPTURE_OBS_LINE}' line missing/invalid '{PREROLL_WAITS}': {line}")
@@ -5607,6 +5761,7 @@ fn eval_playback_drain_rate(data: &TestData, logs: &[String]) -> Result<(), Stri
             let preroll_rearms = parse_token_u64(line, PREROLL_REARMS).ok_or_else(|| {
                 format!("PlaybackDrainRate: '{CAPTURE_OBS_LINE}' line missing/invalid '{PREROLL_REARMS}': {line}")
             })?;
+            let no_tx_yet = windows.is_empty();
             let target = windows.iter_mut().rev().find(|w| w.obs.is_none());
             match target {
                 Some(w) => {
@@ -5615,9 +5770,11 @@ fn eval_playback_drain_rate(data: &TestData, logs: &[String]) -> Result<(), Stri
                         preroll_rearms,
                     })
                 }
-                // No window awaiting an obs line: the emit contract (one adjacent pair per
-                // window) has drifted, or the lines reordered. Guessing an attachment would
-                // silently mis-classify windows — fail loudly instead.
+                // Case 2: the pre-collection tail of a straddling summary.
+                None if no_tx_yet && leading_obs_dropped == 0 => {
+                    leading_obs_dropped = 1;
+                }
+                // Case 3: drift.
                 None => {
                     return Err(format!(
                         "PlaybackDrainRate: orphaned '{CAPTURE_OBS_LINE}' line with no \
@@ -5676,9 +5833,12 @@ fn eval_playback_drain_rate(data: &TestData, logs: &[String]) -> Result<(), Stri
     // Observability (not an assertion): report the device's TX-write-failure count alongside the
     // collected window count, so a shortfall of periodic windows can be attributed to device→host
     // log-frame loss (whole frames dropped when the TX ring filled) rather than a real drain
-    // deficit. Now a typed field, so it is always present.
+    // deficit. `leading-obs-dropped` is 1 when the
+    // collection opened on the obs line of a summary whose tx line preceded it (pairing case 2
+    // above); that line is in no window, so it is neither excluded nor the warmup.
     println!(
-        "  PlaybackDrainRate: collected {} window(s); device tx_write_failures={tx_wf}",
+        "  PlaybackDrainRate: collected {} window(s); device tx_write_failures={tx_wf}; \
+         leading-obs-dropped={leading_obs_dropped}",
         windows.len()
     );
 
@@ -6412,7 +6572,7 @@ mod tests {
     /// test's healthy data, so a swapped pairing fails here rather than on hardware.
     #[test]
     fn check4_typed_gate_pairs_each_test_with_its_own_predicate() {
-        let healthy: [(TestName, TestData); 8] = [
+        let healthy: [(TestName, TestData); 10] = [
             (
                 TestName::I2sWaveformSanity,
                 waveform_data(-32706, 32510, 680),
@@ -6438,6 +6598,14 @@ mod tests {
             (
                 TestName::PsramIdentity,
                 psram_data(true, PSRAM_EXPECTED_SIZE_U32, MallocProbe::Null),
+            ),
+            (
+                TestName::I2sRightSlotSanity,
+                right_slot_data(-900, 880, 870, 3999),
+            ),
+            (
+                TestName::Xvf3800OutputRouting,
+                routing_data(0x00, [8, 0], [3, 0]),
             ),
         ];
 
@@ -7550,6 +7718,150 @@ mod tests {
     // membership and count assertions for REGISTERED_TESTS; no separate spot-check
     // needed here.
 
+    fn right_slot_data(min: i32, max: i32, ac1: i32, differing: u32) -> TestData {
+        TestData::I2sRightSlot {
+            min,
+            max,
+            rms: 200,
+            sat_pct: 0,
+            samples: 4000,
+            ac1,
+            differing,
+        }
+    }
+
+    fn routing_data(write_status: u8, left: [u8; 2], right: [u8; 2]) -> TestData {
+        TestData::Xvf3800OutputRouting {
+            write_status,
+            left,
+            right,
+        }
+    }
+
+    /// A live right slot that differs from the left passes; each liveness gate and the
+    /// copy check fail it on its own.
+    #[test]
+    fn i2s_right_slot_gate() {
+        assert!(eval_i2s_right_slot_pass(&right_slot_data(
+            -900, 880, 870, 3999
+        )));
+        // Dead (silence — the chip's default for the right slot).
+        assert!(!eval_i2s_right_slot_pass(&right_slot_data(0, 0, 0, 3999)));
+        // Frozen: tiny spread around a large offset, at the raw-mic spread floor.
+        assert!(!eval_i2s_right_slot_pass(&right_slot_data(
+            500, 508, 999, 3999
+        )));
+        // Uncorrelated noise.
+        assert!(!eval_i2s_right_slot_pass(&right_slot_data(
+            -30000, 30000, 10, 3999
+        )));
+        // A copy of the left slot.
+        assert!(!eval_i2s_right_slot_pass(&right_slot_data(
+            -900, 880, 870, 0
+        )));
+        // Saturated.
+        let TestData::I2sRightSlot {
+            min,
+            max,
+            rms,
+            samples,
+            ac1,
+            differing,
+            ..
+        } = right_slot_data(-32768, 32767, 900, 10)
+        else {
+            unreachable!()
+        };
+        assert!(!eval_i2s_right_slot_pass(&TestData::I2sRightSlot {
+            min,
+            max,
+            rms,
+            sat_pct: 96,
+            samples,
+            ac1,
+            differing,
+        }));
+        // Empty window.
+        assert!(!eval_i2s_right_slot_pass(&TestData::I2sRightSlot {
+            min: -900,
+            max: 880,
+            rms: 0,
+            sat_pct: 0,
+            samples: 0,
+            ac1: 870,
+            differing: 1,
+        }));
+        // The left slot's report is not the right slot's.
+        assert!(!eval_i2s_right_slot_pass(&waveform_data(-900, 880, 870)));
+    }
+
+    /// The right slot is judged by the raw-mic guards: a quiet-room raw mic far under the
+    /// beam's dead-line guard passes, and the raw-mic pair holds its pass/fail edges.
+    #[test]
+    fn i2s_right_slot_gate_uses_the_raw_mic_guards() {
+        // The observed quiet room: max_abs 10, spread 20 — dead under the beam's guards.
+        assert!(eval_i2s_right_slot_pass(&right_slot_data(
+            -10, 10, 970, 3950
+        )));
+        // Near-silence: max_abs 4 (spread 8) fails, 5 (spread 10) passes. Spread is at
+        // most twice max_abs, so max_abs 4 fails the dead-line and frozen-line guards
+        // alike; no window fails the dead-line guard alone, and the `all-zero` label that
+        // guard chooses is pinned in `audio_pipeline::ring`.
+        assert!(!eval_i2s_right_slot_pass(&right_slot_data(
+            -4, 4, 970, 3950
+        )));
+        assert!(eval_i2s_right_slot_pass(&right_slot_data(-5, 5, 970, 3950)));
+        // Frozen line: spread 8 fails with max_abs well above the dead-line guard.
+        assert!(!eval_i2s_right_slot_pass(&right_slot_data(
+            100, 108, 970, 3950
+        )));
+        assert!(eval_i2s_right_slot_pass(&right_slot_data(
+            100, 109, 970, 3950
+        )));
+    }
+
+    /// The device and host route constants agree with the documented values.
+    #[test]
+    fn routing_expectations_are_the_documented_routes() {
+        assert_eq!(XVF3800_RIGHT_SLOT_ROUTE, [3, 0]);
+        assert_eq!(XVF3800_LEFT_SLOT_EXPECTED, [8, 0]);
+    }
+
+    /// The routing gate needs an accepted write and both documented routes.
+    #[test]
+    fn xvf3800_output_routing_gate() {
+        assert!(eval_xvf3800_output_routing_pass(&routing_data(
+            0x00,
+            [8, 0],
+            [3, 0]
+        )));
+        // Write refused.
+        assert!(!eval_xvf3800_output_routing_pass(&routing_data(
+            0x02,
+            [8, 0],
+            [3, 0]
+        )));
+        // Right slot still at its default.
+        assert!(!eval_xvf3800_output_routing_pass(&routing_data(
+            0x00,
+            [8, 0],
+            [0, 0]
+        )));
+        // Left slot moved off the beam.
+        assert!(!eval_xvf3800_output_routing_pass(&routing_data(
+            0x00,
+            [7, 3],
+            [3, 0]
+        )));
+        // A different microphone index.
+        assert!(!eval_xvf3800_output_routing_pass(&routing_data(
+            0x00,
+            [8, 0],
+            [3, 1]
+        )));
+        assert!(!eval_xvf3800_output_routing_pass(&TestData::None));
+    }
+
     // ── I2sWaveformSanity tests ───────────────────────────────────────────────
     //
     // Pass data (mono ring snapshot): `TestData::I2sWaveform { min, max, rms, sat_pct,
@@ -7644,6 +7956,31 @@ mod tests {
         assert_eq!(I2S_HOST_AUTOCORR_FLOOR, 200);
         assert_eq!(I2S_HOST_ZERO_ABS_THRESHOLD, 16);
         assert_eq!(I2S_HOST_SPREAD_FLOOR, 32);
+        assert_eq!(I2S_HOST_RAW_MIC_ZERO_ABS_THRESHOLD, 4);
+        assert_eq!(I2S_HOST_RAW_MIC_SPREAD_FLOOR, 8);
+    }
+
+    /// The device judges each slot by a guard set (`defect_under(&BEAM_GUARDS)`,
+    /// `defect_under(&RAW_MIC_GUARDS)`); the host gates bind the loose constants. A set
+    /// edited apart from its constants would have the two ends of one test judge the
+    /// same window by different guards.
+    #[test]
+    fn i2s_host_guards_are_the_device_guard_sets() {
+        use audio_pipeline::ring::{BEAM_GUARDS, LivenessGuards, RAW_MIC_GUARDS};
+        assert_eq!(
+            BEAM_GUARDS,
+            LivenessGuards {
+                zero_abs_threshold: I2S_HOST_ZERO_ABS_THRESHOLD,
+                stuck_spread_floor: I2S_HOST_SPREAD_FLOOR,
+            }
+        );
+        assert_eq!(
+            RAW_MIC_GUARDS,
+            LivenessGuards {
+                zero_abs_threshold: I2S_HOST_RAW_MIC_ZERO_ABS_THRESHOLD,
+                stuck_spread_floor: I2S_HOST_RAW_MIC_SPREAD_FLOOR,
+            }
+        );
     }
 
     /// `ac1` one unit above the floor (201) → true.
@@ -8645,6 +8982,7 @@ mod tests {
             connected: true,
             segment_start_seen: true,
             declared_preroll: 16_000,
+            hello_channels: Some(RTD_CAPTURE_CHANNELS),
             // Paced pre-roll drain (50 frames × 5 ms = 250 ms): a realistic passing burst,
             // under the 350 ms ceiling. The ceiling boundary itself is exercised by the
             // burst_drain_ms = MAX+1 rejection tests below.
@@ -8764,6 +9102,18 @@ mod tests {
             eval_stream_realtime_duplex(&rtd_verdict_b(), &o).is_err(),
             "a short sample count must fail the integrity check"
         );
+    }
+
+    #[test]
+    fn eval_rtd_mono_hello_fails() {
+        for channels in [None, Some(1)] {
+            let mut o = rtd_pass_obs();
+            o.hello_channels = channels;
+            assert!(
+                eval_stream_realtime_duplex(&rtd_verdict_b(), &o).is_err(),
+                "a Hello declaring {channels:?} channels must fail"
+            );
+        }
     }
 
     #[test]
@@ -11790,13 +12140,14 @@ mod tests {
         );
     }
 
-    /// An obs line with no un-paired window (here: before any tx line) means the device's emit
-    /// order/contract drifted. The eval must fail loudly rather than guess an attachment.
+    /// An obs line after the first tx with no un-paired window (here: a second obs for a window
+    /// that already has one) means the device's emit order/contract drifted. The eval must fail
+    /// loudly rather than guess an attachment.
     #[test]
-    fn eval_playback_drain_rate_orphaned_obs_line_fails_loudly() {
+    fn eval_playback_drain_rate_orphaned_obs_after_a_window_fails_loudly() {
         let logs = [
-            vec![drain_obs_line(0, 0)], // orphan: no window to attach to
             sat_line(40, 1_000_000),
+            vec![drain_obs_line(0, 0)], // orphan: the window above already has its obs
             sat_line(50, 1_000_000),
         ]
         .concat();
@@ -11805,6 +12156,81 @@ mod tests {
         assert!(
             err.contains("orphaned"),
             "the error must name the orphaned obs line / emit-order drift: {err}"
+        );
+    }
+
+    /// One obs line before any tx line is the tail of a summary whose tx line was written
+    /// before the collection opened. It is dropped: the run passes as the healthy case does,
+    /// with the second collected window scoring, whatever the dropped line's counters say.
+    #[test]
+    fn eval_playback_drain_rate_one_leading_obs_is_the_pre_collection_tail() {
+        // The clean straddle, and the tone-test tail as the bench shows it: pre-roll waits
+        // counted and no RX window healthy. Neither may refill-exclude or fail anything.
+        let tone_tail =
+            drain_obs_line(19, 0).replace(&format!("{RX_WIN_OK}1"), &format!("{RX_WIN_OK}0"));
+        assert!(
+            tone_tail.contains(&format!("{RX_WIN_OK}0")),
+            "fixture: {tone_tail}"
+        );
+        for leading in [drain_obs_line(0, 0), tone_tail] {
+            let logs = [
+                vec![leading.clone()],
+                sat_line(40, 1_000_000),
+                sat_line(50, 1_000_000),
+            ]
+            .concat();
+            let result = eval_playback_drain_rate(&drain_verdict(120), &logs);
+            assert!(
+                result.is_ok(),
+                "one leading obs line must be dropped, not fail the run: {result:?} (leading: {leading})"
+            );
+        }
+        // The second window is the one scored: a slow second window still fails on the rate,
+        // so the dropped line did not shift the pairing or the warmup drop.
+        let logs = [
+            vec![drain_obs_line(0, 0)],
+            sat_line(50, 1_000_000),
+            sat_line(30, 1_000_000),
+        ]
+        .concat();
+        let err = eval_playback_drain_rate(&drain_verdict(120), &logs)
+            .expect_err("the second window drains at 0.6x real-time and must fail");
+        assert!(!err.contains("orphaned"), "scored, not orphaned: {err}");
+    }
+
+    /// Only one obs line can precede the first tx line; a second one is drift and fails loudly.
+    #[test]
+    fn eval_playback_drain_rate_two_leading_obs_lines_fail_loudly() {
+        let logs = [
+            vec![drain_obs_line(0, 0), drain_obs_line(0, 0)],
+            sat_line(40, 1_000_000),
+            sat_line(50, 1_000_000),
+        ]
+        .concat();
+        let err = eval_playback_drain_rate(&drain_verdict(120), &logs)
+            .expect_err("a second leading obs line must fail loudly");
+        assert!(
+            err.contains("orphaned"),
+            "the error must name the orphaned obs line / emit-order drift: {err}"
+        );
+    }
+
+    /// The leading-obs tolerance applies after the token parse, so a malformed leading obs line
+    /// still fails on its missing token.
+    #[test]
+    fn eval_playback_drain_rate_leading_obs_missing_token_still_fails() {
+        let mangled = drain_obs_line(0, 0).replace(PREROLL_WAITS, "elided=");
+        let logs = [
+            vec![mangled.clone()],
+            sat_line(40, 1_000_000),
+            sat_line(50, 1_000_000),
+        ]
+        .concat();
+        let err = eval_playback_drain_rate(&drain_verdict(120), &logs)
+            .expect_err("a leading obs line missing a token must fail, not be dropped");
+        assert!(
+            err.contains("missing/invalid") && err.contains(PREROLL_WAITS),
+            "the error must name the missing token: {err} (line: {mangled})"
         );
     }
 
@@ -12301,6 +12727,54 @@ mod tests {
         let mut client = openssl::ssl::SslStream::new(ssl, tcp).expect("client SslStream");
         client.connect().expect("client handshake");
         (client, handle)
+    }
+
+    /// The listener counts per-channel samples from the channel count the device's own
+    /// `Hello` declared: a stereo frame of 1280 B is 320 sample indexes, not 640.
+    #[test]
+    fn rtd_serve_counts_samples_per_channel_from_the_hello() {
+        use audio_pipeline::wire::{
+            AudioFrame, ChannelSource, EndReason, MAX_AUDIO_PAYLOAD, SegmentEnd, StreamFrame,
+        };
+        let slot = Arc::new(Mutex::new(RtdObservation::default()));
+        let (mut client, handle) = rtd_spawn_serve(&slot, 0);
+
+        let StreamFrame::Hello(mut hello) = rtd_test_hello() else {
+            unreachable!("the fixture is a Hello")
+        };
+        hello.channels = 2;
+        hello.channel_source = ChannelSource::StereoBeamRawMic;
+        rtd_test_write_frame(&mut client, &StreamFrame::Hello(hello));
+        rtd_test_write_frame(&mut client, &rtd_test_segment_start(320));
+        let mut pcm = heapless::Vec::new();
+        pcm.resize(MAX_AUDIO_PAYLOAD, 0u8).expect("payload fits");
+        rtd_test_write_frame(
+            &mut client,
+            &StreamFrame::Audio(AudioFrame {
+                segment_id: 0,
+                first_sample_index: 0,
+                device_ts_us: 0,
+                pcm,
+            }),
+        );
+        rtd_test_write_frame(
+            &mut client,
+            &StreamFrame::SegmentEnd(SegmentEnd {
+                segment_id: 0,
+                device_ts_us: 0,
+                frames_sent: 1,
+                samples_sent: 320,
+                reason: EndReason::VadRelease,
+            }),
+        );
+        handle.join().expect("serve thread joins");
+        drop(client);
+
+        let o = slot.lock().unwrap();
+        assert_eq!(o.hello_channels, Some(2));
+        assert_eq!(o.total_samples, 320);
+        assert!(o.burst_drain_ms.is_some());
+        assert!(o.error.is_none(), "{:?}", o.error);
     }
 
     /// Property 1: an evaluator that snapshots the slot mid-flight — after the device

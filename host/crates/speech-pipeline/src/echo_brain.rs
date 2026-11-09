@@ -11,13 +11,14 @@
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::brain::{BrainEventFn, BrainStats, send_or_report};
 use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{
     ContextSegment, InterruptProgress, SpeakBody, SpeakCmd, Utterance, UtteranceId,
 };
+use crate::volume::{VolumeBook, resolve_shared};
 
 /// Most words of the interrupted response the readback names back before "…and
 /// then you said". A longer clip would otherwise read its own first half aloud.
@@ -27,12 +28,23 @@ const READBACK_TAIL_WORDS: usize = 8;
 pub struct EchoBrain {
     events: BrainEventFn,
     stats: Arc<BrainStats>,
+    /// Per-pod reply volume, read to resolve each reply's gain as it is queued.
+    volume: Arc<Mutex<VolumeBook>>,
 }
 
 impl EchoBrain {
-    /// Build an `EchoBrain` over the shared event sink and counters.
-    pub fn new(events: BrainEventFn, stats: Arc<BrainStats>) -> Self {
-        Self { events, stats }
+    /// Build an `EchoBrain` over the shared event sink, counters and volume
+    /// book.
+    pub fn new(
+        events: BrainEventFn,
+        stats: Arc<BrainStats>,
+        volume: Arc<Mutex<VolumeBook>>,
+    ) -> Self {
+        Self {
+            events,
+            stats,
+            volume,
+        }
     }
 }
 
@@ -82,12 +94,15 @@ impl Brain for EchoBrain {
             Some(seg) => barge_readback(seg, &text),
             None => text,
         };
+        let gain = resolve_shared(&self.volume, &u.pod, None, u.level.as_ref());
         let cmd = SpeakCmd {
             target: u.pod,
             in_reply_to: Some(u.id),
             body: SpeakBody::Text(reply),
             interruptible: true,
             timings: u.timings.clone(),
+            gain,
+            level: u.level,
         };
         send_or_report(&mut out, cmd, utterance, &self.events, &self.stats);
         // A parrot never asks to be answered, so every turn it takes is closed.
@@ -140,6 +155,32 @@ mod tests {
         utterance_full(transcript, None)
     }
 
+    fn default_book() -> Arc<Mutex<VolumeBook>> {
+        Arc::new(Mutex::new(VolumeBook::default()))
+    }
+
+    #[test]
+    fn a_replys_gain_is_resolved_from_the_books_hold_when_queued() {
+        let book = default_book();
+        let hold = crate::volume::VolumeCommand {
+            hold_db: Some(-9.0),
+            ..Default::default()
+        };
+        book.lock()
+            .unwrap()
+            .apply(&PodId("pod-x".into()), &hold)
+            .unwrap();
+        let (events, _seen) = event_collector();
+        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()), Arc::clone(&book));
+        let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
+        drop(brain.handle(utterance_with(Some("hi")), ResponseSink::new(tx)));
+
+        let cmd = rx.try_recv().expect("a SpeakCmd was queued");
+        assert_eq!(cmd.gain.held_db(), -9.0);
+        assert_eq!(cmd.gain.applied_db(), -9.0);
+        assert_eq!(cmd.gain.override_db(), None);
+    }
+
     fn utterance_full(transcript: Option<&str>, wake: Option<WakeConfirmation>) -> Utterance {
         Utterance {
             id: UtteranceId(42),
@@ -157,6 +198,7 @@ mod tests {
             wake,
             barge_in: None,
             over_playback: false,
+            level: None,
         }
     }
 
@@ -164,7 +206,7 @@ mod tests {
     fn echoes_the_transcript_as_text() {
         let (events, seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, Arc::clone(&stats));
+        let brain = EchoBrain::new(events, Arc::clone(&stats), default_book());
 
         let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
         // A parrot never asks to be answered, so every turn it takes is closed —
@@ -193,7 +235,7 @@ mod tests {
     fn trims_surrounding_whitespace_before_echoing() {
         let (events, _seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, stats);
+        let brain = EchoBrain::new(events, stats, default_book());
 
         let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
         drop(brain.handle(
@@ -214,12 +256,13 @@ mod tests {
         // split only fires on an empty transcript.
         let (events, seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, Arc::clone(&stats));
+        let brain = EchoBrain::new(events, Arc::clone(&stats), default_book());
 
         let wake = Some(WakeConfirmation {
             score: 0.9,
             wake_end_sample: 16_000,
             stt_trim_samples: 12_800,
+            level: None,
         });
         let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
         drop(brain.handle(
@@ -248,12 +291,14 @@ mod tests {
             body: SpeakBody::Text(String::new()),
             interruptible: false,
             timings: StageTimings::default(),
+            gain: VolumeBook::default().resolve(&PodId("filler".into()), None, None),
+            level: None,
         })
         .expect("the sender's one guaranteed slot accepts the first send");
 
         let (events, seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, Arc::clone(&stats));
+        let brain = EchoBrain::new(events, Arc::clone(&stats), default_book());
 
         drop(brain.handle(utterance_with(Some("hi")), ResponseSink::new(tx)));
 
@@ -298,7 +343,7 @@ mod tests {
     #[test]
     fn barge_reads_back_the_cut_response_then_parrots() {
         let (events, _seen) = event_collector();
-        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()));
+        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()), default_book());
 
         // Heard half of a four-word response: the tail is the heard prefix, the
         // new transcript is quoted and then parroted at the end.
@@ -316,7 +361,7 @@ mod tests {
     #[test]
     fn barge_readback_caps_the_tail_at_eight_words() {
         let (events, _seen) = event_collector();
-        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()));
+        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()), default_book());
 
         // The whole ten-word response was heard before the barge; only the last
         // eight words are read back, so a long clip never recites its own opening.
@@ -332,7 +377,7 @@ mod tests {
     #[test]
     fn barge_on_a_pcm_response_degrades_to_the_tailless_form() {
         let (events, _seen) = event_collector();
-        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()));
+        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()), default_book());
 
         // A Pcm reply has no words to quote; the readback drops the "after" clause.
         let u = barge_utterance("wait", vec![segment(None, 300, 1_000)]);
@@ -345,7 +390,7 @@ mod tests {
     #[test]
     fn barge_with_nothing_heard_degrades_to_the_tailless_form() {
         let (events, _seen) = event_collector();
-        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()));
+        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()), default_book());
 
         // The barge landed at the very start of the response: no whole word was
         // heard, so there is nothing to quote and the readback drops the "after"
@@ -360,7 +405,7 @@ mod tests {
     #[test]
     fn barge_reads_back_only_the_last_chain_segment() {
         let (events, _seen) = event_collector();
-        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()));
+        let brain = EchoBrain::new(events, Arc::new(BrainStats::default()), default_book());
 
         // A multi-cycle chain: the readback names the most recent cut, not the first.
         let u = barge_utterance(
@@ -381,7 +426,7 @@ mod tests {
     fn interrupt_is_a_no_op() {
         let (events, seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = EchoBrain::new(events, Arc::clone(&stats));
+        let brain = EchoBrain::new(events, Arc::clone(&stats), default_book());
 
         brain.interrupt(
             UtteranceId(42),

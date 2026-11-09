@@ -266,6 +266,26 @@ re-derivation above.
 See `TODO(heap-floor-post-flash-boot-path-offset)` at `HEAP_MIN_EVER_FLOOR` in
 `firmware/crates/device-protocol/src/lib.rs`.
 
+## `test-routing-reissues-log-field-unverified`
+
+The ESP pod's boot `routing:` line (`apply_right_slot_routing` in
+`firmware/devices/respeaker-pod/src/routing.rs`) is an emitted interface whose doc promises
+its fields, including `reissues=`, and its level rule: Warn unless both `applied` and
+`left_is_beam` hold, whatever the count. The level choice and the format string sit behind
+`cfg(target_os = "espidf")`, so no host test pins either; renaming or dropping the token, or
+raising the level on any non-zero count, would pass every check. Two things to settle and do
+together. First, decide what the level should mean when the count includes a non-NAK
+transport error: the count does not separate a NAK (`ESP_FAIL`, the chip's transient busy
+window) from a timeout (a held or not-yet-ready bus), and today only the transport's warn
+lines tell them apart. One option is to classify the error in the device wrapper, carry the
+two counts separately in `RoutingOutcome`, and raise the line to Warn on a non-NAK re-issue.
+Second, move the level choice and line formatting into a host-built pure function, such as
+`routing_line(outcome, left_is_beam) -> (Level, String)`, with tests for the agreed rule and
+the presence of the `reissues=` token. Either change alters the device image, so it needs a
+HIL run on that image.
+
+See `TODO(test-routing-reissues-log-field-unverified)` in `apply_right_slot_routing`.
+
 ## `tls-link-bench-measure` — BLOCKED as of 2026-07-25 (needs a bench session with the pod)
 
 The TLS-PSK audio link (`docs/adr/2026/07/22-pod--tls-and-auth/`) landed with the
@@ -356,6 +376,81 @@ ASR tuning is the expected pick for a host-side wake-word/STT consumer).
 
 See `TODO(reachy-beam-mapping)` at `beam_energy_speech` in
 `firmware/devices/reachy-pod/src/beam.rs`.
+
+## `rtd-flake-sample`
+
+`StreamRealtimeDuplex`'s pre-roll burst (`burst_drain_ms`, ceiling `RTD_BURST_DRAIN_MAX_MS =
+350` in `firmware/crates/hil-host/src/main.rs`) sits near its ceiling and crosses it on some
+runs while catch-up holds (`VadRelease`, ~5.02 s for 5 s of audio). Recorded samples:
+
+- Mono stream, 2880 B send window, six selector runs: passing bursts 289-337 ms, failing
+  366-803 ms; one Scenario B mid-segment backpressure drop (`SegmentDroppedSocketKept`,
+  221 of 300 frames); host `max_read_gap_ms` 142-157 on the slow runs against 50-90 on the
+  fast ones.
+- Stereo stream, 2880 B window, one full run and three selector runs: every run over the
+  ceiling (A 358-483, B 507-738 ms), catch-up held.
+- Stereo stream, 5760 B window (the shipped `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`), three
+  selector runs: A 254-354, B 336-365 ms; two of three passed; internal-heap lows
+  `hla`/`hlb` 36-52 KB against `RTD_HEAP_LOW_FLOOR = 24_576`.
+- Stereo stream, 5760 B window, full `make -C firmware flash-and-test` run (ELF sha256
+  `2289418571d494ff7f872e3f2400b04c5de62812da2e5cca4e0020e259163618`), every test before it
+  passed: Scenario B over the ceiling, A under it, both `VadRelease` with 96000 samples per
+  channel and `hello_channels: Some(2)`:
+
+  ```
+  [rtd] conn=0 paced=false bytes=387938 frames=303 max_read_gap_ms=58 dur_ms=5025 burst_drain_ms=296 catch_up_ms=5017
+  [rtd] conn=1 paced=true bytes=387938 frames=303 max_read_gap_ms=56 dur_ms=5021 burst_drain_ms=372 catch_up_ms=5012
+  StreamRealtimeDuplex result: Rtd { underruns: 0, gap_ms: 0, consumed: 225 } src=rtd mh_post=27276 hla=53912 hlb=29208 shwm=2848 ptcb=636 phwm=1756 rr=11 wsub=0
+  FAIL [check 4 — behavioral]: StreamRealtimeDuplex Scenario B assertion failed: StreamRealtimeDuplex: pre-roll burst drained in 372 ms > 350 ms ceiling — the loop services at most one frame per poll wake
+  ```
+
+  The next full run of the same image, flashed again, the same way:
+
+  ```
+  [rtd] conn=0 paced=false bytes=387938 frames=303 max_read_gap_ms=64 dur_ms=5021 burst_drain_ms=288 catch_up_ms=5013
+  [rtd] conn=1 paced=true bytes=387938 frames=303 max_read_gap_ms=70 dur_ms=5026 burst_drain_ms=379 catch_up_ms=5014
+  StreamRealtimeDuplex result: Rtd { underruns: 0, gap_ms: 0, consumed: 225 } src=rtd mh_post=26232 hla=52228 hlb=28908 shwm=2904 ptcb=872 phwm=1904 rr=11 wsub=0
+  FAIL [check 4 — behavioral]: StreamRealtimeDuplex Scenario B assertion failed: StreamRealtimeDuplex: pre-roll burst drained in 379 ms > 350 ms ceiling — the loop services at most one frame per poll wake
+  ```
+
+No mechanism is identified. Not yet examined: a race in the host's RTD observation window,
+a heap sample landing in the TLS handshake, a listener port-reuse race, and Wi-Fi airtime
+variance on the bench. The ceiling is not widened without a mechanism or a derivation from
+measured data.
+
+Done = the mechanism is identified and fixed at its construction, or the ceiling is
+re-derived from measured data with the derivation at the constant, and the test passes on
+repeated selector runs. See `TODO(rtd-flake-sample)` at `RTD_BURST_DRAIN_MAX_MS`.
+
+## `deser-flood-ping-stall-sample`
+
+The always-on deser-error check's phase B (`run_deser_error_check` in
+`firmware/crates/hil-host/src/main.rs`) timed out once waiting for the `Ping` it sends after a
+200-frame corrupt flood; phase A of the same invocation had passed. Failure text:
+
+> `FAIL [deser-error]: Ping timed out after a 200-frame corrupt flood — the read loop stalled`
+
+Runs: seen once, on a mono image (`a07ae41`) during a
+`RESPEAKER_HIL_ONLY=StreamRealtimeDuplex` selector invocation (the third of six baseline
+runs). The check runs before the suite on every invocation, and it passed on every other
+invocation recorded on that image and on the stereo images that followed it, full-suite and
+selector alike.
+
+The check's message asserts a stall in the device's read loop; one sighting cannot place it.
+Not yet examined:
+
+- Did the device's COBS accumulator or its read task stop
+  (`firmware/devices/respeaker-pod/src/protocol_rx.rs`)?
+- Did the host's 200 back-to-back `write_raw` calls exceed what the USB-CDC path accepted, so
+  the `Ping` never reached the device?
+- Is `RESPONSE_TIMEOUT` tight against the device's recovery after a flood?
+- Does the stall reproduce on a repeated flood?
+
+Done = the mechanism is identified — on the device, fixed at its construction with the check
+kept as its regression guard; on the host or in the check's own timing, the check corrected
+with the derivation at the constant — or the sighting is shown not to reproduce over a stated
+number of repeated floods and this entry says so. See `TODO(deser-flood-ping-stall-sample)`
+at the phase-B timeout arm.
 
 ## `gate-only-single-sighting-flakes` — not blocked as of 2026-08-31 (two single observations left; the next failing gate run is the sample)
 
@@ -843,3 +938,58 @@ The enum's current shape, covering the configured and cued poses, was chosen del
 gaze began carrying a direction, so splitting it is a design decision. It also reshapes the look
 tests in `scripter.rs`, `pipeline.rs` and `config.rs`. Marked at `enum Raise`,
 `host/crates/speech-surface/src/scripter.rs`.
+
+## `far-field-auto-volume-cue`
+
+The automatic reply-volume term (`AutoPolicy::term`,
+`host/crates/speech-pipeline/src/volume.rs`) drives on the utterance's own speech level
+by default (`k_speech = 1`, `k_ambient = 0`): a voice that reads quieter at the
+microphone gets a quieter reply. At the acceptance session for the volume feature
+(brenn-ops `docs/adr/2026/11/08-pod--stt-wake-prompt-and-tts-volume/`) the speaker sat
+0.5–0.8 m from the array; the same voice across the room reads quieter at the mic for
+the same listener distance, so the speech term turns the reply *down* exactly when a
+far listener needs it louder. The owner raised this during the session: "if you respond
+based on the volume of my speech it might be too quiet to hear. The ambient volume is
+probably a better bet in the long run, but we'll see how well each works."
+
+The ambient term exists and defaults off. Its reference is bench-derived
+(`DEFAULT_AUTO_AMBIENT_REF_DBFS`, the raw-mic quiet-room floor), and the raw-mic ambient
+reading was measured to track broadband noise 1:1 above that floor, so turning
+`k_ambient` on through the brain's `<volume/>` knobs is meaningful today. What is not
+known is which cue, or what combination, serves a far-field speaker — speech, ambient,
+both, or something distance-aware — and that needs a far-field voiced session with the
+owner, which the owner said they would run. Nothing is baked until then.
+
+Done = a far-field session recorded in the ADR directory, the policy decided from it
+(the default knobs, the references, or a new cue), and a test pinning the chosen
+default against the session's levels, as `volume.rs` pins the near-field defaults.
+See `TODO(far-field-auto-volume-cue)` at `AutoPolicy::term` in
+`host/crates/speech-pipeline/src/volume.rs`.
+
+## `stt-noise-reject-before-wake-sample`
+
+Under controlled broadband noise, STT rejected a command before wake detection
+failed. Setup (brenn-ops `docs/adr/2026/11/08-pod--stt-wake-prompt-and-tts-volume/`,
+the final check's addendum): pink noise from a Bluetooth speaker 1.2 m from the array,
+4 s lead then continuing under the line; a wake line synthesized by the pod's own TTS
+(Kokoro `af_heart`) and normalised to −17 dBFS mean, identical in every take; `[stt]`
+gate at its default `no_speech_max = 0.2`, `avg_logprob_min` off. At −40 and −30 dBFS
+digital noise (raw-mic `ambient_dbfs` −79.0 and −72.4) the turn went through. At −20
+dBFS (`ambient_dbfs` −64.0, `speech_dbfs` −52.6, roughly 12 dB SNR at the mic)
+OpenWakeWord fired at 0.93 and Whisper scored the command `no_speech 0.53`, so the turn
+was dropped — `wake_command_absent`, reason `low_confidence` — at the
+`GateOutcome::DeclineWake` arm. One sighting. The raw-mic ambient reading tracked the
+noise 1:1 above the room floor, and `speech_dbfs` moved +1.8 dB across the three noise
+levels, so the level feed was not what failed.
+
+Not yet examined: which captured channel each consumer scores and whether the two
+degrade differently under the same noise; whether the gate's threshold or the STT
+input is the limit at that SNR (a raised `no_speech_max` admits hallucinated text,
+which is what the gate exists to stop); whether it reproduces across takes and across
+commands longer than one phrase. No threshold moved on this sighting.
+
+Done = the mechanism is identified — a channel, an input or a gate — and fixed at its
+construction with a test under recorded noise, or the sighting is shown not to
+reproduce over a stated number of takes and this entry says so. See
+`TODO(stt-noise-reject-before-wake-sample)` at the `GateOutcome::DeclineWake` arm in
+`host/crates/speech-surface/src/pipeline.rs`.

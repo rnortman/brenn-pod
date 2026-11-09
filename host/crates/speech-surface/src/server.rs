@@ -38,15 +38,15 @@ use pod_ingest::{
 };
 use speech_pipeline::{
     AssemblerLimits, Brain, BrainEvent, BrainEventFn, BrainStats, BrainStatsSnapshot, BrennBrain,
-    BuildError, ConfidenceGate, DropOldestQueue, EchoBrain, FeedSender, FlushRejected,
+    BuildError, ConfidenceGate, DropOldestQueue, EchoBrain, FeedSender, FlushRejected, FrameLevel,
     HttpSynthesizer, HttpTranscriber, InterruptProgress, Listener, ListenerConfig, ListenerEvent,
     ListenerHandle, ListenerStats, ListenerStatsSnapshot, OwwModels, PacerConfig, PlayRejected,
     PlaybackEventFn, PlaybackHandle, PlaybackJob, PlaybackStats, PlaybackStatsSnapshot,
     PlaybackWriter, PodId, QueueStats, RoomId, SPINE_FORMAT, Segment, SegmentAssembler,
     SegmentEndCause, Sender, SileroModel, SpeakBody, SpeakCmd, StageTimings, StatsHandle,
     SttParams, SttStats, SttStatsSnapshot, Synthesizer, Transcriber, TtsParams, TtsStats,
-    TtsStatsSnapshot, UtteranceId, WakeCommandReason, WakeError, WavBrain, audio_ms,
-    stage_delta_us,
+    TtsStatsSnapshot, UtteranceId, VolumeBook, WakeCommandReason, WakeError, WavBrain, audio_ms,
+    resolve_shared, stage_delta_us,
 };
 
 use crate::alerts::{Alert, AlertInbox};
@@ -697,6 +697,29 @@ impl Server {
         // utterance).
         let turn_ledger = Arc::new(TurnLedger::new());
 
+        // Per-pod reply volume, read by every producer of a speak command to
+        // resolve its gain as it is queued. The operator's bounds and baselines
+        // are said once here, so a `reply_gain` line's clamped `held_db` can be
+        // read against what was configured. The line is read from the book, not
+        // the config, so it states exactly what every resolution clamps against.
+        let book = config.volume_book();
+        let bounds = book.bounds();
+        let baselines = book.baselines();
+        jsonl.emit(
+            "volume_configured",
+            &json!({
+                "gain_db": baselines.default_db,
+                "min_db": bounds.min_db(),
+                "max_db": bounds.max_db(),
+                "auto": book.auto_defaults(),
+                "pods": baselines
+                    .per_pod
+                    .iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            }),
+        );
+        let volume_book = Arc::new(std::sync::Mutex::new(book));
+
         // The cue vocabulary, read once. A configured file that will not parse is
         // fatal here rather than an empty vocabulary later: the deployment said
         // the head may be cued, and a run that silently refused every cue would
@@ -817,7 +840,7 @@ impl Server {
         // (zeros with no brain) so `stage_health` reports the dropped-reply count
         // (`speak_send_failures`) uniformly across configs.
         let (brain, brain_events, brain_stats, brenn_brain) =
-            build_brain(&config, &jsonl, brenn_link)
+            build_brain(&config, &jsonl, brenn_link, Arc::clone(&volume_book))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         // Build the transcriber from `[stt]`; a malformed endpoint or a client that
         // will not build is fatal at startup, before anything is accepted. No
@@ -873,6 +896,7 @@ impl Server {
                         inbox,
                         speak_tx.clone(),
                         playback_registry.clone(),
+                        Arc::clone(&volume_book),
                         shutdown_token.clone(),
                         jsonl.clone(),
                     )));
@@ -902,6 +926,7 @@ impl Server {
                         // identically to one the brain itself declined.
                         events: brain_events,
                         stats: brain_stats.clone(),
+                        volume: Arc::clone(&volume_book),
                     }),
                     Some(join),
                 )
@@ -1578,6 +1603,61 @@ async fn tap_listener(
     }
 }
 
+/// Watches a beam + raw-mic session's raw-mic channel for a whole segment that
+/// reads as dead.
+///
+/// `level_channel_dead { pod, segment_id }` is emitted once for a segment of
+/// such a session that carried audio and in which every raw-mic frame read at or
+/// below `DEAD_CHANNEL_DBFS`. A reader may conclude that the pod's raw
+/// microphone channel was silence for that segment — the routing that feeds it
+/// was lost or never applied — and that automatic gain had no level to read for
+/// any utterance in it. A mono session, or a segment with no audio, never
+/// produces the line.
+#[derive(Debug, Default)]
+struct RawMicWatch {
+    /// The accepted `Hello` declared a raw-mic channel.
+    raw_mic: bool,
+    /// The open segment carried at least one raw-mic frame.
+    heard: bool,
+    /// Some raw-mic frame of the open segment read above the dead line.
+    live: bool,
+}
+
+impl RawMicWatch {
+    /// Fold one session event in; returns the segment id when that event closed
+    /// a segment whose raw-mic channel was dead throughout.
+    fn observe(&mut self, ev: &SessionEvent) -> Option<u32> {
+        match ev {
+            SessionEvent::HelloAccepted { capture, .. } => {
+                *self = RawMicWatch {
+                    raw_mic: capture.has_raw_mic(),
+                    ..RawMicWatch::default()
+                };
+                None
+            }
+            SessionEvent::SegmentOpened { .. } => {
+                self.heard = false;
+                self.live = false;
+                None
+            }
+            SessionEvent::Audio { aux: Some(aux), .. } if self.raw_mic => {
+                self.heard = true;
+                if !FrameLevel::measure(aux).is_dead() {
+                    self.live = true;
+                }
+                None
+            }
+            SessionEvent::SegmentClosed { segment_id, .. } => {
+                let dead = self.raw_mic && self.heard && !self.live;
+                self.heard = false;
+                self.live = false;
+                dead.then_some(*segment_id)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// What `build_brain` produces: the optional brain implementation, the shared
 /// event adapter (the same instance the brain emits through, so the pipeline's
 /// confidence-gate decline reports through it too), the shared `BrainStats`
@@ -1628,6 +1708,7 @@ fn build_brain(
     config: &Config,
     jsonl: &JsonlHandle,
     link: Option<BridgeLink>,
+    volume: Arc<std::sync::Mutex<VolumeBook>>,
 ) -> Result<BuiltBrain, BrainBuildError> {
     let stats = Arc::new(BrainStats::default());
     // One event adapter, built once and shared: the brain emits through it, and
@@ -1651,16 +1732,17 @@ fn build_brain(
                 // Return the same actionable error rather than panicking.
                 let path = brain.clip.clone().ok_or(ClipError::MissingPath)?;
                 let clip = load_announced_clip(&path, "brain_clip_loaded", jsonl)?;
-                let brain = WavBrain::new(clip, events.clone(), stats.clone());
+                let brain = WavBrain::new(clip, events.clone(), stats.clone(), volume);
                 Ok((Some(Arc::new(brain) as Arc<dyn Brain>), events, stats, None))
             }
             BrainMode::Echo => {
                 // Echo reads the transcript back; it needs no clip. The transcript
                 // arrives on the utterance and the synthesizer belongs to the
                 // router, both wired separately — the brain itself needs only the
-                // shared event adapter and stats.
+                // shared event adapter, stats, and the volume book its replies'
+                // gains are resolved from.
                 jsonl.emit("brain_echo", &json!({}));
-                let brain = EchoBrain::new(events.clone(), stats.clone());
+                let brain = EchoBrain::new(events.clone(), stats.clone(), volume);
                 Ok((Some(Arc::new(brain) as Arc<dyn Brain>), events, stats, None))
             }
             BrainMode::Brenn => {
@@ -1691,6 +1773,7 @@ fn build_brain(
                     brenn.failure_message.clone(),
                     events.clone(),
                     stats.clone(),
+                    volume,
                 ));
                 Ok((
                     Some(brain.clone() as Arc<dyn Brain>),
@@ -1789,6 +1872,8 @@ fn build_transcriber(
                     url: url.clone(),
                     model: model.clone(),
                     language: stt.language.clone(),
+                    prompt: stt.prompt.clone(),
+                    hotwords: stt.hotwords.clone(),
                     timeout: Duration::from_millis(stt.timeout_ms),
                     connect_timeout: Duration::from_millis(stt.connect_timeout_ms),
                 };
@@ -1805,6 +1890,9 @@ fn build_transcriber(
                         "url": url,
                         "model": model,
                         "language": stt.language.clone(),
+                        "prompt": stt.prompt.clone(),
+                        "hotwords": stt.hotwords.clone(),
+                        "wake_word": stt.wake_word,
                         "no_speech_max": stt.no_speech_max,
                         "avg_logprob_min": stt.avg_logprob_min,
                     }),
@@ -2208,6 +2296,7 @@ async fn drain_announcements(
     mut inbox: AnnounceInbox,
     mut speak: mpsc::Sender<SpeakCmd>,
     registry: PlaybackRegistry,
+    volume: Arc<Mutex<VolumeBook>>,
     shutdown: CancellationToken,
     jsonl: JsonlHandle,
 ) {
@@ -2239,12 +2328,16 @@ async fn drain_announcements(
         }
         let mut spoken: Vec<String> = Vec::with_capacity(pods.len());
         for pod in pods {
+            let target = PodId(pod.clone());
+            let gain = resolve_shared(&volume, &target, None, None);
             let cmd = SpeakCmd {
-                target: PodId(pod.clone()),
+                target,
                 in_reply_to: None,
                 body: SpeakBody::Text(text.clone()),
                 interruptible: false,
                 timings: StageTimings::default(),
+                gain,
+                level: None,
             };
             match speak.try_send(cmd) {
                 Ok(()) => spoken.push(pod),
@@ -2606,6 +2699,7 @@ async fn connection(
     // The pod identity the listener feed is keyed on, set once `Hello` decodes.
     // Pre-`Hello` events carry none and are not tapped.
     let mut listener_pod: Option<PodId> = None;
+    let mut raw_mic_watch = RawMicWatch::default();
 
     // Terminal cause for the post-loop `fsm.close`. A read/decode failure sets a
     // more specific cause; a fatal protocol error parks the FSM (its close is a
@@ -2722,8 +2816,16 @@ async fn connection(
             // Tap the live pre-assembly stream to the continuous listener (a no-op
             // when none is wired), before the assembler consumes the same event.
             tap_listener(listener.as_ref(), &mut listener_pod, ev, conn_seq).await;
+            if let Some(segment_id) = raw_mic_watch.observe(ev) {
+                jsonl.emit(
+                    "level_channel_dead",
+                    &json!({ "pod": fsm.pod_id(), "segment_id": segment_id }),
+                );
+            }
             match ev {
-                SessionEvent::HelloAccepted { pod_id, .. } => {
+                SessionEvent::HelloAccepted {
+                    pod_id, capture, ..
+                } => {
                     // Identity binding: the pod id the FSM accepted off the wire
                     // must be the identity the handshake authenticated. Checked
                     // here, before the room lookup, the recorder rename, registry
@@ -2758,6 +2860,8 @@ async fn connection(
                             "room": current_room,
                             "conn_seq": conn_seq,
                             "unmapped": room.is_unmapped(),
+                            "channels": capture.channels,
+                            "channel_source": capture.source,
                         }),
                     );
 
@@ -3336,6 +3440,89 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    /// The raw-mic watch: one line for a segment whose raw-mic channel was
+    /// silence throughout, none for a live one, none for a mono session.
+    #[test]
+    fn raw_mic_watch_reports_a_dead_segment_once() {
+        use pod_ingest::{CaptureLayout, ChannelSource, DeviceMicros, EndReason, SegmentClose};
+        let hello = |channels, source| SessionEvent::HelloAccepted {
+            pod_id: "p".into(),
+            host_rx: HostMicros(0),
+            capture: CaptureLayout { channels, source },
+        };
+        let opened = |segment_id| SessionEvent::SegmentOpened {
+            segment_id,
+            base_sample_index: 0,
+            preroll_samples: 0,
+            base_device_ts: DeviceMicros(0),
+            is_resume: false,
+            host_rx: HostMicros(0),
+        };
+        let audio = |aux: Option<Vec<i16>>| SessionEvent::Audio {
+            segment_id: 1,
+            first_sample_index: 0,
+            pcm: vec![1_000; 320],
+            aux,
+            device_ts: DeviceMicros(0),
+            gap: None,
+            host_rx: HostMicros(0),
+        };
+        let closed = |segment_id| SessionEvent::SegmentClosed {
+            segment_id,
+            close: SegmentClose::Completed {
+                end_reason: EndReason::VadRelease,
+                frames_sent: 1,
+                samples_sent: 320,
+                cross_check: CrossCheck::Match,
+            },
+            host_rx: HostMicros(0),
+        };
+        let run = |watch: &mut RawMicWatch, evs: Vec<SessionEvent>| -> Vec<u32> {
+            evs.iter().filter_map(|e| watch.observe(e)).collect()
+        };
+
+        let mut watch = RawMicWatch::default();
+        let stereo = hello(2, ChannelSource::StereoBeamRawMic);
+        assert_eq!(run(&mut watch, vec![stereo]), Vec::<u32>::new());
+        // Dead throughout: reported at the close.
+        let dead = run(
+            &mut watch,
+            vec![
+                opened(1),
+                audio(Some(vec![0; 320])),
+                audio(Some(vec![0; 320])),
+                closed(1),
+            ],
+        );
+        assert_eq!(dead, vec![1]);
+        // One live frame keeps the segment quiet on this line.
+        let live = run(
+            &mut watch,
+            vec![
+                opened(2),
+                audio(Some(vec![0; 320])),
+                audio(Some(vec![300; 320])),
+                closed(2),
+            ],
+        );
+        assert!(live.is_empty());
+        // A segment that carried no audio says nothing about the channel.
+        assert!(run(&mut watch, vec![opened(3), closed(3)]).is_empty());
+
+        // A mono session never produces the line.
+        let mut mono = RawMicWatch::default();
+        let silent = run(
+            &mut mono,
+            vec![
+                hello(1, ChannelSource::CommunicationBeam),
+                opened(1),
+                audio(None),
+                closed(1),
+            ],
+        );
+        assert!(silent.is_empty());
+    }
+
     use audio_pipeline::wire::{
         AUDIO_PROTOCOL_VERSION, AudioFrame, ChannelSource, Codec, EndReason, Hello,
         MAX_AUDIO_PAYLOAD, SegmentEnd, SegmentStart, StreamFrame, Telemetry, TelemetryKind,
@@ -3657,7 +3844,8 @@ mod tests {
         let cfg = config(&dir.path().join("store"), false);
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
-        let (brain, _, stats, brenn) = build_brain(&cfg, &handle, None).unwrap();
+        let (brain, _, stats, brenn) =
+            build_brain(&cfg, &handle, None, Default::default()).unwrap();
         assert!(brain.is_none());
         assert!(brenn.is_none());
         assert_eq!(stats.snapshot().speak_send_failures, 0);
@@ -3678,7 +3866,8 @@ mod tests {
         let cfg = wav_brain_config(&dir.path().join("store"), Some(&clip_path));
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
-        let (brain, _, _stats, brenn) = build_brain(&cfg, &handle, None).unwrap();
+        let (brain, _, _stats, brenn) =
+            build_brain(&cfg, &handle, None, Default::default()).unwrap();
         assert!(brain.is_some());
         assert!(brenn.is_none());
 
@@ -3704,7 +3893,7 @@ mod tests {
         let (handle, _join, _path) = jsonl_file(dir.path()).await;
 
         // `Arc<dyn Brain>` is not `Debug`, so match rather than `unwrap_err`.
-        let result = build_brain(&cfg, &handle, None);
+        let result = build_brain(&cfg, &handle, None, Default::default());
         assert!(matches!(
             result,
             Err(BrainBuildError::Clip(ClipError::Open { .. }))
@@ -3721,7 +3910,7 @@ mod tests {
         let (handle, _join, _path) = jsonl_file(dir.path()).await;
 
         assert!(matches!(
-            build_brain(&cfg, &handle, None),
+            build_brain(&cfg, &handle, None, Default::default()),
             Err(BrainBuildError::Clip(ClipError::MissingPath))
         ));
     }
@@ -4073,7 +4262,8 @@ mod tests {
         let cfg = Arc::new(test_config(&text).expect("config parses"));
         let (handle, join, path) = jsonl_file(dir.path()).await;
 
-        let (brain, _, _stats, brenn) = build_brain(&cfg, &handle, None).unwrap();
+        let (brain, _, _stats, brenn) =
+            build_brain(&cfg, &handle, None, Default::default()).unwrap();
         assert!(brain.is_some());
         assert!(brenn.is_none());
 
@@ -4147,7 +4337,8 @@ mod tests {
             handle.clone(),
         );
 
-        let (brain, _, _stats, brenn) = build_brain(&cfg, &handle, Some(link)).unwrap();
+        let (brain, _, _stats, brenn) =
+            build_brain(&cfg, &handle, Some(link), Default::default()).unwrap();
         // One object behind both handles, and that is the whole reason the
         // fourth slot exists: the driver delivers responses into the same
         // pending slot the pipeline's dispatch arms. Two `BrennBrain`s here
@@ -4183,7 +4374,7 @@ mod tests {
         let (handle, _join, _path) = jsonl_file(dir.path()).await;
 
         assert!(matches!(
-            build_brain(&brenn_config(dir.path()), &handle, None),
+            build_brain(&brenn_config(dir.path()), &handle, None, Default::default()),
             Err(BrainBuildError::BrennLinkAbsent)
         ));
 
@@ -4195,7 +4386,7 @@ mod tests {
         );
         let cfg = Arc::new(test_config(&text).expect("config parses"));
         assert!(matches!(
-            build_brain(&cfg, &handle, None),
+            build_brain(&cfg, &handle, None, Default::default()),
             Err(BrainBuildError::BrennConfigAbsent)
         ));
     }
@@ -4919,6 +5110,7 @@ mod tests {
             inbox,
             speak_tx,
             registry,
+            Arc::new(Mutex::new(VolumeBook::default())),
             CancellationToken::new(),
             jsonl.clone(),
         )
@@ -4946,6 +5138,8 @@ mod tests {
             body: SpeakBody::Text("a reply".into()),
             interruptible: true,
             timings: StageTimings::default(),
+            gain: VolumeBook::default().resolve(&PodId("pod-filler".into()), None, None),
+            level: None,
         }
     }
 
@@ -5069,6 +5263,7 @@ mod tests {
             inbox,
             speak_tx,
             registry,
+            Arc::new(Mutex::new(VolumeBook::default())),
             CancellationToken::new(),
             jsonl.clone(),
         )
@@ -5124,7 +5319,14 @@ mod tests {
         // so returning at all is the assertion.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            drain_announcements(inbox, speak_tx, registry, shutdown, jsonl.clone()),
+            drain_announcements(
+                inbox,
+                speak_tx,
+                registry,
+                Arc::new(Mutex::new(VolumeBook::default())),
+                shutdown,
+                jsonl.clone(),
+            ),
         )
         .await
         .expect("a cancelled drain returns");
@@ -6029,6 +6231,45 @@ mod tests {
         assert_eq!(configured.len(), 1);
         assert_eq!(configured[0]["no_speech_max"], f64::from(0.35_f32));
         assert_eq!(configured[0]["avg_logprob_min"], f64::from(-0.9_f32));
+    }
+
+    /// The priming text and the wake-word mode reach the line verbatim, and an
+    /// unset priming field reads null: a transcript is only interpretable
+    /// against what the decoder was primed with.
+    #[tokio::test]
+    async fn stt_configured_carries_priming_and_wake_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let base = format!(
+            "listen_addr = \"127.0.0.1:0\"\n\
+             [record]\nenabled = false\ndir = {:?}\n\
+             [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
+             model = \"whisper-small\"\n",
+            store.to_str().unwrap(),
+        );
+        for (extra, prompt, hotwords, wake_word) in [
+            ("", Value::Null, Value::Null, "trim"),
+            (
+                "wake_word = \"keep\"\nprompt = \"Hey Jarvis.\"\nhotwords = \"Jarvis\"\n",
+                json!("Hey Jarvis."),
+                json!("Jarvis"),
+                "keep",
+            ),
+        ] {
+            let cfg = Arc::new(test_config(&format!("{base}{extra}")).expect("config parses"));
+            let sub = tempfile::tempdir().unwrap();
+            let (handle, join, path) = jsonl_file(sub.path()).await;
+            let transcriber = build_transcriber(&cfg, &handle).unwrap();
+            drop(transcriber);
+            drop(handle);
+            join.await.unwrap();
+            let lines = read_lines(&path);
+            let configured = events_named(&lines, "stt_configured");
+            assert_eq!(configured.len(), 1);
+            assert_eq!(configured[0]["prompt"], prompt);
+            assert_eq!(configured[0]["hotwords"], hotwords);
+            assert_eq!(configured[0]["wake_word"], wake_word);
+        }
     }
 
     #[tokio::test]
@@ -8291,6 +8532,7 @@ mod tests {
                     score: 0.9,
                     wake_end_sample: i,
                     doa: Vec::new(),
+                    level: None,
                 },
             ));
         }
@@ -8376,6 +8618,7 @@ mod tests {
                 score: 0.9,
                 wake_end_sample: 8,
                 doa: Vec::new(),
+                level: None,
             },
         ));
 

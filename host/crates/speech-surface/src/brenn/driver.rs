@@ -214,6 +214,7 @@ impl BridgeDriver {
                     poses: library.map(CueLibrary::help_poses).unwrap_or_default(),
                     motions: library.map(CueLibrary::help_motions).unwrap_or_default(),
                     continued_ms: config.continuation_timeout_ms,
+                    volume: brain.help_volume(),
                 },
             ),
             published: Arc::new(AtomicBool::new(false)),
@@ -712,6 +713,7 @@ mod tests {
             config.failure_message.clone(),
             Arc::new(|_| {}),
             Arc::new(BrainStats::default()),
+            Arc::default(),
         ));
         let teardown = CancellationToken::new();
         let driver = BridgeDriver::new(
@@ -847,6 +849,7 @@ mod tests {
             wake: None,
             barge_in: None,
             over_playback: false,
+            level: None,
         }
     }
 

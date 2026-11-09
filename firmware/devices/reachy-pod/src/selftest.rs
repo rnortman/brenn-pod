@@ -1238,9 +1238,10 @@ mod tests {
             .collect()
     }
 
-    // The classifier itself — the five thresholds, the defect precedence, and each
-    // broken shape — is pinned in `audio_pipeline::ring`, which owns it for every
-    // liveness check in the tree. What is asserted here is this registry's use of it.
+    // The classifier itself — the guard sets, the defect precedence, and each broken
+    // shape — is pinned in `audio_pipeline::ring`, which owns it for every liveness
+    // check in the tree; this registry's `defect()` call judges by the beam's set
+    // (`BEAM_GUARDS`). What is asserted here is this registry's use of it.
 
     #[test]
     fn the_verdict_covers_every_channel_and_reports_each_ones_reading() {

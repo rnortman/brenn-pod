@@ -30,6 +30,7 @@ use crate::types::{
     Cue, InterruptProgress, PodId, SPINE_FORMAT, SpeakCmd, Transcript, TranscriptConfidence,
     Utterance, UtteranceId,
 };
+use crate::volume::VolumeCommand;
 
 /// The PCM handed to a `Transcriber`: the segment's samples plus their rate.
 #[derive(Debug, Clone)]
@@ -117,6 +118,11 @@ pub type SinkTap = Arc<dyn Fn(&SpeakCmd) + Send + Sync>;
 /// against its library and sends one message.
 pub type CueTap = Arc<dyn Fn(Vec<Cue>) + Send + Sync>;
 
+/// Receives the persistent volume change a response asked for. Built per turn
+/// with the pod already captured, so it takes no pod. Synchronous and on the
+/// brain's own thread, like [`CueTap`], so it must not block on an await.
+pub type VolumeTap = Arc<dyn Fn(VolumeCommand) + Send + Sync>;
+
 /// The channel a `Brain` writes its responses into. Wraps the sender half of the
 /// response path; the pipeline holds the receiver. Bounded, so a slow playback
 /// path back-pressures the brain rather than growing unboundedly.
@@ -128,6 +134,7 @@ pub struct ResponseSink {
     tx: mpsc::Sender<SpeakCmd>,
     tap: Option<SinkTap>,
     cues: Option<CueTap>,
+    volume: Option<VolumeTap>,
 }
 
 impl ResponseSink {
@@ -136,21 +143,37 @@ impl ResponseSink {
             tx,
             tap: None,
             cues: None,
+            volume: None,
         }
     }
 
-    /// A sink with both taps, either of which may be absent. The command tap is
-    /// the surface's seam for counting a turn's responses and capturing their
-    /// text; the cue tap is where a movement the reply named reaches the head. A
-    /// deployment that wires no head has no use for the second, and a cue it
-    /// drops is a movement nobody could have made. The brain is unaware of
-    /// either.
+    /// A sink with its taps, any of which may be absent. The command tap is the
+    /// surface's seam for counting a turn's responses and capturing their text;
+    /// the cue tap is where a movement the reply named reaches the head; the
+    /// volume tap is where a persistent volume change reaches the pod's volume
+    /// state. A deployment that wires no head has no use for the cue tap, and a
+    /// cue it drops is a movement nobody could have made. The brain is unaware
+    /// of all three.
     pub fn with_taps(
         tx: mpsc::Sender<SpeakCmd>,
         tap: Option<SinkTap>,
         cues: Option<CueTap>,
+        volume: Option<VolumeTap>,
     ) -> Self {
-        Self { tx, tap, cues }
+        Self {
+            tx,
+            tap,
+            cues,
+            volume,
+        }
+    }
+
+    /// Hand the persistent volume change one response message asked for to the
+    /// volume tap. A no-op when none is wired.
+    pub fn volume(&self, cmd: VolumeCommand) {
+        if let Some(tap) = self.volume.as_ref() {
+            tap(cmd);
+        }
     }
 
     /// Hand the movements one response message asked for to the cue tap. A no-op
@@ -429,6 +452,8 @@ mod tests {
             body: SpeakBody::Text(text.into()),
             interruptible: true,
             timings: StageTimings::default(),
+            gain: crate::VolumeBook::default().resolve(&PodId("pod-x".into()), None, None),
+            level: None,
         }
     }
 
@@ -459,6 +484,7 @@ mod tests {
                 }
             })),
             None,
+            None,
         );
 
         sink.try_send(cmd("first")).unwrap();
@@ -466,6 +492,30 @@ mod tests {
         assert_eq!(sink.try_send(cmd("second")), Err(SinkSendError::Full));
 
         assert_eq!(*seen.lock().unwrap(), ["first", "second"]);
+    }
+
+    #[test]
+    fn the_volume_tap_receives_commands_and_its_absence_is_a_no_op() {
+        use std::sync::Mutex;
+
+        let (tx, _rx) = mpsc::channel::<SpeakCmd>(1);
+        ResponseSink::new(tx.clone()).volume(VolumeCommand::default());
+        let seen: Arc<Mutex<Vec<VolumeCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        let tap_seen = Arc::clone(&seen);
+        let sink = ResponseSink::with_taps(
+            tx,
+            None,
+            None,
+            Some(Arc::new(move |cmd: VolumeCommand| {
+                tap_seen.lock().unwrap().push(cmd);
+            })),
+        );
+        let hold = VolumeCommand {
+            hold_db: Some(-10.0),
+            ..VolumeCommand::default()
+        };
+        sink.volume(hold);
+        assert_eq!(*seen.lock().unwrap(), [hold]);
     }
 
     #[test]

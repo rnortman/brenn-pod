@@ -161,14 +161,30 @@ pub struct FormatConstraint {
     pub sample_rate_hz: u32,
     /// Required `Hello.bits_per_sample`.
     pub bits_per_sample: u8,
-    /// Required `Hello.channels`.
+    /// The channel count of the spine's mono stream. A `Hello` declaring this
+    /// count is accepted with any mono beam source; a two-channel `Hello` is
+    /// accepted only as [`ChannelSource::StereoBeamRawMic`] (see
+    /// [`SessionFsm`]'s format gate), and its beam channel feeds the spine.
     pub channels: u8,
     /// Required `Hello.codec`.
     pub codec: Codec,
-    /// When `true`, `ChannelSource::Stereo` is rejected (any mono beam variant
-    /// is accepted). `channels = 1` with `Stereo` is wire-legal, so the
-    /// channel-count check does not subsume this.
-    pub mono_beam_only: bool,
+}
+
+/// The channel layout a session's accepted `Hello` declared.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct CaptureLayout {
+    /// `Hello.channels`: interleaved channels per `AudioFrame` sample index.
+    pub channels: u8,
+    /// `Hello.channel_source`: what those channels carry.
+    pub source: ChannelSource,
+}
+
+impl CaptureLayout {
+    /// `true` when channel 1 is the uncompressed raw microphone
+    /// ([`ChannelSource::StereoBeamRawMic`]).
+    pub fn has_raw_mic(self) -> bool {
+        self.source == ChannelSource::StereoBeamRawMic
+    }
 }
 
 // ── Session events ─────────────────────────────────────────────────────────
@@ -273,6 +289,9 @@ pub enum ProtocolErrorKind {
     ControlFrameOnUplink,
     /// An `Audio` frame carried an odd-length PCM payload (non-fatal; skipped).
     OddPcmLength,
+    /// An `Audio` frame's sample count was not a multiple of the session's
+    /// channel count (non-fatal; skipped).
+    PcmChannelMisaligned,
 }
 
 impl ProtocolErrorKind {
@@ -298,6 +317,8 @@ pub enum SessionEvent {
         pod_id: String,
         /// Host receive time of the `Hello` frame.
         host_rx: HostMicros,
+        /// The channel layout the accepted `Hello` declared.
+        capture: CaptureLayout,
     },
     /// A segment opened.
     SegmentOpened {
@@ -320,8 +341,12 @@ pub enum SessionEvent {
         segment_id: u32,
         /// Absolute sample index of `pcm[0]`.
         first_sample_index: u64,
-        /// Decoded mono S16 samples.
+        /// Decoded S16 samples of channel 0 (the beam) — mono whatever the
+        /// session's channel count.
         pcm: Vec<i16>,
+        /// Channel 1 (the raw microphone) of a two-channel session, the same
+        /// length as `pcm`; `None` on a mono session.
+        aux: Option<Vec<i16>>,
         /// Device-clock capture time of this frame's first sample.
         device_ts: DeviceMicros,
         /// Set when this frame's index broke continuity with the previous one.
@@ -416,6 +441,9 @@ pub struct SessionFsm {
     constraint: FormatConstraint,
     state: State,
     pod_id: Option<String>,
+    /// Interleaved channels per sample index, from the accepted `Hello`. Every
+    /// per-channel count divides by this, never by `constraint.channels`.
+    channels: u8,
     stats: FsmStats,
     /// Cross-connection resume state, shared across every pod connection. Locked
     /// only inside `open_segment` and `truncate_open_segment` — the sole two
@@ -433,6 +461,7 @@ impl SessionFsm {
             constraint,
             state: State::AwaitHello,
             pod_id: None,
+            channels: 1,
             stats: FsmStats::default(),
             ledger,
         }
@@ -512,8 +541,16 @@ impl SessionFsm {
         // server layer's responsibility — it owns both facts.
         let pod_id = hello.pod_id.as_str().to_owned();
         self.pod_id = Some(pod_id.clone());
+        self.channels = hello.channels;
         self.state = State::Idle;
-        out.push(SessionEvent::HelloAccepted { pod_id, host_rx });
+        out.push(SessionEvent::HelloAccepted {
+            pod_id,
+            host_rx,
+            capture: CaptureLayout {
+                channels: hello.channels,
+                source: hello.channel_source,
+            },
+        });
     }
 
     fn feed_idle(&mut self, frame: StreamFrame, host_rx: HostMicros, out: &mut Vec<SessionEvent>) {
@@ -565,12 +602,15 @@ impl SessionFsm {
                     self.nonfatal(ProtocolErrorKind::OddPcmLength, host_rx, out);
                     return;
                 }
-                let pcm = decode_pcm(bytes);
+                let channels = usize::from(self.channels.max(1));
+                if (bytes.len() / 2) % channels != 0 {
+                    self.nonfatal(ProtocolErrorKind::PcmChannelMisaligned, host_rx, out);
+                    return;
+                }
+                let (pcm, aux) = decode_pcm(bytes, channels);
                 // Per-channel sample count: `first_sample_index` and
-                // `SegmentEnd.samples_sent` are per-channel by wire contract, so
-                // the accounting must divide out the channel count to stay
-                // correct on multi-channel streams.
-                let frame_samples = pcm.len() as u64 / u64::from(self.constraint.channels.max(1));
+                // `SegmentEnd.samples_sent` are per-channel by wire contract.
+                let frame_samples = pcm.len() as u64;
                 let got = af.first_sample_index;
                 let device_ts = DeviceMicros(af.device_ts_us);
                 let seg = self.seg_mut();
@@ -596,6 +636,7 @@ impl SessionFsm {
                     segment_id,
                     first_sample_index: got,
                     pcm,
+                    aux,
                     device_ts,
                     gap,
                     host_rx,
@@ -717,14 +758,23 @@ impl SessionFsm {
         });
     }
 
-    /// Validate a `Hello`'s format fields against the constraint.
+    /// Validate a `Hello`'s format fields against the constraint. The channel
+    /// layout is either the constraint's mono count with a mono beam source, or
+    /// two channels declared as [`ChannelSource::StereoBeamRawMic`]; any other
+    /// pairing (including the unlabelled `Stereo`) is rejected.
     fn format_ok(&self, hello: &audio_pipeline::wire::Hello) -> bool {
         let c = &self.constraint;
+        let layout_ok = match hello.channel_source {
+            ChannelSource::AsrBeam
+            | ChannelSource::ConferenceBeam
+            | ChannelSource::CommunicationBeam => hello.channels == c.channels,
+            ChannelSource::StereoBeamRawMic => hello.channels == 2,
+            ChannelSource::Stereo => false,
+        };
         hello.sample_rate_hz == c.sample_rate_hz
             && hello.bits_per_sample == c.bits_per_sample
-            && hello.channels == c.channels
             && hello.codec == c.codec
-            && !(c.mono_beam_only && hello.channel_source == ChannelSource::Stereo)
+            && layout_ok
     }
 
     /// Emit a fatal protocol error and park the FSM.
@@ -755,13 +805,24 @@ impl SessionFsm {
     }
 }
 
-/// Decode an even-length little-endian S16 PCM byte run into samples. Callers
-/// reject odd-length payloads before reaching here.
-fn decode_pcm(bytes: &[u8]) -> Vec<i16> {
-    bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect()
+/// Decode an interleaved little-endian S16 PCM byte run into channel 0 and, for
+/// a session of two or more channels, channel 1. Channels past the second are
+/// dropped (the format gate admits at most two). Callers reject odd-length runs
+/// and runs not a whole number of sample frames before reaching here.
+fn decode_pcm(bytes: &[u8], channels: usize) -> (Vec<i16>, Option<Vec<i16>>) {
+    let frame_bytes = 2 * channels;
+    let sample = |c: &[u8], ch: usize| i16::from_le_bytes([c[2 * ch], c[2 * ch + 1]]);
+    let pcm = bytes
+        .chunks_exact(frame_bytes)
+        .map(|c| sample(c, 0))
+        .collect();
+    let aux = (channels >= 2).then(|| {
+        bytes
+            .chunks_exact(frame_bytes)
+            .map(|c| sample(c, 1))
+            .collect()
+    });
+    (pcm, aux)
 }
 
 /// Compute a telemetry timestamp's sample offset from the segment's device-clock
@@ -871,7 +932,6 @@ mod tests {
         bits_per_sample: 16,
         channels: 1,
         codec: Codec::S16Le,
-        mono_beam_only: true,
     };
 
     fn hello(source: ChannelSource) -> StreamFrame {
@@ -986,7 +1046,7 @@ mod tests {
         // variant today, so no mismatched-codec `Hello` can be constructed;
         // add a codec branch here when a second `Codec` variant lands.
 
-        // Stereo channel source with mono_beam_only → fatal.
+        // The unlabelled `Stereo` source is rejected whatever the channel count.
         let mut fsm = SessionFsm::new(SPINE, new_ledger());
         let ev = fsm.feed(hello(ChannelSource::Stereo), hx(1));
         assert!(matches!(
@@ -1034,6 +1094,160 @@ mod tests {
             ev.as_slice(),
             [SessionEvent::ProtocolError {
                 kind: ProtocolErrorKind::FormatMismatch,
+                ..
+            }]
+        ));
+    }
+
+    fn hello_with(channels: u8, source: ChannelSource) -> StreamFrame {
+        StreamFrame::Hello(Hello {
+            version: AUDIO_PROTOCOL_VERSION,
+            pod_id: heapless::String::try_from("pod-test").unwrap(),
+            sample_rate_hz: 16_000,
+            bits_per_sample: 16,
+            channels,
+            codec: Codec::S16Le,
+            channel_source: source,
+        })
+    }
+
+    #[test]
+    fn stereo_layout_gate() {
+        // Accepted: two channels declared as beam + raw mic, recorded on the event.
+        let mut fsm = SessionFsm::new(SPINE, new_ledger());
+        let ev = fsm.feed(hello_with(2, ChannelSource::StereoBeamRawMic), hx(1));
+        assert_eq!(
+            ev,
+            vec![SessionEvent::HelloAccepted {
+                pod_id: "pod-test".into(),
+                host_rx: hx(1),
+                capture: CaptureLayout {
+                    channels: 2,
+                    source: ChannelSource::StereoBeamRawMic,
+                },
+            }]
+        );
+        // Rejected: every other pairing involving two channels or the stereo labels.
+        for (channels, source) in [
+            (1, ChannelSource::StereoBeamRawMic),
+            (2, ChannelSource::Stereo),
+            (1, ChannelSource::Stereo),
+            (2, ChannelSource::CommunicationBeam),
+            (2, ChannelSource::ConferenceBeam),
+            (3, ChannelSource::StereoBeamRawMic),
+        ] {
+            let mut fsm = SessionFsm::new(SPINE, new_ledger());
+            let ev = fsm.feed(hello_with(channels, source), hx(1));
+            assert!(
+                matches!(
+                    ev.as_slice(),
+                    [SessionEvent::ProtocolError {
+                        kind: ProtocolErrorKind::FormatMismatch,
+                        fatal: true,
+                        ..
+                    }]
+                ),
+                "{channels} × {source:?} must be rejected, got {ev:?}"
+            );
+        }
+    }
+
+    /// A stereo frame of `n` sample frames: left = `i`, right = `-i - 1`.
+    fn stereo_audio(segment_id: u32, first: u64, n: usize) -> StreamFrame {
+        let mut pcm: HVec<u8, { audio_pipeline::wire::MAX_AUDIO_PAYLOAD }> = HVec::new();
+        for i in 0..n as i16 {
+            pcm.extend_from_slice(&i.to_le_bytes()).unwrap();
+            pcm.extend_from_slice(&(-i - 1).to_le_bytes()).unwrap();
+        }
+        StreamFrame::Audio(AudioFrame {
+            segment_id,
+            first_sample_index: first,
+            device_ts_us: 0,
+            pcm,
+        })
+    }
+
+    #[test]
+    fn stereo_frames_deinterleave_with_per_channel_accounting() {
+        let mut fsm = SessionFsm::new(SPINE, new_ledger());
+        fsm.feed(hello_with(2, ChannelSource::StereoBeamRawMic), hx(1));
+        fsm.feed(seg_start(1, 0, 0), hx(2));
+        // 640 wire samples per frame advance the index by 320.
+        for i in 0u64..3 {
+            let ev = fsm.feed(stereo_audio(1, i * 320, 320), hx(3 + i));
+            let [SessionEvent::Audio { pcm, aux, gap, .. }] = ev.as_slice() else {
+                panic!("expected one Audio event, got {ev:?}");
+            };
+            assert_eq!(*gap, None, "frame {i} broke continuity");
+            assert_eq!(pcm.len(), 320);
+            let aux = aux.as_ref().expect("stereo session yields aux");
+            assert_eq!(aux.len(), 320);
+            assert_eq!(&pcm[..3], &[0, 1, 2]);
+            assert_eq!(&aux[..3], &[-1, -2, -3]);
+        }
+        let ev = fsm.feed(seg_end(1, 3, 960, EndReason::VadRelease), hx(9));
+        assert!(matches!(
+            ev.as_slice(),
+            [SessionEvent::SegmentClosed {
+                close: SegmentClose::Completed {
+                    cross_check: CrossCheck::Match,
+                    ..
+                },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn mono_session_has_no_aux() {
+        let mut fsm = accepted_fsm(new_ledger());
+        fsm.feed(seg_start(1, 0, 0), hx(2));
+        let ev = fsm.feed(audio(1, 0, 320, 0), hx(3));
+        assert!(matches!(
+            ev.as_slice(),
+            [SessionEvent::Audio { aux: None, .. }]
+        ));
+    }
+
+    #[test]
+    fn stereo_run_with_odd_sample_count_is_misaligned_and_dropped() {
+        let mut fsm = SessionFsm::new(SPINE, new_ledger());
+        fsm.feed(hello_with(2, ChannelSource::StereoBeamRawMic), hx(1));
+        fsm.feed(seg_start(1, 0, 0), hx(2));
+        // 3 samples = 6 bytes: even byte length, but not a whole stereo frame.
+        let ev = fsm.feed(audio(1, 0, 3, 0), hx(3));
+        assert_eq!(
+            ev,
+            vec![SessionEvent::ProtocolError {
+                kind: ProtocolErrorKind::PcmChannelMisaligned,
+                fatal: false,
+                host_rx: hx(3),
+            }]
+        );
+        assert!(fsm.segment_open(), "a misaligned frame keeps the session");
+        // The next well-formed frame is continuous with the segment base: the
+        // dropped frame advanced nothing.
+        let ev = fsm.feed(stereo_audio(1, 0, 320), hx(4));
+        assert!(matches!(
+            ev.as_slice(),
+            [SessionEvent::Audio { gap: None, .. }]
+        ));
+        // Odd byte length is still its own error on a stereo session.
+        let mut odd: HVec<u8, { audio_pipeline::wire::MAX_AUDIO_PAYLOAD }> = HVec::new();
+        odd.extend_from_slice(&[1, 2, 3]).unwrap();
+        let ev = fsm.feed(
+            StreamFrame::Audio(AudioFrame {
+                segment_id: 1,
+                first_sample_index: 320,
+                device_ts_us: 0,
+                pcm: odd,
+            }),
+            hx(5),
+        );
+        assert!(matches!(
+            ev.as_slice(),
+            [SessionEvent::ProtocolError {
+                kind: ProtocolErrorKind::OddPcmLength,
                 ..
             }]
         ));

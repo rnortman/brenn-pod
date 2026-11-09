@@ -196,7 +196,6 @@ mod tests {
         bits_per_sample: 16,
         channels: 1,
         codec: Codec::S16Le,
-        mono_beam_only: true,
     };
 
     fn hello() -> StreamFrame {
@@ -228,6 +227,34 @@ mod tests {
         );
         assert_eq!(out[0], 1);
         assert_eq!(out[319], 320);
+    }
+
+    #[test]
+    fn stereo_log_splices_the_beam_channel_at_its_offsets() {
+        use crate::test_fixtures::{audio_stereo, hello_stereo};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.framelog");
+        write_log(
+            &path,
+            &[
+                hello_stereo("pod-splice"),
+                seg_start(1, 0),
+                audio_stereo(1, 0, 320),
+                audio_stereo(1, 320, 320),
+                seg_end(1, 640),
+            ],
+        );
+
+        let mut out = vec![0i16; 400];
+        let outcome = splice_log_into(open(&path), FORMAT, 100, &mut out).unwrap();
+        assert_eq!(outcome.samples_written, 400);
+        assert_eq!(outcome.protocol_errors, 0);
+        // Index 100 of the first frame is beam sample 101; index 320 starts the
+        // second frame at 1. No raw-mic (negative) sample leaks in.
+        assert_eq!(out[0], 101);
+        assert_eq!(out[219], 320);
+        assert_eq!(out[220], 1);
+        assert!(out.iter().all(|&v| v > 0));
     }
 
     #[test]
@@ -403,7 +430,7 @@ mod tests {
             bits_per_sample: 16,
             channels: 1,
             codec: Codec::S16Le,
-            // `FORMAT.mono_beam_only` rejects a stereo channel source.
+            // The format gate rejects the unlabelled `Stereo` channel source.
             channel_source: ChannelSource::Stereo,
         });
         write_log(&path, &[mismatched_hello]);

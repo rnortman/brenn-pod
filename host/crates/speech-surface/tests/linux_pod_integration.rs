@@ -518,6 +518,7 @@ fn ring_with(written: u64) -> Mutex<Option<CaptureRing<Box<[i16]>>>> {
     }
     Mutex::new(Some(CaptureRing {
         samples,
+        aux: None,
         write_head: written,
         anchor_sample: written.saturating_sub(1),
         anchor_ts_us: DEVICE_ANCHOR_TS_US,

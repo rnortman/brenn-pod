@@ -29,9 +29,9 @@ use pod_ingest::HostMicros;
 use serde::Serialize;
 use serde_json::json;
 use speech_pipeline::{
-    FRAME_MS, Feed, PlayRejected, PlaybackEvent, PlaybackEventFn, PlaybackJob, PodId, SpeakBody,
-    SpeakCmd, StageTimings, SynthesisError, Synthesizer, UtteranceId, signed_offset_us,
-    stage_delta_us,
+    FRAME_MS, Feed, GainResolution, PlayRejected, PlaybackEvent, PlaybackEventFn, PlaybackJob,
+    PodId, SpeakBody, SpeakCmd, StageTimings, SynthesisError, Synthesizer, UtteranceId,
+    UtteranceLevel, gain::apply_gain_db, signed_offset_us, stage_delta_us,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -327,6 +327,7 @@ impl Router {
             self.drop_interrupted(&cmd.target, cmd.in_reply_to, "post_synth");
             return;
         }
+        let pcm = self.apply_gain(&cmd.target, cmd.in_reply_to, &cmd.gain, cmd.level, pcm);
         let job = PlaybackJob {
             pcm,
             in_reply_to: cmd.in_reply_to,
@@ -346,6 +347,57 @@ impl Router {
         if !delivered {
             self.abandon(&cmd.target, cmd.in_reply_to);
         }
+    }
+
+    /// Scale one job's samples by the gain its command carries and emit
+    /// `reply_gain`.
+    ///
+    /// Applied here, once per job, rather than in the writer: a flushed and
+    /// rewritten job replays the same samples, and the writer stays a pure pacer.
+    /// The gain was resolved by the volume book when the command was queued;
+    /// the router touches no shared volume state.
+    ///
+    /// `reply_gain` is an interface line, one per job that reached this point:
+    /// `held_db` is the pod's held gain when the reply was queued (already inside
+    /// the operator's bounds) — not its state when the reply played — `auto_db`
+    /// the automatic term added to it under the policy the reply was queued
+    /// under (inside the pod's swing bounds), `auto` why that term is what it is
+    /// (`applied`, `off`, `no_level`, `source_rejected`, or `overridden` when the
+    /// reply carried its own gain, which then replaces both held and automatic
+    /// terms), `override_db` the reply's own gain as asked (null when it carried
+    /// none), and `applied_db` the gain the samples were actually scaled by —
+    /// always inside `[min_db, max_db]` of `volume_configured`. `clipped_samples`
+    /// of `samples` saturated at the `i16` rails; a reader may treat a non-zero
+    /// count as audible clipping caused by positive gain. `level` is the answered
+    /// utterance's measured level that the automatic term read, present for
+    /// every reply to a measured utterance (null for an announcement, an offline
+    /// clip, or an utterance no live level reading covered — `auto` is then
+    /// `no_level` unless automatic gain is off or overridden).
+    fn apply_gain(
+        &self,
+        pod: &PodId,
+        utterance: Option<UtteranceId>,
+        gain: &GainResolution,
+        level: Option<UtteranceLevel>,
+        pcm: Arc<[i16]>,
+    ) -> Arc<[i16]> {
+        let (scaled, clipped) = apply_gain_db(&pcm, gain.applied_db());
+        self.jsonl.emit(
+            "reply_gain",
+            &json!({
+                "pod": pod,
+                "utterance": utterance,
+                "held_db": gain.held_db(),
+                "auto_db": gain.auto_db(),
+                "auto": gain.auto(),
+                "override_db": gain.override_db(),
+                "applied_db": gain.applied_db(),
+                "clipped_samples": clipped,
+                "samples": scaled.len(),
+                "level": level,
+            }),
+        );
+        scaled
     }
 
     /// Give up on one command that will never play: settle it against the turn
@@ -897,8 +949,8 @@ mod tests {
 
     use serde_json::Value;
     use speech_pipeline::{
-        AbortReason, AudibleJob, InterruptProgress, PacerConfig, PcmChunk, PlaybackEventFn,
-        PlaybackStats, PlaybackWriter, StageTimings, TurnEnd,
+        AbortReason, AudibleJob, InterruptProgress, LevelSource, PacerConfig, PcmChunk,
+        PlaybackEventFn, PlaybackStats, PlaybackWriter, StageTimings, TurnEnd, VolumeBook,
     };
 
     use crate::config::JsonlSink;
@@ -912,6 +964,8 @@ mod tests {
             body: SpeakBody::Pcm(Arc::from(pcm)),
             interruptible: true,
             timings: StageTimings::default(),
+            gain: VolumeBook::default().resolve(&PodId(target.into()), None, None),
+            level: None,
         }
     }
 
@@ -923,6 +977,8 @@ mod tests {
             body: SpeakBody::Text("hello".into()),
             interruptible: true,
             timings: StageTimings::default(),
+            gain: VolumeBook::default().resolve(&PodId(target.into()), None, None),
+            level: None,
         }
     }
 
@@ -1089,6 +1145,8 @@ mod tests {
             body: SpeakBody::Text("my head is not moving".into()),
             interruptible: false,
             timings: StageTimings::default(),
+            gain: VolumeBook::default().resolve(&PodId("pod-x".into()), None, None),
+            level: None,
         };
         let synth: Arc<dyn Synthesizer> = Arc::new(FakeSynth::Chunks(vec![vec![1, 2, 3]]));
         let (_lines, stats) = run_router_scripted(
@@ -1117,6 +1175,262 @@ mod tests {
             seen.is_empty(),
             "an announcement schedules no head movement: {seen:?}"
         );
+    }
+
+    /// A book with the given operator bounds and default baseline.
+    fn volume_book(min_db: f32, max_db: f32, gain_db: f32) -> VolumeBook {
+        VolumeBook::new(
+            speech_pipeline::OperatorBounds::new(min_db, max_db).unwrap(),
+            speech_pipeline::GainBaselines {
+                default_db: gain_db,
+                per_pod: HashMap::new(),
+            },
+            // References fixed so the arithmetic in the tests reads against round numbers.
+            speech_pipeline::AutoPolicy {
+                speech_ref_dbfs: -30.0,
+                ambient_ref_dbfs: -55.0,
+                ..speech_pipeline::AutoPolicy::default()
+            },
+        )
+    }
+
+    /// `cmd` with its gain resolved by `book` the way a producer resolves it
+    /// when queuing: against the command's own pod and level, with
+    /// `override_db` as the reply's own gain.
+    fn resolved(mut cmd: SpeakCmd, book: &VolumeBook, override_db: Option<f32>) -> SpeakCmd {
+        cmd.gain = book.resolve(&cmd.target, override_db, cmd.level.as_ref());
+        cmd
+    }
+
+    /// Route `cmds` to an absent pod (so nothing needs a writer) and return the
+    /// `reply_gain` lines in order.
+    async fn reply_gain_lines(
+        cmds: Vec<SpeakCmd>,
+        synthesizer: Option<Arc<dyn Synthesizer>>,
+    ) -> Vec<Value> {
+        let (lines, _) = run_router_with_synth(empty_registry(), cmds, synthesizer).await;
+        lines
+            .into_iter()
+            .filter(|v| v["event"] == "reply_gain")
+            .collect()
+    }
+
+    /// `reply_gain` reports the resolution the command carries, field for field,
+    /// and the level it carries: the router decides nothing about the gain.
+    #[tokio::test]
+    async fn reply_gain_carries_the_queued_resolution_and_level() {
+        let mut book = volume_book(-30.0, 6.0, 0.0);
+        let pod = PodId("p".into());
+        book.apply(
+            &pod,
+            &speech_pipeline::VolumeCommand {
+                hold_db: Some(-10.0),
+                auto: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let level = UtteranceLevel {
+            speech_dbfs: -36.0,
+            ambient_dbfs: Some(-55.0),
+            source: LevelSource::RawMic,
+        };
+        let mut measured = pcm_cmd("p", 1, &[100, -100]);
+        measured.level = Some(level);
+        let measured = resolved(measured, &book, None);
+        let overridden = resolved(pcm_cmd("p", 2, &[100, -100]), &book, Some(40.0));
+        let expected = [measured.gain, overridden.gain];
+
+        let lines = reply_gain_lines(vec![measured, overridden], None).await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, gain) in lines.iter().zip(expected) {
+            assert_eq!(line["pod"], "p");
+            assert_eq!(line["held_db"], json!(gain.held_db()));
+            assert_eq!(line["auto_db"], json!(gain.auto_db()));
+            assert_eq!(line["auto"], json!(gain.auto()));
+            assert_eq!(line["override_db"], json!(gain.override_db()));
+            assert_eq!(line["applied_db"], json!(gain.applied_db()));
+            assert_eq!(line["samples"], 2);
+        }
+        assert_eq!(lines[0]["utterance"], 1);
+        assert_eq!(lines[0]["auto"], "applied");
+        assert_eq!(lines[0]["applied_db"], -16.0);
+        assert_eq!(
+            lines[0]["level"],
+            json!({"speech_dbfs": -36.0, "ambient_dbfs": -55.0, "source": "raw_mic"})
+        );
+        assert_eq!(lines[1]["auto"], "overridden");
+        assert_eq!(lines[1]["override_db"], 40.0);
+        assert_eq!(lines[1]["applied_db"], 6.0);
+        assert!(lines[1]["level"].is_null());
+        assert_eq!(lines[1]["clipped_samples"], 0);
+    }
+
+    #[tokio::test]
+    async fn reply_gain_scales_text_and_pcm_bodies_alike() {
+        let book = volume_book(-30.0, 6.0, -3.0);
+        let synth: Arc<dyn Synthesizer> = Arc::new(FakeSynth::Chunks(vec![vec![1, 2, 3]]));
+        let lines = reply_gain_lines(
+            vec![
+                resolved(text_cmd("p", 1), &book, None),
+                resolved(pcm_cmd("p", 2, &[1, 2, 3, 4]), &book, None),
+            ],
+            Some(synth),
+        )
+        .await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["utterance"], 1);
+        assert_eq!(lines[0]["samples"], 3);
+        assert_eq!(lines[0]["applied_db"], -3.0);
+        assert_eq!(lines[1]["utterance"], 2);
+        assert_eq!(lines[1]["samples"], 4);
+        assert_eq!(lines[1]["applied_db"], -3.0);
+    }
+
+    #[tokio::test]
+    async fn an_unrendered_text_reply_emits_no_reply_gain() {
+        let lines = reply_gain_lines(vec![text_cmd("p", 1)], None).await;
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// The first `n` samples of each of the first `jobs` `Audio` frames a
+    /// writer puts on `peer`, skipping its `Hello` and any `EndOfAudio`.
+    async fn played_samples(
+        peer: &mut tokio::io::DuplexStream,
+        jobs: usize,
+        n: usize,
+    ) -> Vec<Vec<i16>> {
+        use tokio::io::AsyncReadExt;
+        let mut played = Vec::new();
+        while played.len() < jobs {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut len = [0u8; 2];
+                peer.read_exact(&mut len).await.unwrap();
+                let mut buf = vec![0u8; 2 + u16::from_le_bytes(len) as usize];
+                buf[..2].copy_from_slice(&len);
+                peer.read_exact(&mut buf[2..]).await.unwrap();
+                audio_pipeline::wire::decode_frame(&buf).expect("decode playback frame")
+            })
+            .await
+            .expect("a playback frame within the timeout");
+            if let audio_pipeline::wire::StreamFrame::Audio(a) = frame {
+                played.push(
+                    a.pcm
+                        .chunks_exact(2)
+                        .take(n)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                        .collect(),
+                );
+            }
+        }
+        played
+    }
+
+    /// Route `cmds` to a registered writer for `pod-x` and return the first
+    /// `n` samples of each job it plays. A writer queues at most two jobs, so a
+    /// case routes at most two.
+    async fn play_through_writer(
+        cmds: Vec<SpeakCmd>,
+        synthesizer: Option<Arc<dyn Synthesizer>>,
+        n: usize,
+    ) -> Vec<Vec<i16>> {
+        let (mut peer, device) = tokio::io::duplex(64 * 1024);
+        let noop: PlaybackEventFn = Arc::new(|_| Box::pin(std::future::ready(())));
+        let handle = PlaybackWriter::spawn(
+            device,
+            PodId("pod-x".into()),
+            PacerConfig::default(),
+            Arc::new(PlaybackStats::default()),
+            noop,
+            CancellationToken::new(),
+        );
+        let registry = empty_registry();
+        playback_register(&registry, "pod-x".into(), 1, handle);
+        let jobs = cmds.len();
+        let (lines, stats) = run_router_with_synth(registry, cmds, synthesizer).await;
+        assert_eq!(stats.delivered, jobs as u64, "{lines:?}");
+        played_samples(&mut peer, jobs, n).await
+    }
+
+    /// The gain a command carries is the gain the pod hears, for a `Pcm` and a
+    /// `Text` body: a held baseline of −6.02 dB halves the samples a registered
+    /// writer sends, and a reply's override reaches the samples in place of the
+    /// hold.
+    #[tokio::test]
+    async fn the_writer_plays_the_scaled_samples() {
+        let book = volume_book(-30.0, 6.0, -6.0206);
+        let clip = [1000i16, -1000, 400, -400];
+        let played = play_through_writer(
+            vec![
+                resolved(pcm_cmd("pod-x", 1, &clip), &book, None),
+                resolved(pcm_cmd("pod-x", 2, &clip), &book, Some(-12.0412)),
+            ],
+            None,
+            clip.len(),
+        )
+        .await;
+        assert_eq!(
+            played[0],
+            [500, -500, 200, -200],
+            "the hold reached the pod"
+        );
+        assert_eq!(
+            played[1],
+            [250, -250, 100, -100],
+            "the override reached the pod"
+        );
+
+        let synth: Arc<dyn Synthesizer> =
+            Arc::new(FakeSynth::Chunks(vec![vec![2000, -2000, 800, -800]]));
+        let played = play_through_writer(
+            vec![resolved(text_cmd("pod-x", 3), &book, None)],
+            Some(synth),
+            4,
+        )
+        .await;
+        assert_eq!(
+            played[0],
+            [1000, -1000, 400, -400],
+            "a synthesized reply is scaled like a clip"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_gain_returns_the_same_buffer_only_at_zero_db() {
+        let (jsonl, join) = crate::jsonl::spawn_quiet(&JsonlSink::None).await.unwrap();
+        let router = Router::new(
+            empty_registry(),
+            Arc::new(RouterStats::default()),
+            jsonl.clone(),
+            CancellationToken::new(),
+            RouterWiring {
+                synthesizer: None,
+                ledger: Arc::new(TurnLedger::new()),
+                scripter: None,
+                wake_phrase: None,
+            },
+        );
+        let pcm: Arc<[i16]> = Arc::from(&[1000i16, -1000][..]);
+        let pod = PodId("p".into());
+        let unity_book = VolumeBook::default();
+        let cut_book = volume_book(-30.0, 6.0, -6.0206);
+
+        let unity = unity_book.resolve(&pod, None, None);
+        let unity = router.apply_gain(&pod, None, &unity, None, Arc::clone(&pcm));
+        assert!(Arc::ptr_eq(&pcm, &unity));
+
+        let cut = cut_book.resolve(&pod, None, None);
+        let cut = router.apply_gain(&pod, None, &cut, None, Arc::clone(&pcm));
+        assert!(!Arc::ptr_eq(&pcm, &cut));
+        assert_eq!(&cut[..], &[500, -500]);
+
+        let overridden = unity_book.resolve(&pod, Some(-6.0206), None);
+        let overridden = router.apply_gain(&pod, None, &overridden, None, Arc::clone(&pcm));
+        assert_eq!(&overridden[..], &[500, -500]);
+
+        drop(router);
+        drop(jsonl);
+        join.await.unwrap();
     }
 
     #[tokio::test]
@@ -2869,6 +3183,8 @@ mod tests {
                 body: SpeakBody::Text(text.into()),
                 interruptible: true,
                 timings: StageTimings::default(),
+                gain: VolumeBook::default().resolve(&PodId("pod-x".into()), None, None),
+                level: None,
             };
             let synth: Arc<dyn Synthesizer> = Arc::new(FakeSynth::Chunks(vec![vec![7i16; 1_600]]));
             run_router_phrased(

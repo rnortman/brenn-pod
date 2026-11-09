@@ -42,8 +42,9 @@ use speech_pipeline::{
     EndpointState, Feed, FlushRejected, GateReject, InterruptProgress, ListenerEvent,
     ListenerUtteranceId, PodId, ResponseSink, RoomId, Segment, SegmentTelemetry, SpeakBody,
     SpeakCmd, StageTimings, TrackingEvent, TranscribeError, Transcriber, Transcript,
-    TransitionCause, TurnEnd, Utterance, UtteranceId, WakeCommandReason, WakeConfirmation,
-    send_or_report, stage_delta_us, tracking_event, transcribe_pcm,
+    TransitionCause, TurnEnd, Utterance, UtteranceId, UtteranceLevel, VolumeBook, VolumeCommand,
+    VolumeTap, WakeCommandReason, WakeConfirmation, resolve_shared, send_or_report, stage_delta_us,
+    tracking_event, transcribe_pcm,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -181,6 +182,10 @@ pub struct BrainWiring {
     /// The brain's event sink, shared with the brain itself (one no-command story).
     pub events: BrainEventFn,
     pub stats: Arc<BrainStats>,
+    /// The per-pod volume state each turn's volume tap writes; the same book
+    /// every producer of a speak command, the bus brain included, resolves a
+    /// reply's gain from.
+    pub volume: Arc<std::sync::Mutex<VolumeBook>>,
 }
 
 /// Resolves a pod to its live playback writer and requests a flush of whatever it
@@ -301,6 +306,9 @@ struct Carve {
     start_sample: u64,
     end_sample: u64,
     wake: Option<WakeConfirmation>,
+    /// The level the utterance was addressed at, as the listener measured it at
+    /// the first carve; minted as `Utterance.level`.
+    level: Option<UtteranceLevel>,
     cause: EndpointCause,
     /// This carve is the speech that barged in on playback, so the mint attaches
     /// the pod's context chain to it.
@@ -835,6 +843,7 @@ async fn handle_listener(
             score,
             wake_end_sample,
             doa,
+            level,
         } => {
             jsonl.emit(
                 "wake_detected",
@@ -845,6 +854,7 @@ async fn handle_listener(
                     "wake_end_sample": wake_end_sample,
                     "doa_count": doa.len(),
                     "doa_last": doa.last(),
+                    "level": level,
                 }),
             );
             let state = pods.entry(pod.clone()).or_default();
@@ -1439,6 +1449,7 @@ fn spawn_stt(
         start_sample,
         end_sample,
         wake,
+        level,
         cause,
         barge_in,
         over_playback,
@@ -1451,6 +1462,7 @@ fn spawn_stt(
         start_sample,
         end_sample,
         wake,
+        level,
         cause,
         // STT runs on the audio the same way whatever opened the floor; the mark
         // rides through so the mint on the far side can chain the interrupted turns.
@@ -1641,6 +1653,7 @@ async fn handle_stt_done(
         wake: done.carve.wake,
         barge_in: barge_context,
         over_playback: done.carve.over_playback,
+        level: done.carve.level,
     };
     jsonl.emit(
         "utterance",
@@ -1784,6 +1797,9 @@ async fn handle_stt_done(
                 decline_no_transcript(&utterance, wiring)
             }
         },
+        // TODO(stt-noise-reject-before-wake-sample): at ~12 dB SNR the wake word fired at
+        // 0.93 and this arm dropped the command (no_speech 0.53); one sighting, nothing
+        // moved.
         GateOutcome::DeclineWake(wake, reject) => decline_wake_command(
             &utterance,
             &wake,
@@ -1831,6 +1847,12 @@ async fn handle_stt_done(
                 pod.clone(),
                 id,
             ));
+            let volume_tap = Some(volume_tap(
+                Arc::clone(&wiring.volume),
+                jsonl.clone(),
+                pod.clone(),
+                id,
+            ));
             let sink = turn_sink(
                 barge,
                 &wiring.speak_tx,
@@ -1838,6 +1860,7 @@ async fn handle_stt_done(
                 id,
                 utterance.transcript.as_ref().map(|t| t.text.clone()),
                 cue_tap,
+                volume_tap,
             );
             // Around the await, not inside `end_turn`'s barge arm: a turn is in
             // flight for as long as the brain has it, and that is what keeps
@@ -1869,7 +1892,7 @@ async fn handle_stt_done(
                 }),
             );
             let (pod, id) = (utterance.pod.clone(), utterance.id);
-            let mut sink = turn_sink(barge, &wiring.speak_tx, &pod, id, None, None);
+            let mut sink = turn_sink(barge, &wiring.speak_tx, &pod, id, None, None, None);
             if let Some(scripter) = scripter {
                 scripter.send(ScriptInput::TurnStarted {
                     pod: pod.clone(),
@@ -1884,6 +1907,8 @@ async fn handle_stt_done(
                 body: SpeakBody::Pcm(Arc::clone(&clip.pcm)),
                 interruptible: false,
                 timings: utterance.timings.clone(),
+                gain: resolve_shared(&wiring.volume, &pod, None, None),
+                level: None,
             };
             send_or_report(&mut sink, cmd, id, &wiring.events, &wiring.stats);
             end_turn(barge, scripter, listen, &pod, id, TurnEnd::Closed).await;
@@ -1901,6 +1926,7 @@ fn turn_sink(
     id: UtteranceId,
     transcript: Option<String>,
     cue_tap: Option<CueTap>,
+    volume_tap: Option<VolumeTap>,
 ) -> ResponseSink {
     match barge {
         Some(barge) => {
@@ -1922,9 +1948,10 @@ fn turn_sink(
                     );
                 })),
                 cue_tap,
+                volume_tap,
             )
         }
-        None => ResponseSink::with_taps(speak_tx.clone(), None, cue_tap),
+        None => ResponseSink::with_taps(speak_tx.clone(), None, cue_tap, volume_tap),
     }
 }
 
@@ -2118,6 +2145,46 @@ fn cue_tap(
                 turn,
                 cues: resolved,
             });
+        }
+    })
+}
+
+/// The tap the brain hands each response message's persistent volume change
+/// to: apply it to `pod`'s state in the book as one transaction and say what
+/// happened.
+///
+/// `volume_set` is an interface line, one per applied change: its presence
+/// means the pod's state is now `applied` — the state every later reply to the
+/// pod is resolved against until the next change or a daemon restart. `asked`
+/// carries the marker's attributes under their marker names; a hold the
+/// operator's bounds clamped shows as asked and applied differing.
+///
+/// `volume_refused` is the other outcome, one per refused change: its presence
+/// means none of the marker's persistent attributes took effect and the pod's
+/// state is what it was. `reason` is `min_gt_max` (the swing floor would sit
+/// above the swing ceiling) or `non_finite`.
+fn volume_tap(
+    book: Arc<std::sync::Mutex<VolumeBook>>,
+    jsonl: JsonlHandle,
+    pod: PodId,
+    turn: UtteranceId,
+) -> VolumeTap {
+    Arc::new(move |cmd: VolumeCommand| {
+        // Never held across an await; a poisoned lock means a writer panicked
+        // mid-update, and the book's invariants hold between its statements.
+        let outcome = book
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply(&pod, &cmd);
+        match outcome {
+            Ok(applied) => jsonl.emit(
+                "volume_set",
+                &json!({ "pod": pod, "utterance": turn, "asked": cmd, "applied": applied }),
+            ),
+            Err(reason) => jsonl.emit(
+                "volume_refused",
+                &json!({ "pod": pod, "utterance": turn, "reason": reason, "asked": cmd }),
+            ),
         }
     })
 }
@@ -2478,6 +2545,7 @@ mod tests {
             start_sample: start,
             end_sample: end,
             wake,
+            level: wake.and_then(|w| w.level),
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
             over_playback: false,
@@ -2589,6 +2657,7 @@ mod tests {
             score: 0.9,
             wake_end_sample,
             doa,
+            level: None,
         })
     }
 
@@ -2601,6 +2670,8 @@ mod tests {
                 body: SpeakBody::Text("ack".into()),
                 interruptible: true,
                 timings: u.timings.clone(),
+                gain: VolumeBook::default().resolve(&u.pod, None, u.level.as_ref()),
+                level: u.level,
             };
             let _ = out.try_send(cmd);
             futures::future::ready(TurnEnd::Closed).boxed()
@@ -2630,6 +2701,9 @@ mod tests {
         /// The movements this brain's reply asks for, handed to the cue tap
         /// ahead of the speech as a real reply's are.
         cues: Vec<Cue>,
+        /// The persistent volume change this brain's reply asks for, handed to
+        /// the volume tap ahead of the speech as a real reply's is.
+        volume: Option<VolumeCommand>,
         /// Called first thing in `handle`, so a case can read what had already
         /// happened by the time the brain was reached.
         on_handle: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -2643,6 +2717,9 @@ mod tests {
             let (pod, id) = (u.pod.clone(), u.id);
             if !self.cues.is_empty() {
                 out.cue(self.cues.clone());
+            }
+            if let Some(cmd) = self.volume {
+                out.volume(cmd);
             }
             let spoken = EchoTestBrain.handle(u, out);
             let end = self.end;
@@ -2740,6 +2817,8 @@ mod tests {
         gaze: Option<Arc<dyn WakeGaze>>,
         cues: Option<Arc<CueLibrary>>,
         reply_cues: Vec<Cue>,
+        reply_volume: Option<VolumeCommand>,
+        volume: Arc<std::sync::Mutex<VolumeBook>>,
         turn_end: TurnEnd,
         queue_depth: usize,
         unreachable_clip: Option<UnreachableClip>,
@@ -2765,6 +2844,8 @@ mod tests {
                 gaze: None,
                 cues: None,
                 reply_cues: Vec::new(),
+                reply_volume: None,
+                volume: Arc::default(),
                 queue_depth: 32,
                 unreachable_clip: None,
                 on_handle: None,
@@ -2825,6 +2906,17 @@ mod tests {
         /// What this harness's brain asks the head to do in its reply.
         fn reply_cues(mut self, cues: Vec<Cue>) -> Harness {
             self.reply_cues = cues;
+            self
+        }
+        /// The persistent volume change this harness's brain asks for in its
+        /// reply.
+        fn reply_volume(mut self, cmd: VolumeCommand) -> Harness {
+            self.reply_volume = Some(cmd);
+            self
+        }
+        /// The volume book the run's volume taps write.
+        fn volume(mut self, book: Arc<std::sync::Mutex<VolumeBook>>) -> Harness {
+            self.volume = book;
             self
         }
         /// Wire barge-in against `ledger` and a flush entry point that returns
@@ -2892,11 +2984,13 @@ mod tests {
                         end: self.turn_end,
                         settle_first: self.settle_first.clone(),
                         cues: self.reply_cues.clone(),
+                        volume: self.reply_volume,
                         on_handle: self.on_handle.clone(),
                     }),
                     speak_tx,
                     events,
                     stats: self.stats.clone(),
+                    volume: Arc::clone(&self.volume),
                 })
             } else {
                 None
@@ -3186,6 +3280,7 @@ mod tests {
             score: 0.9,
             wake_end_sample: 0,
             stt_trim_samples: 0,
+            level: None,
         };
         let (lines, cmds) = Harness::new()
             .transcriber(FakeTranscriber(Some((
@@ -3352,6 +3447,7 @@ mod tests {
                         score: 0.8,
                         wake_end_sample: 0,
                         stt_trim_samples: 0,
+                        level: None,
                     },
                     start_sample: 0,
                     end_sample: 16,
@@ -3380,6 +3476,7 @@ mod tests {
             score: 0.9,
             wake_end_sample: 0,
             stt_trim_samples: 0,
+            level: None,
         };
         Harness::new()
             .transcriber(FakeTranscriber(Some((
@@ -3518,6 +3615,7 @@ mod tests {
                 start_sample: 0,
                 end_sample: 16,
                 wake: None,
+                level: None,
                 cause: EndpointCause::SoftEndpoint,
                 barge_in: false,
                 over_playback: false,
@@ -3705,6 +3803,7 @@ mod tests {
             score: 0.8,
             wake_end_sample: 8_000,
             stt_trim_samples: 0,
+            level: None,
         };
         // One row per variant: the compiler catches a variant nobody named, not a
         // variant named as another one, and the name is what a drop line sends its
@@ -3813,6 +3912,7 @@ mod tests {
             start_sample: 0,
             end_sample: 100,
             wake: None,
+            level: None,
             cause: EndpointCause::SoftEndpoint,
             barge_in: false,
             over_playback: false,
@@ -3967,6 +4067,7 @@ mod tests {
             score: 0.9,
             wake_end_sample: 0,
             stt_trim_samples: 0,
+            level: None,
         });
         let (_lines, cmds) = h.run(vec![soft_endpoint(carved(1, 0, 16, wake))]).await;
         assert!(cmds.is_empty(), "a gated hallucination never dispatches");
@@ -4012,6 +4113,7 @@ mod tests {
             score: 0.9,
             wake_end_sample: 0,
             stt_trim_samples: 0,
+            level: None,
         })
     }
 
@@ -4370,6 +4472,7 @@ mod tests {
             score: 0.8,
             wake_end_sample: 5_000,
             stt_trim_samples: 4,
+            level: None,
         };
         let mut h = Harness::new().wake_word(mode);
         h.transcriber = Some(Arc::new(LengthTranscriber));
@@ -4419,6 +4522,7 @@ mod tests {
             score: 0.8,
             wake_end_sample: 5_000,
             stt_trim_samples: 40,
+            level: None,
         };
         let mut h = Harness::new().wake_word(WakeWordInStt::Trim);
         h.transcriber = Some(Arc::new(LengthTranscriber));
@@ -4443,6 +4547,77 @@ mod tests {
         );
     }
 
+    /// The wake's measured level is minted onto the utterance, serialized on its
+    /// line, and reaches the reply's `SpeakCmd` through the brain; a wake with no
+    /// level leaves the line's `level` null.
+    #[tokio::test]
+    async fn the_wake_level_is_minted_onto_the_utterance_and_its_reply() {
+        let level = speech_pipeline::UtteranceLevel {
+            speech_dbfs: -27.5,
+            ambient_dbfs: Some(-58.5),
+            source: speech_pipeline::LevelSource::RawMic,
+        };
+        let wake = WakeConfirmation {
+            score: 0.8,
+            wake_end_sample: 8_000,
+            stt_trim_samples: 0,
+            level: Some(level),
+        };
+        let (lines, cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("lights on".into(), None))))
+            .brain()
+            .run(vec![soft_endpoint(carved(1, 0, 16_000, Some(wake)))])
+            .await;
+        let utt = lines.iter().find(|l| l["event"] == "utterance").unwrap();
+        assert_eq!(
+            utt["level"],
+            json!({"speech_dbfs": -27.5, "ambient_dbfs": -58.5, "source": "raw_mic"}),
+            "{lines:?}"
+        );
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].level, Some(level));
+
+        let (lines, _cmds) = Harness::new()
+            .brain()
+            .run(vec![soft_endpoint(carved(1, 0, 16_000, None))])
+            .await;
+        let utt = lines.iter().find(|l| l["event"] == "utterance").unwrap();
+        assert!(utt["level"].is_null(), "{lines:?}");
+    }
+
+    /// A wake-less carve — here a follow-up — carries the level the listener
+    /// measured on its own speech, and the mint puts it on the utterance line
+    /// and the reply's command just as it does a wake's.
+    #[tokio::test]
+    async fn a_wakeless_carves_level_is_minted_onto_the_utterance_and_its_reply() {
+        let level = speech_pipeline::UtteranceLevel {
+            speech_dbfs: -31.0,
+            ambient_dbfs: Some(-57.0),
+            source: speech_pipeline::LevelSource::RawMic,
+        };
+        let follow_up = CarvedUtterance {
+            follow_up: true,
+            level: Some(level),
+            ..carved(1, 0, 16_000, None)
+        };
+        let (feed, _fed) = spy_listen_feed();
+        let (lines, cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("and the hall".into(), None))))
+            .brain()
+            .listen(feed, TEST_LISTEN_WINDOW)
+            .run(vec![soft_endpoint(follow_up)])
+            .await;
+        let utt = lines.iter().find(|l| l["event"] == "utterance").unwrap();
+        assert!(utt["wake"].is_null(), "{lines:?}");
+        assert_eq!(
+            utt["level"],
+            json!({"speech_dbfs": -31.0, "ambient_dbfs": -57.0, "source": "raw_mic"}),
+            "{lines:?}"
+        );
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert_eq!(cmds[0].level, Some(level));
+    }
+
     /// With no transcriber there is no clip, so the line says so rather than
     /// reporting an offset into audio nothing read.
     #[tokio::test]
@@ -4451,6 +4626,7 @@ mod tests {
             score: 0.8,
             wake_end_sample: 5_000,
             stt_trim_samples: 4,
+            level: None,
         };
         let (lines, _cmds) = Harness::new()
             .run(vec![soft_endpoint(carved_trimmed(1, 0, 16, wake))])
@@ -4472,6 +4648,7 @@ mod tests {
             score: 0.8,
             wake_end_sample: 8_000,
             stt_trim_samples: 4_800,
+            level: None,
         };
         let (_lines, cmds) = h
             .run(vec![PipelineItem::Listener(ListenerEvent::ArmExpired {
@@ -4515,6 +4692,7 @@ mod tests {
                     score: 0.8,
                     wake_end_sample: 8_000,
                     stt_trim_samples: 4_800,
+                    level: None,
                 },
                 start_sample: 0,
                 end_sample: 16_000,
@@ -4547,6 +4725,7 @@ mod tests {
                 score: 0.8,
                 wake_end_sample: 8_000,
                 stt_trim_samples: 4_800,
+                level: None,
             },
             start_sample: 0,
             end_sample: 16_000,
@@ -4573,6 +4752,7 @@ mod tests {
                     score: 0.8,
                     wake_end_sample: 0,
                     stt_trim_samples: 0,
+                    level: None,
                 },
                 start_sample: 0,
                 end_sample: 16,
@@ -4675,6 +4855,7 @@ mod tests {
                 score: 0.8,
                 wake_end_sample: 15_360,
                 stt_trim_samples: 0,
+                level: None,
             },
             start_sample: 7_360,
             end_sample: 15_360,
@@ -4705,6 +4886,7 @@ mod tests {
                 score: 0.8,
                 wake_end_sample: 8_000,
                 stt_trim_samples: 4_800,
+                level: None,
             },
             start_sample: 7_360,
             end_sample: 15_360,
@@ -4843,6 +5025,7 @@ mod tests {
             score: 0.9,
             wake_end_sample: 0,
             stt_trim_samples: 0,
+            level: None,
         };
         for (grant_spent, carve, expected) in [
             (true, carved(1, 0, 16, Some(wake)), vec![]),
@@ -5874,6 +6057,7 @@ mod tests {
             score: 0.99,
             wake_end_sample: 8,
             stt_trim_samples: 0,
+            level: None,
         });
         let carve = CarvedUtterance {
             over_playback: true,
@@ -7069,6 +7253,7 @@ mod tests {
             score: 0.99,
             wake_end_sample: 8,
             stt_trim_samples: 0,
+            level: None,
         });
         for (carve, transcript, dispatches) in [
             (
@@ -7152,6 +7337,7 @@ mod tests {
             score: 0.99,
             wake_end_sample: 8,
             stt_trim_samples: 0,
+            level: None,
         });
         let h = Harness::new()
             .brain()
@@ -7465,6 +7651,7 @@ mod tests {
             score: 0.99,
             wake_end_sample: 8,
             stt_trim_samples: 0,
+            level: None,
         });
         let phantom = || says("phantom", Some(conf(0.97, -1.5)));
         let marked = |mark: fn(&mut CarvedUtterance)| {
@@ -7872,5 +8059,69 @@ mod tests {
         assert_eq!(refused["name"], "bench/nod");
         assert_eq!(refused["kind"], "motion");
         assert_eq!(refused["reason"], "no_head");
+    }
+
+    #[tokio::test]
+    async fn a_replys_volume_change_is_applied_to_its_pod_and_narrated() {
+        let book: Arc<std::sync::Mutex<VolumeBook>> = Arc::default();
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .volume(Arc::clone(&book))
+            .reply_volume(VolumeCommand {
+                hold_db: Some(60.0),
+                auto: Some(true),
+                ..VolumeCommand::default()
+            })
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        let set = lines
+            .iter()
+            .find(|v| v["event"] == "volume_set")
+            .expect("the applied change is narrated");
+        assert_eq!(set["asked"], json!({ "hold": 60.0, "auto": true }));
+        assert_eq!(set["applied"]["held_db"], json!(6.0), "clamped to max_db");
+        assert_eq!(set["applied"]["auto"], json!(true));
+        let pod = PodId(set["pod"].as_str().unwrap().into());
+        let state = book.lock().unwrap().state(&pod);
+        assert_eq!(state.held_db, 6.0);
+        assert!(state.auto);
+    }
+
+    #[tokio::test]
+    async fn a_volume_change_with_the_swing_floor_above_the_ceiling_is_refused() {
+        let book: Arc<std::sync::Mutex<VolumeBook>> = Arc::default();
+        let (lines, _cmds) = Harness::new()
+            .transcriber(FakeTranscriber(Some(("hello world".into(), None))))
+            .brain()
+            .volume(Arc::clone(&book))
+            .reply_volume(VolumeCommand {
+                hold_db: Some(-10.0),
+                auto_min_db: Some(10.0),
+                ..VolumeCommand::default()
+            })
+            .run(vec![
+                wake_detected(1, 8),
+                soft_endpoint(carved(1, 0, 16, None)),
+            ])
+            .await;
+
+        assert!(!lines.iter().any(|v| v["event"] == "volume_set"));
+        let refused = lines
+            .iter()
+            .find(|v| v["event"] == "volume_refused")
+            .expect("the refusal is narrated");
+        assert_eq!(refused["reason"], "min_gt_max");
+        assert_eq!(refused["asked"], json!({ "hold": -10.0, "min": 10.0 }));
+        let pod = PodId(refused["pod"].as_str().unwrap().into());
+        assert_eq!(
+            book.lock().unwrap().state(&pod).held_db,
+            0.0,
+            "nothing applied, not even the hold"
+        );
     }
 }

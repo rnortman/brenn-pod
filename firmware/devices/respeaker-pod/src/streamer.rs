@@ -16,9 +16,12 @@ use crate::wifi::{jitter_seed, monotonic_secs, snapshot_wifi_state, wifi_is_up_n
 use crate::{CAPTURE_RING, build_inbound_stream_sink};
 use audio_pipeline::ring::RingIndex;
 use audio_pipeline::stream_send::{SendOutcome, WRITE_TIMEOUT_MS};
+use audio_pipeline::wire::ChannelSource;
 use pod_streamer::idle::{ParkOutcome, park_drain, should_log_provisioning_failure};
 use pod_streamer::link::LinkStream;
-use pod_streamer::run::{StreamerExit, StreamerPlatform, StreamerRuntime, run_streamer_loop};
+use pod_streamer::run::{
+    CaptureFormat, StreamerExit, StreamerPlatform, StreamerRuntime, run_streamer_loop,
+};
 use pod_streamer::segment::ObsEvent;
 pub(crate) use pod_streamer::segment::StreamerMsg;
 use std::sync::Mutex;
@@ -171,6 +174,14 @@ pub(crate) fn segment_obs(segment_id: u32) -> impl FnMut(ObsEvent) {
     move |event| segment_obs_event(segment_id, event)
 }
 
+/// What this pod's `Hello` declares: the capture ring carries the right I2S slot in
+/// `aux`, and every `AudioFrame` interleaves the left slot (the auto-select beam) with
+/// it (raw microphone 0, as `routing::RIGHT_SLOT_ROUTE` routes it).
+pub(crate) const ESP_CAPTURE_FORMAT: CaptureFormat = CaptureFormat {
+    channels: 2,
+    channel_source: ChannelSource::StereoBeamRawMic,
+};
+
 /// This pod's answers to the shared streamer loop's platform questions: an
 /// esp-tls connection, the WiFi supervisor's link state and diagnostics, the
 /// `esp_timer` clock, and the `esp_idf_svc::sys::poll` shim.
@@ -223,6 +234,10 @@ impl StreamerPlatform for EspPlatform {
 
     fn poll(&self) -> &dyn pod_streamer::netpoll::NetPoll {
         &EspPoll
+    }
+
+    fn capture_format(&self) -> CaptureFormat {
+        ESP_CAPTURE_FORMAT
     }
 }
 

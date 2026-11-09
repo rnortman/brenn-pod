@@ -21,8 +21,9 @@ use pod_ingest::{
     SessionEvent, SessionFsm, TelemetryKind,
 };
 use speech_pipeline::{
-    BargeInConfig, Feed, ListenerConfig, ListenerEvent, ListenerState, OwwConfig, OwwModels, PodId,
-    SPINE_FORMAT, SegmentEndCause, SileroConfig, SileroModel, WakeError,
+    BargeInConfig, Feed, FrameLevel, LevelSource, ListenerConfig, ListenerEvent, ListenerState,
+    OwwConfig, OwwModels, PodId, SPINE_FORMAT, SegmentEndCause, SileroConfig, SileroModel,
+    WakeError,
 };
 
 use crate::config::{BargeConfig, Config, EndpointerConfig, WakeConfig, WakeMode};
@@ -40,18 +41,29 @@ pub(crate) fn feed_end_cause(close: &SegmentClose) -> SegmentEndCause {
 
 /// Map one [`SessionEvent`] to the listener [`Feed`] it feeds, tracking the pod
 /// identity across the connection. `HelloAccepted` establishes `pod` and opens a
-/// fresh epoch; audio and segment boundaries stream through; azimuth telemetry
-/// becomes a `Feed::Doa`; other telemetry and protocol errors produce no feed. The single mapping shared by the
-/// live `tap_listener` and the offline replay engine, so the two can never drift.
+/// fresh epoch, naming the connection's level source; audio streams through with
+/// its frame level, segment boundaries likewise; azimuth telemetry becomes a
+/// `Feed::Doa`; other telemetry and protocol errors produce no feed. The single
+/// mapping shared by the live `tap_listener` and the offline replay engine, so
+/// the two can never drift.
 pub(crate) fn session_event_to_feed(
     ev: &SessionEvent,
     pod: &mut Option<PodId>,
     epoch: u64,
 ) -> Option<Feed> {
     match ev {
-        SessionEvent::HelloAccepted { pod_id, .. } => {
+        SessionEvent::HelloAccepted {
+            pod_id, capture, ..
+        } => {
             *pod = Some(PodId(pod_id.clone()));
-            Some(Feed::Connected { epoch })
+            Some(Feed::Connected {
+                epoch,
+                level_source: if capture.has_raw_mic() {
+                    LevelSource::RawMic
+                } else {
+                    LevelSource::Beam
+                },
+            })
         }
         SessionEvent::SegmentOpened {
             base_sample_index,
@@ -66,6 +78,7 @@ pub(crate) fn session_event_to_feed(
         SessionEvent::Audio {
             first_sample_index,
             pcm,
+            aux,
             gap,
             device_ts,
             host_rx,
@@ -76,6 +89,9 @@ pub(crate) fn session_event_to_feed(
             pcm: Arc::from(pcm.as_slice()),
             device_ts: *device_ts,
             host_rx: *host_rx,
+            // The raw microphone when the session carries one, the beam otherwise
+            // — the same choice `Connected.level_source` reports.
+            level: FrameLevel::measure(aux.as_deref().unwrap_or(pcm)),
         }),
         SessionEvent::SegmentClosed { close, host_rx, .. } => Some(Feed::SegmentClosed {
             end: feed_end_cause(close),
@@ -396,6 +412,57 @@ mod tests {
             session_event_to_feed(&telemetry(TelemetryKind::SpEnergy { values }), &mut pod, 1)
                 .is_none()
         );
+    }
+
+    /// A beam + raw-mic session names the raw mic as its level source and meters
+    /// the raw-mic channel; a mono session names the beam and meters the beam.
+    #[test]
+    fn level_feed_meters_the_raw_mic_when_the_session_carries_one() {
+        use pod_ingest::{CaptureLayout, ChannelSource};
+        let hello = |channels, source| SessionEvent::HelloAccepted {
+            pod_id: "pod-x".into(),
+            host_rx: HostMicros(0),
+            capture: CaptureLayout { channels, source },
+        };
+        let audio = |aux| SessionEvent::Audio {
+            segment_id: 1,
+            first_sample_index: 0,
+            pcm: vec![16_384; 320],
+            aux,
+            device_ts: DeviceMicros(0),
+            gap: None,
+            host_rx: HostMicros(0),
+        };
+        let mut pod = None;
+        let connected =
+            session_event_to_feed(&hello(2, ChannelSource::StereoBeamRawMic), &mut pod, 1);
+        assert!(matches!(
+            connected,
+            Some(Feed::Connected {
+                epoch: 1,
+                level_source: LevelSource::RawMic
+            })
+        ));
+        // Raw mic silent, beam loud: the level is the raw mic's floor.
+        match session_event_to_feed(&audio(Some(vec![0; 320])), &mut pod, 1) {
+            Some(Feed::Audio { level, .. }) => assert_eq!(level.dbfs, -100.0),
+            other => panic!("audio maps to audio: {other:?}"),
+        }
+
+        let connected =
+            session_event_to_feed(&hello(1, ChannelSource::CommunicationBeam), &mut pod, 2);
+        assert!(matches!(
+            connected,
+            Some(Feed::Connected {
+                epoch: 2,
+                level_source: LevelSource::Beam
+            })
+        ));
+        // Half scale DC on the beam is −6.02 dBFS.
+        match session_event_to_feed(&audio(None), &mut pod, 2) {
+            Some(Feed::Audio { level, .. }) => assert!((level.dbfs + 6.0206).abs() < 0.001),
+            other => panic!("audio maps to audio: {other:?}"),
+        }
     }
 
     /// Every knob the assembly sets lands in its own field. The two ms values are

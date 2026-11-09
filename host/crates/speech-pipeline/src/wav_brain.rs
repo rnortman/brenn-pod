@@ -12,7 +12,7 @@
 //! in the record store, so a lost demo reply costs responsiveness, not data);
 //! the drop is made loud via a typed event plus a counter.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -20,6 +20,7 @@ use futures::future::BoxFuture;
 use crate::brain::{BrainEventFn, BrainStats, send_or_report};
 use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{InterruptProgress, SpeakBody, SpeakCmd, Utterance, UtteranceId};
+use crate::volume::{VolumeBook, resolve_shared};
 
 /// The trivial `Brain`: every utterance that reaches it is answered by queueing
 /// one fixed clip, whatever it said.
@@ -27,16 +28,24 @@ pub struct WavBrain {
     clip: Arc<[i16]>,
     events: BrainEventFn,
     stats: Arc<BrainStats>,
+    /// Per-pod reply volume, read to resolve each reply's gain as it is queued.
+    volume: Arc<Mutex<VolumeBook>>,
 }
 
 impl WavBrain {
     /// Build a `WavBrain` around a validated, pre-loaded clip. The clip is shared
     /// by `Arc::clone` into every response — no per-utterance copy.
-    pub fn new(clip: Arc<[i16]>, events: BrainEventFn, stats: Arc<BrainStats>) -> Self {
+    pub fn new(
+        clip: Arc<[i16]>,
+        events: BrainEventFn,
+        stats: Arc<BrainStats>,
+        volume: Arc<Mutex<VolumeBook>>,
+    ) -> Self {
         Self {
             clip,
             events,
             stats,
+            volume,
         }
     }
 }
@@ -44,12 +53,15 @@ impl WavBrain {
 impl Brain for WavBrain {
     fn handle(&self, u: Utterance, mut out: ResponseSink) -> BoxFuture<'static, TurnEnd> {
         let utterance = u.id;
+        let gain = resolve_shared(&self.volume, &u.pod, None, u.level.as_ref());
         let cmd = SpeakCmd {
             target: u.pod,
             in_reply_to: Some(u.id),
             body: SpeakBody::Pcm(Arc::clone(&self.clip)),
             interruptible: true,
             timings: u.timings.clone(),
+            gain,
+            level: u.level,
         };
         send_or_report(&mut out, cmd, utterance, &self.events, &self.stats);
         // One fixed clip is the whole conversation this brain has, so every turn
@@ -73,6 +85,36 @@ mod tests {
 
     use crate::brain::BrainEvent;
     use crate::types::{AudioSpan, DoaTrack, PodId, RoomId, StageTimings};
+
+    fn default_book() -> Arc<Mutex<VolumeBook>> {
+        Arc::new(Mutex::new(VolumeBook::default()))
+    }
+
+    #[test]
+    fn a_replys_gain_is_resolved_from_the_books_hold_when_queued() {
+        let book = default_book();
+        let hold = crate::volume::VolumeCommand {
+            hold_db: Some(-9.0),
+            ..Default::default()
+        };
+        book.lock()
+            .unwrap()
+            .apply(&PodId("pod-x".into()), &hold)
+            .unwrap();
+        let (events, _seen) = event_collector();
+        let brain = WavBrain::new(
+            Arc::from(vec![0i16].as_slice()),
+            events,
+            Arc::new(BrainStats::default()),
+            Arc::clone(&book),
+        );
+        let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
+        drop(brain.handle(test_utterance(), ResponseSink::new(tx)));
+
+        let cmd = rx.try_recv().expect("a SpeakCmd was queued");
+        assert_eq!(cmd.gain.held_db(), -9.0);
+        assert_eq!(cmd.gain.applied_db(), -9.0);
+    }
 
     /// A `BrainEventFn` that collects emitted events for assertion.
     fn event_collector() -> (BrainEventFn, Arc<Mutex<Vec<BrainEvent>>>) {
@@ -105,6 +147,7 @@ mod tests {
             wake: None,
             barge_in: None,
             over_playback: false,
+            level: None,
         }
     }
 
@@ -113,7 +156,12 @@ mod tests {
         let clip: Arc<[i16]> = Arc::from(vec![1i16, -2, 3].as_slice());
         let (events, seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = WavBrain::new(Arc::clone(&clip), events, Arc::clone(&stats));
+        let brain = WavBrain::new(
+            Arc::clone(&clip),
+            events,
+            Arc::clone(&stats),
+            default_book(),
+        );
 
         let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
         let sink = ResponseSink::new(tx);
@@ -150,12 +198,19 @@ mod tests {
             body: SpeakBody::Text(String::new()),
             interruptible: false,
             timings: StageTimings::default(),
+            gain: VolumeBook::default().resolve(&PodId("filler".into()), None, None),
+            level: None,
         })
         .expect("the sender's one guaranteed slot accepts the first send");
 
         let (events, seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = WavBrain::new(Arc::from(vec![0i16].as_slice()), events, Arc::clone(&stats));
+        let brain = WavBrain::new(
+            Arc::from(vec![0i16].as_slice()),
+            events,
+            Arc::clone(&stats),
+            default_book(),
+        );
 
         drop(brain.handle(test_utterance(), ResponseSink::new(tx)));
 
@@ -175,7 +230,12 @@ mod tests {
 
         let (events, seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = WavBrain::new(Arc::from(vec![0i16].as_slice()), events, Arc::clone(&stats));
+        let brain = WavBrain::new(
+            Arc::from(vec![0i16].as_slice()),
+            events,
+            Arc::clone(&stats),
+            default_book(),
+        );
 
         drop(brain.handle(test_utterance(), ResponseSink::new(tx)));
 
@@ -192,7 +252,12 @@ mod tests {
     fn interrupt_is_a_no_op() {
         let (events, seen) = event_collector();
         let stats = Arc::new(BrainStats::default());
-        let brain = WavBrain::new(Arc::from(vec![0i16].as_slice()), events, Arc::clone(&stats));
+        let brain = WavBrain::new(
+            Arc::from(vec![0i16].as_slice()),
+            events,
+            Arc::clone(&stats),
+            default_book(),
+        );
 
         brain.interrupt(
             UtteranceId(42),

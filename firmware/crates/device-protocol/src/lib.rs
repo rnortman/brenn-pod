@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// Wire-contract capacity: `Payload::Identify::tests` is typed as
 /// `HVec<TestName, MAX_TESTS>`.  This constant must never be decreased.
 /// It may be larger than `REGISTERED_TESTS.len()` (slack capacity is fine).
-pub const MAX_TESTS: usize = 30;
+pub const MAX_TESTS: usize = 32;
 
 /// The canonical, ordered registry of self-tests a conforming device advertises
 /// in `Payload::Identify` and the host harness expects (HIL check 3).
@@ -79,6 +79,8 @@ pub const REGISTERED_TESTS: &[TestName] = &[
     TestName::TlsInboundBackpressure,
     TestName::TlsPskHandshake,
     TestName::TlsPskWrongKeyRejected,
+    TestName::Xvf3800OutputRouting,
+    TestName::I2sRightSlotSanity,
 ];
 
 // ── `TlsInboundFrames` drain-budget tuning constants ──────────────────────────
@@ -409,26 +411,18 @@ pub enum TestName {
     /// (broadside half-plane) but the sane bound is |x| ≤ π to accommodate any chip orientation.
     /// Source: usb-spike-verdict.md §7, xvf3800-control-protocol.md §5.
     Xvf3800DoAPlausibility,
-    /// I2S audio-path waveform sanity test (assertion-as-probe — Cycle 6).
+    /// I2S left-slot waveform sanity test.
     ///
-    /// Configures ESP32-S3 I2S0 as master RX from XVF3800:
-    ///   BCLK=GPIO8, WS=GPIO7, DIN=GPIO43, 16 kHz, 16-bit, stereo (Philips).
+    /// Judges the capture ring's left-slot buffer — the XVF3800's auto-select
+    /// communication beam, the channel the pod streams first. Waits for the ring to hold
+    /// a 4000-sample window (250 ms at 16 kHz), then summarizes the newest window and
+    /// applies the shared liveness gates in `audio_pipeline::ring`: not dead, not frozen,
+    /// not saturated, and correlated (lag-1 autocorrelation above the floor). No loudness
+    /// floor — a quiet room passes. The right slot is judged by
+    /// [`TestName::I2sRightSlotSanity`].
     ///
-    /// Captures ~250 ms / 4000 frames (16000 bytes). Computes per-channel stats:
-    ///   min, max, RMS, saturation %.
-    ///
-    /// PASS criterion ("looks like a live audio waveform"):
-    /// - Not all-zero: at least one channel has max-abs > ZERO_ABS_THRESHOLD (100).
-    /// - Not stuck constant: at least one channel has spread (max−min) > STUCK_SPREAD_MULTIPLIER × ZERO_ABS_THRESHOLD (4 × 100 = 400).
-    /// - Not railed/saturated: neither channel is at ±32700 for >95% of frames.
-    /// - Real variance: at least one channel RMS > RMS_FLOOR (50).
-    ///
-    /// At least one of the two channels must pass all four criteria.
-    /// A FAIL result (all-zero, stuck, saturated, or init error) is an expected possible
-    /// outcome (master/slave mismatch, MCLK required) and recorded as a DISCOVERY.
-    ///
-    /// Reports: "PASS role=R ch0 min=N max=N rms=N sat=N% ch1 min=N max=N rms=N sat=N% frames=N"
-    /// or "FAIL role=R reason=R ch0 min=N max=N rms=N sat=N% ch1 ... frames=N".
+    /// Returns `TestData::I2sWaveform`; a failure detail names the defect and carries
+    /// the same fields.
     I2sWaveformSanity,
     /// WiFi association + DHCP lease self-test (discriminant 8).
     ///
@@ -792,6 +786,29 @@ pub enum TestName {
     /// Returns `TestData::TlsPskRejected`. Requires the same provisioning as
     /// [`TestName::TlsPskHandshake`].
     TlsPskWrongKeyRejected,
+    /// XVF3800 output-routing identity self-test (discriminant 29).
+    ///
+    /// Reports what the boot-time routing write left in the chip's output mux: the
+    /// status the `AUDIO_MGR_OP_R` write returned, and `AUDIO_MGR_OP_L` / `AUDIO_MGR_OP_R`
+    /// read back as `(category, source)` pairs. The host asserts the write was accepted,
+    /// the right slot carries amplified raw microphone 0 (`(3, 0)`), and the left slot
+    /// still carries the auto-select communication beam (`(8, 0)`). An identity test: a
+    /// different reading is shown to a human before any expectation moves.
+    ///
+    /// Returns `TestData::Xvf3800OutputRouting`.
+    Xvf3800OutputRouting,
+    /// I2S right-slot liveness and identity self-test (discriminant 30).
+    ///
+    /// Snapshots the newest window of the capture ring's right-slot (`aux`) buffer and the
+    /// same window of the left-slot buffer. Reports the right window's waveform summary
+    /// and how many indices hold different left and right samples. The host asserts the
+    /// right window is live by the same five gates `I2sWaveformSanity` applies to the
+    /// left, and that the two slots differ — a silent right slot (routing refused or
+    /// landed too early) fails as dead, a chip copying the beam into both slots fails on
+    /// `differing == 0`.
+    ///
+    /// Returns `TestData::I2sRightSlot`.
+    I2sRightSlotSanity,
 }
 
 // ── Response ──────────────────────────────────────────────────────────────────
@@ -1092,6 +1109,25 @@ pub enum TestData {
         /// that consumes the handshake deadline means nothing was refused —
         /// the device fails the test in that case rather than reporting it.
         reject_ms: u32,
+    },
+    Xvf3800OutputRouting {
+        /// Status byte the `AUDIO_MGR_OP_R` write returned (`0x00` = accepted).
+        write_status: u8,
+        /// `AUDIO_MGR_OP_L` read back: `[category, source]`.
+        left: [u8; 2],
+        /// `AUDIO_MGR_OP_R` read back: `[category, source]`.
+        right: [u8; 2],
+    },
+    I2sRightSlot {
+        /// The right window's fields, as `I2sWaveform` reports the left.
+        min: i32,
+        max: i32,
+        rms: i32,
+        sat_pct: u32,
+        samples: u32,
+        ac1: i32,
+        /// Indices in the window whose left and right samples differ.
+        differing: u32,
     },
 }
 
@@ -1606,7 +1642,7 @@ mod tests {
     ///   CapturePeriodicLine=19, PlaybackDrainRate=20, PollReadinessBidir=21,
     ///   FullDuplexRxIntegrity=22, StreamRealtimeDuplex=23, PsramIdentity=24,
     ///   WifiPowerSaveCheck=25, TlsInboundBackpressure=26, TlsPskHandshake=27,
-    ///   TlsPskWrongKeyRejected=28
+    ///   TlsPskWrongKeyRejected=28, Xvf3800OutputRouting=29, I2sRightSlotSanity=30
     ///
     /// Ping encodes to all-0x01 COBS bytes (before the 0x00 delimiter) because all three
     /// postcard bytes are 0x00 (id=0, cmd=0, testname=0), and COBS replaces each zero with
@@ -1678,6 +1714,14 @@ mod tests {
             (
                 TestName::TlsPskWrongKeyRejected,
                 &[0x01, 0x01, 0x02, 0x1c, 0x00],
+            ),
+            (
+                TestName::Xvf3800OutputRouting,
+                &[0x01, 0x01, 0x02, 0x1d, 0x00],
+            ),
+            (
+                TestName::I2sRightSlotSanity,
+                &[0x01, 0x01, 0x02, 0x1e, 0x00],
             ),
         ];
         for (variant, expected) in cases {
@@ -2680,6 +2724,8 @@ mod tests {
             TlsInboundBackpressure,
             TlsPskHandshake,
             TlsPskWrongKeyRejected,
+            Xvf3800OutputRouting,
+            I2sRightSlotSanity,
         );
 
         // Step 2: every variant must be in REGISTERED_TESTS.
@@ -2723,7 +2769,7 @@ mod tests {
     ///
     /// This test uses `test_name_discriminant` from `device-protocol` (derived via
     /// `postcard::to_slice`, not a hand table), so it also exercises the derived helper.
-    /// Covers the whole registry through `TlsPskWrongKeyRejected` (28).
+    /// Covers the whole registry through `I2sRightSlotSanity` (30).
     #[test]
     fn discriminant_values_are_stable() {
         use super::test_name_discriminant;
@@ -2757,6 +2803,8 @@ mod tests {
             (TestName::TlsInboundBackpressure, 26),
             (TestName::TlsPskHandshake, 27),
             (TestName::TlsPskWrongKeyRejected, 28),
+            (TestName::Xvf3800OutputRouting, 29),
+            (TestName::I2sRightSlotSanity, 30),
         ];
         for (variant, expected) in pins {
             assert_eq!(
@@ -2987,6 +3035,8 @@ mod typed_report_tests {
             TestData::TlsInboundBackpressure { .. } => 25,
             TestData::TlsPskHandshake { .. } => 26,
             TestData::TlsPskRejected { .. } => 27,
+            TestData::Xvf3800OutputRouting { .. } => 28,
+            TestData::I2sRightSlot { .. } => 29,
         }
     }
 
@@ -2994,7 +3044,7 @@ mod typed_report_tests {
     /// intact. Adding a variant requires a case here; the pairing with
     /// [`canonical_discriminant`] is enforced by
     /// `test_data_cases_cover_every_discriminant`.
-    fn all_test_data_cases() -> [TestData; 28] {
+    fn all_test_data_cases() -> [TestData; 30] {
         let mut found = HVec::<u8, I2C_SCAN_MAX_ADDRS>::new();
         for a in 0x08u8..=0x77 {
             found.push(a).unwrap();
@@ -3156,6 +3206,20 @@ mod typed_report_tests {
                 peer_ip: [10, 0, 0, 4],
                 peer_port: 17387,
                 reject_ms: 43,
+            },
+            TestData::Xvf3800OutputRouting {
+                write_status: 0,
+                left: [8, 0],
+                right: [3, 0],
+            },
+            TestData::I2sRightSlot {
+                min: -812,
+                max: 905,
+                rms: 140,
+                sat_pct: 0,
+                samples: 16000,
+                ac1: 870,
+                differing: 15_998,
             },
         ]
     }

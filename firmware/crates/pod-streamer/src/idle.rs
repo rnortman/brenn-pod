@@ -609,6 +609,7 @@ mod tests {
     ) -> CaptureRing<Vec<i16>> {
         CaptureRing {
             samples: Vec::new(),
+            aux: None,
             write_head,
             anchor_sample,
             anchor_ts_us,

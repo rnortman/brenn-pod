@@ -330,6 +330,7 @@ pub(crate) fn ring_with(written: u64, anchor_ts_us: u64) -> Mutex<Option<Capture
     }
     Mutex::new(Some(CaptureRing {
         samples,
+        aux: None,
         write_head: written,
         anchor_sample: written.saturating_sub(1),
         anchor_ts_us,

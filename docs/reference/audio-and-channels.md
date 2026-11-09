@@ -12,9 +12,12 @@ The XVF3800 ships in two mutually-exclusive firmware families
   6-channel builds exist here.
 - **I2S firmware** — XVF3800 streams audio over I2S to/from the XIAO ESP32-S3.
   This is the **product path**. All Seeed I2S builds for the Flex Linear are
-  **2-channel** (choice of 16 kHz or 48 kHz). No raw-mic access on I2S without a
-  custom XMOS build. [confirmed via Seeed firmware catalogue,
-  architecture-arc-and-deferred-paths.md:76-79, research-multi-beam.md:159-170]
+  **2-channel** (choice of 16 kHz or 48 kHz) [confirmed via Seeed firmware
+  catalogue, architecture-arc-and-deferred-paths.md:76-79,
+  research-multi-beam.md:159-170]. What each of the two I2S slots carries is
+  runtime-configurable per slot through `AUDIO_MGR_OP_L` / `AUDIO_MGR_OP_R`, so a
+  raw mic is reachable on the stock I2S build without a custom XMOS build — see
+  "Routing the I2S slots" in §2. [measured]
 
 Seeed firmware catalogue (research-multi-beam.md:159-170), naming
 `<conn>_<geom><rate><ch>`:
@@ -62,8 +65,31 @@ map). The two processed beams track the same auto-selected DoA, not separate
 talkers.
 
 > Note: this map is for the **6-ch USB** build. The **product 2-ch I2S** build
-> exposes only the two processed beams (Conference + ASR), both tracking the
-> auto-selected beam — no raw mics.
+> carries two slots whose sources are set per slot at runtime; it is not limited to
+> the processed beams.
+
+### Routing the I2S slots (product 2-ch I2S build) [measured]
+
+The output mux behind each I2S slot is runtime-configurable through the
+`AUDIO_MGR_OP_L` and `AUDIO_MGR_OP_R` control commands (a `(category, index)`
+pair per slot). The respeaker pod leaves the left slot at its default, `(8, 0)` —
+the auto-select communication beam — and at boot writes `(3, 0)` to the right
+slot: amplified raw microphone 0 (uncompressed, no AGC, no noise suppression, no
+beamforming). It reads both registers back and logs the outcome
+(`firmware/devices/respeaker-pod/src/routing.rs`).
+
+Measured on that image:
+
+- The I2S slots are 32-bit, and the sample in them is wider than 16 bits and
+  left-justified: the low half of the slot carries precision beyond the 16 bits the
+  pod keeps, not padding.
+- Raw mic 0 at the chip's default gain, in top-16-bit terms: ≈ −78 dBFS rms in a
+  quiet room, and ≈ −52 dBFS for a normal voice at about 0.8 m.
+
+Standing evidence, run by `firmware/crates/hil-host` on every full suite:
+`Xvf3800OutputRouting` (the boot write accepted and both registers reading
+`(8, 0)` / `(3, 0)` now) and `I2sRightSlotSanity` (the right slot is live,
+correlated, distinct from the left, judged by the raw-mic liveness guards).
 
 ## 3. Sample rates / formats [confirmed]
 

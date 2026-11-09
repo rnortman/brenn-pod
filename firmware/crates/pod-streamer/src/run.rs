@@ -49,7 +49,9 @@ use crate::idle::{
 };
 use crate::link::LinkStream;
 use crate::netpoll::{IDLE_TICK, INBOUND_STEPS_PER_WAKE, NetPoll, Readiness, poll_timeout};
-use crate::segment::{ObsEvent, SegmentDeps, SegmentExit, StreamerMsg, run_segment, send_frame_bp};
+use crate::segment::{
+    ObsEvent, SegmentDeps, SegmentExit, StreamerMsg, frame_channels, run_segment, send_frame_bp,
+};
 
 // ── The platform seam ─────────────────────────────────────────────────────────
 
@@ -105,6 +107,27 @@ pub trait StreamerPlatform {
 
     /// This platform's `poll()` shim.
     fn poll(&self) -> &dyn NetPoll;
+
+    /// The layout of the capture stream this pod sends, as its `Hello` declares it.
+    /// The default is one channel of the chip's communication beam; a pod whose ring
+    /// carries a second channel overrides it to say what both channels are.
+    fn capture_format(&self) -> CaptureFormat {
+        CaptureFormat {
+            channels: 1,
+            channel_source: ChannelSource::CommunicationBeam,
+        }
+    }
+}
+
+/// The outbound capture layout a pod's `Hello` declares: how many channels each
+/// `AudioFrame` interleaves, and what they are. The rate, sample width and codec are
+/// the shared wire format's and are not a platform's to choose.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureFormat {
+    /// Interleaved channels per sample index.
+    pub channels: u8,
+    /// What those channels carry.
+    pub channel_source: ChannelSource,
 }
 
 // ── Connection state ─────────────────────────────────────────────────────────
@@ -209,6 +232,7 @@ pub fn connect_and_hello<P: StreamerPlatform>(
     encode_buf: &mut [u8],
 ) -> io::Result<P::Link> {
     let mut link = platform.connect()?;
+    let capture = platform.capture_format();
     let hello = StreamFrame::Hello(Hello {
         version: AUDIO_PROTOCOL_VERSION,
         // An id too long for the wire field yields an empty one rather than a
@@ -216,9 +240,9 @@ pub fn connect_and_hello<P: StreamerPlatform>(
         pod_id: heapless::String::try_from(platform.pod_id()).unwrap_or_default(),
         sample_rate_hz: DEVICE_PLAYBACK_FORMAT.sample_rate_hz,
         bits_per_sample: DEVICE_PLAYBACK_FORMAT.bits_per_sample,
-        channels: DEVICE_PLAYBACK_FORMAT.channels,
+        channels: capture.channels,
         codec: DEVICE_PLAYBACK_FORMAT.codec,
-        channel_source: ChannelSource::CommunicationBeam,
+        channel_source: capture.channel_source,
     });
     match send_frame_bp(platform.poll(), &mut link, &hello, encode_buf)? {
         SendOutcome::Sent => Ok(link),
@@ -510,6 +534,13 @@ where
                 .lock()
                 .unwrap_or_else(|_| panic!("capture ring mutex poisoned in streamer"));
             let ring = guard.as_ref().expect("capture ring not initialized");
+            // The `Hello` declared the platform's channel count; frames carrying a
+            // different one would be split wrongly by the host on every sample.
+            assert_eq!(
+                frame_channels(ring),
+                platform.capture_format().channels,
+                "capture ring layout disagrees with the platform's declared capture format"
+            );
             plan_segment_start(
                 ring,
                 rt.ridx,
@@ -885,6 +916,70 @@ mod tests {
             "a stale deadline would pace the next drop's reconnect"
         );
         assert_eq!(state.backoff.current_secs(), BACKOFF_FLOOR_SECS);
+    }
+
+    /// A platform that overrides [`StreamerPlatform::capture_format`] and delegates
+    /// everything else to a [`FakePlatform`].
+    struct StereoPlatform(FakePlatform);
+
+    impl StreamerPlatform for StereoPlatform {
+        type Link = FakeLink;
+
+        fn pod_id(&self) -> &str {
+            self.0.pod_id()
+        }
+
+        fn peer(&self) -> SocketAddr {
+            self.0.peer()
+        }
+
+        fn connect(&self) -> io::Result<FakeLink> {
+            self.0.connect()
+        }
+
+        fn link_up(&self) -> Option<bool> {
+            self.0.link_up()
+        }
+
+        fn link_diag(&self) -> impl Display {
+            self.0.link_diag()
+        }
+
+        fn now_secs(&self) -> u64 {
+            self.0.now_secs()
+        }
+
+        fn poll(&self) -> &dyn NetPoll {
+            self.0.poll()
+        }
+
+        fn capture_format(&self) -> CaptureFormat {
+            CaptureFormat {
+                channels: 2,
+                channel_source: ChannelSource::StereoBeamRawMic,
+            }
+        }
+    }
+
+    /// The `Hello` declares the platform's capture layout; the rest of the format is
+    /// the shared wire format's whatever the platform says.
+    #[test]
+    fn the_hello_declares_the_platforms_capture_format() {
+        let platform = StereoPlatform(FakePlatform::with(vec![Ok(FakeLink::new())]));
+        let mut state = LinkState::new(0x11);
+        let mut sink = RecordingSink::new();
+
+        ensure_connected(&platform, &mut state, &mut sink);
+
+        let hello = sent_hello(state.held_socket.as_ref().expect("socket installed"));
+        assert_eq!(hello.channels, 2);
+        assert_eq!(hello.channel_source, ChannelSource::StereoBeamRawMic);
+        assert_eq!(hello.sample_rate_hz, DEVICE_PLAYBACK_FORMAT.sample_rate_hz);
+        assert_eq!(
+            hello.bits_per_sample,
+            DEVICE_PLAYBACK_FORMAT.bits_per_sample
+        );
+        assert_eq!(hello.codec, DEVICE_PLAYBACK_FORMAT.codec);
     }
 
     /// The `Hello` rides the bounded-backpressure path, so a transport that takes

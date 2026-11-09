@@ -138,6 +138,10 @@ pub enum ChannelSource {
     /// the XVF3800 default left output (`AUDIO_MGR_OP_L = (8,0)`).
     /// Discriminant 0x03.
     CommunicationBeam,
+    /// Two interleaved channels: left is the auto-select communication beam
+    /// (`AUDIO_MGR_OP_L = (8,0)`), right is amplified raw microphone 0
+    /// (`AUDIO_MGR_OP_R = (3,0)`). Discriminant 0x04.
+    StereoBeamRawMic,
 }
 
 /// Begins an utterance segment.
@@ -171,8 +175,8 @@ pub struct AudioFrame {
 }
 
 const _: () = assert!(
-    AUDIO_SAMPLES_PER_FRAME * 2 <= MAX_AUDIO_PAYLOAD,
-    "a full mono frame must fit MAX_AUDIO_PAYLOAD"
+    AUDIO_SAMPLES_PER_FRAME * 2 * 2 <= MAX_AUDIO_PAYLOAD,
+    "a full stereo frame must fit MAX_AUDIO_PAYLOAD"
 );
 
 /// Pack `samples` as S16_LE (little-endian) mono bytes.
@@ -757,6 +761,54 @@ mod tests {
         );
     }
 
+    /// Golden bytes for a stereo `Hello` declaring `StereoBeamRawMic` — pins the
+    /// appended discriminant 0x04 and `channels = 2`, and round-trips it.
+    #[test]
+    fn hello_stereo_beam_raw_mic_golden_bytes() {
+        let frame = StreamFrame::Hello(Hello {
+            version: 3,
+            pod_id: HString::try_from("pod-aabbcc").unwrap(),
+            sample_rate_hz: 16_000,
+            bits_per_sample: 16,
+            channels: 2,
+            codec: Codec::S16Le,
+            channel_source: ChannelSource::StereoBeamRawMic,
+        });
+        let mut buf = [0u8; MAX_FRAME_BYTES + 2];
+        let n = encode_frame(&frame, &mut buf).unwrap();
+        let payload = &buf[2..n];
+        let expected: &[u8] = &[
+            0x00, // StreamFrame discriminant 0 = Hello
+            0x03, // version = 3
+            0x0a, // pod_id length = 10
+            b'p', b'o', b'd', b'-', b'a', b'a', b'b', b'b', b'c', b'c', 0x80,
+            0x7d, // sample_rate_hz = 16000 varint
+            0x10, // bits_per_sample = 16
+            0x02, // channels = 2
+            0x00, // Codec::S16Le = 0
+            0x04, // ChannelSource::StereoBeamRawMic = 4
+        ];
+        assert_eq!(payload, expected);
+        assert_eq!(roundtrip(&frame), frame);
+    }
+
+    /// A full stereo frame (320 samples × 2 channels × 2 B = 1280 B) fits the payload.
+    #[test]
+    fn full_stereo_audio_frame_roundtrips() {
+        let mut pcm: HVec<u8, MAX_AUDIO_PAYLOAD> = HVec::new();
+        for i in 0..AUDIO_SAMPLES_PER_FRAME * 2 * 2 {
+            pcm.push(i as u8).unwrap();
+        }
+        assert_eq!(pcm.len(), MAX_AUDIO_PAYLOAD);
+        let frame = StreamFrame::Audio(AudioFrame {
+            segment_id: 1,
+            first_sample_index: 0,
+            device_ts_us: 0,
+            pcm,
+        });
+        assert_eq!(roundtrip(&frame), frame);
+    }
+
     // Renamed from hello_version_mismatch_detectable: this test only verifies that
     // postcard round-trips the version byte faithfully.  Rejecting a mismatched version
     // is the consumer's responsibility, not this wire type's.
@@ -1246,7 +1298,7 @@ mod tests {
         let ci = bad_codec.len() - 2;
         bad_codec[ci] = 0x05; // no such Codec discriminant
         let bad_codec = reframe(&bad_codec);
-        // Bad channel_source tag — the last body byte; only 0x00..=0x03 are valid, both
+        // Bad channel_source tag — the last body byte; only 0x00..=0x04 are valid, both
         // paths deserialize the full body so both reject an out-of-range discriminant.
         let mut bad_channel_source = payload.clone();
         let si = bad_channel_source.len() - 1;

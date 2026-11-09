@@ -101,10 +101,11 @@ pub enum BrainEvent {
         waited_ms: u64,
         continuation: bool,
     },
-    /// A response carried a tag-shaped island the codec does not know (an
-    /// unrecognized name, or one mangled past parsing). It was stripped rather than
-    /// spoken. Loud by contract: it means the peer's vocabulary and ours have
-    /// diverged. `tag` is the raw text as it appeared.
+    /// A response carried a tag-shaped island the codec does not act on (an
+    /// unrecognized name, one mangled past parsing, or a `<volume/>` superseded by
+    /// a later one in the same message). It was stripped rather than spoken, and
+    /// nothing it asked for happened. Loud by contract: it means the peer's use of
+    /// the vocabulary and ours have diverged. `tag` is the raw text as it appeared.
     LinkTagStripped { utterance: UtteranceId, tag: String },
     /// A response carried no turn-correlation marker and was accepted for the one
     /// pending turn anyway. Benign — with a single pending slot there is only one

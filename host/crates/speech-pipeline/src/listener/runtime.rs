@@ -46,7 +46,10 @@ use super::oww_stream::{OwwModels, OwwStream};
 use super::ring::PcmRing;
 use super::silero::{SILERO_CHUNK, SileroModel, SileroVad};
 use super::stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreStats};
-use crate::types::{PodId, SPINE_FORMAT, UtteranceId, WakeConfirmation};
+use crate::level::{FrameLevel, percentile};
+use crate::types::{
+    LevelSource, PodId, SPINE_FORMAT, UtteranceId, UtteranceLevel, WakeConfirmation,
+};
 use crate::wake::WakeError;
 
 /// Depth of the shared `(PodId, Feed)` channel. Audio priority belongs to
@@ -70,6 +73,68 @@ const WAKE_DOA_LEAD_SAMPLES: u64 = 8_000;
 
 /// How far past a wake's end a reading still counts: one 100 ms chunk of slack.
 const WAKE_DOA_SLACK_SAMPLES: u64 = 1_600;
+
+/// Frame levels the listener keeps for the speech reading: 3.2 s of 20 ms
+/// frames. On the wake path the ring has to hold the one-second speech window
+/// plus the detector's lag behind the phrase's acoustic end; on the carve path
+/// it has to hold the carve's speech plus the 256 ms soft hangover that passes
+/// before the carve, so a carve with more than about 2.9 s of speech measures
+/// its last 2.9 s — still the speaker's loud-vowel level.
+const LEVEL_RING_CAPACITY: usize = 160;
+
+/// Room frames the listener keeps for the ambient reading. A room frame is one
+/// pushed while the playback floor is closed, ending after the playback tail,
+/// with the endpointer fully idle: audio the pod was not playing into and
+/// nobody was speaking into. Larger than [`AMBIENT_WINDOW_FRAMES`] because the
+/// reading skips room frames newer than its bound — at a wake detection, the
+/// phrase's own onset lag, whose first chunks are pushed before the endpointer
+/// leaves idle — and must still find a full window below it.
+const ROOM_RING_CAPACITY: usize = 160;
+
+/// The speech window ends at the wake end and reaches back one second: "hey
+/// jarvis" is about 0.8 s, and the detector's wake end leads the acoustic end by
+/// about a chunk, so the last second holds the phrase. Frames are counted in a
+/// window by their first sample.
+const WAKE_SPEECH_WINDOW_SAMPLES: u64 = 16_000;
+
+/// The speech level is the 80th percentile of the window's frame levels: the
+/// loud-vowel level, robust to the pauses inside the phrase and needing no wake
+/// start, which nothing computes.
+const WAKE_SPEECH_PERCENTILE: u32 = 80;
+
+/// The ambient reading is the last second of room frames below the speech
+/// window: 50 frames of 20 ms, counted rather than spanned because room frames
+/// need not be contiguous. In the normal case — pod silent, a phrase said into a
+/// quiet room — they are the second just before the speech window, from the
+/// device's 1 s pre-roll the device VAD took for silence.
+const AMBIENT_WINDOW_FRAMES: usize = 50;
+
+/// The ambient level is the 20th percentile of its window's frame levels: low
+/// enough that the first chunks of a speech run, pushed as room frames before
+/// the endpointer scores them, do not move it.
+const AMBIENT_PERCENTILE: u32 = 20;
+
+/// Fewer room frames than this (half the window) and there is no ambient
+/// reading: too little of the room has been heard to call it the room.
+const AMBIENT_MIN_FRAMES: usize = 25;
+
+/// Append `(first_sample_index, dbfs)` to a level ring bounded at `capacity`,
+/// first dropping every reading from that index on (a re-sent stretch replaces
+/// what the ring held for it) and then the oldest reading if the ring is full.
+fn push_bounded(
+    ring: &mut VecDeque<(u64, f32)>,
+    capacity: usize,
+    first_sample_index: u64,
+    dbfs: f32,
+) {
+    while ring.back().is_some_and(|&(s, _)| s >= first_sample_index) {
+        ring.pop_back();
+    }
+    if ring.len() == capacity {
+        ring.pop_front();
+    }
+    ring.push_back((first_sample_index, dbfs));
+}
 
 /// Per-pod listener knobs. `Copy` so the thread hands a fresh copy to each new pod.
 #[derive(Debug, Clone, Copy)]
@@ -108,11 +173,12 @@ pub struct ListenerConfig {
     /// Barge-in trigger knobs. The guard fires only while playback is active and
     /// interruptible for the pod.
     pub barge_in: BargeInConfig,
-    /// How long past the pod's playback floor dropping [`BargeMode::Mute`] goes on
-    /// scoring every chunk as silence. The pacer's `Finished` is an estimate of the
+    /// How long past the pod's playback floor dropping the pod's own output may
+    /// still be in the microphone. The pacer's `Finished` is an estimate of the
     /// speaker going quiet — its stream clock says the audio is heard out — not a
     /// report of it, so the tail covers the device's own output latency past that
-    /// estimate. Inert under the other two modes.
+    /// estimate. Under [`BargeMode::Mute`] every chunk in it is scored as silence;
+    /// under every mode, no frame in it is taken as a reading of the room.
     pub mute_tail_samples: u64,
 }
 
@@ -254,6 +320,8 @@ struct WakeArm {
     wake_end_sample: u64,
     /// Host receipt of the chunk whose scoring completed this detection.
     detected_rx: Option<HostMicros>,
+    /// How loudly the phrase was spoken, measured at the detection.
+    level: Option<UtteranceLevel>,
 }
 
 /// A wake-gated wake waiting for its command. Installed at the detection whenever
@@ -493,6 +561,10 @@ pub struct ListenerState {
     current_start: Option<u64>,
     /// The current utterance's wake provenance, reused across continuations.
     current_wake: Option<WakeConfirmation>,
+    /// The level the current utterance was addressed at, measured at its first
+    /// carve and reused across continuations: a continuation moves the
+    /// endpoint, never the measurement.
+    current_level: Option<UtteranceLevel>,
     /// This pod's playback state and barge-in trigger state.
     playback: PlaybackFloor,
     /// The capture window the surface asked for, if any: open, or spent on the
@@ -501,10 +573,12 @@ pub struct ListenerState {
     /// The follow-up mark on the utterance currently accumulating, reused across
     /// continuations exactly as `current_barge` is.
     current_follow_up: bool,
-    /// Under [`BargeMode::Mute`], the absolute sample index through which chunks go
-    /// on being scored as silence after the playback floor drops. `0` at rest, and
-    /// inert under the other modes.
-    muted_until_sample: u64,
+    /// The absolute sample index through which the pod's own output may still be
+    /// in the microphone after the playback floor drops: armed at every floor
+    /// drop, in every barge mode. Under [`BargeMode::Mute`] chunks ending at or
+    /// before it go on being scored as silence; under every mode, frames ending
+    /// at or before it are not room frames. `0` at rest.
+    tail_until_sample: u64,
     /// A fired trigger no utterance has taken yet: the next carve consumes it.
     /// Needed because utterance identity is minted at first *carve*, not at onset,
     /// so at trigger time there is often no id to mark.
@@ -557,6 +631,20 @@ pub struct ListenerState {
     /// `DOA_RING_CAPACITY`; cleared with the connection, since indexes are per
     /// connection.
     doa: VecDeque<DoaSample>,
+    /// Recent frame levels as `(first sample index, dBFS)`, bounded at
+    /// `LEVEL_RING_CAPACITY`; cleared with the connection, since indexes are per
+    /// connection. The speech reading's source.
+    levels: VecDeque<(u64, f32)>,
+    /// The room frames among them — pushed with the floor closed, past the
+    /// playback tail, with the endpointer fully idle — bounded at
+    /// `ROOM_RING_CAPACITY` and cleared with the connection like `levels`. The
+    /// ambient reading's source. Which frames are room frames is decided as they
+    /// are pushed, ahead of the Silero chunk that scores them, so the first
+    /// chunks of a speech run land here; the ambient reading's low percentile is
+    /// what keeps them from moving it.
+    room: VecDeque<(u64, f32)>,
+    /// What this connection's frame levels were measured on.
+    level_source: LevelSource,
 }
 
 impl ListenerState {
@@ -589,10 +677,11 @@ impl ListenerState {
             current_id: None,
             current_start: None,
             current_wake: None,
+            current_level: None,
             playback: PlaybackFloor::default(),
             capture: Capture::Closed,
             current_follow_up: false,
-            muted_until_sample: 0,
+            tail_until_sample: 0,
             barge_pending: false,
             pending_from_wake: false,
             current_barge: false,
@@ -608,6 +697,9 @@ impl ListenerState {
             silero_stats: ScoreStats::default(),
             oww_stats: ScoreStats::default(),
             doa: VecDeque::with_capacity(DOA_RING_CAPACITY),
+            levels: VecDeque::with_capacity(LEVEL_RING_CAPACITY),
+            room: VecDeque::with_capacity(ROOM_RING_CAPACITY),
+            level_source: LevelSource::Beam,
         }
     }
 
@@ -629,7 +721,10 @@ impl ListenerState {
         silero_model: &mut SileroModel,
     ) -> Result<Vec<ListenerEvent>, WakeError> {
         match feed {
-            Feed::Connected { epoch } => {
+            Feed::Connected {
+                epoch,
+                level_source,
+            } => {
                 // A pending arm or grant the prior connection never resolved into
                 // a turn expires with the connection.
                 let mut events = Vec::new();
@@ -647,6 +742,7 @@ impl ListenerState {
                 // connection being torn down, before the new epoch is adopted.
                 self.drain_transitions(pod, None, &mut events);
                 self.epoch = epoch;
+                self.level_source = level_source;
                 self.expected_next = None;
                 Ok(events)
             }
@@ -690,16 +786,22 @@ impl ListenerState {
                 pcm,
                 device_ts,
                 host_rx,
-            } => self.handle_audio(
-                pod,
-                first_sample_index,
-                gap.is_some(),
-                &pcm,
-                device_ts,
-                host_rx,
-                oww_models,
-                silero_model,
-            ),
+                level,
+            } => {
+                // Recorded before the frame is scored, so a detection this frame
+                // completes measures a window that includes it.
+                self.push_level(first_sample_index, pcm.len() as u64, level);
+                self.handle_audio(
+                    pod,
+                    first_sample_index,
+                    gap.is_some(),
+                    &pcm,
+                    device_ts,
+                    host_rx,
+                    oww_models,
+                    silero_model,
+                )
+            }
             Feed::Doa {
                 sample_offset,
                 azimuths,
@@ -800,13 +902,14 @@ impl ListenerState {
         self.current_id = None;
         self.current_start = None;
         self.current_wake = None;
+        self.current_level = None;
         // A reconnect killed the writer, so the floor is genuinely closed. The
         // pending trigger and the overlap latch went with the stream reset above:
         // they belong to speech nobody can still be hearing.
         self.playback = PlaybackFloor::default();
         // The reconnect opens a new index domain; a tail dated in the old one means
         // nothing in it, and the writer whose output it covered is gone.
-        self.muted_until_sample = 0;
+        self.tail_until_sample = 0;
         // The window belongs to a reply the old connection played; nobody on the
         // new one is waiting to be answered. Reported, like every other close, so
         // a reader counting windows open against windows ended balances.
@@ -819,6 +922,8 @@ impl ListenerState {
         self.current_wake_rx = None;
         self.current_anchor = None;
         self.doa.clear();
+        self.levels.clear();
+        self.room.clear();
     }
 
     /// Reset the rolling inference state (OWW/Silero windows, endpointer, Silero
@@ -1362,10 +1467,10 @@ impl ListenerState {
             return;
         }
         // The floor going down is the pacer's estimate that the audio is heard out,
-        // so the mute runs on past it by the tail before the microphone is trusted
-        // again.
-        if self.config.barge_in.mode == BargeMode::Mute && self.playback.active && !active {
-            self.muted_until_sample = self.silero_cursor + self.config.mute_tail_samples;
+        // so the microphone is trusted again only past the tail: under the mute,
+        // for scoring; under every mode, for the room reading.
+        if self.playback.active && !active {
+            self.tail_until_sample = self.silero_cursor + self.config.mute_tail_samples;
         }
         self.playback = PlaybackFloor {
             active,
@@ -1385,7 +1490,7 @@ impl ListenerState {
     /// may need is lost.
     fn muted(&self, chunk_end_sample: u64) -> bool {
         self.config.barge_in.mode == BargeMode::Mute
-            && (self.playback.active || chunk_end_sample <= self.muted_until_sample)
+            && (self.playback.active || chunk_end_sample <= self.tail_until_sample)
     }
 
     /// The barge-in guard, one Silero chunk at a time: count consecutive chunks at
@@ -1455,6 +1560,93 @@ impl ListenerState {
         self.current_over_playback = true;
     }
 
+    /// Record one frame's level in the bounded level ring, and in the room ring
+    /// when the frame is a room frame: the floor closed, the frame ending after
+    /// the playback tail, and the endpointer fully idle. A frame re-sent under
+    /// indexes a ring already holds (a segment's preroll overlapping the previous
+    /// one) replaces the readings from that index on, so no stretch of audio is
+    /// counted twice.
+    fn push_level(&mut self, first_sample_index: u64, samples: u64, level: FrameLevel) {
+        let room = !self.playback.active
+            && first_sample_index + samples > self.tail_until_sample
+            && self.endpointer.fully_idle();
+        push_bounded(
+            &mut self.levels,
+            LEVEL_RING_CAPACITY,
+            first_sample_index,
+            level.dbfs,
+        );
+        if room {
+            push_bounded(
+                &mut self.room,
+                ROOM_RING_CAPACITY,
+                first_sample_index,
+                level.dbfs,
+            );
+        } else {
+            // A re-sent stretch replaces what the room ring held for it, whether
+            // or not it is a room frame this time.
+            while self
+                .room
+                .back()
+                .is_some_and(|&(s, _)| s >= first_sample_index)
+            {
+                self.room.pop_back();
+            }
+        }
+    }
+
+    /// How loudly speech in `[speech_lo, speech_hi)` was spoken, and how loud the
+    /// room was before it.
+    ///
+    /// `speech_dbfs` is the 80th percentile of the frame ring's levels with first
+    /// sample in the window; the whole reading is `None` when no frame lies there,
+    /// or when every frame there reads as a dead channel — a floor is not a
+    /// measurement. `ambient_dbfs` is the 20th percentile of the last
+    /// `AMBIENT_WINDOW_FRAMES` room frames with first sample below `speech_lo`:
+    /// the room as last heard with the pod silent and nobody speaking, before
+    /// this speech. It is `None` under `AMBIENT_MIN_FRAMES` such frames, or when
+    /// all of them read as dead.
+    fn level_of(&self, speech_lo: u64, speech_hi: u64) -> Option<UtteranceLevel> {
+        let all_dead = |v: &[f32]| v.iter().all(|&dbfs| FrameLevel { dbfs }.is_dead());
+        let mut speech: Vec<f32> = self
+            .levels
+            .iter()
+            .filter(|(s, _)| (speech_lo..speech_hi).contains(s))
+            .map(|&(_, dbfs)| dbfs)
+            .collect();
+        if all_dead(&speech) {
+            return None;
+        }
+        let speech_dbfs = percentile(&mut speech, WAKE_SPEECH_PERCENTILE)?;
+        let mut ambient: Vec<f32> = self
+            .room
+            .iter()
+            .rev()
+            .filter(|&&(s, _)| s < speech_lo)
+            .take(AMBIENT_WINDOW_FRAMES)
+            .map(|&(_, dbfs)| dbfs)
+            .collect();
+        let ambient_dbfs = if ambient.len() < AMBIENT_MIN_FRAMES || all_dead(&ambient) {
+            None
+        } else {
+            percentile(&mut ambient, AMBIENT_PERCENTILE)
+        };
+        Some(UtteranceLevel {
+            speech_dbfs,
+            ambient_dbfs,
+            source: self.level_source,
+        })
+    }
+
+    /// The level of a phrase ending at `wake_end`: its last second.
+    fn wake_level(&self, wake_end: u64) -> Option<UtteranceLevel> {
+        self.level_of(
+            wake_end.saturating_sub(WAKE_SPEECH_WINDOW_SAMPLES),
+            wake_end,
+        )
+    }
+
     /// Handle a fresh wake detection: expire a prior arm or grant, install this
     /// one, report it, and cut an audible reply if the floor is open.
     ///
@@ -1493,10 +1685,12 @@ impl ListenerState {
         // no command answered in between. A grant waiting on that arm, standing
         // or spent, goes with it: the repeated wake word starts the turn over.
         self.expire_unconsumed_arm(pod, wake_end_sample, ArmExpiryCause::FreshWake, events);
+        let level = self.wake_level(wake_end_sample);
         let arm = WakeArm {
             score,
             wake_end_sample,
             detected_rx: Some(host_rx),
+            level,
         };
         self.wake = Some(arm);
         let lo = wake_end_sample.saturating_sub(WAKE_DOA_LEAD_SAMPLES);
@@ -1513,6 +1707,7 @@ impl ListenerState {
             score,
             wake_end_sample,
             doa,
+            level,
         });
         if self.policy == WakePolicy::WakeGated && self.config.command_wait_samples != 0 {
             // A detection inside a minted utterance's continuation starts the turn
@@ -1782,7 +1977,7 @@ impl ListenerState {
         host_rx: HostMicros,
         events: &mut Vec<ListenerEvent>,
     ) -> Option<CarvedUtterance> {
-        let (id, wake, start, grant_spent) = match self.current_id.clone() {
+        let (id, wake, level, start, grant_spent) = match self.current_id.clone() {
             Some(id) => {
                 // A continuation re-carve is a new candidate under the id that
                 // spent the grant, and its verdict is the one that settles it: the
@@ -1800,6 +1995,7 @@ impl ListenerState {
                 (
                     id,
                     self.current_wake,
+                    self.current_level,
                     self.current_start.unwrap_or(start),
                     grant_spent,
                 )
@@ -1882,6 +2078,7 @@ impl ListenerState {
                                     wake_end_sample: wake_end_rel,
                                     stt_trim_samples: wake_end_rel
                                         .saturating_sub(self.config.stt_margin_samples),
+                                    level: arm.level,
                                 })
                             }
                             // Playback of a response *to you* is an open floor: the
@@ -1912,6 +2109,17 @@ impl ListenerState {
                         }
                     }
                 };
+                // The carve's own speech starts at the onset, past the
+                // endpointer's preroll of room.
+                let level = match wake {
+                    Some(w) => w.level,
+                    None => {
+                        let onset = start
+                            .saturating_add(self.config.endpointer.preroll_pad_samples)
+                            .min(end);
+                        self.level_of(onset, end)
+                    }
+                };
                 self.utterance_seq += 1;
                 let id = ListenerUtteranceId {
                     pod: pod.clone(),
@@ -1929,6 +2137,7 @@ impl ListenerState {
                 self.current_id = Some(id.clone());
                 self.current_start = Some(start);
                 self.current_wake = wake;
+                self.current_level = level;
                 self.current_barge = barge;
                 self.current_follow_up = follow_up;
                 // One candidate at a time, whatever its provenance: the window
@@ -1955,7 +2164,7 @@ impl ListenerState {
                 // playback, even when the endpointer's onset came after the floor
                 // closed and the per-chunk latch never saw it open.
                 self.current_over_playback |= barge;
-                (id, wake, start, grant_spent)
+                (id, wake, level, start, grant_spent)
             }
         };
         let pcm = self.ring.carve(start, end);
@@ -1989,6 +2198,7 @@ impl ListenerState {
             start_sample: start,
             end_sample: end,
             wake,
+            level,
             cause,
             barge_in: self.current_barge,
             over_playback: self.current_over_playback,
@@ -2124,6 +2334,7 @@ impl ListenerState {
                 score: arm.score,
                 wake_end_sample: wake_end_rel,
                 stt_trim_samples: wake_end_rel.saturating_sub(self.config.stt_margin_samples),
+                level: arm.level,
             },
             start_sample: start,
             end_sample: expiry_sample.max(arm.wake_end_sample),
@@ -2229,6 +2440,7 @@ impl ListenerState {
         self.current_id = None;
         self.current_start = None;
         self.current_wake = None;
+        self.current_level = None;
         self.current_barge = false;
         self.current_follow_up = false;
         self.current_over_playback = false;
@@ -2681,6 +2893,370 @@ mod tests {
         PodId("pod-x".into())
     }
 
+    /// A state whose level ring holds one 20 ms frame per 320 samples over
+    /// `[0, end)`, reading `quiet` before `loud_from` and `loud` from it on.
+    fn state_with_levels(end: u64, loud_from: u64, quiet: f32, loud: f32) -> ListenerState {
+        let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
+        state.level_source = LevelSource::RawMic;
+        for start in (0..end).step_by(320) {
+            let dbfs = if start >= loud_from { loud } else { quiet };
+            state.push_level(start, 320, FrameLevel { dbfs });
+        }
+        state
+    }
+
+    /// Loud frames in the last second, quiet before: the speech reading is the
+    /// phrase's level and the ambient reading the room's.
+    #[test]
+    fn wake_level_reads_speech_from_the_last_second_and_ambient_before_it() {
+        let state = state_with_levels(40_000, 24_000, -60.0, -25.0);
+        let level = state.wake_level(40_000).expect("a live window measures");
+        assert_eq!(level.speech_dbfs, -25.0);
+        assert_eq!(level.ambient_dbfs, Some(-60.0));
+        assert_eq!(level.source, LevelSource::RawMic);
+    }
+
+    /// The percentiles: the loud vowels set the speech reading, so pauses inside
+    /// the phrase do not pull it down; the quiet floor sets the ambient one, so
+    /// leading syllables leaking into its window do not push it up.
+    #[test]
+    fn wake_level_percentiles_resist_pauses_and_leaks() {
+        // Speech window [16_000, 32_000): 50 frames, 20 of them pauses at −70.
+        // Ambient window [0, 16_000): 50 frames, 5 of them leaked speech at −30.
+        let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
+        for (i, start) in (0..32_000u64).step_by(320).enumerate() {
+            let dbfs = if start >= 16_000 {
+                if i % 5 < 2 { -70.0 } else { -20.0 }
+            } else if i >= 45 {
+                -30.0
+            } else {
+                -55.0
+            };
+            state.push_level(start, 320, FrameLevel { dbfs });
+        }
+        let level = state.wake_level(32_000).expect("live");
+        assert_eq!(level.speech_dbfs, -20.0);
+        assert_eq!(level.ambient_dbfs, Some(-55.0));
+        assert_eq!(
+            level.source,
+            LevelSource::Beam,
+            "the connection's default source"
+        );
+    }
+
+    /// Too little audio before the phrase: speech is measured, ambient is not.
+    #[test]
+    fn wake_level_has_no_ambient_on_a_short_ring() {
+        // 24 ambient frames, one short of the minimum.
+        let state = state_with_levels(16_000 + 24 * 320, 24 * 320, -60.0, -25.0);
+        let level = state
+            .wake_level(16_000 + 24 * 320)
+            .expect("speech measures");
+        assert_eq!(level.speech_dbfs, -25.0);
+        assert_eq!(level.ambient_dbfs, None);
+    }
+
+    /// A dead speech window is no measurement at all; a dead ambient window is
+    /// no ambient reading; an empty ring measures nothing.
+    #[test]
+    fn wake_level_drops_dead_windows() {
+        let dead = state_with_levels(40_000, 0, -100.0, -100.0);
+        assert_eq!(dead.wake_level(40_000), None);
+        let dead_room = state_with_levels(40_000, 24_000, -100.0, -25.0);
+        assert_eq!(dead_room.wake_level(40_000).unwrap().ambient_dbfs, None);
+        let empty = ListenerState::new(test_config(WakePolicy::WakeGated));
+        assert_eq!(empty.wake_level(40_000), None);
+    }
+
+    /// The ring is bounded, dropping its oldest frames, and a re-sent stretch
+    /// (segment preroll under its original indexes) replaces rather than
+    /// duplicates what the ring holds.
+    #[test]
+    fn level_ring_is_bounded_and_replaces_resent_frames() {
+        let mut state = state_with_levels(320 * 200, 0, -40.0, -40.0);
+        assert_eq!(state.levels.len(), LEVEL_RING_CAPACITY);
+        assert_eq!(state.levels.front().unwrap().0, 320 * 40);
+        // Re-send the last 10 frames at a new level.
+        for start in (320 * 190..320 * 200).step_by(320) {
+            state.push_level(start, 320, FrameLevel { dbfs: -10.0 });
+        }
+        assert_eq!(state.levels.len(), LEVEL_RING_CAPACITY);
+        assert_eq!(
+            state.levels.iter().filter(|&&(_, d)| d == -10.0).count(),
+            10
+        );
+        assert_eq!(state.levels.back().unwrap().0, 320 * 199);
+    }
+
+    /// A detection measures its phrase, reports the level on `WakeDetected`, and
+    /// carries it on the arm whose confirmation the carve takes.
+    #[test]
+    fn wake_detection_carries_the_level_to_the_event_and_the_arm() {
+        let mut state = state_with_levels(40_000, 24_000, -60.0, -25.0);
+        let mut events = Vec::new();
+        state.on_wake_detection(&pod(), 0.9, 40_000, HostMicros(1), &mut events);
+        let want = UtteranceLevel {
+            speech_dbfs: -25.0,
+            ambient_dbfs: Some(-60.0),
+            source: LevelSource::RawMic,
+        };
+        let detected = events
+            .iter()
+            .find_map(|e| match e {
+                ListenerEvent::WakeDetected { level, .. } => Some(*level),
+                _ => None,
+            })
+            .expect("a detection is reported");
+        assert_eq!(detected, Some(want));
+        assert_eq!(state.wake.expect("armed").level, Some(want));
+    }
+
+    /// [`synth_config`] with a three-chunk (1536-sample) preroll, so a carve's
+    /// preroll holds whole level frames that a speech window must leave out.
+    fn level_config(policy: WakePolicy) -> ListenerConfig {
+        let base = synth_config(policy);
+        ListenerConfig {
+            endpointer: EndpointerConfig {
+                preroll_pad_samples: 3 * 512,
+                ..base.endpointer
+            },
+            mute_tail_samples: 1_024,
+            ..base
+        }
+    }
+
+    /// A state under `config` reading raw-mic levels.
+    fn level_state(config: ListenerConfig) -> ListenerState {
+        let mut state = ListenerState::new(config);
+        state.level_source = LevelSource::RawMic;
+        state
+    }
+
+    /// Drive `count` synthetic chunks of probability `p`, each first recorded as
+    /// one 512-sample level frame at `dbfs` — the production order: a frame's
+    /// level is pushed before the chunk that holds it is scored.
+    fn drive_heard(
+        state: &mut ListenerState,
+        p: f32,
+        dbfs: f32,
+        count: usize,
+        cursor: &mut u64,
+    ) -> Vec<ListenerEvent> {
+        let mut evs = Vec::new();
+        for _ in 0..count {
+            state.push_level(*cursor, 512, FrameLevel { dbfs });
+            *cursor += 512;
+            evs.extend(state.drive_probability_for_test(&pod(), p, *cursor));
+        }
+        evs
+    }
+
+    /// A follow-up inside an open window measures its own speech, from the
+    /// onset — the quiet preroll in `[start, onset)` would pull the 80th
+    /// percentile of two speech frames down to the quieter one — and reads the
+    /// room from the room ring before it.
+    #[test]
+    fn a_follow_up_carve_measures_its_own_speech_past_the_preroll() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = level_state(level_config(WakePolicy::WakeGated));
+        let mut cursor = 0u64;
+        drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
+        open_listen(&mut state, cursor, 4_096, &mut oww, &mut silero);
+        let onset = cursor;
+        let mut events = drive_heard(&mut state, 0.9, -30.0, 1, &mut cursor);
+        events.extend(drive_heard(&mut state, 0.9, -20.0, 1, &mut cursor));
+        events.extend(drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "{events:?}");
+        assert!(carved[0].follow_up);
+        assert_eq!(
+            carved[0].start_sample,
+            onset - 3 * 512,
+            "the preroll is there"
+        );
+        assert_eq!(
+            carved[0].level,
+            Some(UtteranceLevel {
+                speech_dbfs: -20.0,
+                ambient_dbfs: Some(-60.0),
+                source: LevelSource::RawMic,
+            })
+        );
+    }
+
+    /// A carve whose speech window holds only dead frames carries no level.
+    #[test]
+    fn a_dead_speech_window_carries_no_level() {
+        let mut state = level_state(level_config(WakePolicy::Bypass));
+        let mut cursor = 0u64;
+        drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
+        let mut events = drive_heard(&mut state, 0.9, -100.0, 2, &mut cursor);
+        events.extend(drive_heard(&mut state, 0.1, -100.0, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "{events:?}");
+        assert_eq!(carved[0].level, None);
+    }
+
+    /// The room ring takes a frame only with the floor closed, past the playback
+    /// tail, and with the endpointer fully idle. The tail is armed at a floor
+    /// drop in every barge mode; outside the mute it decides nothing else.
+    #[test]
+    fn the_room_ring_takes_only_frames_nobody_was_playing_or_speaking_into() {
+        for mode in [BargeMode::Wake, BargeMode::Speech] {
+            let mut state = level_state(ListenerConfig {
+                barge_in: BargeInConfig {
+                    mode,
+                    ..barge_config(WakePolicy::Bypass).barge_in
+                },
+                ..level_config(WakePolicy::Bypass)
+            });
+            let mut cursor = 0u64;
+            play(&mut state, true, false);
+            drive_heard(&mut state, 0.1, -20.0, 4, &mut cursor);
+            assert!(state.room.is_empty(), "{mode:?}: nothing under the floor");
+
+            stop_playback_at(&mut state, cursor);
+            assert_eq!(state.tail_until_sample, cursor + 1_024, "{mode:?}: armed");
+            assert!(
+                !state.muted(cursor + 512),
+                "{mode:?}: the tail mutes nothing"
+            );
+            // Two frames end at or before the tail; the third ends after it.
+            drive_heard(&mut state, 0.1, -50.0, 2, &mut cursor);
+            assert!(state.room.is_empty(), "{mode:?}: nothing inside the tail");
+            drive_heard(&mut state, 0.1, -60.0, 1, &mut cursor);
+            assert_eq!(state.room.len(), 1, "{mode:?}: the room is heard again");
+
+            // The first chunk of a run is pushed while the endpointer is still
+            // idle; every later one is pushed with it counting or in speech.
+            drive_heard(&mut state, 0.9, -25.0, 4, &mut cursor);
+            assert_eq!(state.room.len(), 2, "{mode:?}: only the run's first chunk");
+            drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor);
+            assert_eq!(state.room.len(), 2, "{mode:?}: nor the hangover");
+        }
+    }
+
+    /// A speech-rule barge whose preceding second was all under the floor reads
+    /// the room from before the reply, not the reply; a connection that has
+    /// heard no room frame at all has no ambient reading.
+    #[test]
+    fn a_barge_reads_the_room_from_before_the_reply() {
+        let mut state = level_state(ListenerConfig {
+            mute_tail_samples: 1_024,
+            ..barge_config(WakePolicy::WakeGated)
+        });
+        let mut cursor = 0u64;
+        drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
+        play(&mut state, true, true);
+        drive_heard(&mut state, 0.1, -20.0, 40, &mut cursor);
+        let mut events = drive_heard(&mut state, 0.9, -25.0, 3, &mut cursor);
+        assert_eq!(barge_triggers(&events).len(), 1, "{events:?}");
+        events.extend(drive_heard(&mut state, 0.1, -20.0, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "{events:?}");
+        assert!(carved[0].barge_in);
+        let level = carved[0].level.expect("a barge carries a level");
+        assert_eq!(level.ambient_dbfs, Some(-60.0), "the room, not the reply");
+
+        let mut fresh = level_state(ListenerConfig {
+            mute_tail_samples: 1_024,
+            ..barge_config(WakePolicy::WakeGated)
+        });
+        let mut cursor = 0u64;
+        play(&mut fresh, true, true);
+        let mut events = drive_heard(&mut fresh, 0.9, -25.0, 3, &mut cursor);
+        events.extend(drive_heard(&mut fresh, 0.1, -20.0, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "{events:?}");
+        let level = carved[0].level.expect("the speech is measured");
+        assert_eq!(level.speech_dbfs, -25.0);
+        assert_eq!(level.ambient_dbfs, None, "no room has been heard");
+    }
+
+    /// Long speech does not displace the room ring, so a long follow-up keeps
+    /// its ambient reading; the frame ring is bounded, so speech longer than it
+    /// is measured over its last ~2.9 s. Here a loud head of 40 frames would set
+    /// the 80th percentile of the whole 170, and is mostly gone from the ring
+    /// by the carve.
+    #[test]
+    fn a_long_follow_up_keeps_its_ambient_and_measures_its_tail() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = level_state(ListenerConfig {
+            endpointer: EndpointerConfig {
+                max_utterance_samples: 400 * 512,
+                ..level_config(WakePolicy::WakeGated).endpointer
+            },
+            ..level_config(WakePolicy::WakeGated)
+        });
+        let mut cursor = 0u64;
+        drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
+        open_listen(&mut state, cursor, 4_096, &mut oww, &mut silero);
+        let mut events = drive_heard(&mut state, 0.9, -10.0, 40, &mut cursor);
+        events.extend(drive_heard(&mut state, 0.9, -30.0, 130, &mut cursor));
+        events.extend(drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "{events:?}");
+        assert!(carved[0].follow_up);
+        let level = carved[0].level.expect("measured");
+        assert_eq!(level.speech_dbfs, -30.0, "the ring's tail of the speech");
+        assert_eq!(level.ambient_dbfs, Some(-60.0), "the room is kept");
+    }
+
+    /// A wake said over a reply reads the room from before the reply.
+    #[test]
+    fn a_wake_over_a_reply_reads_the_room_from_before_it() {
+        let mut state = level_state(test_config(WakePolicy::WakeGated));
+        for start in (0..20_000u64).step_by(320) {
+            state.push_level(start, 320, FrameLevel { dbfs: -60.0 });
+        }
+        play(&mut state, true, true);
+        for start in (20_000..60_000u64).step_by(320) {
+            let dbfs = if start >= 44_000 { -25.0 } else { -20.0 };
+            state.push_level(start, 320, FrameLevel { dbfs });
+        }
+        let level = state.wake_level(60_000).expect("measured");
+        assert_eq!(level.speech_dbfs, -25.0);
+        assert_eq!(level.ambient_dbfs, Some(-60.0), "the room, not the reply");
+    }
+
+    /// A wake-gated carve carries its arm's level, not a fresh reading of its
+    /// own speech; a continuation re-carve keeps the first carve's level, under
+    /// a wake and without one.
+    #[test]
+    fn a_carve_keeps_its_first_level_and_a_wake_carve_takes_its_arms() {
+        let mut state = level_state(level_config(WakePolicy::WakeGated));
+        let mut cursor = 0u64;
+        drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
+        state.arm_wake_for_test(0.9, cursor + 400);
+        let arm_level = state.wake.expect("armed").level;
+        assert!(arm_level.is_some());
+        let mut events = drive_heard(&mut state, 0.9, -20.0, 2, &mut cursor);
+        events.extend(drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor));
+        events.extend(drive_heard(&mut state, 0.9, -5.0, 2, &mut cursor));
+        events.extend(drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 2, "{events:?}");
+        assert_eq!(carved[0].level, arm_level, "the arm's level");
+        assert_eq!(carved[0].level, carved[0].wake.unwrap().level);
+        assert_eq!(carved[1].utterance_id, carved[0].utterance_id);
+        assert_eq!(carved[1].level, arm_level, "a continuation keeps it");
+
+        let mut state = level_state(level_config(WakePolicy::Bypass));
+        let mut cursor = 0u64;
+        drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
+        let mut events = drive_heard(&mut state, 0.9, -20.0, 2, &mut cursor);
+        events.extend(drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor));
+        events.extend(drive_heard(&mut state, 0.9, -5.0, 2, &mut cursor));
+        events.extend(drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 2, "{events:?}");
+        assert!(carved[0].wake.is_none());
+        assert_eq!(carved[0].level.expect("measured").speech_dbfs, -20.0);
+        assert_eq!(carved[1].level, carved[0].level, "a continuation keeps it");
+    }
+
     /// Production knobs with the wake-command hold off. The real-audio tests that
     /// use this drive the wake phrase with nothing after it — the exact shape the
     /// hold retains — and their subject is the arm, the segment and the stamps, not
@@ -2810,12 +3386,14 @@ mod tests {
     /// transport delay.
     fn audio_feed(index: u64, pcm: Vec<i16>) -> Feed {
         let len = pcm.len() as u64;
+        let level = FrameLevel::measure(&pcm);
         Feed::Audio {
             first_sample_index: index,
             gap: None,
             pcm: Arc::from(pcm),
             device_ts: dev_at(index),
             host_rx: rx_at(index + len),
+            level,
         }
     }
 
@@ -2904,7 +3482,15 @@ mod tests {
         silero: &mut SileroModel,
     ) {
         state
-            .handle(&pod(), Feed::Connected { epoch: 1 }, oww, silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 1,
+                    level_source: LevelSource::Beam,
+                },
+                oww,
+                silero,
+            )
             .unwrap();
         open_segment(state, base, preroll, oww, silero);
     }
@@ -3149,7 +3735,15 @@ mod tests {
         assert_eq!(state.doa.front().map(|d| d.sample), Some(8 * 1_600));
 
         state
-            .handle(&pod(), Feed::Connected { epoch: 2 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .unwrap();
         assert!(state.doa.is_empty(), "the reconnect clears the ring");
         state
@@ -3480,6 +4074,7 @@ mod tests {
                             pcm: Arc::from(chunk.to_vec()),
                             device_ts: dev_at(index),
                             host_rx: HostMicros(rx_at(index + chunk.len() as u64).0 + late),
+                            level: FrameLevel::measure(chunk),
                         },
                         &mut oww,
                         &mut silero,
@@ -3547,7 +4142,15 @@ mod tests {
 
         // The pod reconnects, and no new segment opens before the next carve.
         state
-            .handle(&pod(), Feed::Connected { epoch: 2 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .expect("connected feed");
         assert!(state.segment.is_none(), "the reconnect dropped the anchors");
 
@@ -3657,6 +4260,7 @@ mod tests {
                         pcm: Arc::from(vec![0_i16; 512]),
                         device_ts: dev_at(index),
                         host_rx: HostMicros(rx_at(index + 512).0 - 30_000),
+                        level: FrameLevel::measure(&[0; 512]),
                     },
                     &mut oww,
                     &mut silero,
@@ -5123,7 +5727,15 @@ mod tests {
         let (mut state, cursor, id) =
             state_with_a_spent_window(WakePolicy::WakeGated, 1_024, &mut oww, &mut silero);
         let reconnected = state
-            .handle(&pod(), Feed::Connected { epoch: 2 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .expect("connected feed");
         assert_eq!(
             expiries(&reconnected),
@@ -6134,7 +6746,15 @@ mod tests {
         assert!(state.barge_pending, "a trigger is pending the next carve");
 
         state
-            .handle(&pod(), Feed::Connected { epoch: 2 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .expect("connected feed");
         assert!(
             !state.playback.active,
@@ -6524,7 +7144,15 @@ mod tests {
         state.expected_next = Some(cursor);
 
         let events = state
-            .handle(&pod(), Feed::Connected { epoch: 5 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 5,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .unwrap();
         assert_eq!(
             transitions(&events),
@@ -6882,7 +7510,15 @@ mod tests {
         state.arm_wake_for_test(0.9, 8_000);
         state.silero_cursor = 9_000;
         let events = state
-            .handle(&pod(), Feed::Connected { epoch: 2 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .unwrap();
         assert!(
             events
@@ -7694,7 +8330,15 @@ mod tests {
         assert_eq!(wake_helds(&events).len(), 1, "held: {events:?}");
 
         let reconnect = state
-            .handle(&pod(), Feed::Connected { epoch: 7 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 7,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .expect("reconnect");
         assert!(
             state.grant.standing().is_none(),
@@ -7723,17 +8367,25 @@ mod tests {
         // The reply is heard out, arming the tail, and its window opens behind it.
         play(&mut state, true, true);
         stop_playback_at(&mut state, 0);
-        assert_eq!(state.muted_until_sample, 1_024, "the tail is armed");
+        assert_eq!(state.tail_until_sample, 1_024, "the tail is armed");
         open_listen(&mut state, 0, 8_192, &mut oww, &mut silero);
 
         let reconnect = state
-            .handle(&pod(), Feed::Connected { epoch: 7 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 7,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .expect("reconnect");
         assert!(
             state.capture.open().is_none(),
             "the window went with the connection"
         );
-        assert_eq!(state.muted_until_sample, 0, "and so did the tail");
+        assert_eq!(state.tail_until_sample, 0, "and so did the tail");
         assert!(
             reconnect
                 .iter()
@@ -8226,7 +8878,15 @@ mod tests {
         let mut silero = silero_model();
         let (mut state, _, _) = state_with_a_spent_grant();
         let events = state
-            .handle(&pod(), Feed::Connected { epoch: 3 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 3,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .expect("reconnect");
         assert_eq!(
             arm_causes(&events),
@@ -8530,7 +9190,15 @@ mod tests {
         state.arm_wake_for_test(0.9, 1_024);
         state.silero_cursor = 2_000;
         let events = state
-            .handle(&pod(), Feed::Connected { epoch: 2 }, &mut oww, &mut silero)
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
             .unwrap();
         assert_eq!(
             arm_causes(&events),
@@ -8714,6 +9382,7 @@ mod tests {
                     pcm: Arc::from(pcm.to_vec()),
                     device_ts: dev_at(index),
                     host_rx: HostMicros(rx_at(index + pcm.len() as u64).0 + late_us),
+                    level: FrameLevel::measure(pcm),
                 },
                 oww,
                 silero,
@@ -9180,7 +9849,15 @@ mod tests {
         )
         .unwrap();
         let p = pod();
-        handle.feed(p.clone(), Feed::Connected { epoch: 1 }).await;
+        handle
+            .feed(
+                p.clone(),
+                Feed::Connected {
+                    epoch: 1,
+                    level_source: LevelSource::Beam,
+                },
+            )
+            .await;
         handle.feed(p.clone(), opened_feed(0, 0)).await;
         let phrase = wake_phrase_pcm();
         handle.feed(p.clone(), audio_feed(0, phrase.clone())).await;
@@ -9225,7 +9902,15 @@ mod tests {
         )
         .unwrap();
         let p = pod();
-        handle.feed(p.clone(), Feed::Connected { epoch: 1 }).await;
+        handle
+            .feed(
+                p.clone(),
+                Feed::Connected {
+                    epoch: 1,
+                    level_source: LevelSource::Beam,
+                },
+            )
+            .await;
         handle.feed(p.clone(), opened_feed(0, 0)).await;
         // Non-blocking feeds pile up far past FEED_CHANNEL_DEPTH while the thread
         // grinds ONNX per chunk.
@@ -9275,14 +9960,20 @@ mod tests {
         let marker_pod = p.clone();
         let marker = tokio::spawn(async move {
             marker_sender
-                .feed(marker_pod, Feed::Connected { epoch: 1 })
+                .feed(
+                    marker_pod,
+                    Feed::Connected {
+                        epoch: 1,
+                        level_source: LevelSource::Beam,
+                    },
+                )
                 .await;
         });
         // Draining makes room; the blocked marker then lands.
         let mut saw_connected = false;
         for _ in 0..FEED_CHANNEL_DEPTH + 1 {
             match rx.recv().await {
-                Some((_, Feed::Connected { epoch })) => {
+                Some((_, Feed::Connected { epoch, .. })) => {
                     assert_eq!(epoch, 1);
                     saw_connected = true;
                     break;
@@ -9353,7 +10044,15 @@ mod tests {
         let p = pod();
         saturate(&sender, &p).await;
         let before = tokio::time::Instant::now();
-        sender.feed(p, Feed::Connected { epoch: 1 }).await;
+        sender
+            .feed(
+                p,
+                Feed::Connected {
+                    epoch: 1,
+                    level_source: LevelSource::Beam,
+                },
+            )
+            .await;
         assert!(
             before.elapsed() >= MARKER_SEND_TIMEOUT,
             "the full bound elapsed"
@@ -9377,7 +10076,15 @@ mod tests {
         let (about_to_send, parked) = tokio::sync::oneshot::channel();
         let marker = tokio::spawn(async move {
             let _ = about_to_send.send(());
-            marker_sender.feed(p, Feed::Connected { epoch: 1 }).await;
+            marker_sender
+                .feed(
+                    p,
+                    Feed::Connected {
+                        epoch: 1,
+                        level_source: LevelSource::Beam,
+                    },
+                )
+                .await;
         });
         // Wait for the task to reach its send, then let it park on the full channel
         // before killing the consumer, so this exercises close-mid-await.

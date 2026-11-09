@@ -16,7 +16,8 @@ pub use framelog::{FrameLogError, FrameLogReader, FrameLogWriter, LogItem, LogMe
 pub use readback::{SpliceOutcome, SpliceStop, splice_log_into};
 pub use segref::{ResolveError, Resolved, SegmentRef, resolve_open};
 pub use session::{
-    ChannelSource, CloseCause, Codec, CrossCheck, EndReason, FormatConstraint, FsmStats, Gap,
-    ProtocolErrorKind, ResumeLedger, SegmentClose, SessionEvent, SessionFsm, TelemetryKind,
+    CaptureLayout, ChannelSource, CloseCause, Codec, CrossCheck, EndReason, FormatConstraint,
+    FsmStats, Gap, ProtocolErrorKind, ResumeLedger, SegmentClose, SessionEvent, SessionFsm,
+    TelemetryKind,
 };
 pub use synth::{SynthError, SynthFrame, SynthParams, synth_session};

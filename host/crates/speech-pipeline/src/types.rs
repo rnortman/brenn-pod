@@ -19,16 +19,19 @@ use pod_ingest::{
 };
 use serde::{Deserialize, Serialize};
 
-/// The one PCM/handshake format the speech spine accepts: 16 kHz mono S16, one
-/// of the mono beam variants (stereo rejected). Supplied to the ingest FSM's
-/// format gate so a wire-legal but spine-incompatible `Hello` (stereo, wrong
-/// rate) is rejected at the door rather than half-interpreted downstream.
+use crate::volume::GainResolution;
+
+/// The PCM/handshake format the speech spine accepts: 16 kHz S16, either mono
+/// with one of the mono beam variants, or two channels declared as beam + raw
+/// mic (the spine reads the beam; the raw mic feeds the level meter). Supplied to
+/// the ingest FSM's format gate so a wire-legal but spine-incompatible `Hello`
+/// (unlabelled stereo, wrong rate) is rejected at the door rather than
+/// half-interpreted downstream.
 pub const SPINE_FORMAT: FormatConstraint = FormatConstraint {
     sample_rate_hz: 16_000,
     bits_per_sample: 16,
     channels: 1,
     codec: Codec::S16Le,
-    mono_beam_only: true,
 };
 
 /// A pod's stable identity, from `Hello.pod_id`.
@@ -205,6 +208,14 @@ pub struct SpeakCmd {
     /// The originating utterance's stamps, carried to the playback side for
     /// latency decomposition. `Default` when there is no originating utterance.
     pub timings: StageTimings,
+    /// How this reply's gain was decided, by the `VolumeBook` when the command
+    /// was queued: a persistent change written to the book afterwards does not
+    /// reach it.
+    pub gain: GainResolution,
+    /// The originating utterance's measured levels, the input `gain`'s
+    /// automatic term read. `None` only for an announcement, an offline clip,
+    /// or a carve no live level reading covered.
+    pub level: Option<UtteranceLevel>,
 }
 
 /// A movement a response asked for.
@@ -402,6 +413,32 @@ pub struct WakeConfirmation {
     pub score: f32,
     pub wake_end_sample: usize,
     pub stt_trim_samples: usize,
+    /// How loudly the wake phrase was spoken, measured at its detection; `None`
+    /// when no live level reading covered it.
+    pub level: Option<UtteranceLevel>,
+}
+
+/// Which signal an utterance's levels were measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelSource {
+    /// An uncompressed raw microphone channel: no AGC, no noise suppression.
+    RawMic,
+    /// The processed beam the pod streams as its speech channel.
+    Beam,
+}
+
+/// How loudly an utterance was addressed, and how loud the room was before it.
+/// Levels are dBFS of 16-bit PCM.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UtteranceLevel {
+    /// The level of the speech that triggered the reply — the wake phrase of a
+    /// wake-gated utterance, the utterance's own speech otherwise.
+    pub speech_dbfs: f32,
+    /// The room as last heard with the pod silent and nobody speaking, before
+    /// this utterance; `None` when too little such audio has been heard.
+    pub ambient_dbfs: Option<f32>,
+    pub source: LevelSource,
 }
 
 /// A self-contained reference to the recorded audio an utterance was carved from:
@@ -619,6 +656,11 @@ pub struct Utterance {
     /// This utterance's speech was heard over the pod's own playback at some
     /// point in its life, whether or not it cut it.
     pub over_playback: bool,
+    /// How loudly this utterance was addressed — the wake phrase that opened
+    /// it, or its own speech when no wake did (a barge, a follow-up, any
+    /// utterance under `Bypass`) — and how loud the room was before it. `None`
+    /// only when no live level reading covered the speech.
+    pub level: Option<UtteranceLevel>,
 }
 
 impl Utterance {
@@ -813,6 +855,7 @@ pub(crate) fn test_utterance() -> Utterance {
         wake: None,
         barge_in: None,
         over_playback: false,
+        level: None,
     }
 }
 
@@ -830,7 +873,6 @@ mod tests {
                 bits_per_sample: 16,
                 channels: 1,
                 codec: Codec::S16Le,
-                mono_beam_only: true,
             }
         );
     }
@@ -1014,6 +1056,7 @@ mod tests {
             wake: None,
             barge_in: None,
             over_playback: false,
+            level: None,
         };
         // Round-trips through serde (the surface-envelope requirement).
         let json = serde_json::to_string(&utt).unwrap();
@@ -1530,6 +1573,8 @@ mod tests {
             body: SpeakBody::Pcm(Arc::from(vec![1i16, -2, 3].as_slice())),
             interruptible: true,
             timings: StageTimings::default(),
+            gain: crate::VolumeBook::default().resolve(&PodId("pod-x".into()), None, None),
+            level: None,
         };
         // Serializes at all only because serde's `rc` feature is enabled.
         let json = serde_json::to_string(&cmd).unwrap();

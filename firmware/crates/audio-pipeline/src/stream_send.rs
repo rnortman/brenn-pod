@@ -1486,7 +1486,7 @@ mod host_socket_tests {
     // and `SO_RCVBUF` at 2304, so the send buffer always has room for a whole frame
     // the instant the peer reads even one byte — across every (sndbuf, rcvbuf, drain
     // pace) combination probed, `write` returned the full frame in one call and
-    // `resume_cycles` was 0.  A sub-frame straddle on lwIP (a 2880-byte send buffer,
+    // `resume_cycles` was 0.  A sub-frame straddle on lwIP (a 5760-byte send buffer,
     // frames landing on a sub-MSS remainder) simply has no localhost analogue for a
     // frame this small.
     //

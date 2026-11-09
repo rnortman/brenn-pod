@@ -13,6 +13,7 @@
 //! speech itself, with control information in tag-shaped islands that [`scan`]
 //! lifts out and everything else passed through verbatim.
 
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -26,7 +27,10 @@ use crate::brain::{BrainEvent, BrainEventFn, BrainStats, send_or_report};
 use crate::traits::{Brain, ResponseSink, TurnEnd};
 use crate::types::{
     ContextSegment, Cue, InterruptProgress, PodId, RoomId, SpeakBody, SpeakCmd, Utterance,
-    UtteranceId,
+    UtteranceId, UtteranceLevel,
+};
+use crate::volume::{
+    AutoPolicy, OperatorBounds, VolumeBook, VolumeCommand, VolumeState, resolve_shared,
 };
 
 /// The transport seam a brenn-side brain publishes through.
@@ -126,6 +130,9 @@ struct UtteranceWire<'a> {
     text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     interrupted: Option<InterruptedBody>,
+    volume: &'a VolumeState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<UtteranceLevel>,
 }
 
 #[derive(Serialize)]
@@ -156,7 +163,11 @@ pub fn wake_body(pod: &PodId) -> String {
 /// where the reply it cut off had reached. One atomic message carries both, so the
 /// interruption estimate can neither be reordered against the new speech nor
 /// half-delivered.
-pub fn utterance_body(u: &Utterance, text: &str) -> String {
+///
+/// `volume` is the pod's volume state when the turn is sent: the peer's only view
+/// of it, so a hold lost to a restart or a value clamped into the operator's
+/// bounds shows on the next turn.
+pub fn utterance_body(u: &Utterance, text: &str, volume: &VolumeState) -> String {
     render(&UtteranceWire {
         kind: "utterance",
         utterance: u.id.0,
@@ -165,6 +176,8 @@ pub fn utterance_body(u: &Utterance, text: &str) -> String {
         speaker: u.speaker.as_ref().map(|s| s.0.as_str()),
         text,
         interrupted: InterruptedBody::for_utterance(u),
+        volume,
+        level: u.level,
     })
 }
 
@@ -196,9 +209,24 @@ pub enum Tag {
     /// motion to play over the standing one. Carries the [`Cue`] the response
     /// delivers verbatim, so the marker and the movement cannot drift apart.
     Cue(Cue),
-    /// A tag-shaped island the vocabulary does not cover, or one mangled past
-    /// parsing. Stripped from the speech and reported loudly, never spoken.
+    /// Change the reply volume: this message's gain, the pod's persistent
+    /// volume state, or both.
+    Volume(VolumeTag),
+    /// A tag-shaped island the vocabulary does not cover, one mangled past
+    /// parsing, or a `<volume/>` superseded by a later one in the same message.
+    /// Stripped from the speech and reported loudly, never spoken or acted on.
     Unknown { raw: String },
+}
+
+/// What one `<volume/>` marker asked for. At least one attribute is present;
+/// every value is a finite number. Range is not checked here: the operator's
+/// bounds belong to the volume book, not to the codec.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VolumeTag {
+    /// The gain for this message's speech only (`db`).
+    pub db: Option<f32>,
+    /// The persistent attributes, applied to the pod's state.
+    pub persistent: VolumeCommand,
 }
 
 /// Tag-shaped islands in a response body. Deliberately not an XML grammar: the
@@ -239,20 +267,66 @@ fn attr_value<'a>(pattern: &Regex, attrs: &'a str) -> Option<&'a str> {
         .map(|m| m.as_str())
 }
 
+/// An optional marker attribute: the pattern that reads its value and the one
+/// that notices its key, so a present but unreadable value mangles the marker
+/// instead of reading as an absent attribute.
+struct MarkerAttr {
+    value: Regex,
+    key: Regex,
+}
+
+impl MarkerAttr {
+    fn new(name: &str) -> Self {
+        Self {
+            value: attr_pattern(name),
+            key: attr_key_pattern(name),
+        }
+    }
+
+    /// Absent, or present and readable, or `Err` — present but unreadable.
+    fn read<'a>(&self, attrs: &'a str) -> Result<Option<&'a str>, ()> {
+        match attr_value(&self.value, attrs) {
+            Some(value) => Ok(Some(value.trim())),
+            None if self.key.is_match(attrs) => Err(()),
+            None => Ok(None),
+        }
+    }
+
+    /// Absent, or a value that parses as `T`, or `Err`.
+    fn parsed<T: FromStr>(&self, attrs: &str) -> Result<Option<T>, ()> {
+        self.read(attrs)?
+            .map(|value| value.parse::<T>().map_err(|_| ()))
+            .transpose()
+    }
+
+    /// Absent, or a finite number, or `Err`.
+    fn number<T: FromStr + Into<f64> + Copy>(&self, attrs: &str) -> Result<Option<T>, ()> {
+        match self.parsed::<T>(attrs)? {
+            Some(n) if !n.into().is_finite() => Err(()),
+            n => Ok(n),
+        }
+    }
+}
+
 /// The `to` attribute of a reply marker.
-static REPLY_TO: LazyLock<Regex> = LazyLock::new(|| attr_pattern("to"));
+static REPLY_TO: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("to"));
 
-/// Whether an attribute list mentions `to` at all.
-static REPLY_TO_KEY: LazyLock<Regex> = LazyLock::new(|| attr_key_pattern("to"));
-
-/// The `name` attribute of a pose or motion marker.
+/// The `name` attribute of a pose or motion marker. Required, so it has no key
+/// check: absent and unreadable both mangle the marker.
 static CUE_NAME: LazyLock<Regex> = LazyLock::new(|| attr_pattern("name"));
 
 /// The `speed` attribute of a pose or motion marker.
-static CUE_SPEED: LazyLock<Regex> = LazyLock::new(|| attr_pattern("speed"));
+static CUE_SPEED: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("speed"));
 
-/// Whether a cue marker mentions `speed` at all.
-static CUE_SPEED_KEY: LazyLock<Regex> = LazyLock::new(|| attr_key_pattern("speed"));
+static VOLUME_DB: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("db"));
+static VOLUME_HOLD: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("hold"));
+static VOLUME_AUTO: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("auto"));
+static VOLUME_K_SPEECH: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("k_speech"));
+static VOLUME_SPEECH_REF: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("speech_ref"));
+static VOLUME_K_AMBIENT: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("k_ambient"));
+static VOLUME_AMBIENT_REF: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("ambient_ref"));
+static VOLUME_MIN: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("min"));
+static VOLUME_MAX: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("max"));
 
 /// Split a response body into the text to speak and the markers it carried, each
 /// with its offset into that text. Known markers are lifted out and acted on by
@@ -264,13 +338,25 @@ static CUE_SPEED_KEY: LazyLock<Regex> = LazyLock::new(|| attr_key_pattern("speed
 /// The offsets are what a future speech-synchronized marker (an emote, a gaze
 /// target) fires on: such a marker's meaning is its position in the speech. Nothing
 /// acts on them today, but the scan never discards the position.
+///
+/// A message carries at most one [`Tag::Volume`]: when it has several, the last is
+/// kept and every earlier one becomes [`Tag::Unknown`], so it is reported as
+/// stripped rather than dropped unseen. One marker's attributes are applied as
+/// one transaction, and the vocabulary has no rule for combining two.
 pub fn scan(body: &str) -> (String, Vec<(Tag, usize)>) {
     let mut text = String::with_capacity(body.len());
-    let mut tags = Vec::new();
+    let mut tags: Vec<(Tag, usize)> = Vec::new();
     let mut cursor = 0;
+    let mut volume_at: Option<(usize, &str)> = None;
     for island in TAG_ISLAND.find_iter(body) {
         text.push_str(&body[cursor..island.start()]);
-        tags.push((parse_island(island.as_str()), text.len()));
+        let tag = parse_island(island.as_str());
+        if matches!(tag, Tag::Volume(_))
+            && let Some((earlier, raw)) = volume_at.replace((tags.len(), island.as_str()))
+        {
+            tags[earlier].0 = Tag::Unknown { raw: raw.into() };
+        }
+        tags.push((tag, text.len()));
         cursor = island.end();
     }
     text.push_str(&body[cursor..]);
@@ -309,8 +395,37 @@ fn parse_island(raw: &str) -> Tag {
         "listen" => Tag::Listen,
         "pose" => parse_cue(attrs, raw, false),
         "motion" => parse_cue(attrs, raw, true),
+        "volume" => parse_volume(attrs).map_or_else(unknown, Tag::Volume),
         _ => unknown(),
     }
+}
+
+/// A volume marker: every attribute optional, at least one present. Like a cue,
+/// a marker with any attribute present but unreadable — a number that is not a
+/// finite number, `auto` other than `on`/`off` — is not read at all: the peer
+/// meant something this side cannot recover, and half of a volume change is not
+/// what it asked for.
+fn parse_volume(attrs: &str) -> Option<VolumeTag> {
+    let auto = match VOLUME_AUTO.read(attrs).ok()? {
+        None => None,
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        Some(_) => return None,
+    };
+    let tag = VolumeTag {
+        db: VOLUME_DB.number(attrs).ok()?,
+        persistent: VolumeCommand {
+            hold_db: VOLUME_HOLD.number(attrs).ok()?,
+            auto,
+            k_speech: VOLUME_K_SPEECH.number(attrs).ok()?,
+            speech_ref_dbfs: VOLUME_SPEECH_REF.number(attrs).ok()?,
+            k_ambient: VOLUME_K_AMBIENT.number(attrs).ok()?,
+            ambient_ref_dbfs: VOLUME_AMBIENT_REF.number(attrs).ok()?,
+            auto_min_db: VOLUME_MIN.number(attrs).ok()?,
+            auto_max_db: VOLUME_MAX.number(attrs).ok()?,
+        },
+    };
+    (tag != VolumeTag::default()).then_some(tag)
 }
 
 /// A pose or motion marker: a required `name` and an optional `speed`.
@@ -327,13 +442,8 @@ fn parse_cue(attrs: &str, raw: &str, motion: bool) -> Tag {
     if name.is_empty() {
         return unknown();
     }
-    let speed = match attr_value(&CUE_SPEED, attrs) {
-        Some(value) => match value.trim().parse::<f64>() {
-            Ok(speed) if speed.is_finite() => Some(speed),
-            _ => return unknown(),
-        },
-        None if CUE_SPEED_KEY.is_match(attrs) => return unknown(),
-        None => None,
+    let Ok(speed) = CUE_SPEED.number::<f64>(attrs) else {
+        return unknown();
     };
     let name = name.to_owned();
     Tag::Cue(if motion {
@@ -352,13 +462,9 @@ fn parse_cue(attrs: &str, raw: &str, motion: bool) -> Tag {
 /// turn's marker, not a stale echo from the peer's context — so a partial read must
 /// not reach the correlation check.
 fn parse_reply(attrs: &str, raw: &str) -> Tag {
-    match attr_value(&REPLY_TO, attrs) {
-        Some(value) => match value.trim().parse::<u64>() {
-            Ok(to) => Tag::Reply { to: Some(to) },
-            Err(_) => Tag::Unknown { raw: raw.into() },
-        },
-        None if REPLY_TO_KEY.is_match(attrs) => Tag::Unknown { raw: raw.into() },
-        None => Tag::Reply { to: None },
+    match REPLY_TO.parsed::<u64>(attrs) {
+        Ok(to) => Tag::Reply { to },
+        Err(()) => Tag::Unknown { raw: raw.into() },
     }
 }
 
@@ -376,11 +482,20 @@ pub struct HelpChannels {
     pub wake: Option<String>,
 }
 
-/// What the instruction document may tell its reader to ask the head for: the
-/// movement vocabulary the deployment resolved, and the window a `<continued/>`
-/// buys. Both are deployment facts, so the document states the ones this run
-/// actually holds rather than an example of them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The volume facts the instruction document states: the operator's bounds and
+/// the automatic policy every pod starts from. Fixed for the process; the live
+/// per-pod state rides on each utterance instead.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HelpVolume {
+    pub bounds: OperatorBounds,
+    pub auto: AutoPolicy,
+}
+
+/// What the instruction document may tell its reader to ask the pod for: the
+/// movement vocabulary the deployment resolved, the window a `<continued/>`
+/// buys, and the volume bounds. All are deployment facts, so the document states
+/// the ones this run actually holds rather than an example of them.
+#[derive(Debug, Clone, PartialEq)]
 pub struct HelpCues {
     /// Pose names the reader may name, already filtered to the ones it is
     /// allowed to command. Empty renders as `(none)`.
@@ -389,6 +504,7 @@ pub struct HelpCues {
     pub motions: Vec<String>,
     /// How long the pod waits for a promised continuation, as configured.
     pub continued_ms: u64,
+    pub volume: HelpVolume,
 }
 
 /// The contract document, written at the language model that answers on the bus —
@@ -436,13 +552,76 @@ Motions you may name: {motions}.
         poses = name_list(&cues.poses),
         motions = name_list(&cues.motions),
     );
+    let volume = volume_section(&cues.volume);
     format!(
         "{HELP_INTRO}\n\
          Utterances from the pods arrive on the channel `{publish}`.\n\
          Publish every reply on the channel `{response}`.\n\
-         {wake_section}{HELP_BODY}\n{markers}{HELP_TAIL}",
+         {wake_section}{HELP_BODY}\n{markers}\n{volume}{HELP_TAIL}",
         publish = channels.publish,
         response = channels.response,
+    )
+}
+
+/// The `# Volume` section: the marker, its attributes, the configured bounds and
+/// defaults, and where the live state is reported.
+fn volume_section(v: &HelpVolume) -> String {
+    let a = &v.auto;
+    format!(
+        "\
+# Volume
+
+All volume numbers are decibels relative to the voice's natural level: 0 is as
+produced, negative is quieter, positive is louder. The operator allows
+{min} to {max} dB; anything outside that is clamped, whatever you ask.
+
+  <volume db=\"N\"/>         play this message's speech at N dB. This message only.
+  <volume hold=\"N\"/>       set the pod's standing volume to N dB. It stays until you
+                           change it or the pod restarts.
+  <volume auto=\"on\"/>      let the pod adjust the volume to how loudly it was
+                           addressed (\"off\" turns that off). Starts {auto_state}.
+  <volume k_speech=\"K\" speech_ref=\"R\" k_ambient=\"A\" ambient_ref=\"B\"/>
+                           tune the automatic adjustment: K dB louder per dB the
+                           speech was above R dBFS, plus A dB per dB the room was
+                           above B dBFS. Defaults: K {k_speech}, R {speech_ref},
+                           A {k_ambient}, B {ambient_ref}.
+  <volume min=\"L\" max=\"H\"/> limit how far the automatic adjustment may move the
+                           volume, L below to H above the standing volume.
+                           Defaults: {auto_min} and {auto_max}. L must not exceed H.
+
+Attributes combine in one marker: `<volume hold=\"-10\" auto=\"off\"/>`. Use one
+`<volume/>` per message and put every attribute in it: when a message has more,
+only the last is acted on and the others are discarded. A marker can be a whole
+message with no speech. A standing change takes effect from the message that
+carries it: earlier messages of the same reply keep the volume they were sent
+under, so put the marker in the message where the change should start.
+
+Every utterance carries a `volume` object with the pod's current state:
+`held_db` (the standing volume), `auto`, `level_source`, `k_speech`,
+`speech_ref_dbfs`, `k_ambient`, `ambient_ref_dbfs`, `auto_min_db`,
+`auto_max_db`, and the operator's `min_db` and `max_db`. Read it rather than
+assuming your last marker took effect.
+
+Every utterance also carries a `level` object saying how loudly you were
+addressed, when the pod's level channel was live: `speech_dbfs` (in dB below
+full scale: the wake phrase for an utterance that followed one, the utterance's
+own speech for a follow-up or an interruption), `ambient_dbfs` (the room as last
+heard with the pod silent and nobody speaking; null when too little was heard),
+and `source` — `raw_mic`, an unprocessed microphone, or `beam`, the processed
+speech channel, whose loudness is flattened and means little. It is absent when
+nothing was measured. The automatic adjustment reads this same object; with
+`level_source` `raw_mic` it ignores a `beam` reading.
+
+",
+        min = v.bounds.min_db(),
+        max = v.bounds.max_db(),
+        auto_state = if a.enabled { "on" } else { "off" },
+        k_speech = a.k_speech,
+        speech_ref = a.speech_ref_dbfs,
+        k_ambient = a.k_ambient,
+        ambient_ref = a.ambient_ref_dbfs,
+        auto_min = a.min_db,
+        auto_max = a.max_db,
     )
 }
 
@@ -594,6 +773,9 @@ struct ParsedResponse {
     listen: bool,
     /// The movements the message asked for, in the order they appeared.
     cues: Vec<Cue>,
+    /// The volume change the message asked for. [`scan`] leaves at most one
+    /// `<volume/>` marker in a message.
+    volume: Option<VolumeTag>,
 }
 
 /// What [`BrennBrain::deliver`] did with a response message. Everything but
@@ -633,11 +815,16 @@ pub struct BrennBrain {
     /// borrow `&self`, so the slot it arms and the slot `deliver` reads have to be the
     /// same shared cell. Held only for slot operations, never across an await.
     pending: Arc<Mutex<Option<PendingTurn>>>,
+    /// The per-pod volume state, read when a turn is sent so the utterance can
+    /// report it, and when each segment is queued to resolve its gain. Written
+    /// by each turn's volume tap, never by the brain.
+    volume: Arc<Mutex<VolumeBook>>,
 }
 
 impl BrennBrain {
     /// Build a brain over `link`. `failure_message` is spoken when a turn ends on a
-    /// link failure; a whitespace-only string keeps such a turn silent.
+    /// link failure; a whitespace-only string keeps such a turn silent. `volume`
+    /// is the book each turn's volume tap writes.
     pub fn new(
         link: Arc<dyn BrainLink>,
         response_timeout: Duration,
@@ -645,6 +832,7 @@ impl BrennBrain {
         failure_message: String,
         events: BrainEventFn,
         stats: Arc<BrainStats>,
+        volume: Arc<Mutex<VolumeBook>>,
     ) -> Self {
         Self {
             link,
@@ -654,6 +842,20 @@ impl BrennBrain {
             events,
             stats,
             pending: Arc::new(Mutex::new(None)),
+            volume,
+        }
+    }
+
+    /// The volume facts the instruction document states: the operator's bounds
+    /// and the default automatic policy, both fixed for the process.
+    pub fn help_volume(&self) -> HelpVolume {
+        let book = self
+            .volume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HelpVolume {
+            bounds: book.bounds(),
+            auto: book.auto_defaults(),
         }
     }
 
@@ -699,6 +901,10 @@ impl BrennBrain {
                     _ => None,
                 })
                 .collect(),
+            volume: tags.iter().rev().find_map(|(tag, _)| match tag {
+                Tag::Volume(volume) => Some(*volume),
+                _ => None,
+            }),
         };
         // The queue push comes before the per-marker events on purpose. A message the
         // turn never receives has had none of its markers acted on, and events saying
@@ -729,7 +935,8 @@ impl BrennBrain {
                         reported += 1;
                     }
                 }
-                Tag::Reply { .. } | Tag::Continued | Tag::Listen | Tag::Cue(_) => {}
+                Tag::Reply { .. } | Tag::Continued | Tag::Listen | Tag::Cue(_) | Tag::Volume(_) => {
+                }
             }
         }
         DeliverOutcome::Delivered
@@ -782,22 +989,32 @@ impl Drop for SlotGuard {
 /// Queue one spoken segment for `u`. Whitespace-only text queues nothing: a message
 /// that was all markers has nothing to say, and the same rule is what makes a
 /// whitespace-only failure message the way to disable the spoken fallback.
+///
+/// `gain_db` is the message's own `<volume db=…/>`; `None` everywhere else. The
+/// segment's gain is resolved from `volume` here, as it is queued, so a
+/// persistent change a later message writes to the book never reaches speech
+/// already queued.
 fn speak(
     out: &mut ResponseSink,
     u: &Utterance,
     text: String,
+    gain_db: Option<f32>,
+    volume: &Mutex<VolumeBook>,
     events: &BrainEventFn,
     stats: &BrainStats,
 ) {
     if text.trim().is_empty() {
         return;
     }
+    let gain = resolve_shared(volume, &u.pod, gain_db, u.level.as_ref());
     let cmd = SpeakCmd {
         target: u.pod.clone(),
         in_reply_to: Some(u.id),
         body: SpeakBody::Text(text),
         interruptible: true,
         timings: u.timings.clone(),
+        gain,
+        level: u.level,
     };
     send_or_report(out, cmd, u.id, events, stats);
 }
@@ -829,12 +1046,18 @@ impl Brain for BrennBrain {
         let response_timeout = self.response_timeout;
         let continuation_timeout = self.continuation_timeout;
         let failure_message = self.failure_message.clone();
+        let book = Arc::clone(&self.volume);
+        // By value, and the lock released here: the future never holds it.
+        let volume = book
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state(&u.pod);
         async move {
             let utterance = u.id;
             let text = u
                 .spoken_text()
                 .expect("the gate declines an utterance with no text before dispatch");
-            let body = utterance_body(&u, text);
+            let body = utterance_body(&u, text, &volume);
             let (tx, mut rx) = mpsc::channel::<ParsedResponse>(SLOT_CAPACITY);
             let slot = SlotGuard::arm(pending, utterance, tx);
             if let Err(err) = link.publish_utterance(body).await {
@@ -849,7 +1072,7 @@ impl Brain for BrennBrain {
                 // Released before the apology is queued, so a message racing in
                 // behind the refusal finds no turn to join.
                 drop(slot);
-                speak(&mut out, &u, failure_message, &events, &stats);
+                speak(&mut out, &u, failure_message, None, &book, &events, &stats);
                 return TurnEnd::Closed;
             }
             let mut window = response_timeout;
@@ -868,7 +1091,7 @@ impl Brain for BrennBrain {
                         });
                         stats.record_link_response_timeout();
                         drop(slot);
-                        speak(&mut out, &u, failure_message, &events, &stats);
+                        speak(&mut out, &u, failure_message, None, &book, &events, &stats);
                         return TurnEnd::Closed;
                     }
                     Ok(Some(parsed)) => {
@@ -888,7 +1111,17 @@ impl Brain for BrennBrain {
                         if !parsed.cues.is_empty() {
                             out.cue(parsed.cues);
                         }
-                        speak(&mut out, &u, parsed.text, &events, &stats);
+                        // Before the speech too, so a hold asked for in this
+                        // message is in the book when `speak` resolves the
+                        // message's own speech. Speech earlier messages queued
+                        // already carries its resolution and keeps it.
+                        let gain_db = parsed.volume.and_then(|volume| {
+                            if !volume.persistent.is_empty() {
+                                out.volume(volume.persistent);
+                            }
+                            volume.db
+                        });
+                        speak(&mut out, &u, parsed.text, gain_db, &book, &events, &stats);
                         if !promised {
                             return if listen {
                                 TurnEnd::Open
@@ -953,8 +1186,10 @@ impl Brain for BrennBrain {
 mod tests {
     use super::*;
     use crate::types::{
-        BargeInContext, InterruptProgress, SpeakerId, Transcript, UtteranceId, test_utterance,
+        BargeInContext, InterruptProgress, LevelSource, SpeakerId, Transcript, UtteranceId,
+        test_utterance,
     };
+    use crate::volume::GainResolution;
     use serde_json::{Value, json};
 
     fn segment(response: Option<&str>, heard_ms: u64, total_ms: u64) -> ContextSegment {
@@ -997,14 +1232,51 @@ mod tests {
     fn utterance_body_carries_the_turn_and_omits_an_unknown_speaker() {
         let u = test_utterance();
         assert_eq!(
-            parsed(&utterance_body(&u, "what is the weather")),
+            parsed(&utterance_body(
+                &u,
+                "what is the weather",
+                &VolumeState::default()
+            )),
             json!({
                 "type": "utterance",
                 "utterance": 42,
                 "pod": "pod-x",
                 "room": "kitchen",
                 "text": "what is the weather",
+                "volume": serde_json::to_value(VolumeState::default()).unwrap(),
             })
+        );
+    }
+
+    #[test]
+    fn utterance_body_carries_the_measured_level_when_there_is_one() {
+        let u = Utterance {
+            level: Some(UtteranceLevel {
+                speech_dbfs: -27.5,
+                ambient_dbfs: Some(-58.25),
+                source: LevelSource::RawMic,
+            }),
+            ..test_utterance()
+        };
+        assert_eq!(
+            parsed(&utterance_body(&u, "hi", &VolumeState::default()))["level"],
+            json!({"speech_dbfs": -27.5, "ambient_dbfs": -58.25, "source": "raw_mic"})
+        );
+        let quiet_room_unknown = Utterance {
+            level: Some(UtteranceLevel {
+                speech_dbfs: -40.0,
+                ambient_dbfs: None,
+                source: LevelSource::Beam,
+            }),
+            ..test_utterance()
+        };
+        assert_eq!(
+            parsed(&utterance_body(
+                &quiet_room_unknown,
+                "hi",
+                &VolumeState::default()
+            ))["level"],
+            json!({"speech_dbfs": -40.0, "ambient_dbfs": null, "source": "beam"})
         );
     }
 
@@ -1014,7 +1286,10 @@ mod tests {
             speaker: Some(SpeakerId("alice".into())),
             ..test_utterance()
         };
-        assert_eq!(parsed(&utterance_body(&u, "hi"))["speaker"], json!("alice"));
+        assert_eq!(
+            parsed(&utterance_body(&u, "hi", &VolumeState::default()))["speaker"],
+            json!("alice")
+        );
     }
 
     #[test]
@@ -1025,7 +1300,11 @@ mod tests {
             vec![segment(Some("the weather today is sunny"), 500, 1_000)],
         );
         assert_eq!(
-            parsed(&utterance_body(&u, "no cancel that"))["interrupted"],
+            parsed(&utterance_body(
+                &u,
+                "no cancel that",
+                &VolumeState::default()
+            ))["interrupted"],
             json!({
                 "utterance": 122,
                 "heard_ms": 500,
@@ -1048,7 +1327,11 @@ mod tests {
             ],
         );
         assert_eq!(
-            parsed(&utterance_body(&u, "no the other one"))["interrupted"]["utterance"],
+            parsed(&utterance_body(
+                &u,
+                "no the other one",
+                &VolumeState::default()
+            ))["interrupted"]["utterance"],
             json!(130)
         );
     }
@@ -1058,7 +1341,8 @@ mod tests {
         // Nothing to cut: the estimate is explicitly null, not omitted, so the peer
         // sees one schema whether or not there were words.
         let u = with_chain(test_utterance(), vec![segment(None, 300, 1_000)]);
-        let interrupted = parsed(&utterance_body(&u, "wait"))["interrupted"].clone();
+        let interrupted =
+            parsed(&utterance_body(&u, "wait", &VolumeState::default()))["interrupted"].clone();
         assert_eq!(interrupted["heard_text"], Value::Null);
         assert_eq!(interrupted["heard_ms"], json!(300));
     }
@@ -1070,14 +1354,18 @@ mod tests {
             vec![segment(Some("the weather today"), 0, 1_000)],
         );
         assert_eq!(
-            parsed(&utterance_body(&u, "stop"))["interrupted"]["heard_text"],
+            parsed(&utterance_body(&u, "stop", &VolumeState::default()))["interrupted"]["heard_text"],
             Value::Null
         );
     }
 
     #[test]
     fn an_utterance_that_interrupted_nothing_omits_the_estimate() {
-        let body = parsed(&utterance_body(&test_utterance(), "hello"));
+        let body = parsed(&utterance_body(
+            &test_utterance(),
+            "hello",
+            &VolumeState::default(),
+        ));
         assert!(
             body.get("interrupted").is_none(),
             "no barge chain, no estimate: {body}"
@@ -1120,7 +1408,7 @@ mod tests {
             ..test_utterance()
         };
         assert_eq!(
-            parsed(&utterance_body(&u, "padded"))["text"],
+            parsed(&utterance_body(&u, "padded", &VolumeState::default()))["text"],
             json!("padded")
         );
     }
@@ -1406,11 +1694,132 @@ mod tests {
         }
     }
 
+    fn volume(body: &str) -> VolumeTag {
+        match tags(body).as_slice() {
+            [Tag::Volume(v)] => *v,
+            other => panic!("{body}: expected one volume marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_volume_marker_reads_each_attribute() {
+        assert_eq!(volume("<volume db=\"-6\"/>").db, Some(-6.0));
+        assert_eq!(
+            volume("<volume hold=\"-10\"/>").persistent.hold_db,
+            Some(-10.0)
+        );
+        assert_eq!(volume("<volume auto=\"on\"/>").persistent.auto, Some(true));
+        assert_eq!(volume("<volume auto='off'/>").persistent.auto, Some(false));
+        let policy = volume(
+            "<volume k_speech=\"0.5\" speech_ref=\"-28\" k_ambient=0.25 ambient_ref=\"-50\"/>",
+        )
+        .persistent;
+        assert_eq!(
+            (
+                policy.k_speech,
+                policy.speech_ref_dbfs,
+                policy.k_ambient,
+                policy.ambient_ref_dbfs
+            ),
+            (Some(0.5), Some(-28.0), Some(0.25), Some(-50.0))
+        );
+        let swing = volume("<volume min=\"-5\" max='5'>").persistent;
+        assert_eq!(
+            (swing.auto_min_db, swing.auto_max_db),
+            (Some(-5.0), Some(5.0))
+        );
+    }
+
+    #[test]
+    fn a_volume_marker_combines_attributes() {
+        let v = volume("<volume db=\"-3\" hold=\"-10\" auto=\"on\" max=\"60\"/>");
+        assert_eq!(v.db, Some(-3.0));
+        assert_eq!(
+            v.persistent,
+            VolumeCommand {
+                hold_db: Some(-10.0),
+                auto: Some(true),
+                auto_max_db: Some(60.0),
+                ..VolumeCommand::default()
+            }
+        );
+    }
+
+    #[test]
+    fn only_the_last_volume_marker_in_a_message_is_kept() {
+        let hold = VolumeTag {
+            db: None,
+            persistent: VolumeCommand {
+                hold_db: Some(-10.0),
+                ..VolumeCommand::default()
+            },
+        };
+        let auto = VolumeTag {
+            db: None,
+            persistent: VolumeCommand {
+                auto: Some(true),
+                ..VolumeCommand::default()
+            },
+        };
+        assert_eq!(
+            tags("<volume db=\"-3\"/>Hi<volume hold=\"-10\"/> there<listen/><volume auto=\"on\"/>"),
+            vec![
+                Tag::Unknown {
+                    raw: "<volume db=\"-3\"/>".into()
+                },
+                Tag::Unknown {
+                    raw: "<volume hold=\"-10\"/>".into()
+                },
+                Tag::Listen,
+                Tag::Volume(auto),
+            ]
+        );
+        // A mangled marker supersedes nothing.
+        assert_eq!(
+            tags("<volume hold=\"-10\"/><volume db=\"loud\"/>"),
+            vec![
+                Tag::Volume(hold),
+                Tag::Unknown {
+                    raw: "<volume db=\"loud\"/>".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mangled_volume_marker_is_unknown() {
+        for body in [
+            "<volume db=\"loud\"/>",
+            "<volume auto=\"maybe\"/>",
+            "<volume/>",
+            "<volume>",
+            "<volume hold=\"-10\"",
+            "<volume db=\"inf\"/>",
+            "<volume db=\"1e40\"/>",
+            "<volume hold=\"-10\" db=/>",
+            "<volume min=\"\"/>",
+        ] {
+            assert_eq!(
+                tags(body),
+                vec![Tag::Unknown { raw: body.into() }],
+                "{body} must be stripped and reported"
+            );
+        }
+    }
+
+    #[test]
+    fn a_volume_marker_is_lifted_out_of_the_speech() {
+        let (text, tags) = scan("<reply to=\"3\"/><volume db=\"-6\"/>Quietly now.");
+        assert_eq!(text, "Quietly now.");
+        assert_eq!(tags.len(), 2);
+    }
+
     fn help_cues() -> HelpCues {
         HelpCues {
             poses: vec!["neutral".into(), "peek".into()],
             motions: vec!["bench/nod".into()],
             continued_ms: 30_000,
+            volume: HelpVolume::default(),
         }
     }
 
@@ -1427,6 +1836,15 @@ mod tests {
             "<listen/>",
             "<pose name=\"P\" speed=\"S\"/>",
             "<motion name=\"M\" speed=\"S\"/>",
+            "<volume db=\"N\"/>",
+            "<volume hold=\"N\"/>",
+            "<volume auto=\"on\"/>",
+            "k_speech=\"K\" speech_ref=\"R\" k_ambient=\"A\" ambient_ref=\"B\"",
+            "<volume min=\"L\" max=\"H\"/>",
+            "`level` object",
+            "`speech_dbfs`",
+            "`ambient_dbfs`",
+            "`raw_mic`",
             "\"type\": \"wake\"",
             "\"type\": \"utterance\"",
             "\"type\": \"interruption\"",
@@ -1501,6 +1919,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_volume_section_states_the_configured_bounds_and_defaults() {
+        let help = response_contract_help(
+            &help_channels(),
+            &HelpCues {
+                volume: HelpVolume {
+                    bounds: OperatorBounds::new(-24.0, 3.0).unwrap(),
+                    auto: AutoPolicy {
+                        enabled: true,
+                        k_speech: 0.5,
+                        speech_ref_dbfs: -40.0,
+                        min_db: -9.0,
+                        ..AutoPolicy::default()
+                    },
+                },
+                ..help_cues()
+            },
+        );
+        assert!(help.contains("The operator allows\n-24 to 3 dB"), "{help}");
+        assert!(help.contains("Starts on."));
+        assert!(help.contains("Defaults: K 0.5, R -40,"), "{help}");
+        assert!(help.contains("Defaults: -9 and 6."));
+        for field in ["`volume` object", "held_db", "auto_min_db", "max_db"] {
+            assert!(help.contains(field), "help text is missing {field:?}");
+        }
+        for rule in [
+            "Every utterance also carries a `level` object",
+            "own speech for a follow-up or an interruption",
+            "heard with the pod silent and nobody speaking",
+            "A standing change takes effect from the message that",
+            "earlier messages of the same reply keep the volume they were sent",
+        ] {
+            assert!(help.contains(rule), "help text is missing {rule:?}");
+        }
+    }
+
     // --- the brain ---
 
     /// What a [`BrainLink`] was asked to carry, in order.
@@ -1544,6 +1998,11 @@ mod tests {
         speak_rx: futures::channel::mpsc::Receiver<SpeakCmd>,
         /// Every batch of cues the sink's cue tap was handed, in order.
         cued: Arc<Mutex<Vec<Vec<Cue>>>>,
+        /// The volume book the brain reads and the fixture's volume tap writes.
+        book: Arc<Mutex<VolumeBook>>,
+        /// What reached the sink, in order: `speak` per offered command and
+        /// `volume` per persistent volume change.
+        order: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl Fixture {
@@ -1557,6 +2016,7 @@ mod tests {
             let sink = Arc::clone(&seen);
             let events: BrainEventFn = Arc::new(move |e| sink.lock().unwrap().push(e));
             let stats = Arc::new(BrainStats::default());
+            let book = Arc::new(Mutex::new(VolumeBook::default()));
             let link = Arc::new(FakeLink {
                 log: Arc::clone(&log),
                 publish,
@@ -1568,6 +2028,7 @@ mod tests {
                 failure_message.into(),
                 events,
                 Arc::clone(&stats),
+                Arc::clone(&book),
             ));
             // Deep enough that a full continuation chain never fills it: an unrelated
             // `SinkFull` in the middle of a turn would be a confusing failure.
@@ -1580,6 +2041,8 @@ mod tests {
                 speak_tx,
                 speak_rx,
                 cued: Arc::new(Mutex::new(Vec::new())),
+                book,
+                order: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1587,12 +2050,41 @@ mod tests {
         /// can play the peer while the turn is parked.
         fn dispatch(&self, u: Utterance) -> tokio::task::JoinHandle<TurnEnd> {
             let cued = Arc::clone(&self.cued);
+            let (book, pod) = (Arc::clone(&self.book), u.pod.clone());
+            let (speak_order, volume_order) = (Arc::clone(&self.order), Arc::clone(&self.order));
             let sink = ResponseSink::with_taps(
                 self.speak_tx.clone(),
-                None,
+                Some(Arc::new(move |_: &SpeakCmd| {
+                    speak_order.lock().unwrap().push("speak");
+                })),
                 Some(Arc::new(move |cues| cued.lock().unwrap().push(cues))),
+                Some(Arc::new(move |cmd: VolumeCommand| {
+                    volume_order.lock().unwrap().push("volume");
+                    let _ = book.lock().unwrap().apply(&pod, &cmd);
+                })),
             );
             tokio::spawn(self.brain.handle(u, sink))
+        }
+
+        fn order(&self) -> Vec<&'static str> {
+            self.order.lock().unwrap().clone()
+        }
+
+        /// The gain resolution of every queued command, in order.
+        fn gains(&mut self) -> Vec<GainResolution> {
+            let mut out = Vec::new();
+            while let Ok(cmd) = self.speak_rx.try_recv() {
+                out.push(cmd.gain);
+            }
+            out
+        }
+
+        /// The per-message override of every queued command, in order.
+        fn overrides(&mut self) -> Vec<Option<f32>> {
+            self.gains()
+                .iter()
+                .map(GainResolution::override_db)
+                .collect()
         }
 
         fn cued(&self) -> Vec<Vec<Cue>> {
@@ -1659,6 +2151,7 @@ mod tests {
                 "pod": "pod-x",
                 "room": "kitchen",
                 "text": "what is the weather",
+                "volume": serde_json::to_value(VolumeState::default()).unwrap(),
             })]
         );
         assert_eq!(f.spoken(), ["Sixty-eight and clear."]);
@@ -1672,6 +2165,97 @@ mod tests {
             f.brain.deliver("<reply to=\"42\"/>late"),
             DeliverOutcome::NoTurnPending
         );
+    }
+
+    #[tokio::test]
+    async fn a_volume_db_rides_on_every_command_of_its_message_only() {
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/><volume db=\"-6\"/>Quietly.<continued/>")
+            .await;
+        f.deliver_armed("<reply to=\"42\"/>Back to normal.").await;
+        turn.await.unwrap();
+        assert_eq!(f.overrides(), [Some(-6.0), None]);
+        assert!(
+            f.order().iter().all(|o| *o == "speak"),
+            "db is not persistent"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_volume_reaches_the_tap_before_the_speech() {
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/>Okay, quieter.<volume hold=\"-10\" db=\"-12\"/>")
+            .await;
+        turn.await.unwrap();
+        assert_eq!(f.order(), ["volume", "speak"]);
+        let gains = f.gains();
+        assert_eq!(gains.len(), 1);
+        assert_eq!(gains[0].override_db(), Some(-12.0));
+        assert_eq!(
+            gains[0].held_db(),
+            -10.0,
+            "the message's own hold is in the book"
+        );
+        assert_eq!(gains[0].applied_db(), -12.0);
+        assert!(f.events().is_empty(), "an acted-on marker is not reported");
+    }
+
+    #[tokio::test]
+    async fn a_hold_in_a_later_message_leaves_earlier_queued_speech_alone() {
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        // Back to back, with nothing routed in between: the first segment is
+        // still queued when the second message writes the hold.
+        f.deliver_armed("<reply to=\"42\"/>Sure, one moment.<continued/>")
+            .await;
+        f.deliver_armed("<reply to=\"42\"/><volume hold=\"-20\"/>Here is the quiet part.")
+            .await;
+        turn.await.unwrap();
+        let held: Vec<f32> = f.gains().iter().map(GainResolution::held_db).collect();
+        assert_eq!(held, [0.0, -20.0]);
+        assert_eq!(f.order(), ["speak", "volume", "speak"]);
+    }
+
+    #[tokio::test]
+    async fn a_volume_only_message_queues_no_speech() {
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/><volume hold=\"-10\"/>")
+            .await;
+        assert_eq!(turn.await.unwrap(), TurnEnd::Closed);
+        assert_eq!(f.order(), ["volume"]);
+        assert!(f.overrides().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_utterance_reports_the_pods_volume_state_after_a_hold() {
+        let mut f = Fixture::new();
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/><volume hold=\"-10\" auto=\"on\"/>Sure.")
+            .await;
+        turn.await.unwrap();
+        assert_eq!(f.published()[0]["volume"]["held_db"], json!(0.0));
+        let turn = f.dispatch(test_utterance());
+        f.deliver_armed("<reply to=\"42\"/>Again.").await;
+        turn.await.unwrap();
+        let second = &f.published()[1]["volume"];
+        assert_eq!(second["held_db"], json!(-10.0));
+        assert_eq!(second["auto"], json!(true));
+        assert_eq!(second["min_db"], json!(-30.0));
+        let _ = f.overrides();
+    }
+
+    #[test]
+    fn help_volume_reads_the_books_configuration() {
+        let f = Fixture::new();
+        *f.book.lock().unwrap() = VolumeBook::new(
+            OperatorBounds::new(-20.0, 0.0).unwrap(),
+            crate::volume::GainBaselines::default(),
+            AutoPolicy::default(),
+        );
+        assert_eq!(f.brain.help_volume().bounds.max_db(), 0.0);
     }
 
     #[tokio::test]

@@ -50,22 +50,18 @@ CONFIG_LWIP_TCP_WND_DEFAULT=11520
 # slower than the old 4xMSS config.
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=10
 
-# Trim the per-socket TCP send buffer to the lwIP minimum of 2xMSS. This is the
-# second half of the in-flight budget (see CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM
-# below): SND_BUF caps the app-side unacked bytes lwIP will hold for one socket,
-# so it bounds the send-queue contribution to the stall-time heap appetite.
-# MSS is the in-tree default 1440 (CONFIG_LWIP_TCP_MSS unset), so 2xMSS = 2880;
-# the IDF default of 5760 (4xMSS) is trimmed to 2880 = ~2.88 KB. lwIP asserts
-# SND_BUF >= 2xMSS at runtime and the Kconfig range floor is 2440, so 2880 is the
-# tightest legal value. The combined stall-time appetite and the engineered
-# free-heap floor are derived in the in-flight budget block on
-# CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM below.
-# Throughput headroom: the 4x-paced catch-up drain is ~128 KB/s (640 B / 5 ms);
-# a 2880 B window sustains that whenever RTT <= 2880/131072 s = ~22 ms, comfortably
-# above LAN RTTs, so the smaller buffer does not threaten the host keep-up ceiling
-# (RTD_CATCH_UP_MAX_MS in hil-host) — the catch-up drain is bound by the 4x pace
-# cadence, not window throughput.
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+# Per-socket TCP send buffer: 4xMSS (the IDF default). SND_BUF caps the app-side
+# unacked bytes lwIP will hold for one socket, so it is the second half of the
+# in-flight budget (see CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM below) and bounds the
+# send-queue contribution to the stall-time heap appetite. MSS is the in-tree default
+# 1440 (CONFIG_LWIP_TCP_MSS unset), so 4xMSS = 5760.
+# Throughput: the pod streams two interleaved channels, so the 4x-paced catch-up drain
+# is ~256 KB/s (1280 B / 5 ms). A window sustains that whenever RTT <= SND_BUF/262144 s:
+# ~22 ms at 5760, ~11 ms at the lwIP minimum of 2xMSS = 2880. At 2880 the stereo
+# pre-roll burst measured 358-738 ms against the 350 ms RTD_BURST_DRAIN_MAX_MS ceiling
+# (catch-up held) on every run; at 5760 it measured 254-365 ms with the RTD internal-heap
+# lows at 36-52 KB, above RTD_HEAP_LOW_FLOOR (24 KB).
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 
 # Corruption-attribution tripwires. Light heap poisoning writes head/tail canaries on every
 # allocation and validates them on free, so a heap overrun is attributed to the exact block
@@ -89,11 +85,11 @@ CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 # concurrently-sending socket under a stall holds up to one SND_BUF of unacked
 # pbufs. The RTD burst window has one streaming socket (one TcpStream per
 # scenario), so:
-#   appetite = 4 x 1.6 KB + 1 x 2.88 KB = ~9.3 KB
+#   appetite = 4 x 1.6 KB + 1 x 5.76 KB = ~12.2 KB
 # Against ~24 KB free entering the segment-start burst window, that engineers a
-# free-heap floor of ~24 - 9.3 = ~15 KB — the discriminating headroom for the
+# free-heap floor of ~24 - 12.2 = ~12 KB — the discriminating headroom for the
 # single-socket case. A second concurrent sender (anticipated, see the TCP_WND
-# block above) adds ~2.88 KB and lowers the floor to ~12 KB.
+# block above) adds ~5.76 KB and lowers the floor to ~6 KB.
 # Trade-off: fewer in-flight TX buffers means backpressure lands earlier onto lwIP
 # and our writes — that is the intended behavior, not a regression.
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=4

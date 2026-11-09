@@ -17,10 +17,11 @@ use audio_pipeline::playback::{
     INBOUND_PCM_RING_BYTES, INBOUND_PCM_WRITE_UNIT_BYTES, PLAYBACK_PREROLL_MAX_TARGET_BYTES,
 };
 use audio_pipeline::wire::MAX_AUDIO_PAYLOAD;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use speech_pipeline::{
-    BargeInConfig, BargeMode, ConfidenceGate, EndpointerConfig as ListenerEndpointerConfig,
-    FRAME_MS, ListenerConfig, PacerConfig, Url, WakePolicy,
+    AutoPolicy, BargeInConfig, BargeMode, ConfidenceGate,
+    EndpointerConfig as ListenerEndpointerConfig, FRAME_MS, GainBaselines, LevelAdmission,
+    ListenerConfig, OperatorBounds, PacerConfig, Url, VolumeBook, WakePolicy,
 };
 
 use crate::psk::parse_psk_hex;
@@ -101,6 +102,11 @@ pub struct Config {
     /// `speak_unsupported` rejection.
     #[serde(default)]
     pub tts: Option<TtsConfig>,
+    /// Reply volume: the baseline gain and the operator's hard bounds on any
+    /// applied gain. Every key defaults, so an absent `[volume]` table plays
+    /// replies as synthesized.
+    #[serde(default)]
+    pub volume: VolumeConfig,
     /// Pod-id → per-pod config (room mapping). Pods absent here resolve to
     /// [`UNMAPPED_ROOM`].
     #[serde(default)]
@@ -265,7 +271,36 @@ impl Config {
             );
         }
         self.playback.validate()?;
+        self.volume.validate()?;
+        for (pod, pod_config) in &self.pods {
+            if let Some(db) = pod_config.gain_db
+                && !db.is_finite()
+            {
+                return Err(format!("pods.{pod}.gain_db {db} must be finite"));
+            }
+        }
         Ok(())
+    }
+
+    /// The volume book's starting state: the operator's bounds and every pod's
+    /// configured baseline. Called after [`Config::validate`], which guarantees
+    /// the bounds are ordered and finite.
+    pub fn volume_book(&self) -> VolumeBook {
+        let bounds = OperatorBounds::new(self.volume.min_db, self.volume.max_db)
+            .expect("validated: volume bounds finite and ordered");
+        let per_pod = self
+            .pods
+            .iter()
+            .filter_map(|(id, pod)| pod.gain_db.map(|db| (id.clone(), db)))
+            .collect();
+        VolumeBook::new(
+            bounds,
+            GainBaselines {
+                default_db: self.volume.gain_db,
+                per_pod,
+            },
+            self.volume.auto.policy(),
+        )
     }
 
     /// Whether a run composed from this configuration drains an alert seam.
@@ -340,6 +375,206 @@ impl RoomLookup {
 #[serde(deny_unknown_fields)]
 pub struct PodConfig {
     pub room: String,
+    /// This pod's baseline reply gain, dB, overriding `[volume] gain_db`.
+    #[serde(default)]
+    pub gain_db: Option<f32>,
+}
+
+/// Largest accepted `[volume] max_db`: positive gain clips loud syllables, and
+/// past this nothing a synthesizer produces stays intelligible.
+pub const MAX_VOLUME_CEILING_DB: f32 = 24.0;
+
+/// Reply volume configuration, in dB relative to the synthesizer's natural level.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeConfig {
+    /// Baseline gain for every pod without its own `pods.<id>.gain_db`.
+    #[serde(default = "default_volume_gain_db")]
+    pub gain_db: f32,
+    /// Floor of any applied gain — the operator's hard bound.
+    #[serde(default = "default_volume_min_db")]
+    pub min_db: f32,
+    /// Ceiling of any applied gain — the operator's hard bound. Positive gain
+    /// clips; `reply_gain.clipped_samples` counts it.
+    #[serde(default = "default_volume_max_db")]
+    pub max_db: f32,
+    /// Automatic gain: every pod's starting policy, retunable per pod by the
+    /// brain.
+    #[serde(default)]
+    pub auto: AutoVolumeConfig,
+}
+
+fn default_volume_gain_db() -> f32 {
+    speech_pipeline::volume::DEFAULT_GAIN_DB
+}
+fn default_volume_min_db() -> f32 {
+    speech_pipeline::volume::DEFAULT_MIN_DB
+}
+fn default_volume_max_db() -> f32 {
+    speech_pipeline::volume::DEFAULT_MAX_DB
+}
+
+impl Default for VolumeConfig {
+    fn default() -> Self {
+        VolumeConfig {
+            gain_db: default_volume_gain_db(),
+            min_db: default_volume_min_db(),
+            max_db: default_volume_max_db(),
+            auto: AutoVolumeConfig::default(),
+        }
+    }
+}
+
+impl VolumeConfig {
+    /// Every value finite, `min_db <= max_db`, `max_db` at most
+    /// [`MAX_VOLUME_CEILING_DB`]. The baseline need not lie inside the bounds:
+    /// it is clamped where it is used.
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, v) in [
+            ("volume.gain_db", self.gain_db),
+            ("volume.min_db", self.min_db),
+            ("volume.max_db", self.max_db),
+        ] {
+            if !v.is_finite() {
+                return Err(format!("{key} {v} must be finite"));
+            }
+        }
+        if self.min_db > self.max_db {
+            return Err(format!(
+                "volume.min_db {} must not exceed volume.max_db {}",
+                self.min_db, self.max_db
+            ));
+        }
+        if self.max_db > MAX_VOLUME_CEILING_DB {
+            return Err(format!(
+                "volume.max_db {} exceeds the {MAX_VOLUME_CEILING_DB} dB ceiling",
+                self.max_db
+            ));
+        }
+        self.auto.validate()
+    }
+}
+
+/// `[volume.auto]`: the automatic-gain policy every pod starts from. Levels are
+/// dBFS; gains are dB.
+///
+/// The swing bounds `min_db` / `max_db` limit the automatic term only, and are
+/// a different object from `[volume] min_db` / `max_db`, which clamp the applied
+/// total afterwards. No rule relates the two.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoVolumeConfig {
+    /// Whether automatic gain runs. The brain can turn it on or off per pod.
+    #[serde(default = "default_auto_enabled")]
+    pub enabled: bool,
+    /// Which measured levels may drive it: `raw_mic` (only an uncompressed raw
+    /// microphone) or `any`.
+    #[serde(default = "default_auto_level_source")]
+    pub level_source: LevelAdmission,
+    /// dB of gain per dB of speech level above `speech_ref_dbfs`.
+    #[serde(default = "default_auto_k_speech")]
+    pub k_speech: f32,
+    /// The speech level at which the speech term is 0.
+    #[serde(default = "default_auto_speech_ref_dbfs")]
+    pub speech_ref_dbfs: f32,
+    /// dB of gain per dB of ambient level above `ambient_ref_dbfs`.
+    #[serde(default = "default_auto_k_ambient")]
+    pub k_ambient: f32,
+    /// The ambient level above which the ambient term contributes.
+    #[serde(default = "default_auto_ambient_ref_dbfs")]
+    pub ambient_ref_dbfs: f32,
+    /// Swing floor: the automatic term never subtracts more than this.
+    #[serde(default = "default_auto_min_db")]
+    pub min_db: f32,
+    /// Swing ceiling: the automatic term never adds more than this.
+    #[serde(default = "default_auto_max_db")]
+    pub max_db: f32,
+}
+
+fn default_auto_enabled() -> bool {
+    speech_pipeline::volume::DEFAULT_AUTO_ENABLED
+}
+fn default_auto_level_source() -> LevelAdmission {
+    LevelAdmission::RawMic
+}
+fn default_auto_k_speech() -> f32 {
+    speech_pipeline::volume::DEFAULT_AUTO_K_SPEECH
+}
+fn default_auto_speech_ref_dbfs() -> f32 {
+    speech_pipeline::volume::DEFAULT_AUTO_SPEECH_REF_DBFS
+}
+fn default_auto_k_ambient() -> f32 {
+    speech_pipeline::volume::DEFAULT_AUTO_K_AMBIENT
+}
+fn default_auto_ambient_ref_dbfs() -> f32 {
+    speech_pipeline::volume::DEFAULT_AUTO_AMBIENT_REF_DBFS
+}
+fn default_auto_min_db() -> f32 {
+    speech_pipeline::volume::DEFAULT_AUTO_MIN_DB
+}
+fn default_auto_max_db() -> f32 {
+    speech_pipeline::volume::DEFAULT_AUTO_MAX_DB
+}
+
+impl Default for AutoVolumeConfig {
+    fn default() -> Self {
+        AutoVolumeConfig {
+            enabled: default_auto_enabled(),
+            level_source: default_auto_level_source(),
+            k_speech: default_auto_k_speech(),
+            speech_ref_dbfs: default_auto_speech_ref_dbfs(),
+            k_ambient: default_auto_k_ambient(),
+            ambient_ref_dbfs: default_auto_ambient_ref_dbfs(),
+            min_db: default_auto_min_db(),
+            max_db: default_auto_max_db(),
+        }
+    }
+}
+
+impl AutoVolumeConfig {
+    /// `k_*` finite; references finite and in `[-100, 0]` dBFS; swing bounds
+    /// finite with `min_db <= max_db`.
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, v) in [
+            ("volume.auto.k_speech", self.k_speech),
+            ("volume.auto.k_ambient", self.k_ambient),
+            ("volume.auto.min_db", self.min_db),
+            ("volume.auto.max_db", self.max_db),
+        ] {
+            if !v.is_finite() {
+                return Err(format!("{key} {v} must be finite"));
+            }
+        }
+        for (key, v) in [
+            ("volume.auto.speech_ref_dbfs", self.speech_ref_dbfs),
+            ("volume.auto.ambient_ref_dbfs", self.ambient_ref_dbfs),
+        ] {
+            if !(-100.0..=0.0).contains(&v) {
+                return Err(format!("{key} {v} must be in [-100, 0] dBFS"));
+            }
+        }
+        if self.min_db > self.max_db {
+            return Err(format!(
+                "volume.auto.min_db {} must not exceed volume.auto.max_db {}",
+                self.min_db, self.max_db
+            ));
+        }
+        Ok(())
+    }
+
+    /// The policy every pod's state starts from.
+    pub fn policy(&self) -> AutoPolicy {
+        AutoPolicy {
+            enabled: self.enabled,
+            level_source: self.level_source,
+            k_speech: self.k_speech,
+            speech_ref_dbfs: self.speech_ref_dbfs,
+            k_ambient: self.k_ambient,
+            ambient_ref_dbfs: self.ambient_ref_dbfs,
+            min_db: self.min_db,
+            max_db: self.max_db,
+        }
+    }
 }
 
 /// JSONL observability sink configuration.
@@ -1272,6 +1507,21 @@ pub struct SttConfig {
     /// Optional language hint; omitted from the request when absent.
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional Whisper `prompt`, sent verbatim: text the decoder reads as what
+    /// preceded the clip. With `wake_word = "keep"`, the wake phrase with its
+    /// punctuation (e.g. `"Hey Jarvis."`) primes the decoder to spell the phrase
+    /// the clip starts with; in either mode it can carry domain context.
+    /// Independent of `wake_word` and never derived from `[wake] phrase`. A
+    /// prompt can make Whisper echo prompt-like text on a near-silent clip; the
+    /// confidence gate stays the defense, and the remedy for a prompt that
+    /// provokes that is a shorter prompt. Non-empty, at most 1 KiB.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Optional faster-whisper `hotwords`, sent verbatim: words the decoder is
+    /// biased toward. Independent of `wake_word`. A server that does not declare
+    /// the field ignores it. Non-empty, at most 1 KiB.
+    #[serde(default)]
+    pub hotwords: Option<String>,
     /// Total per-request budget, milliseconds. Must be greater than zero.
     #[serde(default = "default_http_timeout_ms")]
     pub timeout_ms: u64,
@@ -1334,6 +1584,8 @@ impl SttConfig {
         {
             return Err(format!("stt.avg_logprob_min {min} must be a finite value"));
         }
+        validate_priming_text("stt.prompt", self.prompt.as_deref())?;
+        validate_priming_text("stt.hotwords", self.hotwords.as_deref())?;
         match self.backend {
             SttBackend::Http => {
                 let url = self
@@ -1350,11 +1602,32 @@ impl SttConfig {
     }
 }
 
+/// Longest accepted `[stt] prompt` / `hotwords`, bytes. A prompt is a sentence,
+/// not a document; Whisper keeps at most 224 prompt tokens anyway.
+pub const MAX_STT_PRIMING_BYTES: usize = 1024;
+
+/// A present priming field must say something and stay short.
+fn validate_priming_text(field: &str, text: Option<&str>) -> Result<(), String> {
+    let Some(text) = text else {
+        return Ok(());
+    };
+    if text.trim().is_empty() {
+        return Err(format!("{field} must not be empty or whitespace"));
+    }
+    if text.len() > MAX_STT_PRIMING_BYTES {
+        return Err(format!(
+            "{field} is {} bytes; at most {MAX_STT_PRIMING_BYTES} are accepted",
+            text.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Whether the leading wake word is cut out of the audio the transcriber sees.
 /// The trim boundary is computed by the listener either way and logged either
 /// way; this only decides whether it is applied, so a run's records say what was
 /// sent and an offline comparison can re-transcribe the other variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WakeWordInStt {
     /// Drop everything before the wake end, less a margin.
@@ -3001,6 +3274,196 @@ voice = "af_heart"
             let config = Config::parse(&with_addr(table)).expect("parse");
             let err = config.validate().unwrap_err();
             assert!(err.contains(field), "{field}: {err}");
+        }
+    }
+
+    const STT_HTTP: &str = "[stt]\nbackend = \"http\"\nurl = \"http://h:8000\"\nmodel = \"m\"";
+
+    #[test]
+    fn stt_priming_defaults_to_none() {
+        let config = Config::parse(&with_addr(STT_HTTP)).expect("parse");
+        let stt = config.stt.as_ref().unwrap();
+        assert_eq!(stt.prompt, None);
+        assert_eq!(stt.hotwords, None);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn stt_priming_parses_verbatim() {
+        let config = Config::parse(&with_addr(&format!(
+            "{STT_HTTP}\nwake_word = \"keep\"\nprompt = \"Hey Jarvis.\"\nhotwords = \"Jarvis\""
+        )))
+        .expect("parse");
+        assert!(config.validate().is_ok());
+        let stt = config.stt.as_ref().unwrap();
+        assert_eq!(stt.prompt.as_deref(), Some("Hey Jarvis."));
+        assert_eq!(stt.hotwords.as_deref(), Some("Jarvis"));
+    }
+
+    #[test]
+    fn stt_priming_rejects_empty_and_oversize() {
+        let long = "a".repeat(MAX_STT_PRIMING_BYTES + 1);
+        let exact = "a".repeat(MAX_STT_PRIMING_BYTES);
+        for field in ["prompt", "hotwords"] {
+            for bad in ["", "   "] {
+                let config = Config::parse(&with_addr(&format!("{STT_HTTP}\n{field} = \"{bad}\"")))
+                    .expect("parse");
+                let err = config.validate().unwrap_err();
+                assert!(
+                    err.contains(&format!("stt.{field}")),
+                    "{field}={bad:?}: {err}"
+                );
+            }
+            let config = Config::parse(&with_addr(&format!("{STT_HTTP}\n{field} = \"{long}\"")))
+                .expect("parse");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.contains(&format!("stt.{field}")),
+                "{field} oversize: {err}"
+            );
+            let config = Config::parse(&with_addr(&format!("{STT_HTTP}\n{field} = \"{exact}\"")))
+                .expect("parse");
+            assert!(
+                config.validate().is_ok(),
+                "{field} at the limit is accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn volume_absent_table_is_defaults() {
+        let config = Config::parse(&with_addr("")).expect("parse");
+        assert!(config.validate().is_ok());
+        assert_eq!(config.volume.gain_db, 0.0);
+        assert_eq!(config.volume.min_db, -30.0);
+        assert_eq!(config.volume.max_db, 6.0);
+        let mut book = config.volume_book();
+        assert_eq!(book.bounds().min_db(), -30.0);
+        assert_eq!(book.bounds().max_db(), 6.0);
+        assert_eq!(book.held_db(&speech_pipeline::PodId("any".into())), 0.0);
+    }
+
+    #[test]
+    fn volume_per_pod_baseline_overrides_default() {
+        let config = Config::parse(&with_addr(
+            "[volume]\ngain_db = -4.0\n[pods.kitchen]\nroom = \"kitchen\"\ngain_db = -9.5\n\
+             [pods.den]\nroom = \"den\"",
+        ))
+        .expect("parse");
+        assert!(config.validate().is_ok());
+        let mut book = config.volume_book();
+        let pod = |id: &str| speech_pipeline::PodId(id.into());
+        assert_eq!(book.held_db(&pod("kitchen")), -9.5);
+        assert_eq!(book.held_db(&pod("den")), -4.0);
+        assert_eq!(book.held_db(&pod("unmapped")), -4.0);
+    }
+
+    #[test]
+    fn volume_baseline_outside_bounds_loads() {
+        let config = Config::parse(&with_addr(
+            "[volume]\ngain_db = 12.0\nmin_db = -20.0\nmax_db = 0.0",
+        ))
+        .expect("parse");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn volume_invalid_values_rejected() {
+        for (table, needle) in [
+            ("[volume]\nmin_db = 3.0\nmax_db = 0.0", "volume.min_db"),
+            ("[volume]\nmax_db = 30.0", "volume.max_db"),
+            ("[volume]\ngain_db = nan", "volume.gain_db"),
+            ("[volume]\nmin_db = -inf", "volume.min_db"),
+            ("[volume]\nmax_db = inf", "volume.max_db"),
+            ("[pods.p]\nroom = \"r\"\ngain_db = nan", "pods.p.gain_db"),
+        ] {
+            let config = Config::parse(&with_addr(table)).expect("parse");
+            let err = config.validate().unwrap_err();
+            assert!(err.contains(needle), "{table}: {err}");
+        }
+    }
+
+    #[test]
+    fn volume_auto_absent_is_the_defaults_and_operator_max_alone_loads() {
+        // The obvious "never louder than produced" edit, alone: the swing
+        // defaults stay as they are and nothing relates them to it.
+        let config = Config::parse(&with_addr("[volume]\nmax_db = 0.0")).expect("parse");
+        assert!(config.validate().is_ok());
+        let auto = config.volume_book().auto_defaults();
+        assert_eq!(auto, speech_pipeline::AutoPolicy::default());
+        assert_eq!((auto.min_db, auto.max_db), (-12.0, 6.0));
+        assert!(!auto.enabled);
+        assert_eq!(auto.level_source, LevelAdmission::RawMic);
+    }
+
+    #[test]
+    fn volume_auto_table_reaches_the_book() {
+        let config = Config::parse(&with_addr(
+            "[volume.auto]\nenabled = true\nlevel_source = \"any\"\nk_speech = 0.5\n\
+             speech_ref_dbfs = -28.0\nk_ambient = 0.25\nambient_ref_dbfs = -50.0\n\
+             min_db = -6.0\nmax_db = 3.0",
+        ))
+        .expect("parse");
+        assert!(config.validate().is_ok());
+        let state = config
+            .volume_book()
+            .state(&speech_pipeline::PodId("p".into()));
+        assert!(state.auto);
+        assert_eq!(state.level_source, LevelAdmission::Any);
+        assert_eq!(
+            (
+                state.k_speech,
+                state.speech_ref_dbfs,
+                state.k_ambient,
+                state.ambient_ref_dbfs,
+                state.auto_min_db,
+                state.auto_max_db
+            ),
+            (0.5, -28.0, 0.25, -50.0, -6.0, 3.0)
+        );
+    }
+
+    #[test]
+    fn volume_auto_invalid_values_rejected() {
+        for (table, needle) in [
+            (
+                "[volume.auto]\nmin_db = 3.0\nmax_db = 0.0",
+                "volume.auto.min_db",
+            ),
+            ("[volume.auto]\nk_speech = nan", "volume.auto.k_speech"),
+            ("[volume.auto]\nk_ambient = inf", "volume.auto.k_ambient"),
+            ("[volume.auto]\nmax_db = inf", "volume.auto.max_db"),
+            (
+                "[volume.auto]\nspeech_ref_dbfs = 3.0",
+                "volume.auto.speech_ref_dbfs",
+            ),
+            (
+                "[volume.auto]\nambient_ref_dbfs = -101.0",
+                "volume.auto.ambient_ref_dbfs",
+            ),
+            (
+                "[volume.auto]\nspeech_ref_dbfs = nan",
+                "volume.auto.speech_ref_dbfs",
+            ),
+        ] {
+            let config = Config::parse(&with_addr(table)).expect("parse");
+            let err = config.validate().unwrap_err();
+            assert!(err.contains(needle), "{table}: {err}");
+        }
+        assert!(
+            Config::parse(&with_addr("[volume.auto]\nlevel_source = \"beam\"")).is_err(),
+            "level_source is raw_mic or any"
+        );
+    }
+
+    #[test]
+    fn volume_rejects_unknown_key() {
+        for table in [
+            "[volume.auto]\nenable = true",
+            "[volume]\ngain = 1.0",
+            "[pods.p]\nroom = \"r\"\nvolume_db = 1.0",
+        ] {
+            assert!(Config::parse(&with_addr(table)).is_err(), "{table}");
         }
     }
 

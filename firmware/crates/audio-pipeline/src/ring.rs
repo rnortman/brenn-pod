@@ -45,13 +45,23 @@ pub const PREROLL_SAMPLES: u64 = SAMPLE_RATE_HZ as u64;
 /// struct is plain state with no methods of its own, and the consumers that index
 /// `samples` carry the `Deref`/`DerefMut` bounds they need.
 ///
+/// A ring may carry a second channel in `aux`: a buffer of the same capacity, indexed
+/// by the same `write_head`, so sample `i` of both channels sits at the same slot and
+/// every index, cursor and count stays per channel. A writer that fills `aux` writes it
+/// at the same slot as `samples` before advancing the head; a ring with `aux: None` is
+/// mono.
+///
 /// Typical callers:
-/// - Capture thread: locks, writes samples, advances `write_head`, updates the anchor.
-///   Hold time is one chunk write (≤ 320 samples × 2 B ≈ negligible).
+/// - Capture thread: locks, writes samples (and `aux`), advances `write_head`, updates
+///   the anchor. Hold time is one chunk write (≤ 320 samples × 2 B per channel ≈
+///   negligible).
 /// - Streamer / self-tests: lock, read samples and/or head and anchor, unlock.
 pub struct CaptureRing<B> {
-    /// Sample storage, capacity = [`RING_CAPACITY_SAMPLES`].
+    /// Sample storage, capacity = [`RING_CAPACITY_SAMPLES`]. The primary channel.
     pub samples: B,
+    /// Second-channel storage, the same capacity as `samples`, or `None` for a mono
+    /// ring.
+    pub aux: Option<B>,
     /// Absolute sample index of the next slot to be written (monotonically increasing).
     pub write_head: u64,
     /// Sample index at the moment `anchor_ts_us` was recorded.
@@ -93,6 +103,55 @@ pub const ZERO_ABS_THRESHOLD: i32 = 16;
 /// quiet-room audio has spread ≥ 76; 32 separates the two with margin on both sides.
 pub const STUCK_SPREAD_FLOOR: i32 = 32;
 
+/// Dead-line guard for the raw-microphone slot (the ESP pod's right I2S slot,
+/// `AUDIO_MGR_OP_R = (3, 0)` at default mic gain): the smallest absolute peak a live
+/// raw-mic window may show. Eleven confirmed quiet-room windows reach `max_abs` no
+/// lower than 10 (rms 3–5); 4 sits 2.5× under the quietest live reading, the margin
+/// [`ZERO_ABS_THRESHOLD`] keeps under the beam's quietest (16 under 38). What it
+/// rejects is exact silence — the slot at the chip's default route, which reads 0 on
+/// every sample. It cannot separate a floating or mis-clocked line, which also sits in
+/// the low LSBs, from this quiet room; that discrimination rests on [`AUTOCORR_FLOOR`]
+/// (correlated audio against interference), not on level. NOT a loudness floor.
+/// Every window it rejects also fails [`RAW_MIC_STUCK_SPREAD_FLOOR`], so it chooses the
+/// `all-zero` label rather than the verdict (see [`LivenessGuards`]).
+pub const RAW_MIC_ZERO_ABS_THRESHOLD: i32 = 4;
+
+/// Frozen-line guard for the raw-microphone slot: the smallest spread (`max − min`)
+/// a live raw-mic window may show. Confirmed quiet-room windows have spread ≥ 20; a
+/// frozen / 1-bit line has 0–2. 8 separates the two with the margin
+/// [`STUCK_SPREAD_FLOOR`] keeps for the beam (32 under 76).
+pub const RAW_MIC_STUCK_SPREAD_FLOOR: i32 = 8;
+
+/// The two level-dependent liveness guards — dead line and frozen line — as one
+/// calibrated set. A channel's level decides which set judges it; the saturation and
+/// autocorrelation guards do not depend on level and are shared by every set.
+///
+/// Both sets put the frozen-line floor at twice the dead-line threshold. Since
+/// `spread ≤ 2 · max_abs`, every window the dead-line guard rejects the frozen-line guard
+/// rejects too: the dead-line guard decides the `all-zero` diagnosis, not the verdict,
+/// and a retune of one of the pair should be read against the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LivenessGuards {
+    /// A window whose `max_abs` is at or below this is a dead line.
+    pub zero_abs_threshold: i32,
+    /// A window whose spread is at or below this is a frozen line.
+    pub stuck_spread_floor: i32,
+}
+
+/// The guards for an AGC'd processed beam (the ESP pod's left slot, the Reachy pod's
+/// capture): [`ZERO_ABS_THRESHOLD`] and [`STUCK_SPREAD_FLOOR`].
+pub const BEAM_GUARDS: LivenessGuards = LivenessGuards {
+    zero_abs_threshold: ZERO_ABS_THRESHOLD,
+    stuck_spread_floor: STUCK_SPREAD_FLOOR,
+};
+
+/// The guards for the un-AGC'd raw-microphone slot, a ~10× quieter line than the beam:
+/// [`RAW_MIC_ZERO_ABS_THRESHOLD`] and [`RAW_MIC_STUCK_SPREAD_FLOOR`].
+pub const RAW_MIC_GUARDS: LivenessGuards = LivenessGuards {
+    zero_abs_threshold: RAW_MIC_ZERO_ABS_THRESHOLD,
+    stuck_spread_floor: RAW_MIC_STUCK_SPREAD_FLOOR,
+};
+
 /// Near-full-scale magnitude counted as clipped. Below `i16::MAX` by enough margin to
 /// catch sustained clipping while allowing occasional transients.
 pub const SATURATION_ABS: i32 = 32_700;
@@ -108,10 +167,13 @@ pub const SATURATION_FRAC_MAX: f32 = 0.95;
 /// window). 0.2 sits with margin below the observed acoustic minimum and well above RNG
 /// noise.
 ///
-/// These five thresholds were calibrated on the ESP pod's hardware and are shared by
-/// every liveness check in the tree. A reading that fails one on a different board is a
-/// value for a human to review, not a threshold to lower quietly — and when one is
-/// retuned it must move for every check at once, which is why they live here.
+/// These thresholds were calibrated on the ESP pod's hardware. The saturation and
+/// autocorrelation thresholds are shared by every liveness check in the tree; the
+/// dead-line and frozen-line guards come in two calibrated sets, the beam's
+/// ([`BEAM_GUARDS`]) and the raw mic's ([`RAW_MIC_GUARDS`]). A reading that fails one on a
+/// different board is a value for a human to review, not a threshold to lower quietly —
+/// and when one is retuned it must move for every check that uses it at once, which is
+/// why they live here.
 pub const AUTOCORR_FLOOR: f32 = 0.2;
 
 /// What one channel's capture window looks like.
@@ -162,17 +224,26 @@ impl WaveformStats {
         self.mean_square.sqrt()
     }
 
-    /// Why this window is not live audio, or `None` if it is.
+    /// Why this window is not live beam audio, or `None` if it is: [`defect_under`]
+    /// with [`BEAM_GUARDS`].
+    ///
+    /// [`defect_under`]: Self::defect_under
+    pub fn defect(&self) -> Option<&'static str> {
+        self.defect_under(&BEAM_GUARDS)
+    }
+
+    /// Why this window is not live audio under `guards`' dead-line and frozen-line
+    /// levels, or `None` if it is.
     ///
     /// Ordered so the most specific diagnosis wins: a dead line is also uncorrelated,
     /// and reporting it as low autocorrelation would send someone looking at the wrong
     /// thing.
-    pub fn defect(&self) -> Option<&'static str> {
+    pub fn defect_under(&self, guards: &LivenessGuards) -> Option<&'static str> {
         if self.samples == 0 {
             Some("no samples")
-        } else if self.max_abs() <= ZERO_ABS_THRESHOLD {
+        } else if self.max_abs() <= guards.zero_abs_threshold {
             Some("all-zero")
-        } else if self.spread() <= STUCK_SPREAD_FLOOR {
+        } else if self.spread() <= guards.stuck_spread_floor {
             Some("stuck-constant")
         } else if self.saturated_fraction >= SATURATION_FRAC_MAX {
             Some("saturated")
@@ -592,6 +663,7 @@ mod tests {
     fn capture_ring_works_over_a_deref_backing_buffer() {
         let mut ring = CaptureRing {
             samples: alloc::vec![0i16; 8].into_boxed_slice(),
+            aux: None,
             write_head: 0,
             anchor_sample: 0,
             anchor_ts_us: 0,
@@ -624,12 +696,41 @@ mod tests {
         assert_eq!(ring.anchor_ts_us, 4_242);
     }
 
+    /// A second channel shares the primary's head: the same absolute index lands at the
+    /// same slot in both buffers, including after the ring wraps.
+    #[test]
+    fn capture_ring_aux_shares_the_write_head() {
+        let mut ring = CaptureRing {
+            samples: [0i16; 8],
+            aux: Some([0i16; 8]),
+            write_head: 0,
+            anchor_sample: 0,
+            anchor_ts_us: 0,
+        };
+        let r = RingIndex::new(ring.samples.len());
+        for i in 0..11u64 {
+            let slot = r.slot(ring.write_head);
+            ring.samples[slot] = i as i16;
+            if let Some(aux) = ring.aux.as_mut() {
+                aux[slot] = -(i as i16) - 100;
+            }
+            ring.write_head += 1;
+        }
+        let aux = ring.aux.as_ref().expect("aux allocated");
+        for i in r.oldest(ring.write_head)..ring.write_head {
+            let slot = r.slot(i);
+            assert_eq!(ring.samples[slot], i as i16, "primary at index {i}");
+            assert_eq!(aux[slot], -(i as i16) - 100, "aux at index {i}");
+        }
+    }
+
     /// The struct declares no bound on `B`, so a bare array is a legal backing buffer
     /// too: it is plain state, and the consumers that index `samples` carry the bounds.
     #[test]
     fn capture_ring_holds_samples_and_anchor() {
         let mut ring = CaptureRing {
             samples: [0i16; 8],
+            aux: None,
             write_head: 0,
             anchor_sample: 0,
             anchor_ts_us: 0,
@@ -683,6 +784,90 @@ mod tests {
         assert_eq!(SATURATION_ABS, 32_700);
         assert_eq!(SATURATION_FRAC_MAX, 0.95);
         assert_eq!(AUTOCORR_FLOOR, 0.2);
+        assert_eq!(RAW_MIC_ZERO_ABS_THRESHOLD, 4);
+        assert_eq!(RAW_MIC_STUCK_SPREAD_FLOOR, 8);
+    }
+
+    /// A correlated triangle of the given peak, period 40: `-peak ..= peak`.
+    fn triangle(out: &mut [i16], peak: i32) {
+        for (i, sample) in out.iter_mut().enumerate() {
+            let phase = (i % 40) as i32;
+            let unit = if phase < 20 { phase - 10 } else { 30 - phase };
+            *sample = (unit * peak / 10) as i16;
+        }
+    }
+
+    #[test]
+    fn the_raw_mic_quiet_room_is_live_under_its_own_guards_only() {
+        // Shaped like the observed raw-mic quiet room: correlated, min −10, max 10.
+        let mut window = [0i16; 4_000];
+        triangle(&mut window, 10);
+        let stats = WaveformStats::of(&window);
+        assert_eq!((stats.min, stats.max), (-10, 10), "{stats:?}");
+        assert!(stats.autocorr_lag1 > AUTOCORR_FLOOR, "{stats:?}");
+        assert_eq!(stats.defect_under(&RAW_MIC_GUARDS), None, "{stats:?}");
+        // The fact that forced two sets: the beam's dead-line guard calls it dead.
+        assert_eq!(stats.defect_under(&BEAM_GUARDS), Some("all-zero"));
+    }
+
+    #[test]
+    fn defect_is_the_beam_set() {
+        let mut quiet = [0i16; 4_000];
+        quiet_speech(&mut quiet);
+        let mut uncorrelated = [0i16; 4_000];
+        noise(&mut uncorrelated);
+        let mut clipped = [0i16; 1_000];
+        for (i, sample) in clipped.iter_mut().enumerate() {
+            *sample = if i % 500 < 499 { 32_760 } else { -32_760 };
+        }
+        let fixtures: [&[i16]; 6] = [
+            &quiet,
+            &uncorrelated,
+            &clipped,
+            &[0i16; 1_000],
+            &[1_000i16; 1_000],
+            &[],
+        ];
+        for samples in fixtures {
+            let stats = WaveformStats::of(samples);
+            assert_eq!(
+                stats.defect_under(&BEAM_GUARDS),
+                stats.defect(),
+                "{stats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_raw_mic_guards_bite_at_their_boundaries() {
+        // Dead line: max_abs 4 is dead, 5 is not.
+        let mut at = [0i16; 4_000];
+        triangle(&mut at, 4);
+        let at = WaveformStats::of(&at);
+        assert_eq!(at.max_abs(), 4, "{at:?}");
+        assert_eq!(at.defect_under(&RAW_MIC_GUARDS), Some("all-zero"));
+        let mut over = [0i16; 4_000];
+        triangle(&mut over, 5);
+        let over = WaveformStats::of(&over);
+        assert_eq!((over.max_abs(), over.spread()), (5, 10), "{over:?}");
+        assert_eq!(over.defect_under(&RAW_MIC_GUARDS), None, "{over:?}");
+
+        // Frozen line, offset so max_abs stays above 4: spread 8 is frozen, 9 is not.
+        let ramp = |spread: i16| -> [i16; 4_000] {
+            let mut out = [0i16; 4_000];
+            for (i, sample) in out.iter_mut().enumerate() {
+                let phase = (i % 40) as i16;
+                let tri = if phase < 20 { phase } else { 40 - phase };
+                *sample = 500 + (tri * spread) / 20;
+            }
+            out
+        };
+        let frozen = WaveformStats::of(&ramp(8));
+        assert_eq!(frozen.spread(), 8, "{frozen:?}");
+        assert_eq!(frozen.defect_under(&RAW_MIC_GUARDS), Some("stuck-constant"));
+        let live = WaveformStats::of(&ramp(9));
+        assert_eq!(live.spread(), 9, "{live:?}");
+        assert_ne!(live.defect_under(&RAW_MIC_GUARDS), Some("stuck-constant"));
     }
 
     #[test]

@@ -151,6 +151,7 @@ impl SegmentAssembler {
                 gap,
                 device_ts,
                 host_rx,
+                ..
             } => {
                 let cap = self.limits.max_segment_samples;
                 match &mut self.current {
@@ -378,6 +379,7 @@ mod tests {
             segment_id,
             first_sample_index: first,
             pcm: vec![0i16; n],
+            aux: None,
             device_ts: DeviceMicros(0),
             gap,
             host_rx: HostMicros(first),

@@ -40,6 +40,19 @@ pub fn hello(pod_id: &str) -> StreamFrame {
     })
 }
 
+/// A `Hello` for `pod_id`: 16 kHz S16, two channels, beam + raw mic.
+pub fn hello_stereo(pod_id: &str) -> StreamFrame {
+    StreamFrame::Hello(Hello {
+        version: AUDIO_PROTOCOL_VERSION,
+        pod_id: heapless::String::try_from(pod_id).unwrap(),
+        sample_rate_hz: 16_000,
+        bits_per_sample: 16,
+        channels: 2,
+        codec: Codec::S16Le,
+        channel_source: ChannelSource::StereoBeamRawMic,
+    })
+}
+
 /// A `SegmentStart` at `base`, no preroll.
 pub fn seg_start(segment_id: u32, base: u64) -> StreamFrame {
     StreamFrame::SegmentStart(SegmentStart {
@@ -69,6 +82,23 @@ pub fn audio(segment_id: u32, first: u64, n_samples: usize) -> StreamFrame {
         let v = (i as i16 + 1).to_le_bytes();
         pcm.push(v[0]).unwrap();
         pcm.push(v[1]).unwrap();
+    }
+    StreamFrame::Audio(AudioFrame {
+        segment_id,
+        first_sample_index: first,
+        device_ts_us: 0,
+        pcm,
+    })
+}
+
+/// A stereo audio frame of `n_samples` sample frames starting at `first`:
+/// left (beam) `1..=n`, right (raw mic) `-1..=-n`, interleaved.
+pub fn audio_stereo(segment_id: u32, first: u64, n_samples: usize) -> StreamFrame {
+    let mut pcm: HVec<u8, MAX_AUDIO_PAYLOAD> = HVec::new();
+    for i in 0..n_samples {
+        let v = i as i16 + 1;
+        pcm.extend_from_slice(&v.to_le_bytes()).unwrap();
+        pcm.extend_from_slice(&(-v).to_le_bytes()).unwrap();
     }
     StreamFrame::Audio(AudioFrame {
         segment_id,

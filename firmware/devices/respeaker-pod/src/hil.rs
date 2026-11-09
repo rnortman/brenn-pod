@@ -101,6 +101,8 @@ pub(crate) fn run_handler(name: TestName) -> (Status, Payload) {
         TestName::TlsInboundBackpressure => run_tls_inbound_backpressure(),
         TestName::TlsPskHandshake => crate::net_tests::run_tls_psk_handshake(),
         TestName::TlsPskWrongKeyRejected => crate::net_tests::run_tls_psk_wrong_key_rejected(),
+        TestName::Xvf3800OutputRouting => crate::routing::run_xvf3800_output_routing(),
+        TestName::I2sRightSlotSanity => crate::capture::run_i2s_right_slot_sanity(),
     }
 }
 

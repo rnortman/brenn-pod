@@ -52,6 +52,7 @@ mod inbound;
 mod net_tests;
 mod nvs;
 mod protocol_rx;
+mod routing;
 mod speaker;
 mod tls_link;
 
@@ -353,6 +354,13 @@ fn main() {
         let mut guard = I2C_BUS.lock().expect("I2C_BUS mutex poisoned during init");
         *guard = Some(i2c_driver);
         log::info!("I2C bus initialized (SDA=GPIO5, SCL=GPIO6, 100 kHz)");
+
+        // Raw microphone 0 into the right I2S slot, before the capture thread reads it.
+        // Logs its own `routing:` line; a refusal leaves the right slot silent and boot
+        // continues — the beam on the left slot is unaffected.
+        if let Some(driver) = guard.as_mut() {
+            routing::apply_right_slot_routing(driver);
+        }
     }
 
     // ── WiFi stack ─────────────────────────────────────────────────────────────
@@ -543,9 +551,12 @@ fn main() {
     //
     // Sample storage lives in PSRAM (CAPS-only pool): CPU-access-only, never a DMA
     // target, so it frees an equal amount of the starved internal heap for Wi-Fi/lwIP.
+    // Two channels: `samples` holds the left I2S slot (the communication beam), `aux` the
+    // right slot (the raw microphone the boot routing write puts there).
     {
         let ring = CaptureRing {
             samples: psram::PsramBuf::<i16>::new_zeroed(RING_CAPACITY_SAMPLES),
+            aux: Some(psram::PsramBuf::<i16>::new_zeroed(RING_CAPACITY_SAMPLES)),
             write_head: 0,
             anchor_sample: 0,
             anchor_ts_us: 0,
@@ -556,7 +567,7 @@ fn main() {
         *guard = Some(ring);
         let spiram_free = psram::spiram_free_bytes();
         log::info!(
-            "capture ring initialized in PSRAM ({} mono samples, {} KB; SPIRAM free {} B)",
+            "capture ring initialized in PSRAM (2 channels x {} samples, {} KB each; SPIRAM free {} B)",
             RING_CAPACITY_SAMPLES,
             (RING_CAPACITY_SAMPLES * core::mem::size_of::<i16>()) / 1024,
             spiram_free,
