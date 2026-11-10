@@ -17,6 +17,8 @@ extern crate alloc;
 /// `std`-only: it drives a `dyn std::io::Read` and returns `std::io::Result`.
 #[cfg(feature = "std")]
 pub mod inbound;
+/// The device's room-level meter and its rolling block history.
+pub mod level;
 /// Real-time pacing arithmetic for the outbound audio catch-up drain. Pure and
 /// clock-free so it unit tests on the host; the streamer supplies the clock read.
 pub mod pace;
@@ -27,6 +29,8 @@ pub mod pace;
 #[cfg(feature = "std")]
 pub mod playback;
 pub mod ring;
+/// Cumulative device counters and the gate's published state, shared across threads.
+pub mod stats;
 /// Host-testable streamer send-loop core.
 /// `std`-only: drives a `dyn std::io::Write` with `poll`-backed backpressure.
 #[cfg(feature = "std")]

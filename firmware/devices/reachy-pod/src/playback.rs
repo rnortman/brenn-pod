@@ -19,6 +19,8 @@
 //! the sound card and the sound card never waits on the socket.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use alsa::Direction;
@@ -28,6 +30,7 @@ use audio_pipeline::playback::{
     InboundRingConsumer, InboundRingProducer, LogCountdown, PLAYBACK_LOG_CADENCE_FRAMES,
     PlaybackSink, PrerollGate as SharedPrerollGate, WIRE_BYTES_PER_SAMPLE, is_valid_s16le_pcm,
 };
+use audio_pipeline::stats::PodStats;
 
 use crate::alsa_capture::{
     CAPTURE_PARAMS, CardInfo, PcmError, PcmParams, RecoveryBudget, Retry, enumerate_cards,
@@ -209,17 +212,20 @@ pub struct RingSink {
     /// the host as TCP flow control rather than as a gap.
     full_stalls: u32,
     log_countdown: LogCountdown,
+    /// The pod's counters; each stall is also added to `playback_full_stalls`.
+    stats: Arc<PodStats>,
 }
 
 impl RingSink {
-    /// Wrap the write end of a playback ring.
-    pub fn new(producer: InboundRingProducer) -> Self {
+    /// Wrap the write end of a playback ring, counting its stalls into `stats`.
+    pub fn new(producer: InboundRingProducer, stats: Arc<PodStats>) -> Self {
         Self {
             producer,
             frames: 0,
             samples: 0,
             full_stalls: 0,
             log_countdown: LogCountdown::new(PLAYBACK_LOG_CADENCE_FRAMES),
+            stats,
         }
     }
 
@@ -261,6 +267,7 @@ impl PlaybackSink for RingSink {
         });
         if !banked {
             self.full_stalls = self.full_stalls.wrapping_add(1);
+            PodStats::bump(&self.stats.playback_full_stalls);
             // Logged on this path too: under sustained backpressure it is the only
             // path, and going silent during the overload is the opposite of useful.
             self.tick_log();
@@ -381,11 +388,13 @@ pub struct PlaybackDrain {
     played_frames: u64,
     underruns: u64,
     boundaries: u64,
+    /// The pod's counters; each underrun is also added to `playback_underruns`.
+    stats: Arc<PodStats>,
 }
 
 impl PlaybackDrain {
-    /// Wrap the read end of a playback ring.
-    pub fn new(consumer: InboundRingConsumer) -> Self {
+    /// Wrap the read end of a playback ring, counting its underruns into `stats`.
+    pub fn new(consumer: InboundRingConsumer, stats: Arc<PodStats>) -> Self {
         let acted_generation = consumer.generation();
         Self {
             consumer,
@@ -396,6 +405,7 @@ impl PlaybackDrain {
             played_frames: 0,
             underruns: 0,
             boundaries: 0,
+            stats,
         }
     }
 
@@ -446,6 +456,7 @@ impl PlaybackDrain {
         if available == 0 {
             if let Some(target) = self.gate.note_empty() {
                 self.underruns += 1;
+                PodStats::bump(&self.stats.playback_underruns);
                 log::warn!(
                     "playback: the ring ran dry mid-stream ({} underrun(s)); rebuilding to {target} \
                      bytes before resuming",
@@ -473,6 +484,7 @@ impl PlaybackDrain {
                 Ok(accepted) => accepted,
                 Err(PlaybackFault::Underrun) => {
                     self.underruns += 1;
+                    PodStats::bump(&self.stats.playback_underruns);
                     let target = self.gate.rearm_escalated();
                     log::warn!(
                         "playback: the device underran ({} total); rebuilding to {target} bytes \
@@ -518,21 +530,47 @@ impl PlaybackDrain {
 /// The only exit is a fatal fault, which is the intended one: a board that has gone
 /// away is recovered by the process exiting and being restarted, not by a re-probe
 /// state machine here.
-pub fn run_drain_loop(drain: &mut PlaybackDrain, out: &mut dyn StereoOut) -> PlaybackFault {
+///
+/// `playing` is set on a pass that put audio out and cleared on a pass that found
+/// nothing banked; a pass held by the pre-roll gate leaves it as it was.
+pub fn run_drain_loop(
+    drain: &mut PlaybackDrain,
+    out: &mut dyn StereoOut,
+    playing: &AtomicBool,
+) -> PlaybackFault {
     loop {
         match drain.pass(out, Instant::now()) {
-            Ok(PassOutcome::Idle | PassOutcome::Filling) => std::thread::sleep(IDLE_POLL),
-            Ok(_) => {}
+            Ok(outcome) => {
+                if let Some(now_playing) = playing_after(outcome) {
+                    playing.store(now_playing, Ordering::Relaxed);
+                }
+                if matches!(outcome, PassOutcome::Idle | PassOutcome::Filling) {
+                    std::thread::sleep(IDLE_POLL);
+                }
+            }
             Err(fault) => return fault,
         }
     }
 }
 
+/// What a pass says about whether the speaker output is active: `Some(true)` when it
+/// put audio out, `Some(false)` when nothing was banked, `None` when it says nothing.
+fn playing_after(outcome: PassOutcome) -> Option<bool> {
+    match outcome {
+        PassOutcome::Played(_) | PassOutcome::Boundary(_) => Some(true),
+        PassOutcome::Idle => Some(false),
+        PassOutcome::Filling => None,
+    }
+}
+
 /// A fresh playback ring, split into the end the streamer banks into and the end the
-/// drain thread plays from.
-pub fn playback_pair() -> (RingSink, PlaybackDrain) {
+/// drain thread plays from, both counting into `stats`.
+pub fn playback_pair(stats: &Arc<PodStats>) -> (RingSink, PlaybackDrain) {
     let (producer, consumer) = InboundPcmRing::new(INBOUND_PCM_RING_BYTES).split();
-    (RingSink::new(producer), PlaybackDrain::new(consumer))
+    (
+        RingSink::new(producer, Arc::clone(stats)),
+        PlaybackDrain::new(consumer, Arc::clone(stats)),
+    )
 }
 
 #[cfg(test)]
@@ -596,7 +634,22 @@ mod tests {
     /// A small ring, so the wrap and full paths are reachable without banking 64 KiB.
     fn small_pair(cap: usize) -> (RingSink, PlaybackDrain) {
         let (producer, consumer) = InboundPcmRing::new(cap).split();
-        (RingSink::new(producer), PlaybackDrain::new(consumer))
+        let stats = test_stats();
+        (
+            RingSink::new(producer, Arc::clone(&stats)),
+            PlaybackDrain::new(consumer, stats),
+        )
+    }
+
+    /// Counters for one test's sink and drain.
+    fn test_stats() -> Arc<PodStats> {
+        Arc::new(PodStats::new(audio_pipeline::stats::CounterSources {
+            capture_deficit_frames: false,
+            capture_xruns: true,
+            playback_write_failures: false,
+            playback_discards: false,
+            alloc_failures: false,
+        }))
     }
 
     /// A clock the test walks forward, so reaching the fallback timeout costs nothing.
@@ -697,6 +750,11 @@ mod tests {
         assert_eq!(sink.accept(&wire(1, 32)), Accepted::Enqueued);
         assert_eq!(sink.accept(&wire(100, 1)), Accepted::Full);
         assert_eq!(sink.full_stalls(), 1);
+        assert_eq!(
+            sink.stats.snapshot().playback_full_stalls,
+            1,
+            "the stall reaches the status counters"
+        );
         // Nothing of the refused frame is in the ring: the 32 banked samples are all
         // that comes back out.
         let mut out = FakeOut::default();
@@ -803,6 +861,11 @@ mod tests {
             PassOutcome::Idle
         );
         assert_eq!(drain.underruns(), 1);
+        assert_eq!(
+            drain.stats.snapshot().playback_underruns,
+            1,
+            "the ring running dry reaches the status counters once"
+        );
     }
 
     #[test]
@@ -820,6 +883,11 @@ mod tests {
             PassOutcome::Played(0)
         );
         assert_eq!(drain.underruns(), 1);
+        assert_eq!(
+            drain.stats.snapshot().playback_underruns,
+            1,
+            "the device's underrun reaches the status counters"
+        );
         assert!(drain.gate().pending(), "the cushion is rebuilt first");
 
         open_gate(&mut drain, &mut out, &mut clock);
@@ -1019,7 +1087,7 @@ mod tests {
 
     #[test]
     fn the_loop_plays_what_is_banked_and_ends_only_on_a_fatal_fault() {
-        let (mut sink, mut drain) = playback_pair();
+        let (mut sink, mut drain) = playback_pair(&test_stats());
         // A full cushion, so the loop's own clock releases the gate on depth and the
         // test does not wait out a fallback in real time.
         let per_frame = INBOUND_PCM_WRITE_UNIT_BYTES / WIRE_BYTES_PER_SAMPLE;
@@ -1032,7 +1100,7 @@ mod tests {
             fatal_at: Some(2),
             ..Default::default()
         };
-        let fault = run_drain_loop(&mut drain, &mut out);
+        let fault = run_drain_loop(&mut drain, &mut out, &AtomicBool::new(false));
         assert!(matches!(fault, PlaybackFault::Fatal(_)), "{fault}");
         assert_eq!(
             out.left(),
@@ -1040,6 +1108,14 @@ mod tests {
             "everything the device took before it died, in order"
         );
         assert_eq!(drain.played_frames(), per_frame as u64);
+    }
+
+    #[test]
+    fn playing_is_set_by_output_cleared_by_idle_and_left_by_filling() {
+        assert_eq!(playing_after(PassOutcome::Played(16)), Some(true));
+        assert_eq!(playing_after(PassOutcome::Boundary(0)), Some(true));
+        assert_eq!(playing_after(PassOutcome::Idle), Some(false));
+        assert_eq!(playing_after(PassOutcome::Filling), None);
     }
 
     #[test]

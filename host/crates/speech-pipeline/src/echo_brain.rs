@@ -3,6 +3,10 @@
 //! `SpeakBody::Text`; the router's synthesizer renders it to speech. No clip, no
 //! transcriber inside the brain: the transcript rides in on the utterance.
 //!
+//! A listening parrot ([`EchoBrain::listening`]) asks to be answered after every
+//! reply, so the follow-up window can be exercised end to end with no language
+//! model behind it.
+//!
 //! An utterance with no transcript never arrives — `handle` is called only with
 //! usable text (see `Brain::handle`). A full or
 //! disconnected response sink drops the reply (the utterance's audio still lives
@@ -30,6 +34,8 @@ pub struct EchoBrain {
     stats: Arc<BrainStats>,
     /// Per-pod reply volume, read to resolve each reply's gain as it is queued.
     volume: Arc<Mutex<VolumeBook>>,
+    /// How every turn ends: `Open` for a listening parrot, `Closed` otherwise.
+    turn_end: TurnEnd,
 }
 
 impl EchoBrain {
@@ -44,6 +50,17 @@ impl EchoBrain {
             events,
             stats,
             volume,
+            turn_end: TurnEnd::Closed,
+        }
+    }
+
+    /// Make every turn this parrot takes end `TurnEnd::Open`: each reply asks to
+    /// keep listening, so the next thing said after it is heard without the wake
+    /// word for the surface's configured window.
+    pub fn listening(self) -> Self {
+        Self {
+            turn_end: TurnEnd::Open,
+            ..self
         }
     }
 }
@@ -105,8 +122,7 @@ impl Brain for EchoBrain {
             level: u.level,
         };
         send_or_report(&mut out, cmd, utterance, &self.events, &self.stats);
-        // A parrot never asks to be answered, so every turn it takes is closed.
-        futures::future::ready(TurnEnd::Closed).boxed()
+        futures::future::ready(self.turn_end).boxed()
     }
 
     fn interrupt(&self, _id: UtteranceId, _progress: InterruptProgress) {
@@ -209,8 +225,9 @@ mod tests {
         let brain = EchoBrain::new(events, Arc::clone(&stats), default_book());
 
         let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
-        // A parrot never asks to be answered, so every turn it takes is closed —
-        // and closed synchronously, with nothing left to await.
+        // A parrot that is not listening never asks to be answered, so every turn
+        // it takes is closed — and closed synchronously, with nothing left to
+        // await.
         assert_eq!(
             brain
                 .handle(utterance_with(Some("hello there")), ResponseSink::new(tx))
@@ -229,6 +246,29 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "no failure on a live sink");
         assert_eq!(stats.snapshot().no_transcript, 0);
         assert_eq!(stats.snapshot().speak_send_failures, 0);
+    }
+
+    /// A listening parrot ends every turn open, whatever it was said, and still
+    /// parrots: the window is the only thing that changes.
+    #[test]
+    fn a_listening_parrot_ends_every_turn_open() {
+        let (events, _seen) = event_collector();
+        let brain =
+            EchoBrain::new(events, Arc::new(BrainStats::default()), default_book()).listening();
+        for text in ["hello there", "and again"] {
+            let (tx, mut rx) = mpsc::channel::<SpeakCmd>(1);
+            assert_eq!(
+                brain
+                    .handle(utterance_with(Some(text)), ResponseSink::new(tx))
+                    .now_or_never(),
+                Some(TurnEnd::Open),
+                "{text}"
+            );
+            match rx.try_recv().expect("a SpeakCmd was queued").body {
+                SpeakBody::Text(reply) => assert_eq!(reply, text),
+                SpeakBody::Pcm(_) => panic!("EchoBrain queues Text, never Pcm"),
+            }
+        }
     }
 
     #[test]

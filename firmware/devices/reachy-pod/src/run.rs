@@ -22,17 +22,19 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
 use audio_pipeline::inbound::{InboundObserver, InboundWaypoint};
 use audio_pipeline::ring::{CaptureRing, RING_CAPACITY_SAMPLES, RingIndex};
+use audio_pipeline::stats::{CounterSources, PodStats};
 use audio_pipeline::wire::PlaybackFormat;
 use build_id::{build_id, stamp};
 use pod_streamer::idle::should_log_provisioning_failure;
 use pod_streamer::run::{StreamerExit, StreamerRuntime, run_streamer_loop};
 use pod_streamer::segment::{ObsEvent, STREAMER_CHAN_CAPACITY, StreamerMsg};
+use pod_streamer::status::PlatformGauges;
 use pod_streamer::telemetry::{
     DOA_POLL_HZ, Reading, TelemetryBus, TelemetryCore, TelemetryCtx, VAD_POLL_HZ,
     read_f32x4_reading, run_telemetry_loop,
@@ -59,6 +61,11 @@ pub struct CaptureWiring {
     pub ring: SharedRing,
     /// Which of the board's two capture channels is written into it.
     pub channel: usize,
+    /// Whether the board's speaker output is active, read for every captured frame
+    /// so the ring's level blocks are flagged while the pod is playing.
+    pub playing: Arc<AtomicBool>,
+    /// Where the capture stream's recovered overruns are counted.
+    pub stats: Arc<PodStats>,
 }
 
 /// The telemetry thread's share of the wiring.
@@ -73,6 +80,8 @@ pub struct TelemetryWiring {
     pub threshold: f32,
     /// How long the gate stays open after the energy drops below it.
     pub hangover_ms: u32,
+    /// Where the gate publishes its state and counts dropped messages.
+    pub stats: Arc<PodStats>,
 }
 
 /// The streamer thread's share of the wiring.
@@ -92,12 +101,16 @@ pub struct StreamerWiring {
     pub pod_id: String,
     /// Where the audio host is and which key to present.
     pub config: Config,
+    /// The pod's counters, read into every status frame.
+    pub stats: Arc<PodStats>,
 }
 
 /// The playback thread's share of the wiring.
 pub struct PlaybackWiring {
     /// The read end of the ring the streamer banks into.
     pub drain: crate::playback::PlaybackDrain,
+    /// Set while the drain is putting audio out, cleared when it goes idle.
+    pub playing: Arc<AtomicBool>,
 }
 
 /// Everything the four threads share, split into what each one gets.
@@ -113,6 +126,18 @@ pub struct Wiring {
     pub playback: PlaybackWiring,
 }
 
+/// Which optional counters this pod has a source for. One without is reported as
+/// not measured, never as zero: ALSA does not say how many frames an overrun lost,
+/// a failed playback write other than an underrun ends the process, there is no
+/// inbound discard path, and a failed allocation aborts.
+const POD_COUNTER_SOURCES: CounterSources = CounterSources {
+    capture_deficit_frames: false,
+    capture_xruns: true,
+    playback_write_failures: false,
+    playback_discards: false,
+    alloc_failures: false,
+};
+
 /// Create the shared state and divide it among the threads.
 ///
 /// No hardware: everything here is a ring, a flag, a channel or a value off the
@@ -125,12 +150,16 @@ pub fn wire(config: &Config, pod_id: String, channel: usize) -> Wiring {
     let ring: SharedRing = Arc::new(Mutex::new(Some(new_ring())));
     let vad_closed = Arc::new(AtomicBool::new(false));
     let segment_active = Arc::new(AtomicBool::new(false));
+    let playing = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(PodStats::new(POD_COUNTER_SOURCES));
     let (msg_tx, msg_rx) = sync_channel::<StreamerMsg>(STREAMER_CHAN_CAPACITY);
-    let (sink, drain) = playback_pair();
+    let (sink, drain) = playback_pair(&stats);
     Wiring {
         capture: CaptureWiring {
             ring: Arc::clone(&ring),
             channel,
+            playing: Arc::clone(&playing),
+            stats: Arc::clone(&stats),
         },
         telemetry: TelemetryWiring {
             ring: Arc::clone(&ring),
@@ -138,6 +167,7 @@ pub fn wire(config: &Config, pod_id: String, channel: usize) -> Wiring {
             msg_tx,
             threshold: config.vad_threshold,
             hangover_ms: config.vad_hangover_ms,
+            stats: Arc::clone(&stats),
         },
         streamer: StreamerWiring {
             ring,
@@ -147,8 +177,9 @@ pub fn wire(config: &Config, pod_id: String, channel: usize) -> Wiring {
             sink,
             pod_id,
             config: config.clone(),
+            stats,
         },
-        playback: PlaybackWiring { drain },
+        playback: PlaybackWiring { drain, playing },
     }
 }
 
@@ -340,14 +371,19 @@ impl PeriodSource for CaptureStream<'_> {
 /// [`CaptureStream::read_period`] already does: a stream that will not come back
 /// after its recovery budget is a board that has gone away, and this pod's answer
 /// to that is to exit.
+///
+/// Every overrun the stream recovers from is added to `stats.capture_xruns`.
 pub fn run_capture_loop<S: PeriodSource>(
     source: &mut S,
     ring: &Mutex<Option<CaptureRing<Box<[i16]>>>>,
     channel: usize,
+    playing: &AtomicBool,
+    stats: &PodStats,
     now_us: &dyn Fn() -> u64,
 ) -> PcmError {
+    let mut recoveries_counted = source.recoveries();
     loop {
-        match source.read_period() {
+        let ended = match source.read_period() {
             Ok(period) => {
                 // Dated before the lock: the reading names when the audio arrived,
                 // not when a contended mutex let go of it.
@@ -358,9 +394,27 @@ pub fn run_capture_loop<S: PeriodSource>(
                 let ring = guard
                     .as_mut()
                     .expect("capture ring is wired before the capture thread starts");
-                append_channel(ring, period, channel, arrived);
+                append_channel(
+                    ring,
+                    period,
+                    channel,
+                    playing.load(Ordering::Relaxed),
+                    arrived,
+                );
+                None
             }
-            Err(e) => return e,
+            Err(e) => Some(e),
+        };
+        // Counted after the read either way: the read that recovered, and the one
+        // whose recovery budget ran out, both moved the stream's total.
+        let recoveries = source.recoveries();
+        PodStats::add(
+            &stats.capture_xruns,
+            recoveries.wrapping_sub(recoveries_counted),
+        );
+        recoveries_counted = recoveries;
+        if let Some(e) = ended {
+            return e;
         }
     }
 }
@@ -638,13 +692,19 @@ pub fn run(chip_rebooted: bool, config: Option<&Path>) -> u8 {
 
 /// Spawn the thread that fills the capture ring.
 fn spawn_capture(exit_tx: &Sender<ThreadExit>, pcm: alsa::pcm::PCM, wiring: CaptureWiring) {
-    let CaptureWiring { ring, channel } = wiring;
+    let CaptureWiring {
+        ring,
+        channel,
+        playing,
+        stats,
+    } = wiring;
     spawn(exit_tx, Worker::Capture, move |reporter| {
         // Built inside the thread because the reader borrows the PCM, and the PCM
         // is owned here for the life of the thread.
         match CaptureStream::new(&pcm) {
             Ok(mut stream) => {
-                let cause = run_capture_loop(&mut stream, &ring, channel, &monotonic_us);
+                let cause =
+                    run_capture_loop(&mut stream, &ring, channel, &playing, &stats, &monotonic_us);
                 reporter.set(cause.to_string());
             }
             Err(e) => reporter.set(e.to_string()),
@@ -664,6 +724,7 @@ where
         msg_tx,
         threshold,
         hangover_ms,
+        stats,
     } = wiring;
     log::info!("telemetry: polling SPENERGY at {VAD_POLL_HZ} Hz, DoA at {DOA_POLL_HZ} Hz");
     spawn(exit_tx, Worker::Telemetry, move |_reporter| {
@@ -677,6 +738,7 @@ where
             // Nothing quiesces capture on this pod; the capture thread runs for
             // the life of the process.
             capture_quiesced: &|| false,
+            stats: &stats,
         };
         let mut cadence = StateLineCadence::new();
         let mut say = |line: String| log::info!("{line}");
@@ -700,6 +762,7 @@ fn spawn_streamer(exit_tx: &Sender<ThreadExit>, wiring: StreamerWiring) {
         mut sink,
         pod_id,
         config,
+        stats,
     } = wiring;
     spawn(exit_tx, Worker::Streamer, move |reporter| {
         let seed = jitter_seed(&pod_id);
@@ -719,6 +782,10 @@ fn spawn_streamer(exit_tx: &Sender<ThreadExit>, wiring: StreamerWiring) {
             obs: &mut obs,
             inbound_obs: &mut inbound_obs,
             jitter_seed: seed,
+            stats: &stats,
+            // A Linux pod has no heap figure comparable to the ESP's, and no radio
+            // of its own to read.
+            gauges: &PlatformGauges::default,
         };
         match run_streamer_loop(&platform, &mut runtime) {
             StreamerExit::ChannelDisconnected => reporter
@@ -729,13 +796,13 @@ fn spawn_streamer(exit_tx: &Sender<ThreadExit>, wiring: StreamerWiring) {
 
 /// Spawn the thread that plays banked inbound audio.
 fn spawn_playback(exit_tx: &Sender<ThreadExit>, pcm: alsa::pcm::PCM, wiring: PlaybackWiring) {
-    let PlaybackWiring { mut drain } = wiring;
+    let PlaybackWiring { mut drain, playing } = wiring;
     spawn(
         exit_tx,
         Worker::Playback,
         move |reporter| match AlsaOut::new(&pcm) {
             Ok(mut out) => {
-                let fault = run_drain_loop(&mut drain, &mut out);
+                let fault = run_drain_loop(&mut drain, &mut out, &playing);
                 reporter.set(fault.to_string());
             }
             Err(e) => reporter.set(e.to_string()),
@@ -908,6 +975,10 @@ mod tests {
     struct ScriptedPeriods {
         periods: VecDeque<Vec<i16>>,
         current: Vec<i16>,
+        /// Overruns the stream reports having recovered from, by read: the n-th read
+        /// leaves the total at `recovered_by_read[n]` (the last value thereafter).
+        recovered_by_read: VecDeque<u64>,
+        recoveries: u64,
     }
 
     impl ScriptedPeriods {
@@ -915,12 +986,21 @@ mod tests {
             Self {
                 periods: periods.into(),
                 current: Vec::new(),
+                recovered_by_read: VecDeque::new(),
+                recoveries: 0,
             }
         }
     }
 
+    fn stats() -> PodStats {
+        PodStats::new(POD_COUNTER_SOURCES)
+    }
+
     impl PeriodSource for ScriptedPeriods {
         fn read_period(&mut self) -> Result<&[i16], PcmError> {
+            if let Some(total) = self.recovered_by_read.pop_front() {
+                self.recoveries = total;
+            }
             match self.periods.pop_front() {
                 Some(period) => {
                     self.current = period;
@@ -937,7 +1017,7 @@ mod tests {
         }
 
         fn recoveries(&self) -> u64 {
-            0
+            self.recoveries
         }
     }
 
@@ -957,10 +1037,17 @@ mod tests {
         let ring = empty_ring();
         let mut source = ScriptedPeriods::new(vec![stereo(4, 100), stereo(4, 200)]);
         let clock = std::cell::Cell::new(0u64);
-        let err = run_capture_loop(&mut source, &ring, 1, &|| {
-            clock.set(clock.get() + 20_000);
-            clock.get()
-        });
+        let err = run_capture_loop(
+            &mut source,
+            &ring,
+            1,
+            &AtomicBool::new(false),
+            &stats(),
+            &|| {
+                clock.set(clock.get() + 20_000);
+                clock.get()
+            },
+        );
         assert!(matches!(err, PcmError::Stream { .. }));
 
         let guard = ring.lock().expect("ring");
@@ -979,10 +1066,38 @@ mod tests {
     }
 
     #[test]
+    fn the_capture_loop_counts_each_recovered_overrun_once() {
+        let ring = empty_ring();
+        let mut source = ScriptedPeriods::new(vec![stereo(4, 1), stereo(4, 1), stereo(4, 1)]);
+        // Two recoveries before the loop starts are the stream's, not this loop's
+        // to report again; then one on the second read, two more on the fourth (the
+        // read that fails).
+        source.recoveries = 2;
+        source.recovered_by_read = vec![2, 3, 3, 5].into();
+        let stats = stats();
+        let _ = run_capture_loop(
+            &mut source,
+            &ring,
+            0,
+            &AtomicBool::new(false),
+            &stats,
+            &|| 0,
+        );
+        assert_eq!(stats.snapshot().capture_xruns, Some(3));
+    }
+
+    #[test]
     fn the_capture_loop_ends_on_the_error_the_stream_gave_it() {
         let ring = empty_ring();
         let mut source = ScriptedPeriods::new(vec![]);
-        let err = run_capture_loop(&mut source, &ring, 0, &|| 0);
+        let err = run_capture_loop(
+            &mut source,
+            &ring,
+            0,
+            &AtomicBool::new(false),
+            &stats(),
+            &|| 0,
+        );
         assert!(
             err.to_string().contains("the script ran out"),
             "the loop reports the stream's own cause: {err}"
@@ -998,7 +1113,14 @@ mod tests {
     fn the_write_head_the_gate_publishes_is_the_one_capture_advanced() {
         let ring = empty_ring();
         let mut source = ScriptedPeriods::new(vec![stereo(SAMPLE_RATE_HZ as usize / 50, 1)]);
-        let _ = run_capture_loop(&mut source, &ring, 0, &|| 1_000);
+        let _ = run_capture_loop(
+            &mut source,
+            &ring,
+            0,
+            &AtomicBool::new(false),
+            &stats(),
+            &|| 1_000,
+        );
         assert_eq!(
             ring_write_head(&ring),
             320,
@@ -1122,12 +1244,14 @@ mod tests {
         let mut said = Vec::new();
         let (tx, _rx) = sync_channel::<StreamerMsg>(STREAMER_CHAN_CAPACITY);
         let closed = AtomicBool::new(false);
+        let stats = PodStats::new(POD_COUNTER_SOURCES);
         let ctx = TelemetryCtx {
             tx: &tx,
             vad_closed_flag: &closed,
             write_head: &|| 0,
             now_us: &|| 0,
             capture_quiesced: &|| false,
+            stats: &stats,
         };
         for _ in 0..ticks {
             core.poll_tick(&mut bus, &ctx);
@@ -1222,7 +1346,14 @@ mod tests {
         // And it is one ring in fact, not merely by pointer: what capture appends
         // is what the streamer's write-head reader sees.
         let mut source = ScriptedPeriods::new(vec![stereo(4, 100)]);
-        let _ = run_capture_loop(&mut source, &w.capture.ring, w.capture.channel, &|| 1_000);
+        let _ = run_capture_loop(
+            &mut source,
+            &w.capture.ring,
+            w.capture.channel,
+            &w.capture.playing,
+            &w.capture.stats,
+            &|| 1_000,
+        );
         assert_eq!(ring_write_head(&w.streamer.ring), 4);
         assert_eq!(ring_write_head(&w.telemetry.ring), 4);
     }
@@ -1231,6 +1362,14 @@ mod tests {
     fn the_gate_flag_the_telemetry_thread_sets_is_the_one_the_streamer_reads() {
         let w = wired();
         assert!(Arc::ptr_eq(&w.telemetry.vad_closed, &w.streamer.vad_closed));
+        assert!(
+            Arc::ptr_eq(&w.telemetry.stats, &w.streamer.stats),
+            "the gate publishes into the counters the status frame reads"
+        );
+        assert!(
+            Arc::ptr_eq(&w.capture.stats, &w.streamer.stats),
+            "capture counts its overruns into the counters the status frame reads"
+        );
         // The two flags are the same type, so swapping them compiles clean and
         // passes every other test: telemetry's gate-close would be published to a
         // flag nobody reads, and the streamer would read its own segment-active

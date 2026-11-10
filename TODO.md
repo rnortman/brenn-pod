@@ -300,8 +300,9 @@ plausibly fits but consumes most of the remaining margin.
 The measurement is the design's §7 plan and needs hardware: a full `make hil-test`
 suite run with the TLS link live, plus the two-invocation post-feed procedure from
 `docs/adr/2026/07/19-heap-gate-measure/` (a second, separate
-`RESPEAKER_HIL_ONLY=DeviceHealthCheck make hil-test` on the same boot), reading both
-the post-feed `min_heap` trough and the streamer stack HWM the health report carries.
+`RESPEAKER_HIL_ONLY=DeviceHealthCheck make hil-test` on the same boot), reading the
+post-feed `min_heap` trough. The streamer stack's reading is `gauges.stack_free_min`
+on the host's `pod_status` line (below).
 Expect a `HEAP_MIN_EVER_FLOOR` re-bake either way, combined with the sampling
 `heap-floor-post-flash-boot-path-offset` already wants and following that entry's
 "re-bake against `min()` of both populations" rule.
@@ -329,14 +330,19 @@ after the observed `min_heap_after` came in at 30_512 with the TLS link live. Th
 predate it and need re-derivation against the new floor at the bench session; the
 buffer/stack measurement this entry calls for is otherwise unchanged.
 
-Note (2026-07-25 triage, `docs/adr/2026/07/25-pod--todo-burndown/`): validation confirmed
-the instrumentation this entry needs already exists — the health report carries
-`streamer_hwm` (`health.rs:123-133`), so no new code is required before the bench run. The
-heap half is also partly discharged: the 30_512 `min_heap_after` reading was taken with the
-TLS link live. What remains unmeasured is the **stack** half — no `streamer_hwm` reading
-appears anywhere in the record, so the 28672 stack size has never been checked against an
-actual watermark and may be several KB of waste. Blocked purely on bench time; collect the
-`heap-floor-post-flash-boot-path-offset` samples in the same session.
+Note (2026-07-25 triage, `docs/adr/2026/07/25-pod--todo-burndown/`): the heap half is
+partly discharged: the 30_512 `min_heap_after` reading was taken with the TLS link live.
+
+The stack half's instrument is not the health report's `streamer_hwm`: `DeviceHealthCheck`
+reads it before the streamer thread has made a TLS handshake or run a segment, which is
+where the thread's depth is. It is `gauges.stack_free_min` on the host's `pod_status`
+line: the least free stack of the streamer thread since the pod booted, read over Wi-Fi
+after real work. Its first reading: 18 820 bytes free of 28 672, so 9 852 used, on
+pod-fbe2f8 on 2026-11-10 (image built from `95f7f21`), after 13 h up, four connections
+(each a TLS-PSK handshake), 77 segments and the replies played between them. What
+remains of the stack half is whether 28672 is trimmed toward that reading, and to what
+margin. Collect the `heap-floor-post-flash-boot-path-offset` samples in the same
+session.
 
 See `TODO(tls-link-bench-measure)` at the streamer thread's `.stack_size` in
 `firmware/devices/respeaker-pod/src/streamer.rs` and in the TLS-PSK block of
@@ -412,6 +418,25 @@ runs while catch-up holds (`VadRelease`, ~5.02 s for 5 s of audio). Recorded sam
   StreamRealtimeDuplex result: Rtd { underruns: 0, gap_ms: 0, consumed: 225 } src=rtd mh_post=26232 hla=52228 hlb=28908 shwm=2904 ptcb=872 phwm=1904 rr=11 wsub=0
   FAIL [check 4 — behavioral]: StreamRealtimeDuplex Scenario B assertion failed: StreamRealtimeDuplex: pre-roll burst drained in 379 ms > 350 ms ceiling — the loop services at most one frame per poll wake
   ```
+
+- One session on pod-fbe2f8, `speech-surface` not running, stereo stream, 5760 B
+  window, selector runs (`RESPEAKER_HIL_ONLY=StreamRealtimeDuplex`), `burst_drain_ms` as
+  Scenario A / Scenario B:
+  - Image `a4226bd` (the segment loop then held a `Status` by value; the image also
+    failed the rtd stack floor, `shwm` 628, 740 and 580 against 1 024): 316 / 399,
+    284 / 375 (B's `SegmentEnd` not recorded), 262 / 415.
+  - The image that builds the status frame outside the segment loop's frame, on the
+    14 336-byte rtd stack: 375 / 341, 290 / 359, 291 / 385 (`shwm` 2 652, 2 824, 2 616).
+  - The shipped image `14891e3`, built from a clean detached worktree with its own
+    `hil-host`, at once afterwards: 295 / 451, 302 / 499, 301 / 348 (`shwm` 2 816, 2 816,
+    3 116; the third run passed).
+  - The same session's comparison: neither scenario of the new image was above the largest
+    of the shipped image's three on two of its three runs. The largest shipped-image figures
+    on record are now A 354 and B 499 ms.
+- The full `make -C firmware hil-test` run that followed, on the image with the rtd stack
+  re-baked to 16 384 (ELF sha256
+  `5255a07c14a5879abb80aa08106183fd4a9c669afadffe6d35cfc1cf95c79246`), every test before it
+  passed: A 319, B 367 ms, both `VadRelease`; `mh_post=27848 hla=48860 hlb=27924 shwm=4640`.
 
 No mechanism is identified. Not yet examined: a race in the host's RTD observation window,
 a heap sample landing in the TLS handshake, a listener port-reuse race, and Wi-Fi airtime
@@ -939,33 +964,6 @@ gaze began carrying a direction, so splitting it is a design decision. It also r
 tests in `scripter.rs`, `pipeline.rs` and `config.rs`. Marked at `enum Raise`,
 `host/crates/speech-surface/src/scripter.rs`.
 
-## `far-field-auto-volume-cue`
-
-The automatic reply-volume term (`AutoPolicy::term`,
-`host/crates/speech-pipeline/src/volume.rs`) drives on the utterance's own speech level
-by default (`k_speech = 1`, `k_ambient = 0`): a voice that reads quieter at the
-microphone gets a quieter reply. At the acceptance session for the volume feature
-(brenn-ops `docs/adr/2026/11/08-pod--stt-wake-prompt-and-tts-volume/`) the speaker sat
-0.5–0.8 m from the array; the same voice across the room reads quieter at the mic for
-the same listener distance, so the speech term turns the reply *down* exactly when a
-far listener needs it louder. The owner raised this during the session: "if you respond
-based on the volume of my speech it might be too quiet to hear. The ambient volume is
-probably a better bet in the long run, but we'll see how well each works."
-
-The ambient term exists and defaults off. Its reference is bench-derived
-(`DEFAULT_AUTO_AMBIENT_REF_DBFS`, the raw-mic quiet-room floor), and the raw-mic ambient
-reading was measured to track broadband noise 1:1 above that floor, so turning
-`k_ambient` on through the brain's `<volume/>` knobs is meaningful today. What is not
-known is which cue, or what combination, serves a far-field speaker — speech, ambient,
-both, or something distance-aware — and that needs a far-field voiced session with the
-owner, which the owner said they would run. Nothing is baked until then.
-
-Done = a far-field session recorded in the ADR directory, the policy decided from it
-(the default knobs, the references, or a new cue), and a test pinning the chosen
-default against the session's levels, as `volume.rs` pins the near-field defaults.
-See `TODO(far-field-auto-volume-cue)` at `AutoPolicy::term` in
-`host/crates/speech-pipeline/src/volume.rs`.
-
 ## `stt-noise-reject-before-wake-sample`
 
 Under controlled broadband noise, STT rejected a command before wake detection
@@ -993,3 +991,275 @@ construction with a test under recorded noise, or the sighting is shown not to
 reproduce over a stated number of takes and this entry says so. See
 `TODO(stt-noise-reject-before-wake-sample)` at the `GateOutcome::DeclineWake` arm in
 `host/crates/speech-surface/src/pipeline.rs`.
+
+## `pod-log-over-wifi`
+
+Forward the pod's warn-and-above log lines to the host over the audio connection, so a
+wall-mounted pod needs no console. The status frame (`StreamFrame::Status`) carries
+counters and gauges once a second; no log line leaves the pod except on its console.
+Needs a design: a hook into the ESP-IDF logger that cannot recurse or block the logging
+thread, a bounded queue with a drop counter, and a rate limit so a log storm cannot
+starve audio. Done = a `warn!` on the pod appears as a host JSONL line within a few
+seconds, and a storm of them costs a counted drop, not audio. See
+`TODO(pod-log-over-wifi)` at `StreamFrame::Status` in
+`firmware/crates/audio-pipeline/src/wire.rs`.
+
+## `pod-status-mqtt`
+
+Publish each pod's status — its counters, gauges and room-level summary — to MQTT from
+the host, not from the pod. The host writes the same information as the `pod_status`
+JSONL line (`PodStatusLog::observe` in `host/crates/speech-surface/src/pod_status.rs`
+documents what the line means), and `pod_silent` when a pod stops reporting. Needs a
+design decision: which process publishes, the topic layout, and the broker's
+configuration and credentials. Done = a pod's counters and room level are readable on
+the broker, and a pod that stops reporting is visible there. See
+`TODO(pod-status-mqtt)` at the `pod_status` emission in
+`host/crates/speech-surface/src/server.rs`.
+
+## `gate-open-segment-not-reopened`
+
+A segment lost while the pod's speech gate is still open is not reopened until the gate
+closes and opens again. The streamer opens a segment only when the gate thread reports
+an opening transition (`note_vad_opened` in `firmware/crates/pod-streamer/src/telemetry.rs`
+sends `StreamerMsg::VadOpened` once per opening). When the segment is lost — the socket
+dropped, the host restarted — the pod reconnects and stays silent until the gate closes
+and opens again, however long the sound that holds it open lasts.
+
+Sighting (postmortem §8 in brenn-ops `docs/adr/2026/11/09-pod--volume-and-listen-fixes/`):
+the host was restarted while the pod was 35 s into a segment; the pod reconnected in 4 s
+and opened no segment for about 105 s. Whether the gate was open for those 105 s was not
+recorded; the status frame's `gate_open` gauge, on the host's `pod_status` line, now
+records it.
+
+Repeat (pod-fbe2f8, 2026-11-10, image built from `95f7f21`; one attempt). Pink noise at
+−20 dBFS digital, switched on for 70 % of each half second, from a Bluetooth speaker
+1.2 m from the array, opened a segment and held the gate. 21.9 s into the segment the
+host daemon was stopped and started again; `gate_open` was true on the last
+`pod_status` line before the stop. The pod reconnected 8.8 s after the stop. The noise
+played on for 60 to 63 s after the restart, then stopped.
+
+- `gate_open` stayed true from the reconnect for as long as the noise played: every
+  line from the reconnect's first to the last before the noise stopped (50.7 s after
+  the reconnect, six lines) read true, with no `false` line between them. The first
+  `false` line came 2 to 5 s after the noise stopped.
+- `segments_opened` and `onsets` did not move in that time: no segment was opened
+  while the gate stayed open.
+- No segment opened in the 41 s recorded after the noise stopped; the gate closed and
+  did not open again in that time.
+
+The repeat agrees with the account above: a segment lost under a held gate was not
+reopened while the gate stayed open.
+
+Needs a design decision: what the reopened segment's first sample is (the current write
+head, or pre-roll from the ring), how the gate thread and the streamer agree that a
+segment is open after one side dropped it, and what the host should make of a segment
+that begins mid-speech. Done = a segment lost while the gate stays open is followed by a
+new segment on the next connection without waiting for the gate to close, with a
+`pod-streamer` test that drops the socket mid-segment under a held gate. See
+`TODO(gate-open-segment-not-reopened)` at the idle loop's onset intake in
+`firmware/crates/pod-streamer/src/run.rs`.
+
+## `operator-volume-ceiling-24`
+
+`[volume] max_db` above 24 is refused at load (`VolumeConfig::validate` in
+`host/crates/speech-surface/src/config.rs`), on `MAX_VOLUME_CEILING_DB`'s stated ground
+that "positive gain clips loud syllables, and past this nothing a synthesizer produces
+stays intelligible". At the bench session after the volume feature shipped the owner
+asked for more and could not have it: "The +6 cap is way too small; please relaunch
+with +30 cap"; the daemon was relaunched at 24, the most the config accepts.
+
+Needs the owner's decision: whether a hard limit in code is wanted at all, and if so at
+what value and on what ground — the stated one is an assertion with no measurement
+behind it, and it is about the digital signal, not about how loud a given speaker is in
+a given room. The decision is tied to `reply-gain-no-limiter`: without a limiter, every
+dB of ceiling is a dB of hard clipping on a full-scale reply. Done = the limit is
+removed, or stands at a value whose derivation is written at the constant, and a config
+at the owner's chosen ceiling loads. See `TODO(operator-volume-ceiling-24)` at
+`MAX_VOLUME_CEILING_DB`.
+
+## `reply-gain-no-limiter`
+
+Positive reply gain multiplies and saturates each sample to `i16`
+(`apply_gain_db` in `host/crates/speech-pipeline/src/gain.rs`); the only trace is
+`reply_gain.clipped_samples`. With the operator ceiling at 24 dB and an automatic term
+that can add to the held volume, a reply can be driven far into clipping, which is
+distortion at the moment the system is trying hardest to be heard.
+
+Needs a design: what limits the peak (a look-ahead peak limiter costs no latency,
+because the whole reply's PCM is in hand when gain is applied, at the `apply_gain_db`
+call in `host/crates/speech-surface/src/playback_router.rs`; a soft knee is the cheaper
+alternative), its attack and release, what `reply_gain` then reports (gain reduction
+applied, in place of or beside the clipped count), and whether the automatic term should
+know how much headroom the reply has. How it sounds is the owner's to judge on the
+bench. Done = a reply whose gain would clip plays without hard clipping, `reply_gain`
+states how much it was limited, and a test pins both on a full-scale input. See
+`TODO(reply-gain-no-limiter)` at `apply_gain_db`.
+
+## `volume-state-lost-on-restart`
+
+Pod volume state "lives in memory only, so a restart returns every pod to its configured
+state" (the `VolumeBook` doc in `host/crates/speech-pipeline/src/volume.rs`). What the
+brain sets by voice — the held volume (`<volume hold=…/>`) and the policy retunes
+(`auto`, `k_ambient`, `ambient_ref`, the swing) — is therefore lost when the daemon
+restarts. Sighting (postmortem §7 in brenn-ops
+`docs/adr/2026/11/09-pod--volume-and-listen-fixes/`): a restart reverted a voice-set
+hold of −10 dB and reference of −50 dBFS to the config's 0 and −78, under a ceiling just
+raised to +24; the values were copied into the config by hand before the relaunch.
+
+Needs a design decision, and the first part is the owner's: whether voice-set volume is
+meant to outlive the daemon at all, or the config is the only standing truth. If it is
+to survive: who holds it — the brain re-asserting its settings when a pod connects (the
+daemon already reports the `volume` object to the brain), or the daemon keeping a state
+file — and, for a state file, where. The Device Deployment Doctrine in `CLAUDE.md` rules
+out flash on a device in a dev cycle; a file in RAM survives a daemon restart, which is
+the sighted case, and not a reboot. Done = the decision is written at `VolumeBook`, and
+if state is to survive, a test restarts the book's owner and finds the held volume and
+policy as they were set. See `TODO(volume-state-lost-on-restart)` at `VolumeBook`.
+
+## `gate-misses-speech-over-steady-noise`
+
+A wake line spoken over steady noise that has played for a while opens no segment, so the
+wake phrase never reaches the host. Bench, pod-fbe2f8, 2026-11-09: a Bluetooth speaker
+1.2 m from the array played pink noise at −30 or −20 dBFS digital (raw-mic room reading
+−71.5 and −62.5 dBFS) with a 15 s lead, continuing under the line; the line was
+synthesized at −17 dBFS mean, and at −11 dBFS on four of the seven −20 takes, two of
+which woke. By the rig's calibration the −17 line is about −54.5 dBFS at the microphone
+and the noise alone about −74 and −64; the −11 line's level at the microphone was not
+calibrated. The line produced no wake on 8 takes of 12 (−30 dBFS: 3 of 5; −20 dBFS: 5
+of 7). On seven of the eight the gate opened on the noise within 1.4 to 2.4 s, the
+segment closed 6.7 to 10.6 s later with the noise still playing, and no segment was open
+while the line was spoken. On the eighth a segment left open by the previous reply
+closed 9 s into the noise and none followed. On one of the seven a segment opened 20 s
+into the take, about 5 s after the line began, and brought no wake. In the four takes
+that woke, a segment opened within half a second before the wake.
+
+Not affected: with the −20 dBFS noise switched on and off at 2 Hz (on 70 % of the time)
+one segment stayed open through noise and line and the wake fired, three of three. With
+noise at −40 dBFS (under the room's floor) the line opened a segment and woke, three of
+three; on one of those takes a segment also opened 6 s into the noise and closed 5 s
+later, and the record does not separate the noise from the room as its cause. Earlier
+takes with a 4 s lead did not show the failure. This is not
+`stt-noise-reject-before-wake-sample`: there the wake fired and STT refused the command;
+here no segment was open for the line.
+
+Not known: what the gate's input was while the line was spoken. `gauges.gate_energy` on
+the `pod_status` line is the largest input over about the previous second, and a line
+is written only on a counter or gate change or every 10 s; on the failed takes no line's
+second covers the wake phrase. So the record does not say whether the XVF3800's
+speech-energy output stays low for speech over noise it has adapted to, or the gate's
+threshold or release is the limit.
+
+Needs a design: what the gate's input does under steady noise, and what should open a
+segment then. Done = the gate's input is sampled across a line spoken over steady
+noise, the mechanism is identified from it, and a wake line at −17 dBFS over −20 dBFS
+pink noise that has played for 15 s opens a segment, with a HIL or bench check that
+states how often. See `TODO(gate-misses-speech-over-steady-noise)` where the gate's
+input is taken from the speech-energy reading, in `TelemetryCore::poll_tick`
+(`firmware/crates/pod-streamer/src/telemetry.rs`).
+
+## `capture-deficit-bench-sample`
+
+Sighting: on the first session with the counter on the host's record (pod-fbe2f8,
+2026-11-09, 19 minutes, `pod_status` `delta.capture_deficit_frames`), three losses of
+microphone audio: 381 frames with the pod idle, and 342 and 360 frames each during an
+open segment with no reply playing: 24, 21 and 23 ms of 16 kHz microphone audio the
+reader did not get. `capture_xruns` is not measured on this pod.
+
+Not known: whether the rate is this pod's normal or new; what starved the read each
+time (the capture loop's own warning names a starved read cadence or an RX DMA
+overflow, and does not say which); whether a loss of this size is audible in a carved
+utterance or moves a wake score.
+
+Done = the cause of a loss is identified from the pod's own record — which needs the
+loss to say more than its size — and fixed, or the rate is shown to be expected with the
+figure written at the counter's doc (`PodCounters::capture_deficit_frames` in
+`firmware/crates/audio-pipeline/src/wire.rs`), so a reader of `pod_status` knows what
+rate to alarm on. See `TODO(capture-deficit-bench-sample)` where the capture loop adds
+the window's deficit to `capture_deficit_frames` in
+`firmware/devices/respeaker-pod/src/capture.rs`.
+
+## `build-id-dirty-flag-stale`
+
+The firmware build stamp's dirty flag can be stale. The `build-id` crate's build script
+re-runs only when the git directory's `HEAD`, the current branch's loose ref or
+`packed-refs` changes, or when `build.rs` itself does. The dirty flag (`git status
+--porcelain --untracked-files=no`) is computed in the same run, so a build made after
+tracked files changed under an unmoved ref reuses the flag of the script's last run. Each
+target directory caches its own stamp: the HIL harness (`hil-host`) and the device image
+are built in separate target directories and can disagree.
+
+Sighting: 2026-11-09, a hardware run (`make -C firmware flash-and-test`) on an
+uncommitted tree. The harness's stamp, last computed when the tree was clean, said
+`dirty=false`; the freshly built image said `dirty=true`; check 1 (the build-ID
+comparison) failed a correct image. The same workaround was applied ahead of a second
+hardware run on 2026-11-10, which then passed check 1.
+
+Way through: when check 1 reports a build-ID mismatch in which the commits agree and
+only `dirty` differs, touch `firmware/crates/build-id/build.rs` and build again; the
+script re-runs and both stamps are recomputed.
+
+Not known (unverified): whether a device image built after editing a clean tree carries
+`dirty=false`. The caching rule implies it; nobody has built one and read its stamp.
+Likewise unverified: a stamp left `dirty=true` after the edits were reverted without a
+commit. The first is the direction that matters: the stamp is how one tells which build
+is on a device, and a false "clean" names a commit the image was not built from.
+
+In a linked git worktree the commit goes stale as well. The script finds the git
+directory with `git rev-parse --git-common-dir`, which in a linked worktree is the main
+checkout's `.git`, so it watches the main checkout's `HEAD` and the branch named there,
+not the worktree's own `HEAD` (`git rev-parse --git-path HEAD`) or its branch. A commit
+or checkout inside a worktree whose target directory already holds a stamp re-runs
+nothing, and the image and the harness can both carry an old commit and still agree at
+check 1. A worktree's first build is right; nobody has yet built twice in one and read
+the stamp. The touch-`build.rs` step recomputes it.
+
+Needs a decision: what the rerun rule is — every build (relinking every crate that
+embeds the stamp), keyed on the working tree's state, or a stamp that says it could not
+tell — against what it costs in rebuilds, and what check 1 then asserts. Under any rule
+short of every build, the triggers watch the worktree's own `HEAD` and resolve its
+branch from that file, with the branch ref and `packed-refs` under the common dir. Done
+= the stamp's commit and dirty flag are right for every build, or the stamp states
+plainly that it could not tell, with a test or a documented check for each direction
+(clean then edited; edited then reverted; a second commit or checkout in a linked
+worktree). See `TODO(build-id-dirty-flag-stale)` at the call to
+`emit_git_ref_rerun_triggers` in `main` in `firmware/crates/build-id/build.rs`.
+
+## `inference-error-drops-frame-events`
+
+An inference error in the listener's audio path returns from `handle_audio` without the
+events the frame had already produced, while the state changes behind them stand. The
+wake model's call and the speech model's per-chunk call each return the error with `?`
+and drop the frame's event vector. Events lost that way: an abandoned utterance's
+`UtteranceClosed` and the retirement of a wake hold or a listen window at a
+discontinuity, all pushed before the wake model runs; and anything a wake detection or
+an earlier speech-model chunk of the same frame emitted, before a later chunk fails.
+
+Consequence for a reader of the event stream: after a model error the record can show an
+utterance, a wake hold or a listen window that never ends. The error is not fatal, the
+connection stays up, and a reader that pairs opens with ends is wrong for the rest of the
+session. The mechanism for a lost utterance close: a frame that takes the discontinuity
+path while an utterance is in progress pushes that utterance's `UtteranceClosed` and
+clears it from the listener's state, then calls the wake model; if that call fails, the
+line is dropped and no later frame can emit it. Two ways a frame takes that path, read
+from the code, not observed, and not the only ways: a hole in the audio (a flagged gap
+or an unexpected first index), where one wake-model failure loses the close; and an
+earlier inference error, since `note_inference_error` clears the expected next index, so
+a model that fails on two frames running loses the close on the second.
+
+This predates the change that added the pod's status frame. That change fixed one new
+instance: events emitted before `handle_audio` is called (a listen window dated on the
+frame) now ride out with the error in `HandleError.events`. That is the pattern
+available. The test seam `fail_next_scoring` returns before `handle_audio` pushes
+anything, so a test built on it as it stands cannot show this loss; the failure has to
+be injected at the model call, on a frame that takes the discontinuity path with an
+utterance in progress.
+
+Not known: how often either model errors in practice; nobody has measured it.
+
+Needs a design: what a frame that failed partway reports, and what the listener's state
+is after it — a failure in the speech-model loop leaves the frame half-scored, and which
+of its events are still true once the cursors are torn is not a mechanical change. Done
+= every event emitted before an inference error in the audio path reaches the log, with
+a test that fails a model mid-utterance, at the model call, and finds the closing line.
+See `TODO(inference-error-drops-frame-events)` above the wake model's call in
+`handle_audio` in `host/crates/speech-pipeline/src/listener/runtime.rs`.

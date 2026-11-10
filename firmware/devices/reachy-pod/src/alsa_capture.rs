@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use alsa::pcm::{Access, Format, HwParams, PCM, State};
 use alsa::{Direction, ValueOr};
+use audio_pipeline::level::LevelHistory;
 use audio_pipeline::ring::{CaptureRing, RING_CAPACITY_SAMPLES, RingIndex, SAMPLE_RATE_HZ};
 use audio_pipeline::wire::AUDIO_SAMPLES_PER_FRAME;
 
@@ -497,18 +498,20 @@ impl<'a> CaptureStream<'a> {
 ///
 /// A chunk with a partial trailing frame (fewer samples than the channel count)
 /// drops that remainder: half a frame carries no sample for the channel we stream.
+///
+/// The streamed channel is also the level channel; `playing` flags the chunk's level
+/// blocks as captured while the speaker output was active.
 pub fn append_channel(
     ring: &mut CaptureRing<Box<[i16]>>,
     interleaved: &[i16],
     channel: usize,
+    playing: bool,
     now_us: u64,
 ) {
     debug_assert!(channel < CHANNELS, "channel is validated at configuration");
     let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
     for frame in interleaved.chunks_exact(CHANNELS) {
-        let slot = ridx.slot(ring.write_head);
-        ring.samples[slot] = frame[channel];
-        ring.write_head += 1;
+        ring.commit(&ridx, frame[channel], None, playing);
     }
     if !interleaved.is_empty() {
         ring.anchor_sample = ring.write_head.saturating_sub(1);
@@ -540,6 +543,7 @@ pub fn new_ring() -> CaptureRing<Box<[i16]>> {
         write_head: 0,
         anchor_sample: 0,
         anchor_ts_us: 0,
+        levels: LevelHistory::new(),
     }
 }
 
@@ -694,22 +698,22 @@ mod tests {
         let mut ring = new_ring();
         // Two frames, left and right distinguishable.
         let chunk = [10i16, -10, 20, -20];
-        append_channel(&mut ring, &chunk, 0, 1_000);
+        append_channel(&mut ring, &chunk, 0, false, 1_000);
         assert_eq!(ring.write_head, 2);
         assert_eq!(&ring.samples[..2], &[10, 20]);
 
         let mut ring = new_ring();
-        append_channel(&mut ring, &chunk, 1, 1_000);
+        append_channel(&mut ring, &chunk, 1, false, 1_000);
         assert_eq!(&ring.samples[..2], &[-10, -20]);
     }
 
     #[test]
     fn the_anchor_dates_the_last_sample_written() {
         let mut ring = new_ring();
-        append_channel(&mut ring, &[1, 2, 3, 4], 0, 5_000);
+        append_channel(&mut ring, &[1, 2, 3, 4], 0, false, 5_000);
         assert_eq!(ring.anchor_sample, 1, "the last sample's absolute index");
         assert_eq!(ring.anchor_ts_us, 5_000);
-        append_channel(&mut ring, &[5, 6], 0, 6_000);
+        append_channel(&mut ring, &[5, 6], 0, false, 6_000);
         assert_eq!(ring.anchor_sample, 2);
         assert_eq!(ring.anchor_ts_us, 6_000);
     }
@@ -719,8 +723,8 @@ mod tests {
         // A read that returned nothing is not a moment any sample was captured at,
         // and re-dating the anchor to it would slide every later frame's timestamp.
         let mut ring = new_ring();
-        append_channel(&mut ring, &[1, 2], 0, 5_000);
-        append_channel(&mut ring, &[], 0, 9_000);
+        append_channel(&mut ring, &[1, 2], 0, false, 5_000);
+        append_channel(&mut ring, &[], 0, false, 9_000);
         assert_eq!(ring.write_head, 1);
         assert_eq!(ring.anchor_ts_us, 5_000);
     }
@@ -728,7 +732,7 @@ mod tests {
     #[test]
     fn a_partial_trailing_frame_is_dropped_rather_than_half_written() {
         let mut ring = new_ring();
-        append_channel(&mut ring, &[1, 2, 3], 0, 5_000);
+        append_channel(&mut ring, &[1, 2, 3], 0, false, 5_000);
         assert_eq!(ring.write_head, 1, "one whole frame, not one and a half");
         assert_eq!(ring.samples[0], 1);
     }
@@ -737,7 +741,7 @@ mod tests {
     fn writes_wrap_the_ring_and_keep_the_absolute_index() {
         let mut ring = new_ring();
         ring.write_head = RING_CAPACITY_SAMPLES as u64 - 1;
-        append_channel(&mut ring, &[7, 0, 8, 0], 0, 5_000);
+        append_channel(&mut ring, &[7, 0, 8, 0], 0, false, 5_000);
         assert_eq!(ring.write_head, RING_CAPACITY_SAMPLES as u64 + 1);
         assert_eq!(ring.samples[RING_CAPACITY_SAMPLES - 1], 7);
         assert_eq!(ring.samples[0], 8, "the second sample lapped the ring");

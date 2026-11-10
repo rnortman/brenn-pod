@@ -15,6 +15,7 @@ pub mod gaze;
 pub mod jsonl;
 pub mod pipeline;
 pub mod playback_router;
+mod pod_status;
 pub mod prune;
 pub mod recorder;
 pub mod replay;

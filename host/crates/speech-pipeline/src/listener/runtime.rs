@@ -43,7 +43,9 @@ use super::event::{
     ListenerUtteranceId, StatsFlushCause, StatsModel, WakePolicy,
 };
 use super::oww_stream::{OwwModels, OwwStream};
+use super::pod_clock::PodClock;
 use super::ring::PcmRing;
+use super::room::RoomHistory;
 use super::silero::{SILERO_CHUNK, SileroModel, SileroVad};
 use super::stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreStats};
 use crate::level::{FrameLevel, percentile};
@@ -64,6 +66,13 @@ const FEED_CHANNEL_DEPTH: usize = 512;
 /// connection task.
 const MARKER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a `Feed::PodStatus` waits for room in the feed channel before it is
+/// shed. One slot frees within a single feed's processing time in any healthy
+/// state, so the wait rides out a momentarily full channel; a tenth of the pod's
+/// one-second status period bounds what a wedged listener costs every connected
+/// pod's read loop to a tenth of real time.
+const STATUS_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Azimuth readings the listener keeps: about 3 s at the device's 10 Hz poll.
 const DOA_RING_CAPACITY: usize = 32;
 
@@ -82,15 +91,6 @@ const WAKE_DOA_SLACK_SAMPLES: u64 = 1_600;
 /// its last 2.9 s — still the speaker's loud-vowel level.
 const LEVEL_RING_CAPACITY: usize = 160;
 
-/// Room frames the listener keeps for the ambient reading. A room frame is one
-/// pushed while the playback floor is closed, ending after the playback tail,
-/// with the endpointer fully idle: audio the pod was not playing into and
-/// nobody was speaking into. Larger than [`AMBIENT_WINDOW_FRAMES`] because the
-/// reading skips room frames newer than its bound — at a wake detection, the
-/// phrase's own onset lag, whose first chunks are pushed before the endpointer
-/// leaves idle — and must still find a full window below it.
-const ROOM_RING_CAPACITY: usize = 160;
-
 /// The speech window ends at the wake end and reaches back one second: "hey
 /// jarvis" is about 0.8 s, and the detector's wake end leads the acoustic end by
 /// about a chunk, so the last second holds the phrase. Frames are counted in a
@@ -101,22 +101,6 @@ const WAKE_SPEECH_WINDOW_SAMPLES: u64 = 16_000;
 /// loud-vowel level, robust to the pauses inside the phrase and needing no wake
 /// start, which nothing computes.
 const WAKE_SPEECH_PERCENTILE: u32 = 80;
-
-/// The ambient reading is the last second of room frames below the speech
-/// window: 50 frames of 20 ms, counted rather than spanned because room frames
-/// need not be contiguous. In the normal case — pod silent, a phrase said into a
-/// quiet room — they are the second just before the speech window, from the
-/// device's 1 s pre-roll the device VAD took for silence.
-const AMBIENT_WINDOW_FRAMES: usize = 50;
-
-/// The ambient level is the 20th percentile of its window's frame levels: low
-/// enough that the first chunks of a speech run, pushed as room frames before
-/// the endpointer scores them, do not move it.
-const AMBIENT_PERCENTILE: u32 = 20;
-
-/// Fewer room frames than this (half the window) and there is no ambient
-/// reading: too little of the room has been heard to call it the room.
-const AMBIENT_MIN_FRAMES: usize = 25;
 
 /// Append `(first_sample_index, dbfs)` to a level ring bounded at `capacity`,
 /// first dropping every reading from that index on (a re-sent stretch replaces
@@ -462,6 +446,18 @@ impl Capture {
     }
 }
 
+/// What must be dated from the pod's capture position but arrived before the
+/// connection had one (between `Feed::Connected` and its first status frame or
+/// audio). Dated on the anchor that gives it a position; dropped without a line by
+/// a new connection and by playback starting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Undated {
+    /// A `<listen/>` window of this many samples, not yet opened.
+    listen: Option<u64>,
+    /// The playback floor went down: the mute tail runs from the position.
+    tail: bool,
+}
+
 /// How far before the wake end a hold may begin. The speech run carrying the wake
 /// phrase can have started arbitrarily earlier — the wake word said at the end of a
 /// breath — and the ring is sized against this bound, so a hold starting further
@@ -529,6 +525,26 @@ struct CarveAnchor {
     vad_high_est: Option<HostMicros>,
 }
 
+/// An inference error from [`ListenerState::handle`], with the events the feed
+/// produced before the failure. The state those events report has already
+/// changed, so they are as true as any `Ok` batch and are forwarded like one.
+#[derive(Debug)]
+pub struct HandleError {
+    /// The inference failure.
+    pub error: WakeError,
+    /// Events the feed emitted before it failed, in order.
+    pub events: Vec<ListenerEvent>,
+}
+
+impl From<WakeError> for HandleError {
+    fn from(error: WakeError) -> Self {
+        Self {
+            error,
+            events: Vec::new(),
+        }
+    }
+}
+
 /// One pod's continuous-listener state. Drive it with [`handle`](ListenerState::handle);
 /// it borrows the shared models per call.
 pub struct ListenerState {
@@ -546,6 +562,20 @@ pub struct ListenerState {
     oww_base: u64,
     /// Absolute index the next contiguous audio sample is expected at.
     expected_next: Option<u64>,
+    /// The pod's capture position projected through host time; see
+    /// [`now_sample`](Self::now_sample).
+    clock: PodClock,
+    /// The pod's last statement of how far behind its head a segment opened now
+    /// would begin (`Feed::PodStatus::segment_reach`); 0 until this connection's
+    /// first status frame. See [`heard_through`](Self::heard_through).
+    segment_reach: u64,
+    /// What was asked to be dated before this connection had a position, dated
+    /// when it gets one. See [`Undated`].
+    undated: Undated,
+    /// A transport segment is open: between `SegmentOpened` and `SegmentClosed`
+    /// the pod streams every sample it captures, so audio up to its head is on the
+    /// way. See [`heard_through`](Self::heard_through).
+    streaming: bool,
     /// The armed wake, if any (consumed by the gated utterance).
     wake: Option<WakeArm>,
     /// The hold the last wake-gated detection installed, standing or spent on
@@ -576,8 +606,7 @@ pub struct ListenerState {
     /// The absolute sample index through which the pod's own output may still be
     /// in the microphone after the playback floor drops: armed at every floor
     /// drop, in every barge mode. Under [`BargeMode::Mute`] chunks ending at or
-    /// before it go on being scored as silence; under every mode, frames ending
-    /// at or before it are not room frames. `0` at rest.
+    /// before it go on being scored as silence. `0` at rest.
     tail_until_sample: u64,
     /// A fired trigger no utterance has taken yet: the next carve consumes it.
     /// Needed because utterance identity is minted at first *carve*, not at onset,
@@ -635,16 +664,15 @@ pub struct ListenerState {
     /// `LEVEL_RING_CAPACITY`; cleared with the connection, since indexes are per
     /// connection. The speech reading's source.
     levels: VecDeque<(u64, f32)>,
-    /// The room frames among them — pushed with the floor closed, past the
-    /// playback tail, with the endpointer fully idle — bounded at
-    /// `ROOM_RING_CAPACITY` and cleared with the connection like `levels`. The
-    /// ambient reading's source. Which frames are room frames is decided as they
-    /// are pushed, ahead of the Silero chunk that scores them, so the first
-    /// chunks of a speech run land here; the ambient reading's low percentile is
-    /// what keeps them from moving it.
-    room: VecDeque<(u64, f32)>,
+    /// The pod's level blocks, the spans addressed to it, and the last room
+    /// reading: the ambient reading's source.
+    room: RoomHistory,
     /// What this connection's frame levels were measured on.
     level_source: LevelSource,
+    /// An inference error the next audio frame's scoring returns in place of
+    /// running the models.
+    #[cfg(test)]
+    fail_next_scoring: Option<WakeError>,
 }
 
 impl ListenerState {
@@ -672,6 +700,10 @@ impl ListenerState {
             silero_cursor: 0,
             oww_base: 0,
             expected_next: None,
+            clock: PodClock::default(),
+            segment_reach: 0,
+            undated: Undated::default(),
+            streaming: false,
             wake: None,
             grant: WakeGrant::None,
             current_id: None,
@@ -698,8 +730,10 @@ impl ListenerState {
             oww_stats: ScoreStats::default(),
             doa: VecDeque::with_capacity(DOA_RING_CAPACITY),
             levels: VecDeque::with_capacity(LEVEL_RING_CAPACITY),
-            room: VecDeque::with_capacity(ROOM_RING_CAPACITY),
+            room: RoomHistory::default(),
             level_source: LevelSource::Beam,
+            #[cfg(test)]
+            fail_next_scoring: None,
         }
     }
 
@@ -712,14 +746,16 @@ impl ListenerState {
     }
 
     /// Process one [`Feed`] item for `pod`, returning any [`ListenerEvent`]s it
-    /// produced. An inference error propagates (the thread counts and drops it).
+    /// produced. An inference error propagates with the events emitted ahead of
+    /// it in the feed's own handling (the thread forwards those, then counts the
+    /// error).
     pub fn handle(
         &mut self,
         pod: &PodId,
         feed: Feed,
         oww_models: &mut OwwModels,
         silero_model: &mut SileroModel,
-    ) -> Result<Vec<ListenerEvent>, WakeError> {
+    ) -> Result<Vec<ListenerEvent>, HandleError> {
         match feed {
             Feed::Connected {
                 epoch,
@@ -744,6 +780,37 @@ impl ListenerState {
                 self.epoch = epoch;
                 self.level_source = level_source;
                 self.expected_next = None;
+                self.clock.clear();
+                self.segment_reach = 0;
+                // Asked for on the old connection and never dated: nothing on the
+                // new one is waiting for it, and nothing was said, so nothing is.
+                self.undated = Undated::default();
+                Ok(events)
+            }
+            Feed::PodStatus {
+                host_rx,
+                capture_head,
+                segment_reach,
+                first_block,
+                levels,
+            } => {
+                let mut events = Vec::new();
+                self.clock.anchor_status(capture_head, host_rx);
+                self.segment_reach = u64::from(segment_reach);
+                self.date_undated(pod, host_rx, &mut events);
+                self.room.ingest(first_block, &levels);
+                // A wake grant or a window nobody speaks into ends here, in a room
+                // silent enough that no audio arrives to carry the per-chunk checks
+                // past its deadline: once the pod has said it will open no later
+                // segment reaching back before the deadline (`heard_through`).
+                // Inside a segment the checks wait for the audio still on its way;
+                // with none open, for a segment that speech begun before the
+                // deadline could still open. The grant goes first, as on the
+                // per-chunk path, because a standing grant keeps the window.
+                if let Some(heard) = self.heard_through(host_rx) {
+                    self.check_hold_expiry(pod, heard, &mut events);
+                    self.check_listen_expiry(pod, heard, &mut events);
+                }
                 Ok(events)
             }
             Feed::SegmentOpened {
@@ -757,6 +824,7 @@ impl ListenerState {
                 let mut events = Vec::new();
                 self.reset_stream(pod, base_sample_index, &mut events);
                 self.expected_next = Some(base_sample_index);
+                self.streaming = true;
                 // The timing anchors are per segment: the clock offset re-estimates
                 // over this segment's chunks, and t0 for an utterance that opens it
                 // is this segment's first-audio receipt.
@@ -788,10 +856,16 @@ impl ListenerState {
                 host_rx,
                 level,
             } => {
+                self.clock
+                    .anchor_audio(first_sample_index + pcm.len() as u64, host_rx);
+                let mut events = Vec::new();
+                self.date_undated(pod, host_rx, &mut events);
                 // Recorded before the frame is scored, so a detection this frame
                 // completes measures a window that includes it.
-                self.push_level(first_sample_index, pcm.len() as u64, level);
-                self.handle_audio(
+                self.push_level(first_sample_index, level);
+                // A window this frame dated is open whatever the scoring does, so
+                // its `ListenOpened` rides out on an inference error too.
+                match self.handle_audio(
                     pod,
                     first_sample_index,
                     gap.is_some(),
@@ -800,7 +874,13 @@ impl ListenerState {
                     host_rx,
                     oww_models,
                     silero_model,
-                )
+                ) {
+                    Ok(scored) => {
+                        events.extend(scored);
+                        Ok(events)
+                    }
+                    Err(error) => Err(HandleError { error, events }),
+                }
             }
             Feed::Doa {
                 sample_offset,
@@ -825,6 +905,7 @@ impl ListenerState {
                 interruptible,
                 may_wake,
                 turn,
+                at,
             } => {
                 let mut events = Vec::new();
                 // A reply beginning is the end of any capture window's reason to
@@ -851,34 +932,41 @@ impl ListenerState {
                         (Capture::Spent { .. }, Some(_)) => self.capture = Capture::Closed,
                         _ => self.close_listen(pod, &mut events),
                     }
+                    // A window not yet dated goes the same way, with no line since
+                    // none was written for it; and a floor that is up needs no tail.
+                    self.undated = Undated::default();
                 }
-                self.set_playback(active, interruptible, may_wake, turn);
+                self.set_playback(active, interruptible, may_wake, turn, at);
                 Ok(events)
             }
-            Feed::Listen { window_samples } => {
-                // The Silero cursor is the listener's own "now": the absolute end of
-                // the last chunk scored. The window is dated from there, so it
-                // covers the audio that arrives after the reply, not audio already
-                // behind it.
-                let deadline_sample = self.silero_cursor + window_samples;
-                // A newer reply's window supersedes whatever the previous one left
-                // spent: a decline of that older candidate must not resurrect it
-                // over this one. The older window goes silently — the line below is
-                // the record of what the microphone is doing now.
-                self.capture = Capture::Open(ListenWindow { deadline_sample });
-                Ok(vec![ListenerEvent::ListenOpened {
-                    pod: pod.clone(),
-                    epoch: self.epoch,
-                    deadline_sample,
-                }])
+            Feed::Listen { window_samples, at } => {
+                // Dated from the pod's capture position when the window was asked
+                // for, so it covers the audio captured after the reply, however
+                // long ago the last segment closed. A connection that has not yet
+                // said where its capture is gets the window when it does.
+                let mut events = Vec::new();
+                match self.now_sample(at) {
+                    Some(at_sample) => {
+                        self.open_listen(pod, at_sample, window_samples, &mut events)
+                    }
+                    None => self.undated.listen = Some(window_samples),
+                }
+                Ok(events)
             }
-            Feed::CandidateDeclined { id } => {
+            Feed::CandidateDeclined { id, at } => {
                 // The wake first: a grant standing again keeps a window restored
                 // beside it past its deadline, and a grant that expires in the
                 // same call leaves the window's own expiry check free to run.
+                //
+                // With no position there is nothing to restore: the connection's
+                // reset dropped the window and the grant, and spending either again
+                // takes a carve, which takes audio, which gives a position.
                 let mut events = Vec::new();
-                self.restore_wake(pod, &id, &mut events);
-                self.restore_listen(pod, &id, &mut events);
+                let (Some(now), Some(heard)) = (self.now_sample(at), self.heard_through(at)) else {
+                    return Ok(events);
+                };
+                self.restore_wake(pod, &id, now, heard, &mut events);
+                self.restore_listen(pod, &id, now, heard, &mut events);
                 Ok(events)
             }
             Feed::CandidateDispatched { id } => {
@@ -886,7 +974,94 @@ impl ListenerState {
                 self.close_dispatched(pod, &id, &mut events);
                 Ok(events)
             }
-            Feed::SegmentClosed { host_rx, .. } => self.handle_close(pod, host_rx),
+            Feed::SegmentClosed { host_rx, .. } => {
+                self.streaming = false;
+                Ok(self.handle_close(pod, host_rx)?)
+            }
+        }
+    }
+
+    /// The pod's capture position at host time `at`: the one "now" anything the
+    /// listener dates is dated from — a capture window, a restored window or wake
+    /// grant, the playback tail.
+    ///
+    /// The clock's projection, never behind the audio already received on this
+    /// connection. `None` until the connection has a position — its first status
+    /// frame or its first audio. Inference's cursor is not one: after a reconnect it
+    /// holds the old connection's teardown position, another sample domain once the
+    /// pod has rebooted.
+    fn now_sample(&self, at: HostMicros) -> Option<u64> {
+        let projected = self.clock.project(at)?;
+        Some(
+            self.expected_next
+                .map_or(projected, |next| projected.max(next)),
+        )
+    }
+
+    /// Open a capture window at `at_sample` lasting `window_samples`, and say so.
+    ///
+    /// A newer reply's window supersedes whatever the previous one left spent: a
+    /// decline of that older candidate must not resurrect it over this one. The
+    /// older window goes silently — the line is the record of what the microphone
+    /// is doing now.
+    fn open_listen(
+        &mut self,
+        pod: &PodId,
+        at_sample: u64,
+        window_samples: u64,
+        events: &mut Vec<ListenerEvent>,
+    ) {
+        let deadline_sample = at_sample.saturating_add(window_samples);
+        self.capture = Capture::Open(ListenWindow { deadline_sample });
+        events.push(ListenerEvent::ListenOpened {
+            pod: pod.clone(),
+            epoch: self.epoch,
+            deadline_sample,
+            at_sample,
+        });
+    }
+
+    /// Date what waited for this connection's position, now that the clock has an
+    /// anchor: the mute tail runs from here, and the window opens here with its
+    /// line. Both are late by the time the position took to arrive, which is the
+    /// side that loses no follow-up and scores no echo.
+    fn date_undated(&mut self, pod: &PodId, at: HostMicros, events: &mut Vec<ListenerEvent>) {
+        if self.undated == Undated::default() {
+            return;
+        }
+        let Some(now) = self.now_sample(at) else {
+            return;
+        };
+        let undated = std::mem::take(&mut self.undated);
+        if undated.tail {
+            self.tail_until_sample = now.saturating_add(self.config.mute_tail_samples);
+        }
+        if let Some(window_samples) = undated.listen {
+            self.open_listen(pod, now, window_samples, events);
+        }
+    }
+
+    /// The position up to which the endpointer has judged everything the pod will
+    /// send — what a deadline check off the audio path compares against, since the
+    /// endpointer's idleness means nothing past it.
+    ///
+    /// While a segment is open the pod streams every sample it captures, and the
+    /// audio between the endpointer's position and the pod's head is still on its
+    /// way (a segment's first second drains a pre-roll backlog behind the head):
+    /// the stream's own position, so speech already captured before a deadline is
+    /// heard before the deadline is judged. With no segment open, the next segment
+    /// the pod opens still reaches back a pre-roll behind its head, so speech begun
+    /// before a deadline can still arrive after the head has passed it: the pod's
+    /// position less its stated `segment_reach`, the test
+    /// [`retire_listen_reanchored_past`](Self::retire_listen_reanchored_past) makes
+    /// at `SegmentOpened`, made before the segment exists. `None` without a
+    /// position: nothing to compare, so nothing is checked.
+    fn heard_through(&self, at: HostMicros) -> Option<u64> {
+        if self.streaming {
+            Some(self.expected_next.unwrap_or(self.silero_cursor))
+        } else {
+            self.now_sample(at)
+                .map(|now| now.saturating_sub(self.segment_reach))
         }
     }
 
@@ -918,12 +1093,13 @@ impl ListenerState {
         self.current_barge = false;
         self.current_over_playback = false;
         self.segment = None;
+        self.streaming = false;
         self.current_onset_rx = None;
         self.current_wake_rx = None;
         self.current_anchor = None;
         self.doa.clear();
         self.levels.clear();
-        self.room.clear();
+        self.room.new_connection();
     }
 
     /// Reset the rolling inference state (OWW/Silero windows, endpointer, Silero
@@ -994,6 +1170,10 @@ impl ListenerState {
         oww_models: &mut OwwModels,
         silero_model: &mut SileroModel,
     ) -> Result<Vec<ListenerEvent>, WakeError> {
+        #[cfg(test)]
+        if let Some(error) = self.fail_next_scoring.take() {
+            return Err(error);
+        }
         let mut events = Vec::new();
         self.observe_arrival(first_sample_index, pcm.len() as u64, device_ts, host_rx);
 
@@ -1043,6 +1223,12 @@ impl ListenerState {
         // stream consumed while still short of its readiness window are counted
         // too: they are the ones that produce no score, and an OWW line that
         // reports them is what separates a warming stream from a dead one.
+        //
+        // TODO(inference-error-drops-frame-events): this `?`, and the Silero `?` in
+        // the chunk loop below, return without the events already pushed for this
+        // frame (an abandoned utterance's `UtteranceClosed`, a retired hold or
+        // listen window, a wake detection, earlier chunks' endpointer events),
+        // while the state changes behind them stand.
         let report = self.oww.push(oww_models, pcm)?;
         if let Some(run) = report.unscored {
             self.oww_stats.record_unscored(
@@ -1272,17 +1458,23 @@ impl ListenerState {
     /// the preroll. Detached, it carves on the gated path at its end, takes the
     /// restored grant, and starts at the grant's start.
     ///
-    /// The expiry check runs at the listener's own cursor, because the STT round
-    /// trip may have outlived the deadline — the grant then comes back and ends
-    /// in the same call. Speech in progress holds the expiry off as on the
-    /// per-chunk path, and needs no announcement: the carve that ends it takes
-    /// the standing grant with no timing test.
+    /// `now` is the pod's capture position at the verdict, which the restore line
+    /// carries. The expiry check runs at `heard`
+    /// ([`heard_through`](Self::heard_through) at the verdict), because the STT round
+    /// trip may have outlived the deadline — the grant then comes back and ends in
+    /// the same call, unless a segment opened now could still reach back before
+    /// the deadline, in which case the first status frame past that reach ends it.
+    /// Speech in progress holds the expiry off as on the per-chunk path, and needs
+    /// no announcement: the carve that ends it takes the standing grant with no
+    /// timing test.
     ///
     /// A decline naming anything but the spender is a no-op.
     fn restore_wake(
         &mut self,
         pod: &PodId,
         id: &ListenerUtteranceId,
+        now: u64,
+        heard: u64,
         events: &mut Vec<ListenerEvent>,
     ) {
         let WakeGrant::Spent { on, arm, hold } = &self.grant else {
@@ -1304,10 +1496,10 @@ impl ListenerState {
             pod: pod.clone(),
             epoch: self.epoch,
             deadline_sample: hold.deadline_sample,
-            at_sample: self.silero_cursor,
+            at_sample: now,
             speaking: self.endpointer.speech_start().is_some(),
         });
-        self.check_hold_expiry(pod, self.silero_cursor, events);
+        self.check_hold_expiry(pod, heard, events);
     }
 
     /// Give back the capture window the candidate `id` spent, because the gate
@@ -1319,11 +1511,13 @@ impl ListenerState {
     /// connection's id carries the old epoch, a later candidate's `seq` does not
     /// match, and every other ending of the window has already discarded it.
     ///
-    /// The expiry check runs on the restored window at the listener's own cursor,
-    /// because the STT round trip that produced this verdict may well have outlived
-    /// the deadline — in which case the window comes back and ends in the same
-    /// call, with the `ListenExpired` that balances it. Speech in progress holds
-    /// the expiry off exactly as it does on the per-chunk path.
+    /// `now` is the pod's capture position at the verdict, which the restore line
+    /// carries. The expiry check runs on the restored window at `heard`
+    /// ([`heard_through`](Self::heard_through) at the verdict), because the STT round
+    /// trip that produced this verdict may well have outlived the deadline — in
+    /// which case the window comes back and ends in the same call, with the
+    /// `ListenExpired` that balances it. Speech in progress holds the expiry off
+    /// exactly as it does on the per-chunk path.
     ///
     /// Speech still running when the window comes back is announced here, because
     /// nothing else will: it began while the window was spent, where the onset rule
@@ -1334,6 +1528,8 @@ impl ListenerState {
         &mut self,
         pod: &PodId,
         id: &ListenerUtteranceId,
+        now: u64,
+        heard: u64,
         events: &mut Vec<ListenerEvent>,
     ) {
         let Capture::Spent { on, window } = &self.capture else {
@@ -1348,9 +1544,9 @@ impl ListenerState {
             pod: pod.clone(),
             epoch: self.epoch,
             deadline_sample: window.deadline_sample,
-            at_sample: self.silero_cursor,
+            at_sample: now,
         });
-        self.check_listen_expiry(pod, self.silero_cursor, events);
+        self.check_listen_expiry(pod, heard, events);
         if self.capture.open().is_some()
             && (self.endpointer.speech_start()).is_some_and(|s| s <= window.deadline_sample)
         {
@@ -1454,12 +1650,16 @@ impl ListenerState {
     ///
     /// A reply that answers no turn is no turn: two of them in a row are two
     /// replies, each with its own latch, because nothing identifies them as one.
+    ///
+    /// `at` is the host time of the change; a floor going down dates its tail
+    /// from the pod's capture position then.
     fn set_playback(
         &mut self,
         active: bool,
         interruptible: bool,
         may_wake: bool,
         turn: Option<UtteranceId>,
+        at: HostMicros,
     ) {
         if self.playback.active && active && turn.is_some() && self.playback.turn == turn {
             self.playback.interruptible = interruptible;
@@ -1468,9 +1668,18 @@ impl ListenerState {
         }
         // The floor going down is the pacer's estimate that the audio is heard out,
         // so the microphone is trusted again only past the tail: under the mute,
-        // for scoring; under every mode, for the room reading.
+        // for scoring. The room reading has its own tail, on the pod's playing
+        // flag. The tail is the pod's next `mute_tail_samples` of capture, not a
+        // stretch the last segment already passed.
         if self.playback.active && !active {
-            self.tail_until_sample = self.silero_cursor + self.config.mute_tail_samples;
+            match self.now_sample(at) {
+                Some(now) => {
+                    self.tail_until_sample = now.saturating_add(self.config.mute_tail_samples);
+                }
+                // No position on this connection yet: the tail runs from the one it
+                // gets (`date_undated`).
+                None => self.undated.tail = true,
+            }
         }
         self.playback = PlaybackFloor {
             active,
@@ -1560,91 +1769,61 @@ impl ListenerState {
         self.current_over_playback = true;
     }
 
-    /// Record one frame's level in the bounded level ring, and in the room ring
-    /// when the frame is a room frame: the floor closed, the frame ending after
-    /// the playback tail, and the endpointer fully idle. A frame re-sent under
-    /// indexes a ring already holds (a segment's preroll overlapping the previous
-    /// one) replaces the readings from that index on, so no stretch of audio is
-    /// counted twice.
-    fn push_level(&mut self, first_sample_index: u64, samples: u64, level: FrameLevel) {
-        let room = !self.playback.active
-            && first_sample_index + samples > self.tail_until_sample
-            && self.endpointer.fully_idle();
+    /// Record one frame's level in the bounded level ring. A frame re-sent under
+    /// indexes the ring already holds (a segment's preroll overlapping the
+    /// previous one) replaces the readings from that index on, so no stretch of
+    /// audio is counted twice.
+    fn push_level(&mut self, first_sample_index: u64, level: FrameLevel) {
         push_bounded(
             &mut self.levels,
             LEVEL_RING_CAPACITY,
             first_sample_index,
             level.dbfs,
         );
-        if room {
-            push_bounded(
-                &mut self.room,
-                ROOM_RING_CAPACITY,
-                first_sample_index,
-                level.dbfs,
-            );
-        } else {
-            // A re-sent stretch replaces what the room ring held for it, whether
-            // or not it is a room frame this time.
-            while self
-                .room
-                .back()
-                .is_some_and(|&(s, _)| s >= first_sample_index)
-            {
-                self.room.pop_back();
-            }
-        }
     }
 
     /// How loudly speech in `[speech_lo, speech_hi)` was spoken, and how loud the
-    /// room was before it.
+    /// room was before speech that began at `room_lo` (at or before `speech_lo`),
+    /// measured at host time `at`. `None` when neither half was measured.
     ///
     /// `speech_dbfs` is the 80th percentile of the frame ring's levels with first
-    /// sample in the window; the whole reading is `None` when no frame lies there,
-    /// or when every frame there reads as a dead channel — a floor is not a
-    /// measurement. `ambient_dbfs` is the 20th percentile of the last
-    /// `AMBIENT_WINDOW_FRAMES` room frames with first sample below `speech_lo`:
-    /// the room as last heard with the pod silent and nobody speaking, before
-    /// this speech. It is `None` under `AMBIENT_MIN_FRAMES` such frames, or when
-    /// all of them read as dead.
-    fn level_of(&self, speech_lo: u64, speech_hi: u64) -> Option<UtteranceLevel> {
-        let all_dead = |v: &[f32]| v.iter().all(|&dbfs| FrameLevel { dbfs }.is_dead());
+    /// sample in the window; `None` when no frame lies there, or when every frame
+    /// there reads as a dead channel — a floor is not a measurement. A dead
+    /// speech window leaves the room reading standing. `ambient` is
+    /// [`RoomHistory::read`], which a reading from blocks also makes the carried
+    /// one.
+    fn level_of(
+        &mut self,
+        speech_lo: u64,
+        speech_hi: u64,
+        room_lo: u64,
+        at: HostMicros,
+    ) -> Option<UtteranceLevel> {
         let mut speech: Vec<f32> = self
             .levels
             .iter()
             .filter(|(s, _)| (speech_lo..speech_hi).contains(s))
             .map(|&(_, dbfs)| dbfs)
             .collect();
-        if all_dead(&speech) {
-            return None;
-        }
-        let speech_dbfs = percentile(&mut speech, WAKE_SPEECH_PERCENTILE)?;
-        let mut ambient: Vec<f32> = self
-            .room
-            .iter()
-            .rev()
-            .filter(|&&(s, _)| s < speech_lo)
-            .take(AMBIENT_WINDOW_FRAMES)
-            .map(|&(_, dbfs)| dbfs)
-            .collect();
-        let ambient_dbfs = if ambient.len() < AMBIENT_MIN_FRAMES || all_dead(&ambient) {
+        let speech_dbfs = if speech.iter().all(|&dbfs| FrameLevel { dbfs }.is_dead()) {
             None
         } else {
-            percentile(&mut ambient, AMBIENT_PERCENTILE)
+            percentile(&mut speech, WAKE_SPEECH_PERCENTILE)
         };
-        Some(UtteranceLevel {
+        let ambient = self.room.read(room_lo.min(speech_lo), at);
+        (speech_dbfs.is_some() || ambient.is_some()).then_some(UtteranceLevel {
             speech_dbfs,
-            ambient_dbfs,
+            ambient,
             source: self.level_source,
         })
     }
 
-    /// The level of a phrase ending at `wake_end`: its last second.
-    fn wake_level(&self, wake_end: u64) -> Option<UtteranceLevel> {
-        self.level_of(
-            wake_end.saturating_sub(WAKE_SPEECH_WINDOW_SAMPLES),
-            wake_end,
-        )
+    /// The level of a phrase ending at `wake_end`: its last second, and the room
+    /// before the earlier of that second and the speech the endpointer is in.
+    fn wake_level(&mut self, wake_end: u64, at: HostMicros) -> Option<UtteranceLevel> {
+        let lo = wake_end.saturating_sub(WAKE_SPEECH_WINDOW_SAMPLES);
+        let room_lo = self.endpointer.speech_start().map_or(lo, |s| s.min(lo));
+        self.level_of(lo, wake_end, room_lo, at)
     }
 
     /// Handle a fresh wake detection: expire a prior arm or grant, install this
@@ -1685,7 +1864,7 @@ impl ListenerState {
         // no command answered in between. A grant waiting on that arm, standing
         // or spent, goes with it: the repeated wake word starts the turn over.
         self.expire_unconsumed_arm(pod, wake_end_sample, ArmExpiryCause::FreshWake, events);
-        let level = self.wake_level(wake_end_sample);
+        let level = self.wake_level(wake_end_sample, host_rx);
         let arm = WakeArm {
             score,
             wake_end_sample,
@@ -2110,14 +2289,14 @@ impl ListenerState {
                     }
                 };
                 // The carve's own speech starts at the onset, past the
-                // endpointer's preroll of room.
+                // endpointer's preroll; the room is read from before the carve.
                 let level = match wake {
                     Some(w) => w.level,
                     None => {
                         let onset = start
                             .saturating_add(self.config.endpointer.preroll_pad_samples)
                             .min(end);
-                        self.level_of(onset, end)
+                        self.level_of(onset, end, start, host_rx)
                     }
                 };
                 self.utterance_seq += 1;
@@ -2192,6 +2371,8 @@ impl ListenerState {
                 anchor
             }
         };
+        // Speech addressed to the pod is not the room for the utterances after it.
+        self.room.note_addressed(start, end);
         Some(CarvedUtterance {
             utterance_id: id,
             pcm,
@@ -2562,7 +2743,7 @@ pub struct ListenerStats {
     channel_closed: AtomicU64,
     /// Markers abandoned after waiting `MARKER_SEND_TIMEOUT` for channel room —
     /// the listener is wedged, not merely loaded. Counted apart from `dropped`
-    /// (audio and azimuth overflow, expected under load) because a non-zero value here means
+    /// (audio, azimuth and status overflow, expected under load) because a non-zero value here means
     /// listener state has been corrupted, not just thinned.
     marker_send_timeouts: AtomicU64,
     wakes: AtomicU64,
@@ -2720,23 +2901,23 @@ impl Listener {
                         .or_insert_with(|| ListenerState::new(config));
                     let handled = state.handle(&pod, feed, &mut oww_models, &mut silero_model);
                     thread_stats.accumulate_overlap(state);
-                    match handled {
-                        Ok(evs) => {
-                            thread_stats.record_events(&evs);
-                            for ev in evs {
-                                // The pipeline may be gone (shutdown); a lost event
-                                // is not the listener's concern.
-                                if events.send(ev).is_err() {
-                                    return;
-                                }
-                            }
+                    let (evs, error) = match handled {
+                        Ok(evs) => (evs, None),
+                        Err(HandleError { error, events }) => (events, Some(error)),
+                    };
+                    thread_stats.record_events(&evs);
+                    for ev in evs {
+                        // The pipeline may be gone (shutdown); a lost event is not
+                        // the listener's concern.
+                        if events.send(ev).is_err() {
+                            return;
                         }
-                        Err(e) => {
-                            thread_stats.record_error(&e);
-                            // The mid-chunk failure may have torn this pod's
-                            // streaming cursors; re-anchor on the next chunk.
-                            state.note_inference_error();
-                        }
+                    }
+                    if let Some(error) = error {
+                        thread_stats.record_error(&error);
+                        // The mid-chunk failure may have torn this pod's streaming
+                        // cursors; re-anchor on the next chunk.
+                        state.note_inference_error();
                     }
                 }
             })?;
@@ -2795,13 +2976,19 @@ impl FeedSender {
     /// path. A shed reading costs one 100 ms sample of the array's direction, which
     /// a wake reads a window of.
     ///
+    /// `PodStatus` waits for room up to `STATUS_SEND_TIMEOUT`, then is shed and
+    /// counted in `dropped`: the next one, a second later, re-anchors the clock, so a
+    /// lost one thins the room history by its blocks and corrupts nothing. It comes
+    /// once a second from every connected pod, idle or not, so the short bound is
+    /// what keeps a wedged listener from stalling every pod's read loop.
+    ///
     /// Every other variant is a control marker whose loss corrupts listener state
     /// (a stale epoch, a missed segment re-anchor or fallback carve, a stale
     /// barge-in floor), so it is delivered reliably: the send awaits channel room
     /// for up to `MARKER_SEND_TIMEOUT`, then bumps `marker_send_timeouts` and
-    /// drops the marker rather than stalling the caller forever. Markers travel
-    /// the same channel as audio, so their order relative to surrounding audio
-    /// from the same producer is preserved.
+    /// drops the marker rather than stalling the caller forever. Markers and
+    /// status frames travel the same channel as audio, so their order relative to
+    /// surrounding audio from the same producer is preserved.
     ///
     /// A closed channel (the thread exited) is counted separately
     /// (`channel_closed`) so a dead listener is distinguishable from load drops;
@@ -2818,6 +3005,18 @@ impl FeedSender {
                 // visible as itself, not laundered into the overflow counter.
                 Err(TrySendError::Closed(_)) => {
                     self.stats.channel_closed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        if matches!(feed, Feed::PodStatus { .. }) {
+            match tokio::time::timeout(STATUS_SEND_TIMEOUT, self.tx.clone().reserve_owned()).await {
+                Ok(Ok(permit)) => FeedPermit { permit }.send(pod, feed),
+                Ok(Err(_)) => {
+                    self.stats.channel_closed.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
             return;
@@ -2888,9 +3087,50 @@ mod tests {
     use crate::test_support::{
         WAKE_PREROLL_SAMPLES, oww_models, primed_wake_pcm, silero_model, wake_phrase_pcm,
     };
+    use crate::types::AmbientReading;
 
     fn pod() -> PodId {
         PodId("pod-x".into())
+    }
+
+    /// The host stamp for a dated marker feed in a case that never anchors the
+    /// pod clock (no status frame, no `Feed::Audio`): with no anchor the stamp is
+    /// not read, and "now" is the stream's own position, which such a case sets.
+    const UNCLOCKED: HostMicros = HostMicros(0);
+
+    /// Put the stream at `cursor` for a case the synthetic driver runs: the
+    /// driver feeds the endpointer directly, so neither the Silero cursor nor the
+    /// next expected sample moves with it.
+    fn set_stream_at(state: &mut ListenerState, cursor: u64) {
+        state.silero_cursor = cursor;
+        state.expected_next = Some(cursor);
+    }
+
+    /// Put the stream at `cursor` and give the connection that position the way
+    /// the live path does, with a status frame received at [`UNCLOCKED`]. The frame
+    /// states no segment reach, so with no segment open a deadline is judged at
+    /// `cursor` itself; the cases that test the reach state one.
+    fn position_at(
+        state: &mut ListenerState,
+        cursor: u64,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> Vec<ListenerEvent> {
+        set_stream_at(state, cursor);
+        state
+            .handle(
+                &pod(),
+                Feed::PodStatus {
+                    host_rx: UNCLOCKED,
+                    capture_head: cursor,
+                    segment_reach: 0,
+                    first_block: 0,
+                    levels: Vec::new(),
+                },
+                oww,
+                silero,
+            )
+            .expect("status feed")
     }
 
     /// A state whose level ring holds one 20 ms frame per 320 samples over
@@ -2900,43 +3140,88 @@ mod tests {
         state.level_source = LevelSource::RawMic;
         for start in (0..end).step_by(320) {
             let dbfs = if start >= loud_from { loud } else { quiet };
-            state.push_level(start, 320, FrameLevel { dbfs });
+            state.push_level(start, FrameLevel { dbfs });
         }
         state
     }
 
+    /// One of the pod's 100 ms level blocks, as its status frame carries it.
+    fn level_block(dbfs: f32, playing: bool) -> pod_ingest::LevelBlock {
+        pod_ingest::LevelBlock {
+            half_db: (-dbfs * 2.0).round() as u8,
+            flags: if playing {
+                audio_pipeline::wire::LEVEL_FLAG_PLAYING
+            } else {
+                0
+            },
+        }
+    }
+
+    /// Hand the state blocks `[first, first + n)` at `dbfs`, as status frames do.
+    fn status_blocks(state: &mut ListenerState, first: u64, n: usize, dbfs: f32, playing: bool) {
+        state
+            .room
+            .ingest(first, &vec![level_block(dbfs, playing); n]);
+    }
+
+    /// [`state_with_levels`] with the pod's blocks over the same span, metered
+    /// alike.
+    fn state_with_room(end: u64, loud_from: u64, quiet: f32, loud: f32) -> ListenerState {
+        let mut state = state_with_levels(end, loud_from, quiet, loud);
+        let blocks: Vec<_> = (0..end.div_ceil(1_600))
+            .map(|n| level_block(if n * 1_600 >= loud_from { loud } else { quiet }, false))
+            .collect();
+        state.room.ingest(0, &blocks);
+        state
+    }
+
+    /// The room as read for these tests: blocks at `dbfs`, fresh, from blocks.
+    fn room_reading(dbfs: f32, blocks: u16, age_ms: u32) -> Option<AmbientReading> {
+        Some(AmbientReading {
+            dbfs,
+            blocks,
+            age_ms,
+            carried: false,
+        })
+    }
+
     /// Loud frames in the last second, quiet before: the speech reading is the
-    /// phrase's level and the ambient reading the room's.
+    /// phrase's level, and the ambient reading the blocks that end at least the
+    /// guard before the phrase's second.
     #[test]
     fn wake_level_reads_speech_from_the_last_second_and_ambient_before_it() {
-        let state = state_with_levels(40_000, 24_000, -60.0, -25.0);
-        let level = state.wake_level(40_000).expect("a live window measures");
-        assert_eq!(level.speech_dbfs, -25.0);
-        assert_eq!(level.ambient_dbfs, Some(-60.0));
+        let mut state = state_with_room(40_000, 24_000, -60.0, -25.0);
+        let level = state
+            .wake_level(40_000, UNCLOCKED)
+            .expect("a live window measures");
+        assert_eq!(level.speech_dbfs, Some(-25.0));
+        // Blocks 0..12 end by 24 000 − 4 800.
+        assert_eq!(level.ambient, room_reading(-60.0, 12, 300));
         assert_eq!(level.source, LevelSource::RawMic);
     }
 
-    /// The percentiles: the loud vowels set the speech reading, so pauses inside
-    /// the phrase do not pull it down; the quiet floor sets the ambient one, so
-    /// leading syllables leaking into its window do not push it up.
+    /// The speech percentile: the loud vowels set the reading, so pauses inside
+    /// the phrase do not pull it down. Leading syllables before the speech
+    /// window fall inside the guard, so they do not reach the room.
     #[test]
-    fn wake_level_percentiles_resist_pauses_and_leaks() {
+    fn wake_level_speech_resists_pauses_and_the_guard_keeps_leaks_out() {
         // Speech window [16_000, 32_000): 50 frames, 20 of them pauses at −70.
-        // Ambient window [0, 16_000): 50 frames, 5 of them leaked speech at −30.
         let mut state = ListenerState::new(test_config(WakePolicy::WakeGated));
         for (i, start) in (0..32_000u64).step_by(320).enumerate() {
             let dbfs = if start >= 16_000 {
                 if i % 5 < 2 { -70.0 } else { -20.0 }
-            } else if i >= 45 {
-                -30.0
             } else {
                 -55.0
             };
-            state.push_level(start, 320, FrameLevel { dbfs });
+            state.push_level(start, FrameLevel { dbfs });
         }
-        let level = state.wake_level(32_000).expect("live");
-        assert_eq!(level.speech_dbfs, -20.0);
-        assert_eq!(level.ambient_dbfs, Some(-55.0));
+        // Blocks 0..9 room, block 9 the leaked syllable, 10..20 the phrase.
+        status_blocks(&mut state, 0, 9, -55.0, false);
+        status_blocks(&mut state, 9, 1, -30.0, false);
+        status_blocks(&mut state, 10, 10, -20.0, false);
+        let level = state.wake_level(32_000, UNCLOCKED).expect("live");
+        assert_eq!(level.speech_dbfs, Some(-20.0));
+        assert_eq!(level.ambient, room_reading(-55.0, 7, 300));
         assert_eq!(
             level.source,
             LevelSource::Beam,
@@ -2944,28 +3229,51 @@ mod tests {
         );
     }
 
-    /// Too little audio before the phrase: speech is measured, ambient is not.
+    /// No block heard yet: speech is measured, ambient is not.
     #[test]
-    fn wake_level_has_no_ambient_on_a_short_ring() {
-        // 24 ambient frames, one short of the minimum.
-        let state = state_with_levels(16_000 + 24 * 320, 24 * 320, -60.0, -25.0);
+    fn wake_level_has_no_ambient_before_any_block() {
+        let mut state = state_with_levels(40_000, 24_000, -60.0, -25.0);
         let level = state
-            .wake_level(16_000 + 24 * 320)
+            .wake_level(40_000, UNCLOCKED)
             .expect("speech measures");
-        assert_eq!(level.speech_dbfs, -25.0);
-        assert_eq!(level.ambient_dbfs, None);
+        assert_eq!(level.speech_dbfs, Some(-25.0));
+        assert_eq!(level.ambient, None);
     }
 
-    /// A dead speech window is no measurement at all; a dead ambient window is
-    /// no ambient reading; an empty ring measures nothing.
+    /// A dead speech window keeps the room reading; dead blocks are no room
+    /// reading; nothing measured at all is no level.
     #[test]
-    fn wake_level_drops_dead_windows() {
-        let dead = state_with_levels(40_000, 0, -100.0, -100.0);
-        assert_eq!(dead.wake_level(40_000), None);
-        let dead_room = state_with_levels(40_000, 24_000, -100.0, -25.0);
-        assert_eq!(dead_room.wake_level(40_000).unwrap().ambient_dbfs, None);
-        let empty = ListenerState::new(test_config(WakePolicy::WakeGated));
-        assert_eq!(empty.wake_level(40_000), None);
+    fn wake_level_keeps_each_half_without_the_other() {
+        let mut dead_speech = state_with_levels(40_000, 0, -100.0, -100.0);
+        status_blocks(&mut dead_speech, 0, 12, -60.0, false);
+        let level = dead_speech.wake_level(40_000, UNCLOCKED).expect("the room");
+        assert_eq!(level.speech_dbfs, None);
+        assert_eq!(level.ambient, room_reading(-60.0, 12, 300));
+
+        let mut dead_room = state_with_room(40_000, 24_000, -100.0, -25.0);
+        let level = dead_room.wake_level(40_000, UNCLOCKED).unwrap();
+        assert_eq!((level.speech_dbfs, level.ambient), (Some(-25.0), None));
+
+        let mut dead = state_with_levels(40_000, 0, -100.0, -100.0);
+        assert_eq!(dead.wake_level(40_000, UNCLOCKED), None);
+        let mut empty = ListenerState::new(test_config(WakePolicy::WakeGated));
+        assert_eq!(empty.wake_level(40_000, UNCLOCKED), None);
+    }
+
+    /// The room is read from before the speech the endpointer is in when that
+    /// began earlier than the phrase's last second: a wake said at the end of a
+    /// long sentence does not read the sentence as room.
+    #[test]
+    fn wake_level_reads_the_room_from_before_the_running_speech() {
+        let mut state = state_with_room(80_000, 16_000, -60.0, -25.0);
+        let mut cursor = 16_000u64 - 512;
+        drive(&mut state, 0.9, 3, &mut cursor);
+        let start = state.endpointer.speech_start().expect("speech running");
+        assert!(start < 20_000, "{start}");
+        let level = state.wake_level(80_000, UNCLOCKED).unwrap();
+        let ambient = level.ambient.expect("the room before the sentence");
+        assert_eq!(ambient.dbfs, -60.0);
+        assert!(u64::from(ambient.blocks) * 1_600 <= start, "{ambient:?}");
     }
 
     /// The ring is bounded, dropping its oldest frames, and a re-sent stretch
@@ -2978,7 +3286,7 @@ mod tests {
         assert_eq!(state.levels.front().unwrap().0, 320 * 40);
         // Re-send the last 10 frames at a new level.
         for start in (320 * 190..320 * 200).step_by(320) {
-            state.push_level(start, 320, FrameLevel { dbfs: -10.0 });
+            state.push_level(start, FrameLevel { dbfs: -10.0 });
         }
         assert_eq!(state.levels.len(), LEVEL_RING_CAPACITY);
         assert_eq!(
@@ -2992,12 +3300,12 @@ mod tests {
     /// carries it on the arm whose confirmation the carve takes.
     #[test]
     fn wake_detection_carries_the_level_to_the_event_and_the_arm() {
-        let mut state = state_with_levels(40_000, 24_000, -60.0, -25.0);
+        let mut state = state_with_room(40_000, 24_000, -60.0, -25.0);
         let mut events = Vec::new();
         state.on_wake_detection(&pod(), 0.9, 40_000, HostMicros(1), &mut events);
         let want = UtteranceLevel {
-            speech_dbfs: -25.0,
-            ambient_dbfs: Some(-60.0),
+            speech_dbfs: Some(-25.0),
+            ambient: room_reading(-60.0, 12, 300),
             source: LevelSource::RawMic,
         };
         let detected = events
@@ -3044,7 +3352,7 @@ mod tests {
     ) -> Vec<ListenerEvent> {
         let mut evs = Vec::new();
         for _ in 0..count {
-            state.push_level(*cursor, 512, FrameLevel { dbfs });
+            state.push_level(*cursor, FrameLevel { dbfs });
             *cursor += 512;
             evs.extend(state.drive_probability_for_test(&pod(), p, *cursor));
         }
@@ -3054,12 +3362,13 @@ mod tests {
     /// A follow-up inside an open window measures its own speech, from the
     /// onset — the quiet preroll in `[start, onset)` would pull the 80th
     /// percentile of two speech frames down to the quieter one — and reads the
-    /// room from the room ring before it.
+    /// room from the blocks before the carve.
     #[test]
     fn a_follow_up_carve_measures_its_own_speech_past_the_preroll() {
         let mut oww = oww_models();
         let mut silero = silero_model();
         let mut state = level_state(level_config(WakePolicy::WakeGated));
+        status_blocks(&mut state, 0, 10, -60.0, false);
         let mut cursor = 0u64;
         drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
         open_listen(&mut state, cursor, 4_096, &mut oww, &mut silero);
@@ -3070,82 +3379,57 @@ mod tests {
         let carved = soft_endpoints(&events);
         assert_eq!(carved.len(), 1, "{events:?}");
         assert!(carved[0].follow_up);
-        assert_eq!(
-            carved[0].start_sample,
-            onset - 3 * 512,
-            "the preroll is there"
-        );
+        let start = onset - 3 * 512;
+        assert_eq!(carved[0].start_sample, start, "the preroll is there");
+        // Blocks 0..5 end by the carve's start less the guard.
         assert_eq!(
             carved[0].level,
             Some(UtteranceLevel {
-                speech_dbfs: -20.0,
-                ambient_dbfs: Some(-60.0),
+                speech_dbfs: Some(-20.0),
+                ambient: room_reading(-60.0, 5, ((start - 5 * 1_600) / 16) as u32),
                 source: LevelSource::RawMic,
             })
         );
     }
 
-    /// A carve whose speech window holds only dead frames carries no level.
+    /// A carve whose speech window holds only dead frames carries the room
+    /// alone, and nothing at all when no block has been heard.
     #[test]
-    fn a_dead_speech_window_carries_no_level() {
-        let mut state = level_state(level_config(WakePolicy::Bypass));
-        let mut cursor = 0u64;
-        drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
-        let mut events = drive_heard(&mut state, 0.9, -100.0, 2, &mut cursor);
-        events.extend(drive_heard(&mut state, 0.1, -100.0, 3, &mut cursor));
-        let carved = soft_endpoints(&events);
-        assert_eq!(carved.len(), 1, "{events:?}");
-        assert_eq!(carved[0].level, None);
-    }
-
-    /// The room ring takes a frame only with the floor closed, past the playback
-    /// tail, and with the endpointer fully idle. The tail is armed at a floor
-    /// drop in every barge mode; outside the mute it decides nothing else.
-    #[test]
-    fn the_room_ring_takes_only_frames_nobody_was_playing_or_speaking_into() {
-        for mode in [BargeMode::Wake, BargeMode::Speech] {
-            let mut state = level_state(ListenerConfig {
-                barge_in: BargeInConfig {
-                    mode,
-                    ..barge_config(WakePolicy::Bypass).barge_in
-                },
-                ..level_config(WakePolicy::Bypass)
-            });
+    fn a_dead_speech_window_keeps_the_room() {
+        for heard in [false, true] {
+            let mut state = level_state(level_config(WakePolicy::Bypass));
+            if heard {
+                status_blocks(&mut state, 0, 10, -60.0, false);
+            }
             let mut cursor = 0u64;
-            play(&mut state, true, false);
-            drive_heard(&mut state, 0.1, -20.0, 4, &mut cursor);
-            assert!(state.room.is_empty(), "{mode:?}: nothing under the floor");
-
-            stop_playback_at(&mut state, cursor);
-            assert_eq!(state.tail_until_sample, cursor + 1_024, "{mode:?}: armed");
-            assert!(
-                !state.muted(cursor + 512),
-                "{mode:?}: the tail mutes nothing"
-            );
-            // Two frames end at or before the tail; the third ends after it.
-            drive_heard(&mut state, 0.1, -50.0, 2, &mut cursor);
-            assert!(state.room.is_empty(), "{mode:?}: nothing inside the tail");
-            drive_heard(&mut state, 0.1, -60.0, 1, &mut cursor);
-            assert_eq!(state.room.len(), 1, "{mode:?}: the room is heard again");
-
-            // The first chunk of a run is pushed while the endpointer is still
-            // idle; every later one is pushed with it counting or in speech.
-            drive_heard(&mut state, 0.9, -25.0, 4, &mut cursor);
-            assert_eq!(state.room.len(), 2, "{mode:?}: only the run's first chunk");
-            drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor);
-            assert_eq!(state.room.len(), 2, "{mode:?}: nor the hangover");
+            drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
+            let mut events = drive_heard(&mut state, 0.9, -100.0, 2, &mut cursor);
+            events.extend(drive_heard(&mut state, 0.1, -100.0, 3, &mut cursor));
+            let carved = soft_endpoints(&events);
+            assert_eq!(carved.len(), 1, "{events:?}");
+            let level = carved[0].level;
+            if heard {
+                let level = level.expect("the room half");
+                assert_eq!(level.speech_dbfs, None);
+                assert_eq!(level.ambient.map(|a| a.dbfs), Some(-60.0));
+            } else {
+                assert_eq!(level, None);
+            }
         }
     }
 
-    /// A speech-rule barge whose preceding second was all under the floor reads
-    /// the room from before the reply, not the reply; a connection that has
-    /// heard no room frame at all has no ambient reading.
+    /// A speech-rule barge reads the room from the blocks before the reply: the
+    /// pod flags every block it played into. A connection that has heard no
+    /// block at all has no ambient reading.
     #[test]
     fn a_barge_reads_the_room_from_before_the_reply() {
         let mut state = level_state(ListenerConfig {
             mute_tail_samples: 1_024,
             ..barge_config(WakePolicy::WakeGated)
         });
+        // The reply starts at 15 360, inside block 9.
+        status_blocks(&mut state, 0, 9, -60.0, false);
+        status_blocks(&mut state, 9, 20, -20.0, true);
         let mut cursor = 0u64;
         drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
         play(&mut state, true, true);
@@ -3157,7 +3441,12 @@ mod tests {
         assert_eq!(carved.len(), 1, "{events:?}");
         assert!(carved[0].barge_in);
         let level = carved[0].level.expect("a barge carries a level");
-        assert_eq!(level.ambient_dbfs, Some(-60.0), "the room, not the reply");
+        let ambient = level.ambient.expect("the room");
+        assert_eq!(
+            (ambient.dbfs, ambient.blocks),
+            (-60.0, 9),
+            "the room, not the reply"
+        );
 
         let mut fresh = level_state(ListenerConfig {
             mute_tail_samples: 1_024,
@@ -3170,15 +3459,14 @@ mod tests {
         let carved = soft_endpoints(&events);
         assert_eq!(carved.len(), 1, "{events:?}");
         let level = carved[0].level.expect("the speech is measured");
-        assert_eq!(level.speech_dbfs, -25.0);
-        assert_eq!(level.ambient_dbfs, None, "no room has been heard");
+        assert_eq!(level.speech_dbfs, Some(-25.0));
+        assert_eq!(level.ambient, None, "no room has been heard");
     }
 
-    /// Long speech does not displace the room ring, so a long follow-up keeps
-    /// its ambient reading; the frame ring is bounded, so speech longer than it
-    /// is measured over its last ~2.9 s. Here a loud head of 40 frames would set
-    /// the 80th percentile of the whole 170, and is mostly gone from the ring
-    /// by the carve.
+    /// A long follow-up keeps its ambient reading; the frame ring is bounded,
+    /// so speech longer than it is measured over its last ~2.9 s. Here a loud
+    /// head of 40 frames would set the 80th percentile of the whole 170, and is
+    /// mostly gone from the ring by the carve.
     #[test]
     fn a_long_follow_up_keeps_its_ambient_and_measures_its_tail() {
         let mut oww = oww_models();
@@ -3190,6 +3478,8 @@ mod tests {
             },
             ..level_config(WakePolicy::WakeGated)
         });
+        status_blocks(&mut state, 0, 10, -60.0, false);
+        status_blocks(&mut state, 10, 60, -20.0, false);
         let mut cursor = 0u64;
         drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
         open_listen(&mut state, cursor, 4_096, &mut oww, &mut silero);
@@ -3200,8 +3490,16 @@ mod tests {
         assert_eq!(carved.len(), 1, "{events:?}");
         assert!(carved[0].follow_up);
         let level = carved[0].level.expect("measured");
-        assert_eq!(level.speech_dbfs, -30.0, "the ring's tail of the speech");
-        assert_eq!(level.ambient_dbfs, Some(-60.0), "the room is kept");
+        assert_eq!(
+            level.speech_dbfs,
+            Some(-30.0),
+            "the ring's tail of the speech"
+        );
+        assert_eq!(
+            level.ambient.map(|a| a.dbfs),
+            Some(-60.0),
+            "the room is kept"
+        );
     }
 
     /// A wake said over a reply reads the room from before the reply.
@@ -3209,16 +3507,92 @@ mod tests {
     fn a_wake_over_a_reply_reads_the_room_from_before_it() {
         let mut state = level_state(test_config(WakePolicy::WakeGated));
         for start in (0..20_000u64).step_by(320) {
-            state.push_level(start, 320, FrameLevel { dbfs: -60.0 });
+            state.push_level(start, FrameLevel { dbfs: -60.0 });
         }
         play(&mut state, true, true);
         for start in (20_000..60_000u64).step_by(320) {
             let dbfs = if start >= 44_000 { -25.0 } else { -20.0 };
-            state.push_level(start, 320, FrameLevel { dbfs });
+            state.push_level(start, FrameLevel { dbfs });
         }
-        let level = state.wake_level(60_000).expect("measured");
-        assert_eq!(level.speech_dbfs, -25.0);
-        assert_eq!(level.ambient_dbfs, Some(-60.0), "the room, not the reply");
+        // Block 12 holds the reply's first samples.
+        status_blocks(&mut state, 0, 12, -60.0, false);
+        status_blocks(&mut state, 12, 26, -20.0, true);
+        let level = state.wake_level(60_000, UNCLOCKED).expect("measured");
+        assert_eq!(level.speech_dbfs, Some(-25.0));
+        assert_eq!(
+            level.ambient,
+            room_reading(-60.0, 12, ((44_000 - 19_200) / 16) as u32),
+            "the room, not the reply"
+        );
+    }
+
+    /// An utterance addressed to the pod is not room for the next one: its
+    /// carved span is excluded, so a long first command does not raise the
+    /// reading taken for the second.
+    #[test]
+    fn an_addressed_utterance_is_not_room_for_the_next() {
+        let mut state = level_state(ListenerConfig {
+            endpointer: EndpointerConfig {
+                max_utterance_samples: 400 * 512,
+                ..level_config(WakePolicy::Bypass).endpointer
+            },
+            ..level_config(WakePolicy::Bypass)
+        });
+        let mut cursor = 0u64;
+        drive_heard(&mut state, 0.1, -60.0, 32, &mut cursor);
+        let first_onset = cursor;
+        let mut events = drive_heard(&mut state, 0.9, -20.0, 94, &mut cursor);
+        let first_end = cursor;
+        events.extend(drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor));
+        assert_eq!(soft_endpoints(&events).len(), 1, "{events:?}");
+        // Idle past the continuation window, then the pod's blocks for all of it.
+        drive_heard(&mut state, 0.1, -60.0, 30, &mut cursor);
+        let blocks: Vec<_> = (0..cursor / 1_600)
+            .map(|n| {
+                let loud = (first_onset..first_end).contains(&(n * 1_600));
+                level_block(if loud { -20.0 } else { -60.0 }, false)
+            })
+            .collect();
+        state.room.ingest(0, &blocks);
+        let mut events = drive_heard(&mut state, 0.9, -25.0, 2, &mut cursor);
+        events.extend(drive_heard(&mut state, 0.1, -60.0, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "{events:?}");
+        let ambient = carved[0].level.and_then(|l| l.ambient).expect("the room");
+        assert_eq!(ambient.dbfs, -60.0, "{ambient:?}");
+        let loud_blocks = blocks.iter().filter(|b| b.dbfs() == -20.0).count();
+        assert!(
+            usize::from(ambient.blocks) < blocks.len() - loud_blocks,
+            "{ambient:?}"
+        );
+    }
+
+    /// The last reading outlives the connection; the blocks do not.
+    #[test]
+    fn the_carried_reading_survives_a_reconnect() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = state_with_room(40_000, 24_000, -60.0, -25.0);
+        let measured = state.wake_level(40_000, HostMicros(1_000_000)).unwrap();
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::RawMic,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .unwrap();
+        for start in (0..40_000u64).step_by(320) {
+            state.push_level(start, FrameLevel { dbfs: -25.0 });
+        }
+        let level = state.wake_level(40_000, HostMicros(3_000_000)).unwrap();
+        let carried = level.ambient.expect("carried across the reconnect");
+        assert!(carried.carried);
+        assert_eq!(carried.dbfs, measured.ambient.unwrap().dbfs);
+        assert_eq!(carried.age_ms, measured.ambient.unwrap().age_ms + 2_000);
     }
 
     /// A wake-gated carve carries its arm's level, not a fresh reading of its
@@ -3253,7 +3627,7 @@ mod tests {
         let carved = soft_endpoints(&events);
         assert_eq!(carved.len(), 2, "{events:?}");
         assert!(carved[0].wake.is_none());
-        assert_eq!(carved[0].level.expect("measured").speech_dbfs, -20.0);
+        assert_eq!(carved[0].level.expect("measured").speech_dbfs, Some(-20.0));
         assert_eq!(carved[1].level, carved[0].level, "a continuation keeps it");
     }
 
@@ -4577,7 +4951,7 @@ mod tests {
     fn play(state: &mut ListenerState, active: bool, interruptible: bool) {
         static NEXT_TURN: AtomicU64 = AtomicU64::new(1);
         let turn = active.then(|| UtteranceId(NEXT_TURN.fetch_add(1, Ordering::Relaxed)));
-        state.set_playback(active, interruptible, false, turn);
+        state.set_playback(active, interruptible, false, turn, UNCLOCKED);
     }
 
     /// The same knobs under the default mode: only a wake detection cuts.
@@ -4715,7 +5089,7 @@ mod tests {
     #[test]
     fn a_wake_over_a_reply_that_says_the_phrase_cuts_nothing() {
         let mut state = ListenerState::new(wake_mode_config());
-        state.set_playback(true, true, true, Some(UtteranceId(7)));
+        state.set_playback(true, true, true, Some(UtteranceId(7)), UNCLOCKED);
 
         let events = state.detect_wake_for_test(&pod(), 0.9, 4_096);
         assert!(
@@ -4877,9 +5251,9 @@ mod tests {
     }
 
     /// Open a capture window with the stream at `cursor`. The synthetic driver
-    /// feeds the endpointer directly and never advances the state's own Silero
-    /// cursor, which is the "now" the window is dated from, so a case says where
-    /// the stream is.
+    /// feeds the endpointer directly and never advances the state's own stream
+    /// position, so a case says where the stream is ([`position_at`]), which is
+    /// the "now" the window is dated from.
     fn open_listen(
         state: &mut ListenerState,
         cursor: u64,
@@ -4887,10 +5261,21 @@ mod tests {
         oww: &mut OwwModels,
         silero: &mut SileroModel,
     ) -> Vec<ListenerEvent> {
-        state.silero_cursor = cursor;
-        state
-            .handle(&pod(), Feed::Listen { window_samples }, oww, silero)
-            .expect("listen feed")
+        let mut events = position_at(state, cursor, oww, silero);
+        events.extend(
+            state
+                .handle(
+                    &pod(),
+                    Feed::Listen {
+                        window_samples,
+                        at: UNCLOCKED,
+                    },
+                    oww,
+                    silero,
+                )
+                .expect("listen feed"),
+        );
+        events
     }
 
     fn listen_heards(events: &[ListenerEvent]) -> usize {
@@ -5224,10 +5609,11 @@ mod tests {
     }
 
     /// Report the gate's decline of `id` with the stream at `cursor`. The synthetic
-    /// driver never advances the state's own Silero cursor, which is the "now" a
-    /// restored window's deadline is judged against, so a case says where the
-    /// stream is — the STT round trip that produced this verdict may well have
-    /// outlived the window.
+    /// driver never advances the state's own stream position, so a case says where
+    /// the stream is ([`position_at`]) — the STT round trip that produced this
+    /// verdict may well have outlived the window. Only the decline's own events
+    /// are returned: the status frame giving the position ends nothing a decline
+    /// restores.
     fn decline_at(
         state: &mut ListenerState,
         cursor: u64,
@@ -5235,11 +5621,14 @@ mod tests {
         oww: &mut OwwModels,
         silero: &mut SileroModel,
     ) -> Vec<ListenerEvent> {
-        state.silero_cursor = cursor;
+        position_at(state, cursor, oww, silero);
         state
             .handle(
                 &pod(),
-                Feed::CandidateDeclined { id: id.clone() },
+                Feed::CandidateDeclined {
+                    id: id.clone(),
+                    at: UNCLOCKED,
+                },
                 oww,
                 silero,
             )
@@ -6027,7 +6416,7 @@ mod tests {
         oww: &mut OwwModels,
         silero: &mut SileroModel,
     ) -> Vec<ListenerEvent> {
-        state.silero_cursor = cursor;
+        set_stream_at(state, cursor);
         close_segment(state, cursor, oww, silero)
     }
 
@@ -6133,16 +6522,23 @@ mod tests {
             interruptible: true,
             may_wake: false,
             turn: None,
+            at: UNCLOCKED,
         }
     }
 
     /// A playback report through the real feed, so the rules the feed arm owns run.
     fn playback_feed(active: bool) -> Feed {
+        playback_feed_at(active, UNCLOCKED)
+    }
+
+    /// [`playback_feed`], received at `at`.
+    fn playback_feed_at(active: bool, at: HostMicros) -> Feed {
         Feed::PlaybackState {
             active,
             interruptible: true,
             may_wake: false,
             turn: active.then_some(UtteranceId(1)),
+            at,
         }
     }
 
@@ -6162,12 +6558,14 @@ mod tests {
     }
 
     /// The reply stops with the stream at `cursor`. The synthetic driver feeds the
-    /// endpointer directly and never advances the state's own Silero cursor, which
-    /// is what the tail is dated from, so a case that means to cross the tail says
-    /// where the stream is.
+    /// endpointer directly and never advances the state's own stream position, so
+    /// a case that means to cross the tail says where the stream is, and the pod's
+    /// clock is anchored there as a status frame would anchor it: the tail is dated
+    /// from the pod's position.
     fn stop_playback_at(state: &mut ListenerState, cursor: u64) {
-        state.silero_cursor = cursor;
-        state.set_playback(false, false, false, None);
+        set_stream_at(state, cursor);
+        state.clock.anchor_status(cursor, UNCLOCKED);
+        state.set_playback(false, false, false, None, UNCLOCKED);
     }
 
     /// Under the mute a wake detection over the reply, and through the tail after
@@ -6404,21 +6802,21 @@ mod tests {
     fn a_same_turn_report_keeps_the_latch_and_a_new_turn_resets_it() {
         let turn = Some(UtteranceId(4));
         let mut state = ListenerState::new(wake_mode_config());
-        state.set_playback(true, true, false, turn);
+        state.set_playback(true, true, false, turn, UNCLOCKED);
         assert_eq!(
             barge_causes(&state.detect_wake_for_test(&pod(), 0.9, 1_024)).len(),
             1
         );
 
         // The next clip of the same reply, the one that says the phrase.
-        state.set_playback(true, true, true, turn);
+        state.set_playback(true, true, true, turn, UNCLOCKED);
         assert!(
             state.playback.fired,
             "the reply is still the one already cut"
         );
         assert!(state.playback.may_wake, "and now known to say the phrase");
 
-        state.set_playback(true, true, false, Some(UtteranceId(5)));
+        state.set_playback(true, true, false, Some(UtteranceId(5)), UNCLOCKED);
         assert!(
             !state.playback.fired,
             "another reply is another cut to make"
@@ -6431,10 +6829,10 @@ mod tests {
         // The speech rule's run survives a same-turn report for the same reason.
         let mut spoken = ListenerState::new(barge_config(WakePolicy::WakeGated));
         spoken.push_ring_for_test(0, &vec![5_i16; 16_384]);
-        spoken.set_playback(true, true, false, turn);
+        spoken.set_playback(true, true, false, turn, UNCLOCKED);
         let mut cursor = 0u64;
         drive(&mut spoken, 0.9, 2, &mut cursor);
-        spoken.set_playback(true, true, false, turn);
+        spoken.set_playback(true, true, false, turn, UNCLOCKED);
         let events = drive(&mut spoken, 0.9, 1, &mut cursor);
         assert_eq!(
             barge_causes(&events).len(),
@@ -6449,16 +6847,16 @@ mod tests {
     #[test]
     fn a_turn_less_report_is_always_a_fresh_floor() {
         let mut state = ListenerState::new(wake_mode_config());
-        state.set_playback(true, true, false, None);
+        state.set_playback(true, true, false, None, UNCLOCKED);
         assert_eq!(
             barge_causes(&state.detect_wake_for_test(&pod(), 0.9, 1_024)).len(),
             1
         );
 
-        state.set_playback(true, true, true, None);
+        state.set_playback(true, true, true, None, UNCLOCKED);
         assert!(!state.playback.fired, "the next reply is its own to cut");
 
-        state.set_playback(true, true, false, None);
+        state.set_playback(true, true, false, None, UNCLOCKED);
         assert!(
             !state.playback.may_wake,
             "and says nothing the last one said"
@@ -6783,6 +7181,7 @@ mod tests {
                     interruptible: true,
                     may_wake: false,
                     turn: Some(UtteranceId(1)),
+                    at: UNCLOCKED,
                 },
                 &mut oww,
                 &mut silero,
@@ -8777,8 +9176,24 @@ mod tests {
             "a spent grant outlives a close"
         );
 
-        let back = decline_at(&mut state, 11_264, &second, &mut oww, &mut silero);
-        assert_eq!(wake_restores(&back), [(11_264, 11_264, false)], "{back:?}");
+        // A status frame short of the deadline, then the verdict 1.5 s on, when no
+        // later segment can reach back before the deadline.
+        let t = HostMicros(HOST_EPOCH_US);
+        state
+            .handle(&pod(), status_feed(cursor, t), &mut oww, &mut silero)
+            .expect("status feed");
+        let back = decline_stamped(
+            &mut state,
+            &second,
+            host_after(t, 1_500),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(
+            wake_restores(&back),
+            [(11_264, cursor + 24_000, false)],
+            "{back:?}"
+        );
         assert_eq!(
             arm_causes(&back),
             [(ArmExpiryCause::Deadline, true)],
@@ -9989,6 +10404,48 @@ mod tests {
         assert_eq!(snap.marker_send_timeouts, 0);
     }
 
+    /// A pod status frame rides the marker lane: on a full channel it waits for
+    /// room and is delivered, never dropped as audio is.
+    #[tokio::test]
+    async fn pod_status_waits_for_room_on_a_full_channel() {
+        let (sender, mut rx) = test_sender();
+        let p = pod();
+        saturate(&sender, &p).await;
+        let status_sender = sender.clone();
+        let status_pod = p.clone();
+        let status = tokio::spawn(async move {
+            status_sender
+                .feed(
+                    status_pod,
+                    Feed::PodStatus {
+                        host_rx: HostMicros(1),
+                        capture_head: 16_000,
+                        segment_reach: 16_000,
+                        first_block: 0,
+                        levels: Vec::new(),
+                    },
+                )
+                .await;
+        });
+        let mut saw_status = false;
+        for _ in 0..FEED_CHANNEL_DEPTH + 1 {
+            match rx.recv().await {
+                Some((_, Feed::PodStatus { capture_head, .. })) => {
+                    assert_eq!(capture_head, 16_000);
+                    saw_status = true;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        status.await.unwrap();
+        assert!(saw_status, "the status was delivered, not dropped");
+        let snap = sender.stats.snapshot();
+        assert_eq!(snap.dropped, 0);
+        assert_eq!(snap.marker_send_timeouts, 0);
+    }
+
     /// Markers and audio from one producer arrive in send order even when the
     /// channel is saturated and drains slowly — the property the whole design
     /// rests on.
@@ -10034,6 +10491,80 @@ mod tests {
         producer.await.unwrap();
         let tail = &seen[seen.len() - 3..];
         assert_eq!(tail, ["opened", "audio", "closed"], "seen: {seen:?}");
+    }
+
+    /// A wedged consumer costs a status frame only the short bound, and the shed
+    /// frame is counted as load, not as a corrupting marker loss.
+    #[tokio::test(start_paused = true)]
+    async fn wedged_consumer_sheds_a_status_frame_after_the_short_bound() {
+        let (sender, _rx) = test_sender();
+        let p = pod();
+        saturate(&sender, &p).await;
+        let dropped_before = sender.stats.snapshot().dropped;
+        let before = tokio::time::Instant::now();
+        sender
+            .feed(
+                p,
+                Feed::PodStatus {
+                    host_rx: UNCLOCKED,
+                    capture_head: 0,
+                    segment_reach: 0,
+                    first_block: 0,
+                    levels: Vec::new(),
+                },
+            )
+            .await;
+        assert_eq!(before.elapsed(), STATUS_SEND_TIMEOUT, "the short bound");
+        let snap = sender.stats.snapshot();
+        assert_eq!(snap.dropped, dropped_before + 1, "shed as load");
+        assert_eq!(snap.marker_send_timeouts, 0, "not a marker loss");
+        assert_eq!(snap.channel_closed, 0);
+    }
+
+    /// A status frame waits out a momentarily full channel and is delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_frame_waits_for_a_slot_freed_within_its_bound() {
+        let (sender, mut rx) = test_sender();
+        let p = pod();
+        saturate(&sender, &p).await;
+        let status = tokio::spawn({
+            let sender = sender.clone();
+            let p = p.clone();
+            async move {
+                sender
+                    .feed(
+                        p,
+                        Feed::PodStatus {
+                            host_rx: UNCLOCKED,
+                            capture_head: 7,
+                            segment_reach: 7,
+                            first_block: 0,
+                            levels: Vec::new(),
+                        },
+                    )
+                    .await;
+            }
+        });
+        tokio::time::sleep(STATUS_SEND_TIMEOUT / 2).await;
+        rx.recv().await.expect("one queued item");
+        status.await.unwrap();
+        let mut last = None;
+        while let Ok(item) = rx.try_recv() {
+            last = Some(item);
+        }
+        assert!(
+            matches!(
+                last,
+                Some((
+                    _,
+                    Feed::PodStatus {
+                        capture_head: 7,
+                        ..
+                    }
+                ))
+            ),
+            "delivered behind the queue: {last:?}"
+        );
     }
 
     /// A consumer that never drains must not hang the producer forever: the marker
@@ -10119,6 +10650,7 @@ mod tests {
                 interruptible: false,
                 may_wake: false,
                 turn: None,
+                at: UNCLOCKED,
             },
         );
         assert!(matches!(
@@ -10254,5 +10786,1298 @@ mod tests {
             512,
             "the 512 re-sent samples are counted whatever the inference outcome"
         );
+    }
+
+    /// The pre-roll a pod whose ring holds more than a second states in every
+    /// status frame.
+    const POD_REACH: u64 = 16_000;
+
+    /// A status frame stating the pod's capture position, received at `host_rx`,
+    /// from a pod whose segments reach back [`POD_REACH`].
+    fn status_feed(capture_head: u64, host_rx: HostMicros) -> Feed {
+        status_feed_reaching(capture_head, POD_REACH, host_rx)
+    }
+
+    /// A status frame stating the pod's capture position and its segment reach.
+    fn status_feed_reaching(capture_head: u64, segment_reach: u64, host_rx: HostMicros) -> Feed {
+        Feed::PodStatus {
+            host_rx,
+            capture_head,
+            segment_reach: u32::try_from(segment_reach).unwrap(),
+            first_block: 0,
+            levels: Vec::new(),
+        }
+    }
+
+    /// `ms` milliseconds of host time after `t`.
+    fn host_after(t: HostMicros, ms: u64) -> HostMicros {
+        HostMicros(t.0 + ms * 1_000)
+    }
+
+    /// A connected pod with one closed segment of real audio frames (silence)
+    /// ending at `last`, the way the live path leaves the listener after a turn:
+    /// the last audio anchored the pod clock, and nothing has arrived since.
+    fn state_after_a_segment_ending_at(
+        last: u64,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> ListenerState {
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        let base = last - 4_096;
+        open(&mut state, base, oww, silero);
+        feed_audio_chunkwise(&mut state, base, &[0_i16; 4_096], oww, silero);
+        close_segment(&mut state, last, oww, silero);
+        state
+    }
+
+    fn listen_at(
+        state: &mut ListenerState,
+        window_samples: u64,
+        at: HostMicros,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> Vec<ListenerEvent> {
+        state
+            .handle(&pod(), Feed::Listen { window_samples, at }, oww, silero)
+            .expect("listen feed")
+    }
+
+    /// `(at_sample, deadline_sample)` of every window opened in `events`.
+    fn opened_windows(events: &[ListenerEvent]) -> Vec<(u64, u64)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ListenerEvent::ListenOpened {
+                    at_sample,
+                    deadline_sample,
+                    ..
+                } => Some((*at_sample, *deadline_sample)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The defect this clock exists for. The last audio of a turn ends at
+    /// 292 876 480; the brain thinks and the reply plays for 8.5 s with no segment
+    /// open, so no audio arrives; then the reply asks to keep listening. Dated
+    /// from the last audio the window's deadline would be 8.5 s gone by the time
+    /// the person answers, and the answer's segment would retire it. Dated from
+    /// the pod's position at the request it runs its full 8 s, and the answer,
+    /// which begins 1.8 s into it, carves as a follow-up.
+    #[test]
+    fn a_window_asked_for_after_a_silence_runs_from_the_pod_s_position_then() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 292_876_480;
+        let mut state = state_after_a_segment_ending_at(last, &mut oww, &mut silero);
+
+        let opened = listen_at(
+            &mut state,
+            128_000,
+            host_after(rx_at(last), 8_500),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(
+            opened_windows(&opened),
+            [(293_012_480, 293_140_480)],
+            "dated from where the pod is, a full window long: {opened:?}"
+        );
+
+        let onset = 293_041_152;
+        let preroll = 16_384;
+        let mut events = open_segment(
+            &mut state,
+            onset - preroll,
+            preroll as u32,
+            &mut oww,
+            &mut silero,
+        );
+        events.extend(feed_audio_chunkwise(
+            &mut state,
+            onset - preroll,
+            &vec![0_i16; preroll as usize],
+            &mut oww,
+            &mut silero,
+        ));
+        state.push_ring_for_test(onset, &vec![5_i16; 8_192]);
+        let mut cursor = onset;
+        events.extend(drive(&mut state, 0.9, 2, &mut cursor));
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert_eq!(expiries(&events), 0, "the window is still open: {events:?}");
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "the answer carves: {events:?}");
+        assert!(carved[0].follow_up, "as a follow-up, with no wake word");
+    }
+
+    /// A status frame between the last audio and the request re-anchors the
+    /// clock on the pod's own word, so the window is dated from its
+    /// `capture_head` and not from an extrapolation of the audio.
+    #[test]
+    fn a_status_frame_dates_the_window_from_its_capture_head() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 292_876_480;
+        let mut state = state_after_a_segment_ending_at(last, &mut oww, &mut silero);
+
+        // 7 s after the last audio the pod reports 112 160 samples on: its crystal
+        // runs 10 ms ahead of the host's reckoning, and the pod is the authority.
+        let status_rx = host_after(rx_at(last), 7_000);
+        state
+            .handle(
+                &pod(),
+                status_feed(last + 112_160, status_rx),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        let opened = listen_at(
+            &mut state,
+            128_000,
+            host_after(status_rx, 1_500),
+            &mut oww,
+            &mut silero,
+        );
+        let at = last + 112_160 + 24_000;
+        assert_eq!(opened_windows(&opened), [(at, at + 128_000)], "{opened:?}");
+    }
+
+    /// In a room nobody speaks in, no audio arrives to carry the per-chunk check
+    /// past the deadline. The pod's status frames do, once the pod says no later
+    /// segment can reach back before it: a frame whose head is past the deadline
+    /// by less than its segment reach leaves the window open, and the first whose
+    /// `capture_head - segment_reach` is at or past the deadline ends it.
+    #[test]
+    fn a_window_nobody_speaks_into_ends_on_the_first_status_past_its_deadline() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 1,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("connect");
+        let t = HostMicros(HOST_EPOCH_US);
+        state
+            .handle(&pod(), status_feed(1_000_000, t), &mut oww, &mut silero)
+            .expect("status feed");
+        let opened = listen_at(&mut state, 128_000, t, &mut oww, &mut silero);
+        assert_eq!(opened_windows(&opened), [(1_000_000, 1_128_000)]);
+
+        let before = state
+            .handle(
+                &pod(),
+                status_feed(1_126_400, host_after(t, 7_900)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(expiries(&before), 0, "not yet: {before:?}");
+        assert!(state.capture.open().is_some());
+
+        for (head, after_ms) in [(1_142_400, 8_900), (1_143_999, 8_999)] {
+            let within_reach = state
+                .handle(
+                    &pod(),
+                    status_feed(head, host_after(t, after_ms)),
+                    &mut oww,
+                    &mut silero,
+                )
+                .expect("status feed");
+            assert_eq!(
+                expiries(&within_reach),
+                0,
+                "the head is past the deadline, but a segment opened now would reach \
+                 back before it: {within_reach:?}"
+            );
+            assert!(state.capture.open().is_some());
+        }
+
+        let past = state
+            .handle(
+                &pod(),
+                status_feed(1_128_000 + POD_REACH, host_after(t, 9_000)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(expiries(&past), 1, "ended with no audio: {past:?}");
+        assert!(state.capture.open().is_none());
+    }
+
+    /// A segment's pre-roll describes audio captured up to a second before it is
+    /// sent; it must not pull the clock back. A status frame is always adopted,
+    /// even behind the projection. And a request stamped before the anchor (a
+    /// host clock stepped back) projects no elapsed time.
+    #[test]
+    fn pre_roll_never_moves_the_clock_back_and_a_status_frame_always_does() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let head = 2_000_000;
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        open(&mut state, head - 16_000, &mut oww, &mut silero);
+        let t = rx_at(head);
+        state
+            .handle(&pod(), status_feed(head, t), &mut oww, &mut silero)
+            .expect("status feed");
+        // The pre-roll's first frame, ending 15 488 samples behind the head,
+        // received 50 ms after the status frame.
+        let late_us = t.0 + 50_000 - rx_at(head - 15_488).0;
+        feed_audio_late(
+            &mut state,
+            head - 16_000,
+            &[0_i16; 512],
+            late_us,
+            &mut oww,
+            &mut silero,
+        );
+        let opened = listen_at(&mut state, 1_000, host_after(t, 50), &mut oww, &mut silero);
+        assert_eq!(
+            opened_windows(&opened),
+            [(head + 800, head + 1_800)],
+            "{opened:?}"
+        );
+
+        let stepped_back = listen_at(
+            &mut state,
+            1_000,
+            HostMicros(t.0 - 1_000_000),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(
+            opened_windows(&stepped_back),
+            [(head, head + 1_000)],
+            "no elapsed time before the anchor: {stepped_back:?}"
+        );
+
+        state
+            .handle(
+                &pod(),
+                status_feed(head - 8_000, host_after(t, 60)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        let re_anchored = listen_at(&mut state, 1_000, host_after(t, 60), &mut oww, &mut silero);
+        assert_eq!(
+            opened_windows(&re_anchored),
+            [(head - 8_000, head - 7_000)],
+            "the pod's word replaces the projection: {re_anchored:?}"
+        );
+    }
+
+    /// A reply that ends with no segment open mutes the pod's next stretch of
+    /// capture, not a stretch the last segment already passed: 5 s after the
+    /// last audio, the tail runs from the pod's position then.
+    #[test]
+    fn the_playback_tail_runs_from_the_pod_s_position_when_the_reply_ends() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 1_000_000;
+        let mut state = state_after_a_segment_ending_at(last, &mut oww, &mut silero);
+        let tail = state.config.mute_tail_samples;
+        for (active, after_ms) in [(true, 500), (false, 5_500)] {
+            state
+                .handle(
+                    &pod(),
+                    playback_feed_at(active, host_after(rx_at(last), after_ms)),
+                    &mut oww,
+                    &mut silero,
+                )
+                .expect("playback feed");
+        }
+        assert_eq!(state.tail_until_sample, last + 88_000 + tail);
+    }
+
+    /// A pod with a window spent on a follow-up carved from real audio ending at
+    /// `last`, the speech after it driven synthetically. Returns the state, the
+    /// stream position after the carve's continuation has run out, and the id.
+    fn state_with_a_spent_window_after_audio(
+        last: u64,
+        window_samples: u64,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> (ListenerState, u64, ListenerUtteranceId) {
+        let mut state = state_after_a_segment_ending_at(last, oww, silero);
+        listen_at(&mut state, window_samples, rx_at(last), oww, silero);
+        open_segment(&mut state, last, 0, oww, silero);
+        state.push_ring_for_test(last, &vec![5_i16; 8_192]);
+        let mut cursor = last;
+        let mut events = drive(&mut state, 0.9, 2, &mut cursor);
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "the follow-up carves: {events:?}");
+        assert!(carved[0].follow_up);
+        let id = carved[0].utterance_id.clone();
+        drive(&mut state, 0.1, 4, &mut cursor);
+        close_segment(&mut state, cursor, oww, silero);
+        (state, cursor, id)
+    }
+
+    fn decline_stamped(
+        state: &mut ListenerState,
+        id: &ListenerUtteranceId,
+        at: HostMicros,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> Vec<ListenerEvent> {
+        state
+            .handle(
+                &pod(),
+                Feed::CandidateDeclined { id: id.clone(), at },
+                oww,
+                silero,
+            )
+            .expect("decline feed")
+    }
+
+    /// A decline that lands 3 s after the segment closed restores the window with
+    /// what is left of it measured from the pod's position then; a window whose
+    /// deadline passed in those 3 s comes back and ends in the same call.
+    #[test]
+    fn a_decline_after_the_segment_closed_is_measured_from_the_pod_s_position() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 1_000_000;
+
+        let (mut state, cursor, id) =
+            state_with_a_spent_window_after_audio(last, 128_000, &mut oww, &mut silero);
+        state
+            .handle(
+                &pod(),
+                status_feed(cursor, rx_at(cursor)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        let back = decline_stamped(
+            &mut state,
+            &id,
+            host_after(rx_at(cursor), 3_000),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(restored_at(&back), [cursor + 48_000], "{back:?}");
+        assert_eq!(restored_deadlines(&back), [last + 128_000]);
+        assert_eq!(expiries(&back), 0, "time is left: {back:?}");
+
+        let (mut state, cursor, id) =
+            state_with_a_spent_window_after_audio(last, 32_000, &mut oww, &mut silero);
+        assert!(
+            cursor < last + 32_000,
+            "the deadline was ahead at the close"
+        );
+        state
+            .handle(
+                &pod(),
+                status_feed(cursor, rx_at(cursor)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert!(
+            cursor + 48_000 - POD_REACH >= last + 32_000,
+            "3 s on, a segment opened would begin past the deadline"
+        );
+        let back = decline_stamped(
+            &mut state,
+            &id,
+            host_after(rx_at(cursor), 3_000),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(restored_deadlines(&back), [last + 32_000], "{back:?}");
+        assert_eq!(expiries(&back), 1, "and ended at once: {back:?}");
+        assert!(state.capture.open().is_none());
+    }
+
+    /// A follow-up that begins just before the deadline opens a segment whose first
+    /// status frame, sent ahead of the pre-roll backlog, reports the pod's head
+    /// already past the deadline. The audio holding the speech's start is still on
+    /// its way, so that frame does not end the window, and the answer carves as a
+    /// follow-up with no `ListenExpired` before it.
+    #[test]
+    fn a_status_ahead_of_a_segment_s_backlog_does_not_end_the_window() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 1_000_000;
+        let mut state = state_after_a_segment_ending_at(last, &mut oww, &mut silero);
+        let deadline = last + 64_000;
+        let opened = listen_at(&mut state, 64_000, rx_at(last), &mut oww, &mut silero);
+        assert_eq!(opened_windows(&opened), [(last, deadline)]);
+
+        let onset = deadline - 4_096;
+        let preroll = 16_384;
+        let mut events = open_segment(
+            &mut state,
+            onset - preroll,
+            preroll as u32,
+            &mut oww,
+            &mut silero,
+        );
+        events.extend(
+            state
+                .handle(
+                    &pod(),
+                    status_feed(deadline + 3_200, host_after(rx_at(last), 4_200)),
+                    &mut oww,
+                    &mut silero,
+                )
+                .expect("status feed"),
+        );
+        assert_eq!(expiries(&events), 0, "the backlog is unheard: {events:?}");
+        events.extend(feed_audio_chunkwise(
+            &mut state,
+            onset - preroll,
+            &vec![0_i16; preroll as usize],
+            &mut oww,
+            &mut silero,
+        ));
+        state.push_ring_for_test(onset, &vec![5_i16; 8_192]);
+        let mut cursor = onset;
+        events.extend(drive(&mut state, 0.9, 2, &mut cursor));
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert_eq!(expiries(&events), 0, "the window is still open: {events:?}");
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "the answer carves: {events:?}");
+        assert!(carved[0].follow_up, "as a follow-up, with no wake word");
+    }
+
+    /// A decline that lands while a segment's audio is in flight restores the
+    /// window dated from the pod's head, and judges its expiry at the stream's own
+    /// position: the audio up to the head may hold speech begun before the
+    /// deadline, so the window is not ended on the head's word.
+    #[test]
+    fn a_decline_during_a_segment_s_backlog_does_not_end_the_window() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 1_000_000;
+        let (mut state, cursor, id) =
+            state_with_a_spent_window_after_audio(last, 64_000, &mut oww, &mut silero);
+        let deadline = last + 64_000;
+        open_segment(&mut state, cursor, 16_384, &mut oww, &mut silero);
+        let t = host_after(rx_at(cursor), 3_000);
+        let head = deadline + 3_200;
+        state
+            .handle(&pod(), status_feed(head, t), &mut oww, &mut silero)
+            .expect("status feed");
+
+        let back = decline_stamped(&mut state, &id, host_after(t, 100), &mut oww, &mut silero);
+        assert_eq!(restored_at(&back), [head + 1_600], "{back:?}");
+        assert_eq!(restored_deadlines(&back), [deadline]);
+        assert_eq!(expiries(&back), 0, "the backlog is unheard: {back:?}");
+        assert!(state.capture.open().is_some());
+    }
+
+    /// A pod that reconnects starts a new sample domain, and the previous
+    /// connection's position must not leak into "now": after real audio far into
+    /// the old domain, a status frame on the new connection dates the window, and a
+    /// later status frame past its deadline ends it.
+    #[test]
+    fn after_a_reconnect_the_window_is_dated_in_the_new_connection_s_domain() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 292_876_480;
+        let mut state = state_after_a_segment_ending_at(last, &mut oww, &mut silero);
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("connect");
+        let t = host_after(rx_at(last), 5_000);
+        state
+            .handle(&pod(), status_feed(16_000, t), &mut oww, &mut silero)
+            .expect("status feed");
+
+        let opened = listen_at(
+            &mut state,
+            128_000,
+            host_after(t, 500),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(
+            opened_windows(&opened),
+            [(24_000, 152_000)],
+            "in the new connection's domain: {opened:?}"
+        );
+
+        let at_deadline = state
+            .handle(
+                &pod(),
+                status_feed(152_000, host_after(t, 8_500)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(expiries(&at_deadline), 0, "within reach: {at_deadline:?}");
+        let past = state
+            .handle(
+                &pod(),
+                status_feed(152_000 + POD_REACH, host_after(t, 9_500)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(
+            expiries(&past),
+            1,
+            "ended on the new domain's clock: {past:?}"
+        );
+    }
+
+    /// A wake grant given back by a decline is dated from the pod's position at the
+    /// verdict, not from where the last audio left the stream: a quarter second on,
+    /// the grant stands with time left. 1.2 s on, the head is past its deadline but
+    /// a segment opened then would reach back before it, so it still stands; 1.3 s
+    /// on, no later segment can, and it comes back and ends in the same call.
+    #[test]
+    fn a_wake_decline_is_dated_from_the_pod_s_position() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let t = HostMicros(HOST_EPOCH_US);
+        for (after_ms, at, expired) in [
+            (250, 10_656, false),
+            (1_200, 25_856, false),
+            (1_300, 27_456, true),
+        ] {
+            let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+            drive(&mut state, 0.1, 4, &mut cursor);
+            assert_eq!(cursor, 6_656);
+            state
+                .handle(&pod(), status_feed(cursor, t), &mut oww, &mut silero)
+                .expect("status feed");
+
+            let back = decline_stamped(
+                &mut state,
+                &utt.utterance_id,
+                host_after(t, after_ms),
+                &mut oww,
+                &mut silero,
+            );
+            assert_eq!(wake_restores(&back), [(11_264, at, false)], "{back:?}");
+            if expired {
+                assert_eq!(
+                    arm_causes(&back),
+                    [(ArmExpiryCause::Deadline, true)],
+                    "expired in the same call: {back:?}"
+                );
+                assert!(matches!(state.grant, WakeGrant::None));
+            } else {
+                assert!(arm_expiries(&back).is_empty(), "the grant stands: {back:?}");
+                assert!(matches!(state.grant, WakeGrant::Standing(_)));
+            }
+        }
+    }
+
+    /// The wake-side twin of the window restored within the reach: a grant a
+    /// decline gives back with the pod's head past its deadline by less than the
+    /// reach, and nobody speaking, stands; a status frame whose head is still
+    /// within the reach ends nothing, and the first one whose head less the reach
+    /// is past the deadline ends it, with no audio in the take.
+    #[test]
+    fn a_wake_grant_restored_within_the_reach_stands_until_a_status_ends_it() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let t = HostMicros(HOST_EPOCH_US);
+        let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+        drive(&mut state, 0.1, 4, &mut cursor);
+        state
+            .handle(&pod(), status_feed(cursor, t), &mut oww, &mut silero)
+            .expect("status feed");
+
+        let back = decline_stamped(
+            &mut state,
+            &utt.utterance_id,
+            host_after(t, 1_200),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(wake_restores(&back), [(11_264, 25_856, false)], "{back:?}");
+        assert!(arm_expiries(&back).is_empty(), "within the reach: {back:?}");
+
+        // Head 27 056: 11 056 less the reach, still short of the deadline.
+        let within = state
+            .handle(
+                &pod(),
+                status_feed(27_056, host_after(t, 1_275)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert!(arm_expiries(&within).is_empty(), "{within:?}");
+        assert!(matches!(state.grant, WakeGrant::Standing(_)));
+
+        // Head 27 264: the reach puts it exactly on the deadline.
+        let past = state
+            .handle(
+                &pod(),
+                status_feed(27_264, host_after(t, 1_288)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(
+            arm_causes(&past),
+            [(ArmExpiryCause::Deadline, true)],
+            "ended on the status path: {past:?}"
+        );
+        assert!(matches!(state.grant, WakeGrant::None));
+    }
+
+    /// A grant restored with time left, in a room nobody speaks into, ends on a
+    /// status frame whose head less the reach is past its deadline, and a window
+    /// opened beside it and past its own deadline ends in the same frame, after
+    /// the grant that kept it.
+    #[test]
+    fn a_status_past_a_standing_grant_ends_it_and_the_window_it_kept() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let t = HostMicros(HOST_EPOCH_US);
+        let (mut state, mut cursor, utt) = state_with_a_spent_grant();
+        drive(&mut state, 0.1, 4, &mut cursor);
+        state
+            .handle(&pod(), status_feed(cursor, t), &mut oww, &mut silero)
+            .expect("status feed");
+        let back = decline_stamped(
+            &mut state,
+            &utt.utterance_id,
+            host_after(t, 250),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(wake_restores(&back), [(11_264, 10_656, false)], "{back:?}");
+        let opened = state
+            .handle(
+                &pod(),
+                Feed::Listen {
+                    window_samples: 1_000,
+                    at: host_after(t, 260),
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("listen");
+        assert_eq!(opened_windows(&opened).len(), 1, "{opened:?}");
+
+        let (_, window_deadline) = opened_windows(&opened)[0];
+        assert!(window_deadline > 11_264, "{window_deadline}");
+
+        // Head less the reach past both deadlines.
+        let past = state
+            .handle(
+                &pod(),
+                status_feed(window_deadline + POD_REACH, host_after(t, 1_400)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(
+            arm_causes(&past),
+            [(ArmExpiryCause::Deadline, true)],
+            "{past:?}"
+        );
+        assert_eq!(expiries(&past), 1, "the window it kept ends too: {past:?}");
+        assert!(matches!(state.grant, WakeGrant::None));
+        assert!(state.capture.open().is_none());
+    }
+
+    /// A window `window_samples` long opened at the end of a closed segment of real
+    /// audio ending at `last`, with the pod's status frames stating
+    /// [`POD_REACH`]; then a status frame received 4.2 s on reporting the pod's head
+    /// 3 200 samples past the deadline, ahead of any segment. Returns the state, the
+    /// deadline and the events so far.
+    fn window_past_its_deadline_at_the_head(
+        last: u64,
+        window_samples: u64,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> (ListenerState, u64, Vec<ListenerEvent>) {
+        let mut state = state_after_a_segment_ending_at(last, oww, silero);
+        let deadline = last + window_samples;
+        let mut events = listen_at(&mut state, window_samples, rx_at(last), oww, silero);
+        assert_eq!(opened_windows(&events), [(last, deadline)]);
+        events.extend(
+            state
+                .handle(
+                    &pod(),
+                    status_feed(deadline + 3_200, host_after(rx_at(last), 4_200)),
+                    oww,
+                    silero,
+                )
+                .expect("status feed"),
+        );
+        (state, deadline, events)
+    }
+
+    /// The race the segment reach closes. A window's deadline passes in a silent
+    /// room, and the pod's next status frame reports its head past the deadline
+    /// but within its segment reach, ahead of the `SegmentOpened` for speech that
+    /// began just before the deadline. The frame ends nothing, and the answer —
+    /// in a segment beginning no earlier than the frame said one could — carves
+    /// as a follow-up with no `ListenExpired` before it.
+    #[test]
+    fn a_status_ahead_of_the_segment_for_speech_begun_before_the_deadline_ends_nothing() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, deadline, mut events) =
+            window_past_its_deadline_at_the_head(1_000_000, 64_000, &mut oww, &mut silero);
+        assert_eq!(
+            expiries(&events),
+            0,
+            "a segment opened now would reach back before the deadline: {events:?}"
+        );
+
+        let speech = deadline - 4_096;
+        let base = speech - 8_192;
+        assert!(
+            base >= deadline + 3_200 - POD_REACH,
+            "within the stated reach"
+        );
+        events.extend(open_segment(
+            &mut state,
+            base,
+            POD_REACH as u32,
+            &mut oww,
+            &mut silero,
+        ));
+        events.extend(feed_audio_chunkwise(
+            &mut state,
+            base,
+            &[0_i16; 8_192],
+            &mut oww,
+            &mut silero,
+        ));
+        state.push_ring_for_test(speech, &vec![5_i16; 8_192]);
+        let mut cursor = speech;
+        events.extend(drive(&mut state, 0.9, 2, &mut cursor));
+        events.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert_eq!(expiries(&events), 0, "the window is still open: {events:?}");
+        let carved = soft_endpoints(&events);
+        assert_eq!(carved.len(), 1, "the answer carves: {events:?}");
+        assert!(carved[0].follow_up, "as a follow-up, with no wake word");
+    }
+
+    /// The same frames with the speech beginning after the deadline: the reach
+    /// does not lengthen the window. The segment's audio carries the per-chunk
+    /// check past the deadline with nothing said, the window ends there, and the
+    /// speech after it is nobody's follow-up.
+    #[test]
+    fn speech_begun_after_the_deadline_is_refused_whatever_the_reach() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, deadline, mut events) =
+            window_past_its_deadline_at_the_head(1_000_000, 64_000, &mut oww, &mut silero);
+        assert_eq!(expiries(&events), 0, "{events:?}");
+
+        let speech = deadline + 4_096;
+        let base = deadline - 12_288;
+        events.extend(open_segment(
+            &mut state,
+            base,
+            POD_REACH as u32,
+            &mut oww,
+            &mut silero,
+        ));
+        events.extend(feed_audio_chunkwise(
+            &mut state,
+            base,
+            &[0_i16; 16_384],
+            &mut oww,
+            &mut silero,
+        ));
+        assert_eq!(
+            expiries(&events),
+            1,
+            "ended on the audio past it: {events:?}"
+        );
+        state.push_ring_for_test(speech, &vec![5_i16; 8_192]);
+        let mut cursor = speech;
+        let mut after = drive(&mut state, 0.9, 2, &mut cursor);
+        after.extend(drive(&mut state, 0.1, 3, &mut cursor));
+        assert_eq!(listen_heards(&after), 0, "no window is open: {after:?}");
+        assert!(
+            soft_endpoints(&after).iter().all(|u| !u.follow_up),
+            "not a follow-up: {after:?}"
+        );
+    }
+
+    /// A decline with no segment open, landing when the pod's head is past the
+    /// deadline by less than its reach, restores the window and ends nothing in
+    /// that call; the next status frame whose head less the reach is past the
+    /// deadline ends it.
+    #[test]
+    fn a_window_restored_within_the_reach_stands_until_a_status_ends_it() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 1_000_000;
+        let deadline = last + 32_000;
+        let (mut state, cursor, id) =
+            state_with_a_spent_window_after_audio(last, 32_000, &mut oww, &mut silero);
+        state
+            .handle(
+                &pod(),
+                status_feed(cursor, rx_at(cursor)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        let head = cursor + 32_000;
+        assert!(head > deadline && head - POD_REACH < deadline, "{cursor}");
+
+        let back = decline_stamped(
+            &mut state,
+            &id,
+            host_after(rx_at(cursor), 2_000),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(restored_at(&back), [head], "{back:?}");
+        assert_eq!(restored_deadlines(&back), [deadline]);
+        assert_eq!(expiries(&back), 0, "within the reach: {back:?}");
+        assert!(state.capture.open().is_some());
+
+        let next = state
+            .handle(
+                &pod(),
+                status_feed(cursor + 48_000, host_after(rx_at(cursor), 3_000)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(expiries(&next), 1, "{next:?}");
+        assert!(state.capture.open().is_none());
+    }
+
+    /// The reach is the connection's own. With no status frame on it (a v3 frame
+    /// log) it is 0 and a deadline off the audio path is judged at the pod's
+    /// position; a reconnect forgets the previous connection's.
+    #[test]
+    fn a_segment_reach_is_the_connection_s_own() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 1_000_000;
+        let mut state = state_after_a_segment_ending_at(last, &mut oww, &mut silero);
+        let at = rx_at(last);
+        assert_eq!(state.segment_reach, 0);
+        assert_eq!(state.heard_through(at), Some(last), "no status: no reach");
+
+        state
+            .handle(&pod(), status_feed(last, at), &mut oww, &mut silero)
+            .expect("status feed");
+        assert_eq!(state.heard_through(at), Some(last - POD_REACH));
+
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("connect");
+        assert_eq!(state.heard_through(at), None, "no position yet");
+        open_segment(&mut state, 0, 0, &mut oww, &mut silero);
+        feed_audio_chunkwise(&mut state, 0, &[0_i16; 4_096], &mut oww, &mut silero);
+        close_segment(&mut state, 4_096, &mut oww, &mut silero);
+        assert_eq!(
+            state.heard_through(rx_at(4_096)),
+            Some(4_096),
+            "the old connection's reach is not used: {:?}",
+            state.segment_reach
+        );
+    }
+
+    /// A pod that reconnects (here, after a reboot: the new connection counts from
+    /// 0) and gets a `<listen/>` before its first status frame. The window cannot
+    /// be dated in the old domain, so it waits: no line and no window until the
+    /// status frame gives the connection a position, then the window opens there,
+    /// a full window long, and ends by the reach rule in the new domain.
+    #[test]
+    fn a_window_asked_for_before_the_connection_has_a_position_opens_when_it_does() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 292_876_480;
+        let mut state = state_after_a_segment_ending_at(last, &mut oww, &mut silero);
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("connect");
+        let t = host_after(rx_at(last), 5_000);
+        let asked = listen_at(&mut state, 128_000, t, &mut oww, &mut silero);
+        assert!(asked.is_empty(), "nothing to say yet: {asked:?}");
+        assert!(state.capture.window().is_none());
+
+        let first = state
+            .handle(
+                &pod(),
+                status_feed(16_000, host_after(t, 30)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(opened_windows(&first), [(16_000, 144_000)], "{first:?}");
+
+        let within = state
+            .handle(
+                &pod(),
+                status_feed(144_000 + POD_REACH - 1, host_after(t, 9_000)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(expiries(&within), 0, "{within:?}");
+        let past = state
+            .handle(
+                &pod(),
+                status_feed(144_000 + POD_REACH, host_after(t, 9_001)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(expiries(&past), 1, "{past:?}");
+    }
+
+    fn playback_at(
+        state: &mut ListenerState,
+        active: bool,
+        at: HostMicros,
+        oww: &mut OwwModels,
+        silero: &mut SileroModel,
+    ) -> Vec<ListenerEvent> {
+        state
+            .handle(&pod(), playback_feed_at(active, at), oww, silero)
+            .expect("playback feed")
+    }
+
+    /// The mute tail's twin. After the same reconnect a reply starts and stops
+    /// before any status frame: the tail cannot be dated in the old domain, where
+    /// it would mute the new connection's every chunk, so it runs from the
+    /// position the first status frame gives — a chunk ending inside it is muted,
+    /// and the first chunk past it is scored.
+    #[test]
+    fn a_reply_that_ends_before_the_connection_has_a_position_mutes_from_the_one_it_gets() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(mute_config());
+        let last = 292_876_480;
+        open(&mut state, last - 4_096, &mut oww, &mut silero);
+        feed_audio_chunkwise(
+            &mut state,
+            last - 4_096,
+            &[0_i16; 4_096],
+            &mut oww,
+            &mut silero,
+        );
+        close_segment(&mut state, last, &mut oww, &mut silero);
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("connect");
+        let t = host_after(rx_at(last), 5_000);
+        playback_at(&mut state, true, t, &mut oww, &mut silero);
+        playback_at(
+            &mut state,
+            false,
+            host_after(t, 2_000),
+            &mut oww,
+            &mut silero,
+        );
+        assert_eq!(state.tail_until_sample, 0, "nothing dated yet");
+
+        let head = 16_000;
+        state
+            .handle(
+                &pod(),
+                status_feed(head, host_after(t, 2_010)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        let tail = state.config.mute_tail_samples;
+        assert_eq!(state.tail_until_sample, head + tail);
+        assert!(state.muted(head + tail), "inside the tail");
+        assert!(!state.muted(head + tail + 1), "and scored past it");
+    }
+
+    /// An undated tail goes, with nothing applied, when its reason does: a reply
+    /// starting again keeps the floor up, which needs no tail, and a new connection
+    /// is not the one the reply played on. The first position after either dates
+    /// no tail.
+    #[test]
+    fn an_undated_tail_is_dropped_by_a_reply_starting_or_a_reconnect() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        for reconnect in [false, true] {
+            let mut state = ListenerState::new(mute_config());
+            let last = 1_000_000;
+            open(&mut state, last - 4_096, &mut oww, &mut silero);
+            feed_audio_chunkwise(
+                &mut state,
+                last - 4_096,
+                &[0_i16; 4_096],
+                &mut oww,
+                &mut silero,
+            );
+            close_segment(&mut state, last, &mut oww, &mut silero);
+            state
+                .handle(
+                    &pod(),
+                    Feed::Connected {
+                        epoch: 2,
+                        level_source: LevelSource::Beam,
+                    },
+                    &mut oww,
+                    &mut silero,
+                )
+                .expect("connect");
+            let t = host_after(rx_at(last), 5_000);
+            playback_at(&mut state, true, t, &mut oww, &mut silero);
+            playback_at(
+                &mut state,
+                false,
+                host_after(t, 2_000),
+                &mut oww,
+                &mut silero,
+            );
+            if reconnect {
+                state
+                    .handle(
+                        &pod(),
+                        Feed::Connected {
+                            epoch: 3,
+                            level_source: LevelSource::Beam,
+                        },
+                        &mut oww,
+                        &mut silero,
+                    )
+                    .expect("connect");
+            } else {
+                playback_at(
+                    &mut state,
+                    true,
+                    host_after(t, 2_005),
+                    &mut oww,
+                    &mut silero,
+                );
+            }
+            state
+                .handle(
+                    &pod(),
+                    status_feed(16_000, host_after(t, 2_010)),
+                    &mut oww,
+                    &mut silero,
+                )
+                .expect("status feed");
+            assert_eq!(
+                state.tail_until_sample, 0,
+                "reconnect {reconnect}: no tail dated"
+            );
+        }
+    }
+
+    /// What waited for a position goes, with no line, when its reason does: a
+    /// reply starting supersedes the window, and so does a new connection.
+    #[test]
+    fn an_undated_window_is_dropped_by_a_reply_starting_or_a_reconnect() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        for reconnect in [false, true] {
+            let mut state = state_after_a_segment_ending_at(1_000_000, &mut oww, &mut silero);
+            state
+                .handle(
+                    &pod(),
+                    Feed::Connected {
+                        epoch: 2,
+                        level_source: LevelSource::Beam,
+                    },
+                    &mut oww,
+                    &mut silero,
+                )
+                .expect("connect");
+            let t = host_after(rx_at(1_000_000), 5_000);
+            listen_at(&mut state, 128_000, t, &mut oww, &mut silero);
+            let dropped = if reconnect {
+                state
+                    .handle(
+                        &pod(),
+                        Feed::Connected {
+                            epoch: 3,
+                            level_source: LevelSource::Beam,
+                        },
+                        &mut oww,
+                        &mut silero,
+                    )
+                    .expect("connect")
+            } else {
+                playback_at(&mut state, true, host_after(t, 10), &mut oww, &mut silero)
+            };
+            assert_eq!(expiries(&dropped), 0, "no line for a window never opened");
+            let first = state
+                .handle(
+                    &pod(),
+                    status_feed(16_000, host_after(t, 30)),
+                    &mut oww,
+                    &mut silero,
+                )
+                .expect("status feed");
+            assert!(
+                opened_windows(&first).is_empty(),
+                "reconnect {reconnect}: {first:?}"
+            );
+            assert!(state.capture.window().is_none());
+        }
+    }
+
+    /// A decline on a connection with no position restores nothing: the reset
+    /// that began the connection took the window, and there is nothing to date a
+    /// restore from.
+    #[test]
+    fn a_decline_before_the_connection_has_a_position_says_nothing() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let (mut state, cursor, id) =
+            state_with_a_spent_window_after_audio(1_000_000, 128_000, &mut oww, &mut silero);
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 2,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("connect");
+        let back = decline_stamped(
+            &mut state,
+            &id,
+            host_after(rx_at(cursor), 1_000),
+            &mut oww,
+            &mut silero,
+        );
+        assert!(back.is_empty(), "{back:?}");
+        assert!(state.capture.window().is_none());
+    }
+
+    /// A frame log recorded before status frames existed gives the connection its
+    /// position with its first audio: an undated window opens on the first chunk,
+    /// dated from where that chunk ends.
+    #[test]
+    fn with_no_status_frame_an_undated_window_opens_on_the_first_audio() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 1,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("connect");
+        let asked = listen_at(&mut state, 128_000, rx_at(40_000), &mut oww, &mut silero);
+        assert!(asked.is_empty(), "{asked:?}");
+        let opened = open_segment(&mut state, 48_000, 0, &mut oww, &mut silero);
+        assert!(
+            opened_windows(&opened).is_empty(),
+            "a segment is no position"
+        );
+        let first = feed_audio(&mut state, 48_000, &[0_i16; 512], &mut oww, &mut silero);
+        assert_eq!(opened_windows(&first), [(48_512, 176_512)], "{first:?}");
+    }
+
+    /// A first audio frame that dates an undated window and then fails scoring
+    /// still reports the window: it is open, and its `ListenOpened` comes back
+    /// with the error.
+    #[test]
+    fn a_window_dated_by_audio_whose_scoring_fails_still_reports_its_open() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let mut state = ListenerState::new(synth_config(WakePolicy::WakeGated));
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch: 1,
+                    level_source: LevelSource::Beam,
+                },
+                &mut oww,
+                &mut silero,
+            )
+            .expect("connect");
+        listen_at(&mut state, 128_000, rx_at(40_000), &mut oww, &mut silero);
+        open_segment(&mut state, 48_000, 0, &mut oww, &mut silero);
+        state.fail_next_scoring = Some(WakeError::NonFiniteScore);
+        let Err(failed) = state.handle(
+            &pod(),
+            audio_feed(48_000, vec![0_i16; 512]),
+            &mut oww,
+            &mut silero,
+        ) else {
+            panic!("scoring was set to fail");
+        };
+        assert!(matches!(failed.error, WakeError::NonFiniteScore));
+        assert_eq!(
+            opened_windows(&failed.events),
+            [(48_512, 176_512)],
+            "{:?}",
+            failed.events
+        );
+        assert!(state.capture.open().is_some());
+    }
+
+    /// A window wider than any sample count saturates its deadline rather than
+    /// wrapping it behind "now", so it never expires.
+    #[test]
+    fn a_saturated_window_never_expires() {
+        let mut oww = oww_models();
+        let mut silero = silero_model();
+        let last = 1_000_000;
+        let mut state = state_after_a_segment_ending_at(last, &mut oww, &mut silero);
+        let opened = listen_at(&mut state, u64::MAX, rx_at(last), &mut oww, &mut silero);
+        assert_eq!(opened_windows(&opened), [(last, u64::MAX)]);
+        let later = state
+            .handle(
+                &pod(),
+                status_feed(last + 160_000, host_after(rx_at(last), 10_000)),
+                &mut oww,
+                &mut silero,
+            )
+            .expect("status feed");
+        assert_eq!(expiries(&later), 0, "{later:?}");
+        assert!(state.capture.open().is_some());
     }
 }

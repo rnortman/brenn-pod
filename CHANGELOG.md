@@ -9,6 +9,28 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **Every pod reports its health and its room once a second, whether or not
+  anyone is speaking.** The pod sends a small status frame over the
+  connection it already holds: its capture position, 100 ms room-level blocks
+  measured on the raw microphone (a rolling 30 s history, each block marked
+  when the pod was playing), and counters and gauges — reconnects, segments
+  opened and dropped, capture and playback underruns and stalls, Wi-Fi signal,
+  free heap, the streamer's least free stack. The voice host writes a
+  `pod_status` line on the first frame of each connection, whenever a counter
+  moves or the speech gate opens or closes, and every 10 s otherwise; a pod
+  that sends nothing for 10 s gets a `pod_silent` line and its connection is
+  closed. A counter a pod does not measure is `null`, never 0. This is protocol
+  version 4: **update the voice host before or with the pods** — an older host
+  refuses a version-4 pod. The new host still reads version-3 pods and
+  recorded frame logs, without status. Hardware self-tests
+  (`LevelMeterMatchesRing`, `LevelBlocksFlagPlayback`, `PodStatusIdle`) guard
+  the meter, the playing flag and the idle frame; `PodStatusIdle` needs one
+  more port open to the HIL host (`hil-host --print-ports` lists it, and
+  `scripts/hil-firewall.sh` opens it).
+- **The echo brain can listen after its replies.** A new `[echo]
+  listen_window_ms` makes the parrot end every turn open, so the follow-up
+  window can be exercised end to end with no language model. Refused under
+  any brain other than echo.
 - **Spoken replies now have a volume control, up to answering at the volume
   you spoke.** Every sound the pod plays — brain replies, announcements, the
   offline "can't hear you" clip — passes through one gain stage, set in
@@ -18,9 +40,9 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   - the brenn brain can send a `<volume/>` marker: `db` for one reply,
     `hold` to keep a level until changed (or the voice host restarts), and
     `auto`, the automatic gain's tuning knobs and its swing limits;
-  - automatic gain (`[volume.auto]`, off by default): louder when you speak
-    loudly, quieter when you whisper, optionally raised in a noisy room, with
-    a conversion factor, reference levels and min/max swing.
+  - automatic gain (`[volume.auto]`, off by default): louder in a noisy room,
+    quieter in a quiet one, with a conversion factor, a reference room level
+    and min/max swing (see "Automatic volume follows the room" under Changed).
   Each played reply logs a `reply_gain` line saying what was applied and why;
   brain changes log `volume_set` or `volume_refused`. The brain also sees the
   pod's current volume state and how loudly it was addressed on every
@@ -103,6 +125,34 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Changed
 
+- **Automatic volume follows the room, both up and down, and nothing else.**
+  The automatic term is now `k_ambient` dB per dB the room is above
+  `ambient_ref_dbfs`, and the same per dB *below* it, within the swing bounds:
+  set the reference to the room level you call typical, set `gain_db` for
+  that room, and replies get louder in a louder room and quieter in a quieter
+  one. How loudly you spoke no longer moves the volume (a quiet voice next to
+  the pod and a loud one across the room read alike). The room is measured
+  from the pod's own level blocks: the median of the last 10 s of blocks
+  before you spoke, leaving out blocks while the pod was playing and just
+  after, and your own earlier requests. A reading counts fully for 30 s and
+  not at all from 5 min on (`stale` on the `reply_gain` line); the
+  utterance's `level` and the brain's view of it now carry the room reading's
+  block count, age and whether it was carried over from earlier. Default
+  `k_ambient` is 1.0. **To migrate:**
+  - delete `k_speech` and `speech_ref_dbfs` from `[volume.auto]`: the voice
+    host refuses a config that names either, naming the key. A brain that
+    still writes `k_speech` or `speech_ref` in `<volume/>` has them ignored
+    beside a live attribute, and reported as an unknown marker alone;
+  - re-set `ambient_ref_dbfs` before running this build. A value tuned when
+    the room could only boost (a very low reference, with `gain_db` turned
+    down to compensate) now turns every reply *down* in any room quieter than
+    it, by `k_ambient` dB per dB, as far as the swing floor. Choose the room
+    level you call typical: the `pod_status` lines' `levels.p50_dbfs` shows
+    the room continuously. On the bench a quiet room read about −77 dBFS,
+    and about −74 on the loudest of three takes. The swing (`min_db` / `max_db`) now bounds
+    attenuation as well as boost.
+- **The HIL speaker tone is about half as loud** (amplitude 0.16, was 0.5;
+  `SpeakerOutput` reports `amp=16`).
 - **`[wake] wake_tail_ms` defaults to 500 (was 1500).** Short commands ("hey
   cogsworth, tell me a joke") were held as a bare wake. A command under about
   half a second said in one breath with the wake phrase is still held.
@@ -303,6 +353,15 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Fixed
 
+- **`<listen/>` now actually listens.** The window after a reply was dated
+  from the last audio the pod had sent, so after a reply it had usually
+  expired before it opened and the follow-up was ignored. It is now dated
+  from the pod's own capture position, which the status frame keeps current
+  while nothing is streaming; the playback mute tail and a window restored
+  after a declined candidate are dated the same way. A window nobody speaks
+  into ends one to two seconds after its deadline, on the pod's clock, with
+  `listen_expired`. A window asked for before a new connection has reported
+  its position opens when it does. `listen_opened` gains `at_sample`.
 - **After the wake word, the robot no longer holds its head up while ignoring
   what you say.** Sometimes the head stayed in its listening pose for a long
   time after a wake while every repeat of the command was dropped — when the

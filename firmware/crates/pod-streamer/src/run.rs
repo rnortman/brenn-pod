@@ -14,8 +14,9 @@
 //! [`crate::idle`]'s; this module is where they are spent.
 //!
 //! [`run_streamer_loop`] is the whole idle/segment cycle: maintain the
-//! connection, wait for readiness or a VAD onset, drain inbound playback, and on
-//! an onset open a segment and hand it to [`crate::segment::run_segment`]. A pod
+//! connection, wait for readiness or a VAD onset, drain inbound playback, send the
+//! status frame when it is due, and on an onset open a segment and hand it to
+//! [`crate::segment::run_segment`]. A pod
 //! reaches it with a [`StreamerRuntime`] holding the capture ring, the telemetry
 //! channel, the playback sink and its clocks; nothing above it is shared, because
 //! everything above it is how the platform got those things (NVS or a config
@@ -35,8 +36,9 @@ use audio_pipeline::inbound::{
     pump_inbound,
 };
 use audio_pipeline::playback::PlaybackSink;
-use audio_pipeline::ring::{CaptureRing, PREROLL_SAMPLES, RingIndex};
-use audio_pipeline::stream_send::SendOutcome;
+use audio_pipeline::ring::{CaptureRing, RingIndex};
+use audio_pipeline::stats::PodStats;
+use audio_pipeline::stream_send::{FrameWriteState, SendOutcome, StepOutcome, Writable};
 use audio_pipeline::wire::{
     AUDIO_PROTOCOL_VERSION, ChannelSource, DEVICE_PLAYBACK_FORMAT, Hello, MAX_FRAME_BYTES,
     StreamFrame,
@@ -48,9 +50,15 @@ use crate::idle::{
     note_socket_established, note_socket_lost, plan_segment_start, should_attempt_idle_connect,
 };
 use crate::link::LinkStream;
-use crate::netpoll::{IDLE_TICK, INBOUND_STEPS_PER_WAKE, NetPoll, Readiness, poll_timeout};
+use crate::netpoll::{
+    IDLE_TICK, INBOUND_STEPS_PER_WAKE, NetPoll, Readiness, poll_timeout, poll_writable,
+};
 use crate::segment::{
-    ObsEvent, SegmentDeps, SegmentExit, StreamerMsg, frame_channels, run_segment, send_frame_bp,
+    ObsEvent, SegmentDeps, SegmentExit, SegmentStatus, StreamerMsg, frame_channels, run_segment,
+    send_frame_bp,
+};
+use crate::status::{
+    BegunStatus, PlatformGauges, StatusBuild, StatusSchedule, StatusSource, begin_status_frame,
 };
 
 // ── The platform seam ─────────────────────────────────────────────────────────
@@ -163,6 +171,19 @@ pub struct LinkState<L> {
     pub(crate) attempt_counter: u32,
     /// Per-pod jitter seed, so a fleet's pods do not converge on one retry beat.
     pub(crate) jitter_seed_base: u32,
+    /// The held connection's status cadence and level cursor, reset by every new
+    /// connection.
+    pub(crate) status: StatusSchedule,
+    /// A status frame the idle loop has begun writing into `encode_buf` and not
+    /// finished. Empty whenever no socket is held, and on entry to every segment.
+    pub(crate) idle_status: Option<IdleStatus>,
+}
+
+/// A status frame in flight on the idle loop: its write cursor, and the level block
+/// its run ends before, for the schedule once it is written whole.
+pub(crate) struct IdleStatus {
+    write: FrameWriteState,
+    end_block: u64,
 }
 
 impl<L> LinkState<L> {
@@ -177,11 +198,17 @@ impl<L> LinkState<L> {
             reconnect_deadline_secs: 0,
             attempt_counter: 0,
             jitter_seed_base,
+            status: StatusSchedule::new(),
+            idle_status: None,
         }
     }
 
-    /// Install a fresh connection: see [`note_socket_established`].
+    /// Install a fresh connection: see [`note_socket_established`]. The new
+    /// connection's first status frame is due at once and carries the whole level
+    /// history.
     pub fn note_socket_established(&mut self, link: L, sink: &mut dyn PlaybackSink) {
+        self.status.reset();
+        self.idle_status = None;
         note_socket_established(
             &mut self.held_socket,
             link,
@@ -191,8 +218,10 @@ impl<L> LinkState<L> {
         );
     }
 
-    /// Tear the connection down: see [`note_socket_lost`].
+    /// Tear the connection down: see [`note_socket_lost`]. A status frame in flight
+    /// is discarded with it; its tail must never reach another connection.
     pub fn note_socket_lost(&mut self, sink: &mut dyn PlaybackSink) {
+        self.idle_status = None;
         note_socket_lost(
             &mut self.held_socket,
             &mut self.inbound_accum,
@@ -219,6 +248,23 @@ impl<L> LinkState<L> {
 
 // ── Connect ───────────────────────────────────────────────────────────────────
 
+/// The `Hello` a pod introduces a connection with: this protocol version, the shared
+/// wire format's rate, width and codec, and `capture`'s layout.
+///
+/// An id too long for the wire field yields an empty one rather than a truncated
+/// one: a wrong id must not be able to look like a valid one.
+pub fn hello_frame(pod_id: &str, capture: CaptureFormat) -> StreamFrame {
+    StreamFrame::Hello(Hello {
+        version: AUDIO_PROTOCOL_VERSION,
+        pod_id: heapless::String::try_from(pod_id).unwrap_or_default(),
+        sample_rate_hz: DEVICE_PLAYBACK_FORMAT.sample_rate_hz,
+        bits_per_sample: DEVICE_PLAYBACK_FORMAT.bits_per_sample,
+        channels: capture.channels,
+        codec: DEVICE_PLAYBACK_FORMAT.codec,
+        channel_source: capture.channel_source,
+    })
+}
+
 /// Open a connection and introduce this pod with a `Hello`.
 ///
 /// Returns the ready session, or an error if connect, handshake, or `Hello`
@@ -232,18 +278,7 @@ pub fn connect_and_hello<P: StreamerPlatform>(
     encode_buf: &mut [u8],
 ) -> io::Result<P::Link> {
     let mut link = platform.connect()?;
-    let capture = platform.capture_format();
-    let hello = StreamFrame::Hello(Hello {
-        version: AUDIO_PROTOCOL_VERSION,
-        // An id too long for the wire field yields an empty one rather than a
-        // truncated one: a wrong id must not be able to look like a valid one.
-        pod_id: heapless::String::try_from(platform.pod_id()).unwrap_or_default(),
-        sample_rate_hz: DEVICE_PLAYBACK_FORMAT.sample_rate_hz,
-        bits_per_sample: DEVICE_PLAYBACK_FORMAT.bits_per_sample,
-        channels: capture.channels,
-        codec: DEVICE_PLAYBACK_FORMAT.codec,
-        channel_source: capture.channel_source,
-    });
+    let hello = hello_frame(platform.pod_id(), platform.capture_format());
     match send_frame_bp(platform.poll(), &mut link, &hello, encode_buf)? {
         SendOutcome::Sent => Ok(link),
         SendOutcome::BackpressureAligned => Err(io::Error::other(
@@ -252,16 +287,32 @@ pub fn connect_and_hello<P: StreamerPlatform>(
     }
 }
 
+/// [`connect_and_hello`], counted in `stats.connects` or `stats.connect_failures`.
+fn connect_counted<P: StreamerPlatform>(
+    platform: &P,
+    encode_buf: &mut [u8],
+    stats: &PodStats,
+) -> io::Result<P::Link> {
+    let result = connect_and_hello(platform, encode_buf);
+    PodStats::bump(if result.is_ok() {
+        &stats.connects
+    } else {
+        &stats.connect_failures
+    });
+    result
+}
+
 /// Idle-tick connection maintenance. Run once per streamer loop iteration.
 ///
 /// No-op when the socket is already up. A down link skips silently, charging no
 /// backoff — radio recovery is the platform's business, not an audio-host
 /// failure. A failed connect arms the next deadline and returns; the caller keeps
-/// idling.
+/// idling. Every attempt is counted in `stats`.
 pub fn ensure_connected<P: StreamerPlatform>(
     platform: &P,
     state: &mut LinkState<P::Link>,
     sink: &mut dyn PlaybackSink,
+    stats: &PodStats,
 ) {
     if state.held_socket.is_some() {
         return;
@@ -278,7 +329,7 @@ pub fn ensure_connected<P: StreamerPlatform>(
         return;
     }
 
-    match connect_and_hello(platform, &mut state.encode_buf) {
+    match connect_counted(platform, &mut state.encode_buf, stats) {
         Ok(link) => {
             state.note_socket_established(link, sink);
             state.note_connect_success();
@@ -336,6 +387,146 @@ pub struct StreamerRuntime<'a, B> {
     /// Per-pod reconnect jitter seed, so a fleet's pods do not converge on one
     /// retry beat.
     pub jitter_seed: u32,
+    /// The device's counters: the loop adds its own events and reads them all into
+    /// each status frame.
+    pub stats: &'a PodStats,
+    /// The platform's point-in-time readings for a status frame (heap, RSSI).
+    pub gauges: &'a dyn Fn() -> PlatformGauges,
+}
+
+// ── Idle status ───────────────────────────────────────────────────────────────
+
+/// One idle wake's turn at the status frame. Never waits for the socket.
+///
+/// With no frame in flight and one due, builds it into `encode_buf`. With one in
+/// flight, makes one non-blocking write attempt, repeated only while the transport
+/// takes a part of it: a written frame advances the level cursor, a refused one waits
+/// for the next wake. A frame no byte of which was accepted for a whole write budget
+/// is dropped and counted in `status_skipped`, keeping the socket and the cursor, so
+/// its blocks ride the next frame.
+///
+/// `Err` means the connection can no longer be trusted — a write error, or a
+/// partly-written frame that stalled — and the caller drops the socket.
+///
+/// The streamer loop calls it once per idle wake; a self-test may drive it on a
+/// connection of its own, installed with [`LinkState::note_socket_established`].
+pub fn idle_status_step<L: LinkStream, B: Deref<Target = [i16]>>(
+    state: &mut LinkState<L>,
+    ring: &Mutex<Option<CaptureRing<B>>>,
+    ridx: &RingIndex,
+    source: &StatusSource<'_>,
+    now_us: u64,
+    now_instant: &dyn Fn() -> Instant,
+) -> io::Result<()> {
+    let Some(socket) = state.held_socket.as_mut() else {
+        return Ok(());
+    };
+    if state.idle_status.is_none() && state.status.is_due(now_us) {
+        let begun = begin_status_frame(
+            &StatusBuild {
+                ring,
+                ridx,
+                source: *source,
+                schedule: &state.status,
+                now_us,
+                now_instant,
+            },
+            &mut state.encode_buf,
+        );
+        state.status.note_due(now_us);
+        match begun {
+            Ok(BegunStatus { write, end_block }) => {
+                state.idle_status = Some(IdleStatus { write, end_block })
+            }
+            Err(e) => {
+                log::warn!("streamer: Status encode failed: {:?} — skipping it", e);
+                PodStats::bump(&source.stats.status_skipped);
+                return Ok(());
+            }
+        }
+    }
+    let Some(pending) = state.idle_status.as_mut() else {
+        return Ok(());
+    };
+    let written_whole = loop {
+        match pending
+            .write
+            .step_writable(socket.as_write(), &state.encode_buf, now_instant)?
+        {
+            StepOutcome::WroteWhole => break true,
+            StepOutcome::WrotePartial => {}
+            StepOutcome::WouldBlock => break false,
+        }
+    };
+    if written_whole {
+        state.status.note_sent(pending.end_block);
+        state.idle_status = None;
+        return Ok(());
+    }
+    match pending.write.check_deadlines(now_instant) {
+        None => Ok(()),
+        Some(Ok(SendOutcome::BackpressureAligned)) => {
+            log::debug!("streamer: idle Status backpressure — skipped, socket kept");
+            PodStats::bump(&source.stats.status_skipped);
+            state.idle_status = None;
+            Ok(())
+        }
+        Some(Ok(SendOutcome::Sent)) => {
+            unreachable!("check_deadlines returned Sent, which its contract forbids")
+        }
+        Some(Err(e)) => Err(e),
+    }
+}
+
+/// Clear the idle status slot before an onset writes `SegmentStart` into the same
+/// buffer and stream.
+///
+/// A frame no byte of which was written is dropped and counted in `status_skipped`,
+/// its blocks left for the next frame. A frame with a prefix on the wire must be
+/// finished first, or the stream would be cut mid-frame: it is driven to completion
+/// under `poll` within its own write deadlines. `Err` means it could not be, and the
+/// caller drops the socket.
+fn settle_idle_status_for_onset<P: StreamerPlatform>(
+    platform: &P,
+    state: &mut LinkState<P::Link>,
+    stats: &PodStats,
+    now_instant: &dyn Fn() -> Instant,
+) -> io::Result<()> {
+    let Some(mut pending) = state.idle_status.take() else {
+        return Ok(());
+    };
+    if pending.write.written() == 0 {
+        PodStats::bump(&stats.status_skipped);
+        return Ok(());
+    }
+    let socket = state
+        .held_socket
+        .as_mut()
+        .expect("an idle status frame in flight implies a held socket");
+    let fd = socket.link_fd();
+    loop {
+        match pending
+            .write
+            .step_writable(socket.as_write(), &state.encode_buf, now_instant)?
+        {
+            StepOutcome::WroteWhole => {
+                state.status.note_sent(pending.end_block);
+                return Ok(());
+            }
+            StepOutcome::WrotePartial => continue,
+            StepOutcome::WouldBlock => {}
+        }
+        if let Some(outcome) = pending.write.check_deadlines(now_instant) {
+            return Err(outcome.err().unwrap_or_else(|| {
+                io::Error::other("a part-written Status frame classified as aligned")
+            }));
+        }
+        if let Writable::Fault(e) =
+            poll_writable(platform.poll(), fd, pending.write.next_deadline())
+        {
+            return Err(e);
+        }
+    }
 }
 
 /// Why [`run_streamer_loop`] returned. It has no success exit: the loop runs for
@@ -389,8 +580,13 @@ where
     // so a backlog drains with timeout-0 re-polls instead of one frame per tick.
     let mut idle_work_pending = false;
 
+    let source = StatusSource {
+        stats: rt.stats,
+        gauges: rt.gauges,
+    };
+
     'outer: loop {
-        ensure_connected(platform, &mut state, &mut *rt.inbound_sink);
+        ensure_connected(platform, &mut state, &mut *rt.inbound_sink, rt.stats);
 
         // ── Idle readiness wait ──────────────────────────────────────────────
         // POLLIN de-armed while the accumulator is full (backpressure) to avoid
@@ -398,6 +594,9 @@ where
         let inbound_armed = state.held_socket.is_some() && inbound_has_room(&state.inbound_accum);
 
         let mut readable = false;
+        // A segment opens only on the gate's opening transition (`VadOpened`).
+        // TODO(gate-open-segment-not-reopened): a segment lost while the gate stays
+        // open is not reopened until the gate closes and opens again.
         let onset = if let Some((fd, interest)) = state
             .held_socket
             .as_ref()
@@ -485,15 +684,51 @@ where
             }
         }
 
+        // After the drain, so a due frame never delays inbound audio, and only on a
+        // wake with no onset: an onset settles the slot itself below.
+        if onset.is_none()
+            && let Err(e) = idle_status_step(
+                &mut state,
+                rt.ring,
+                rt.ridx,
+                &source,
+                (rt.now_us)(),
+                rt.now_instant,
+            )
+        {
+            log::warn!(
+                "streamer: idle Status write failed — clearing socket, backing off: {:?}",
+                e
+            );
+            state.note_socket_lost(&mut *rt.inbound_sink);
+            state.arm_backoff(platform.now_secs());
+            continue 'outer;
+        }
+
         let vad_write_head = match onset {
             Some(wh) => wh,
             None => continue 'outer,
         };
+        // Counted where it is taken, so every path below that drops the utterance
+        // before `SegmentStart` reaches the host shows as an onset with no segment.
+        PodStats::bump(&rt.stats.onsets);
 
         // Publish the onset span so a platform's quiesce check can wait for it to
         // end before borrowing the ring. Clears at the end of this iteration,
         // covering every reconnect-drop path and the segment return.
         let _segment_active = SegmentActiveGuard::new(rt.segment_active_flag);
+
+        // `SegmentStart` shares the stream and `encode_buf` with an idle status frame
+        // in flight; settle it first. A failure loses the socket, and the onset then
+        // connects afresh below.
+        if let Err(e) = settle_idle_status_for_onset(platform, &mut state, rt.stats, rt.now_instant)
+        {
+            log::warn!(
+                "streamer: finishing an idle Status before SegmentStart failed — clearing socket: {:?}",
+                e
+            );
+            state.note_socket_lost(&mut *rt.inbound_sink);
+        }
 
         // ── Ensure a connection (real-time-or-drop) ──────────────────────────
         // An onset connects even when the idle gate would not have: a paced
@@ -503,7 +738,7 @@ where
         let mut fresh_connect = false;
         if state.held_socket.is_none() {
             log::info!("streamer: connecting to {}", platform.peer());
-            match connect_and_hello(platform, &mut state.encode_buf) {
+            match connect_counted(platform, &mut state.encode_buf, rt.stats) {
                 Ok(stream) => {
                     // Inbound state is already clean when `held_socket` is None;
                     // the redundant reset preserves the "fresh socket = fresh
@@ -547,7 +782,6 @@ where
                 &SegmentOnset {
                     segment_id,
                     vad_write_head,
-                    preroll_samples: PREROLL_SAMPLES,
                 },
             )
         };
@@ -589,7 +823,7 @@ where
                 platform.link_diag(),
                 e
             );
-            match connect_and_hello(platform, &mut state.encode_buf) {
+            match connect_counted(platform, &mut state.encode_buf, rt.stats) {
                 Ok(mut stream) => {
                     let resend = send_frame_bp(
                         platform.poll(),
@@ -638,6 +872,7 @@ where
             cursor,
             preroll_count
         );
+        PodStats::bump(&rt.stats.segments_opened);
 
         // ── Run the shared segment loop ──────────────────────────────────────
         let exit = {
@@ -658,9 +893,16 @@ where
                 now_instant: rt.now_instant,
                 obs: &mut obs,
                 inbound_obs: &mut *rt.inbound_obs,
+                status: Some(SegmentStatus {
+                    source,
+                    schedule: &mut state.status,
+                }),
             };
             run_segment(&mut deps, segment_id, cursor)
         };
+        if exit != SegmentExit::Completed {
+            PodStats::bump(&rt.stats.segments_dropped);
+        }
         if exit == SegmentExit::SocketLost {
             // No backoff on a mid-segment loss: the next idle tick reconnects
             // immediately.
@@ -674,6 +916,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::status_end_block;
 
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -681,7 +924,10 @@ mod tests {
     use std::sync::mpsc::{Sender, channel};
     use std::time::Duration;
 
-    use audio_pipeline::wire::{AUDIO_SAMPLES_PER_FRAME, EndReason, decode_frame};
+    use audio_pipeline::wire::{
+        AUDIO_SAMPLES_PER_FRAME, EndReason, LEVEL_BLOCK_SAMPLES, STATUS_PERIOD_US, Status,
+        decode_frame,
+    };
     use wifi_reconnect::BACKOFF_FLOOR_SECS;
 
     use crate::link::PollInterest;
@@ -691,6 +937,18 @@ mod tests {
         wire_bytes,
     };
     use audio_pipeline::inbound::InboundWaypoint;
+    use audio_pipeline::stats::CounterSources;
+
+    /// Device counters with every optional counter unsourced.
+    fn test_stats() -> PodStats {
+        PodStats::new(CounterSources {
+            capture_deficit_frames: false,
+            capture_xruns: false,
+            playback_write_failures: false,
+            playback_discards: false,
+            alloc_failures: false,
+        })
+    }
 
     /// A platform whose connects are scripted and whose queries are settable, so
     /// a test states the situation and then asserts what was attempted.
@@ -823,7 +1081,7 @@ mod tests {
         state.held_socket = Some(FakeLink::new());
         let mut sink = RecordingSink::new();
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
 
         assert_eq!(platform.attempts.get(), 0);
         assert!(sink.marks.is_empty(), "a held socket is not a new stream");
@@ -841,7 +1099,7 @@ mod tests {
             let mut state = LinkState::<FakeLink>::new(0x11);
             let mut sink = RecordingSink::new();
 
-            ensure_connected(&platform, &mut state, &mut sink);
+            ensure_connected(&platform, &mut state, &mut sink, &test_stats());
 
             assert_eq!(platform.attempts.get(), 0, "link={link:?}");
             assert_eq!(
@@ -865,11 +1123,11 @@ mod tests {
         let mut sink = RecordingSink::new();
 
         platform.now_secs.set(99);
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
         assert_eq!(platform.attempts.get(), 0, "99 < 100 must not attempt");
 
         platform.now_secs.set(100);
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
         assert_eq!(platform.attempts.get(), 1, "100 >= 100 must attempt");
         assert!(state.held_socket.is_some());
     }
@@ -888,7 +1146,7 @@ mod tests {
         platform.now_secs.set(100);
         let mut sink = RecordingSink::new();
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
 
         let link = state.held_socket.as_ref().expect("socket installed");
         let hello = sent_hello(link);
@@ -969,7 +1227,7 @@ mod tests {
         let mut state = LinkState::new(0x11);
         let mut sink = RecordingSink::new();
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
 
         let hello = sent_hello(state.held_socket.as_ref().expect("socket installed"));
         assert_eq!(hello.channels, 2);
@@ -992,7 +1250,7 @@ mod tests {
         let mut state = LinkState::new(0x11);
         let mut sink = RecordingSink::new();
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
 
         let link = state.held_socket.as_ref().expect("socket installed");
         assert_eq!(sent_hello(link).pod_id.as_str(), "pod-aabbcc");
@@ -1014,7 +1272,7 @@ mod tests {
         let mut state = LinkState::new(0x11);
         let mut sink = RecordingSink::new();
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
 
         let link = state
             .held_socket
@@ -1036,7 +1294,7 @@ mod tests {
         let mut sink = RecordingSink::new();
         platform.now_secs.set(1_000);
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
 
         assert_eq!(platform.attempts.get(), 1);
         assert!(
@@ -1066,17 +1324,17 @@ mod tests {
         let mut sink = RecordingSink::new();
         platform.now_secs.set(1_000);
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
         let first = state.reconnect_deadline_secs;
         assert!(first > 1_000, "a failure must arm a deadline");
         assert_eq!(state.attempt_counter, 1);
 
         // The armed deadline holds off the second attempt until it elapses.
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
         assert_eq!(platform.attempts.get(), 1, "the deadline must be honored");
 
         platform.now_secs.set(first);
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
         assert_eq!(platform.attempts.get(), 2);
         assert_eq!(state.attempt_counter, 2);
         assert!(
@@ -1095,9 +1353,9 @@ mod tests {
         let mut state = LinkState::new(0x11);
         let mut sink = RecordingSink::new();
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
         platform.now_secs.set(state.reconnect_deadline_secs);
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
 
         assert!(state.held_socket.is_some());
         assert_eq!(state.reconnect_deadline_secs, 0);
@@ -1115,7 +1373,7 @@ mod tests {
         let mut state = LinkState::new(0x11);
         let mut sink = RecordingSink::new();
 
-        ensure_connected(&platform, &mut state, &mut sink);
+        ensure_connected(&platform, &mut state, &mut sink, &test_stats());
         // A completed handshake plus a partial tail, as a live connection carries.
         (state.inbound_accum, state.inbound_state) = dirty_inbound();
 
@@ -1253,6 +1511,7 @@ mod tests {
         segment_active: Rc<AtomicBool>,
         sink: RecordingSink,
         inbound_obs: RecordingInboundObs,
+        stats: PodStats,
     }
 
     impl LoopHarness {
@@ -1265,6 +1524,7 @@ mod tests {
                 segment_active: Rc::new(AtomicBool::new(false)),
                 sink: RecordingSink::new(),
                 inbound_obs: RecordingInboundObs::new(),
+                stats: test_stats(),
             }
         }
     }
@@ -1285,9 +1545,19 @@ mod tests {
         platform: &FakePlatform,
         rx: &Receiver<StreamerMsg>,
     ) -> (StreamerExit, Vec<Obs>) {
+        drive_with(h, platform, rx, &free_running_clock(), &Instant::now)
+    }
+
+    /// [`drive`] on caller-supplied clocks.
+    fn drive_with(
+        h: &mut LoopHarness,
+        platform: &FakePlatform,
+        rx: &Receiver<StreamerMsg>,
+        clock: &dyn Fn() -> u64,
+        instants: &dyn Fn() -> Instant,
+    ) -> (StreamerExit, Vec<Obs>) {
         let flag = Rc::clone(&h.segment_active);
         let observed = RefCell::new(Vec::new());
-        let clock = free_running_clock();
         let exit = {
             let mut obs = |segment_id: u32, event: ObsEvent| {
                 observed.borrow_mut().push(Obs {
@@ -1303,11 +1573,13 @@ mod tests {
                 vad_closed_flag: &h.vad_closed,
                 segment_active_flag: &h.segment_active,
                 inbound_sink: &mut h.sink,
-                now_us: &clock,
-                now_instant: &Instant::now,
+                now_us: clock,
+                now_instant: instants,
                 obs: &mut obs,
                 inbound_obs: &mut h.inbound_obs,
                 jitter_seed: 0x11,
+                stats: &h.stats,
+                gauges: &PlatformGauges::default,
             };
             run_streamer_loop(platform, &mut rt)
         };
@@ -1361,11 +1633,17 @@ mod tests {
             [
                 StreamFrame::Hello(hello),
                 StreamFrame::SegmentStart(start),
+                StreamFrame::Status(status),
                 StreamFrame::Audio(full),
                 StreamFrame::Audio(residual),
                 StreamFrame::SegmentEnd(end),
             ] => {
                 assert_eq!(hello.pod_id.as_str(), "pod-aabbcc");
+                // The onset arrived on the connection's first wake, so its first
+                // status frame went out inside the segment, ahead of the audio.
+                assert_eq!(status.capture_head, HISTORY);
+                assert_eq!(status.counters.connects, 1);
+                assert_eq!(status.counters.segments_opened, 1);
                 assert_eq!(start.segment_id, 0, "the first segment is numbered zero");
                 assert_eq!(
                     start.base_sample_index, 0,
@@ -1529,6 +1807,7 @@ mod tests {
         assert!(observed.is_empty(), "no segment ran: {observed:?}");
         assert!(h.sink.marks.is_empty(), "playback saw no stream boundary");
         assert!(!h.segment_active.load(Ordering::Acquire));
+        assert_lost_onset(&h);
     }
 
     /// A `SegmentStart` that fails on a *held* socket gets one reconnect, and the
@@ -1620,6 +1899,7 @@ mod tests {
             vec![SinkMark::StreamReset, SinkMark::EndOfAudio],
             "the failed socket was torn down"
         );
+        assert_lost_onset(&h);
     }
 
     /// A `SegmentStart` that stalls on write backpressure drops the segment but
@@ -1655,6 +1935,49 @@ mod tests {
             vec![SinkMark::StreamReset],
             "a stalled host is not a lost socket, so playback saw no teardown"
         );
+        assert_lost_onset(&h);
+    }
+
+    /// A `SegmentStart` that fails on a held socket and whose one reconnect fails too
+    /// drops the utterance, and the drop is on the record as an onset with no segment.
+    #[test]
+    fn a_segment_start_failure_whose_reconnect_fails_drops_the_segment() {
+        const HISTORY: u64 = 400;
+        let mut h = LoopHarness::new(HISTORY);
+        let (dying, wire) = tapped_link(FakeLink::dying_after(1));
+        let (tx, rx) = channel();
+        tx.send(StreamerMsg::VadOpened {
+            write_head: HISTORY,
+        })
+        .expect("the receiver is live");
+        drop(tx);
+        // The idle connect, the onset's one reconnect, and the idle loop's next
+        // paced attempt once the onset is over.
+        let platform = FakePlatform::with(vec![
+            Ok(dying),
+            Err(io::Error::other("no route")),
+            Err(io::Error::other("no route")),
+        ]);
+
+        let (exit, observed) = drive(&mut h, &platform, &rx);
+
+        assert_eq!(exit, StreamerExit::ChannelDisconnected);
+        assert_eq!(platform.attempts.get(), 3, "one reconnect for the onset");
+        assert!(
+            matches!(wire_frames(&wire).as_slice(), [StreamFrame::Hello(_)]),
+            "the SegmentStart never left"
+        );
+        assert!(observed.is_empty(), "no segment ran: {observed:?}");
+        assert_lost_onset(&h);
+    }
+
+    /// One onset taken, no segment opened: the utterance was dropped before its
+    /// `SegmentStart` reached the host, and the counters say so.
+    fn assert_lost_onset(h: &LoopHarness) {
+        let counters = h.stats.snapshot();
+        assert_eq!(counters.onsets, 1, "the onset was taken");
+        assert_eq!(counters.segments_opened, 0, "no segment opened");
+        assert_eq!(counters.segments_dropped, 0, "no opened segment was lost");
     }
 
     /// An utterance dropped after its `SegmentStart` was numbered burns that id: the
@@ -2056,5 +2379,385 @@ mod tests {
             vec![SinkMark::StreamReset, SinkMark::EndOfAudio],
             "stale partial bytes are dropped with the socket"
         );
+    }
+
+    // ── Idle status ───────────────────────────────────────────────────────
+
+    /// A `poll` shim for idle-only runs: every wake advances a shared fake clock by
+    /// `step_us`, and the wake after `wakes` hangs up the channel so the loop exits.
+    struct IdleClockPoll {
+        poll: FakePoll,
+        tx: RefCell<Option<Sender<StreamerMsg>>>,
+        wakes: u32,
+        now_us: Rc<Cell<u64>>,
+        step_us: u64,
+    }
+
+    impl NetPoll for IdleClockPoll {
+        fn poll_readiness(
+            &self,
+            fd: std::os::fd::RawFd,
+            interest: PollInterest,
+            timeout: std::time::Duration,
+        ) -> io::Result<Readiness> {
+            self.now_us.set(self.now_us.get() + self.step_us);
+            if self.poll.wakes.get() >= self.wakes {
+                self.tx.borrow_mut().take();
+            }
+            self.poll.poll_readiness(fd, interest, timeout)
+        }
+    }
+
+    /// One idle-only run of `wakes` wakes at `step_us` apiece over `link`, on a fake
+    /// clock both currencies read. Returns the shim, for what it saw.
+    fn drive_idle(
+        h: &mut LoopHarness,
+        link: FakeLink,
+        wakes: u32,
+        step_us: u64,
+        poll: FakePoll,
+    ) -> Rc<IdleClockPoll> {
+        let (tx, rx) = channel();
+        let now_us = Rc::new(Cell::new(0u64));
+        let shim = Rc::new(IdleClockPoll {
+            poll,
+            tx: RefCell::new(Some(tx)),
+            wakes,
+            now_us: Rc::clone(&now_us),
+            step_us,
+        });
+        let platform = FakePlatform::with_poll(vec![Ok(link)], Rc::clone(&shim) as Rc<dyn NetPoll>);
+        let base = Instant::now();
+        let clock = || now_us.get();
+        let instants = || base + Duration::from_micros(now_us.get());
+        let (exit, observed) = drive_with(h, &platform, &rx, &clock, &instants);
+        assert_eq!(exit, StreamerExit::ChannelDisconnected);
+        assert!(observed.is_empty(), "no segment ran: {observed:?}");
+        shim
+    }
+
+    /// The statuses on a connection after its `Hello`, asserting nothing else was
+    /// sent and nothing was left half-written.
+    fn idle_statuses(wire: &Wire) -> Vec<Status> {
+        let frames = wire_frames(wire);
+        assert!(matches!(frames.first(), Some(StreamFrame::Hello(_))));
+        frames[1..]
+            .iter()
+            .map(|f| match f {
+                StreamFrame::Status(st) => st.clone(),
+                other => panic!("an idle connection sent {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Meter `samples` of a constant through the production ring writer.
+    fn meter(h: &LoopHarness, samples: u64) {
+        let mut guard = h.ring.lock().unwrap();
+        let ring = guard.as_mut().unwrap();
+        for _ in 0..samples {
+            ring.commit(&h.ridx, 300, None, false);
+        }
+    }
+
+    /// An idle connection carries one status frame per period and nothing else; the
+    /// first carries the whole held history and the runs that follow are contiguous.
+    #[test]
+    fn an_idle_connection_sends_a_status_each_period_and_nothing_else() {
+        let mut h = LoopHarness::new(0);
+        meter(&h, 3 * LEVEL_BLOCK_SAMPLES as u64 + 10);
+        let (link, wire) = tapped_link(FakeLink::new());
+
+        drive_idle(&mut h, link, 35, 100_000, FakePoll::always_writable());
+
+        let statuses = idle_statuses(&wire);
+        assert_eq!(statuses.len(), 4, "3.5 s of wakes, one frame a second");
+        assert_eq!(statuses[0].levels.first_block, 0);
+        assert_eq!(statuses[0].levels.blocks.len(), 3, "the whole history");
+        for st in &statuses {
+            assert_eq!(
+                u64::from(st.segment_reach),
+                st.capture_head,
+                "a ring younger than the pre-roll: a segment would reach back to its start"
+            );
+        }
+        for pair in statuses.windows(2) {
+            assert_eq!(
+                pair[1].levels.first_block,
+                status_end_block(&pair[0]),
+                "runs are contiguous"
+            );
+            assert!(pair[1].device_ts_us - pair[0].device_ts_us >= STATUS_PERIOD_US);
+        }
+        assert_eq!(h.stats.snapshot().status_skipped, 0);
+    }
+
+    /// A due status frame on a link that refuses every write costs the idle loop one
+    /// write attempt per wake and nothing else: the poll is never asked for POLLOUT
+    /// or to wait past the idle tick, inbound audio drains on the wake it arrives,
+    /// and after a write budget with no byte taken the frame is dropped and counted,
+    /// keeping the socket.
+    #[test]
+    fn a_refused_idle_status_never_holds_the_inbound_pump() {
+        let mut h = LoopHarness::new(0);
+        let mut link = FakeLink {
+            write_default: 0,
+            ..FakeLink::new()
+        };
+        // The Hello goes out whole; every status write is refused.
+        link.write_script = [usize::MAX].into_iter().collect();
+        link.queue_read(&wire_bytes(&inbound_hello()));
+        for _ in 0..3 {
+            link.queue_read(&wire_bytes(&inbound_audio(160)));
+        }
+        let write_calls = Rc::clone(&link.write_calls);
+
+        let shim = drive_idle(&mut h, link, 10, 100_000, FakePoll::readable_for(1));
+
+        assert_eq!(
+            h.sink.offers,
+            vec![320, 320, 320],
+            "the inbound frames drained on the first wake"
+        );
+        assert_eq!(
+            write_calls.get(),
+            1 + 9,
+            "the Hello, then one attempt on each wake the frame was in flight"
+        );
+        let seen = shim.poll.seen.borrow();
+        assert!(
+            seen.iter().all(|s| !s.1.write),
+            "POLLOUT is never armed while idle"
+        );
+        assert!(
+            seen.iter().all(|s| s.2 == IDLE_TICK),
+            "a writable-but-refusing link never shortens the idle wait: {seen:?}"
+        );
+        assert_eq!(h.stats.snapshot().status_skipped, 1);
+        assert_eq!(
+            h.sink.marks,
+            vec![SinkMark::StreamReset],
+            "the socket was kept"
+        );
+    }
+
+    /// A status frame the link takes in parts is resumed on later wakes and reaches
+    /// the receiver whole.
+    #[test]
+    fn a_partial_idle_status_resumes_on_later_wakes() {
+        let mut h = LoopHarness::new(0);
+        meter(&h, LEVEL_BLOCK_SAMPLES as u64);
+        let mut link = FakeLink::new();
+        link.write_script = [usize::MAX, 10, 0, 10, 0, 10].into_iter().collect();
+        let (link, wire) = tapped_link(link);
+
+        drive_idle(&mut h, link, 5, 10_000, FakePoll::always_writable());
+
+        let statuses = idle_statuses(&wire);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].levels.blocks.len(), 1);
+        assert_eq!(h.stats.snapshot().status_skipped, 0);
+    }
+
+    /// An `Instant` clock advancing `step` per read, so a few reads pass any write
+    /// budget.
+    fn stepping_instants(step: Duration) -> impl Fn() -> Instant {
+        let base = Instant::now();
+        let reads = Cell::new(0u32);
+        move || {
+            let now = base + step * reads.get();
+            reads.set(reads.get() + 1);
+            now
+        }
+    }
+
+    fn status_link_state(link: FakeLink) -> LinkState<FakeLink> {
+        let mut state = LinkState::new(1);
+        state.note_socket_established(link, &mut RecordingSink::new());
+        state
+    }
+
+    fn step_at(
+        state: &mut LinkState<FakeLink>,
+        h: &LoopHarness,
+        now_us: u64,
+        instants: &dyn Fn() -> Instant,
+    ) -> io::Result<()> {
+        let source = StatusSource {
+            stats: &h.stats,
+            gauges: &PlatformGauges::default,
+        };
+        idle_status_step(state, &h.ring, &h.ridx, &source, now_us, instants)
+    }
+
+    /// A status frame dropped for backpressure leaves the cursor, so the next frame
+    /// carries its blocks and the newer ones together.
+    #[test]
+    fn a_skipped_idle_status_leaves_its_blocks_for_the_next() {
+        let h = LoopHarness::new(0);
+        meter(&h, 2 * LEVEL_BLOCK_SAMPLES as u64);
+        let (link, wire) = tapped_link(FakeLink {
+            write_default: 0,
+            ..FakeLink::new()
+        });
+        let mut state = status_link_state(link);
+        let stalled = stepping_instants(Duration::from_millis(400));
+
+        for _ in 0..3 {
+            step_at(&mut state, &h, 0, &stalled).expect("a refusal is not an error");
+        }
+        assert!(state.idle_status.is_none(), "the stalled frame was dropped");
+        assert_eq!(h.stats.snapshot().status_skipped, 1);
+        assert_eq!(state.status.next_block(), 0, "the cursor did not move");
+
+        meter(&h, 2 * LEVEL_BLOCK_SAMPLES as u64);
+        state.held_socket.as_mut().unwrap().write_default = usize::MAX;
+        step_at(&mut state, &h, STATUS_PERIOD_US, &Instant::now).expect("the link is back");
+
+        let statuses: Vec<Status> = wire_frames(&wire)
+            .into_iter()
+            .map(|f| match f {
+                StreamFrame::Status(st) => st,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].levels.first_block, 0);
+        assert_eq!(statuses[0].levels.blocks.len(), 4, "both runs in one frame");
+        assert_eq!(state.status.next_block(), 4);
+    }
+
+    /// A write error is the caller's socket-lost signal.
+    #[test]
+    fn an_idle_status_write_error_is_returned() {
+        let h = LoopHarness::new(0);
+        let mut state = status_link_state(FakeLink::dying_after(0));
+        let err = step_at(&mut state, &h, 0, &Instant::now);
+        assert!(err.is_err());
+    }
+
+    /// An onset with a status frame built but not one byte of it written drops the
+    /// frame, counts it, and leaves nothing on the wire.
+    #[test]
+    fn an_onset_drops_an_unwritten_idle_status() {
+        let h = LoopHarness::new(0);
+        meter(&h, LEVEL_BLOCK_SAMPLES as u64);
+        let (link, wire) = tapped_link(FakeLink {
+            write_default: 0,
+            ..FakeLink::new()
+        });
+        let mut state = status_link_state(link);
+        step_at(&mut state, &h, 0, &Instant::now).unwrap();
+        assert!(state.idle_status.is_some());
+        let platform = FakePlatform::unconnectable();
+
+        settle_idle_status_for_onset(&platform, &mut state, &h.stats, &Instant::now)
+            .expect("an unwritten frame settles by being dropped");
+
+        assert!(state.idle_status.is_none());
+        assert!(wire.borrow().is_empty());
+        assert_eq!(h.stats.snapshot().status_skipped, 1);
+        assert_eq!(state.status.next_block(), 0);
+    }
+
+    /// An onset with a status frame part-written finishes it before anything else
+    /// can be written, so the receiver decodes the whole status first.
+    #[test]
+    fn an_onset_finishes_a_part_written_idle_status() {
+        let h = LoopHarness::new(0);
+        meter(&h, LEVEL_BLOCK_SAMPLES as u64);
+        let mut link = FakeLink::new();
+        link.write_script = [10, 0, 0].into_iter().collect();
+        let (link, wire) = tapped_link(link);
+        let mut state = status_link_state(link);
+        step_at(&mut state, &h, 0, &Instant::now).unwrap();
+        assert_eq!(state.idle_status.as_ref().unwrap().write.written(), 10);
+        let platform = FakePlatform::unconnectable();
+
+        settle_idle_status_for_onset(&platform, &mut state, &h.stats, &Instant::now)
+            .expect("the link takes the rest");
+
+        assert!(state.idle_status.is_none());
+        let (frames, partial) = decode_stream(&wire.borrow());
+        assert_eq!(partial, 0);
+        assert!(matches!(frames.as_slice(), [StreamFrame::Status(_)]));
+        assert_eq!(state.status.next_block(), 1);
+        assert_eq!(h.stats.snapshot().status_skipped, 0);
+    }
+
+    /// A part-written status frame the link will not finish fails the onset's
+    /// settle, which the loop treats as a lost socket.
+    #[test]
+    fn an_onset_whose_part_written_status_stalls_loses_the_socket() {
+        let h = LoopHarness::new(0);
+        meter(&h, LEVEL_BLOCK_SAMPLES as u64);
+        let mut link = FakeLink {
+            write_default: 0,
+            ..FakeLink::new()
+        };
+        link.write_script = [10].into_iter().collect();
+        let mut state = status_link_state(link);
+        step_at(&mut state, &h, 0, &Instant::now).unwrap();
+        let platform = FakePlatform::unconnectable();
+
+        let settled = settle_idle_status_for_onset(
+            &platform,
+            &mut state,
+            &h.stats,
+            &stepping_instants(Duration::from_millis(300)),
+        );
+
+        assert!(settled.is_err());
+        assert!(state.idle_status.is_none());
+    }
+
+    /// A socket lost with a status frame part-written discards it: the next
+    /// connection starts clean and its first status goes out whole from byte zero.
+    #[test]
+    fn a_lost_socket_discards_a_part_written_idle_status() {
+        let h = LoopHarness::new(0);
+        meter(&h, LEVEL_BLOCK_SAMPLES as u64);
+        let mut link = FakeLink::new();
+        link.write_script = [10, 0].into_iter().collect();
+        let mut state = status_link_state(link);
+        step_at(&mut state, &h, 0, &Instant::now).unwrap();
+        assert!(state.idle_status.is_some());
+
+        state.note_socket_lost(&mut RecordingSink::new());
+        assert!(state.idle_status.is_none());
+        let (link, wire) = tapped_link(FakeLink::new());
+        state.note_socket_established(link, &mut RecordingSink::new());
+        step_at(&mut state, &h, 0, &Instant::now).unwrap();
+
+        let (frames, partial) = decode_stream(&wire.borrow());
+        assert_eq!(partial, 0);
+        match frames.as_slice() {
+            [StreamFrame::Status(st)] => assert_eq!(st.levels.blocks.len(), 1),
+            other => panic!("expected one whole status, got {other:?}"),
+        }
+    }
+
+    /// The loop counts connects, onsets and segments: an onset over the idle
+    /// connection is one connect, one onset and one segment opened, none dropped.
+    #[test]
+    fn the_loop_counts_its_connects_and_segments() {
+        const HISTORY: u64 = 500;
+        let mut h = LoopHarness::new(HISTORY);
+        h.vad_closed.store(true, Ordering::Release);
+        let (tx, rx) = channel();
+        tx.send(StreamerMsg::VadOpened {
+            write_head: HISTORY,
+        })
+        .unwrap();
+        let poll = HangupPoll::new(tx, Rc::clone(&h.segment_active), Vec::new());
+        let platform = FakePlatform::with_poll(vec![Ok(FakeLink::new())], Rc::new(poll));
+
+        drive(&mut h, &platform, &rx);
+
+        let counters = h.stats.snapshot();
+        assert_eq!(counters.connects, 1);
+        assert_eq!(counters.connect_failures, 0);
+        assert_eq!(counters.onsets, 1);
+        assert_eq!(counters.segments_opened, 1);
+        assert_eq!(counters.segments_dropped, 0);
     }
 }

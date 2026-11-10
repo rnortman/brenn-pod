@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use pod_ingest::{DeviceMicros, Gap, HostMicros};
+use pod_ingest::{DeviceMicros, Gap, HostMicros, LevelBlock};
 use serde::Serialize;
 
 use super::endpointer::{EndpointCause, EndpointTransition};
@@ -28,8 +28,10 @@ use crate::types::{
 ///
 /// The time stamps are **supplied by the caller**, never read by the listener — the
 /// same contract the ingest `SessionFsm` keeps, and what leaves the listener pure
-/// (no clock, no I/O) and replay-testable. Every stamped field is copied verbatim
-/// off the corresponding `SessionEvent`.
+/// (no clock, no I/O) and replay-testable. A feed made from a `SessionEvent` copies
+/// its stamp verbatim off that event; a feed with no event behind it (a capture
+/// window opening, a gate verdict, a playback change) carries the host time it was
+/// created at, which the listener projects the pod's capture position to.
 #[derive(Debug, Clone)]
 pub enum Feed {
     /// A new connection for this pod — reset all per-pod state and adopt `epoch`
@@ -40,6 +42,25 @@ pub enum Feed {
         /// What this connection's [`Feed::Audio`] levels are measured on: the
         /// raw microphone of a beam + raw-mic session, the beam otherwise.
         level_source: LevelSource,
+    },
+    /// The pod's status frame: where its capture is and the room-level blocks it
+    /// has not sent before on this connection. Sent about once a second whether or
+    /// not a segment is open.
+    PodStatus {
+        /// Host receipt of the frame.
+        host_rx: HostMicros,
+        /// The pod's capture write head when it built the frame: the absolute index
+        /// of the next sample it will capture.
+        capture_head: u64,
+        /// How far behind `capture_head` a segment the pod opened now would begin:
+        /// `capture_head - segment_reach` is the position before which no later
+        /// segment on this connection begins.
+        segment_reach: u32,
+        /// Block index of `levels[0]`; block `n` covers samples
+        /// `[n * LEVEL_BLOCK_SAMPLES, (n + 1) * LEVEL_BLOCK_SAMPLES)`.
+        first_block: u64,
+        /// Consecutive 100 ms level blocks on the pod's level channel.
+        levels: Vec<LevelBlock>,
     },
     /// A transport segment opened at `base_sample_index`. Segments are separated by
     /// real device-VAD silence, so this re-anchors the streaming inference state.
@@ -90,6 +111,9 @@ pub enum Feed {
         /// turn: a report naming the turn already audible refines it and leaves
         /// the latch alone, while a different turn is a new reply to cut.
         turn: Option<UtteranceId>,
+        /// Host time of the change. A floor going down dates the playback tail
+        /// from the pod's capture position at this instant.
+        at: HostMicros,
     },
     /// Open a capture window: for the next `window_samples` of audio, speech may be
     /// carved with no wake word. Fed by the surface when a reply that asked to keep
@@ -100,7 +124,15 @@ pub enum Feed {
     /// candidate the pipeline's gate then declines did not become a turn and costs
     /// the window nothing: [`Feed::CandidateDeclined`] restores it at the deadline
     /// it opened with, which is never re-dated.
-    Listen { window_samples: u64 },
+    ///
+    /// On a connection that has not yet stated its capture position, the window
+    /// opens, and its `ListenOpened` is written, when it does.
+    Listen {
+        window_samples: u64,
+        /// Host time the window was asked for: the window runs from the pod's
+        /// capture position at this instant.
+        at: HostMicros,
+    },
     /// The pipeline's gate declined the candidate `id`: it became no turn. Fed for
     /// every gate outcome that is not a dispatch, whether or not any window is
     /// involved — the listener is what decides whether a decline reopens anything.
@@ -110,7 +142,12 @@ pub enum Feed {
     /// When `id` is the candidate whose mint spent a wake's grant, the grant
     /// returns with the deadline it was spent with
     /// ([`ListenerEvent::WakeRestored`]). Any other id is a no-op.
-    CandidateDeclined { id: ListenerUtteranceId },
+    CandidateDeclined {
+        id: ListenerUtteranceId,
+        /// Host time of the verdict: what a restore reports as left of a window or
+        /// a grant is measured from the pod's capture position at this instant.
+        at: HostMicros,
+    },
     /// The pipeline dispatched the candidate `id` as a turn. Dispatch is terminal
     /// for the utterance: the listener ends its identity and returns the endpointer
     /// to idle, so speech that resumes afterwards re-onsets fresh and must pass the
@@ -209,9 +246,10 @@ pub struct CarvedUtterance {
     /// The level the utterance was addressed at: the wake phrase's (the same
     /// value `wake.level` carries) for a wake-gated utterance, the utterance's
     /// own speech from its onset to its end otherwise — a barge, a follow-up, or
-    /// any carve under `Bypass`. The ambient half is the room as last heard with
-    /// the pod silent and nobody speaking. `None` when no live frame covered the
-    /// speech. Measured at the first carve; a continuation keeps it.
+    /// any carve under `Bypass`. The ambient half is the room read from the
+    /// pod's level blocks before the speech, or the last good reading carried.
+    /// `None` when neither half was measured. Measured at the first carve; a
+    /// continuation keeps it.
     pub level: Option<UtteranceLevel>,
     /// Why this utterance's audio ends where it does.
     pub cause: EndpointCause,
@@ -287,7 +325,7 @@ pub enum ListenerEvent {
         /// a bearing needs the array's attitude, which the listener does not have.
         doa: Vec<DoaSample>,
         /// How loudly the phrase was spoken and how loud the room was before it;
-        /// `None` when the level ring holds no live reading of the phrase.
+        /// `None` when neither was measured.
         level: Option<UtteranceLevel>,
     },
     /// A wake phrase crossed threshold and was discarded unheard, because the pod
@@ -387,7 +425,7 @@ pub enum ListenerEvent {
         epoch: u64,
         /// The grant's deadline, as it was spent.
         deadline_sample: u64,
-        /// The listener's cursor at the restore, in `deadline_sample`'s index
+        /// The pod's capture position at the restore, in `deadline_sample`'s index
         /// domain: `deadline_sample − at_sample` is what is left of the grant, and
         /// the surface dates the head's own fallback from it.
         at_sample: u64,
@@ -451,12 +489,19 @@ pub enum ListenerEvent {
     /// it stops doing so at the next `ListenExpired`. `deadline_sample` is
     /// accounting only — the deadline is the listener's own state and nothing
     /// downstream acts on it.
+    ///
+    /// On a connection that has not yet stated its capture position, the window
+    /// opens, and this line is written, when it does: `at_sample` is that position.
     ListenOpened {
         pod: PodId,
         epoch: u64,
         /// The last absolute sample index at which speech may still begin inside
         /// the window.
         deadline_sample: u64,
+        /// The pod's capture position the window was dated from, in
+        /// `deadline_sample`'s index domain: `deadline_sample − at_sample` is the
+        /// window's length.
+        at_sample: u64,
     },
     /// The capture window an utterance's mint closed is open again, at the same
     /// `deadline_sample` it opened with: the pipeline's gate declined that
@@ -474,8 +519,9 @@ pub enum ListenerEvent {
         epoch: u64,
         /// The restored window's deadline — the one it opened with.
         deadline_sample: u64,
-        /// The listener's cursor at the restore, in `deadline_sample`'s index
-        /// domain: `deadline_sample − at_sample` is what is left of the window.
+        /// The pod's capture position at the restore, in `deadline_sample`'s
+        /// index domain: `deadline_sample − at_sample` is what is left of the
+        /// window.
         /// Unlike [`ListenerEvent::ListenOpened`]'s deadline this is acted on —
         /// it is how long a reader has before the grant this line announces runs
         /// out, and the surface dates the head's own fallback from it.
@@ -495,10 +541,11 @@ pub enum ListenerEvent {
     /// standing, or the window outlived its reason — a new reply began over it, the
     /// stream re-anchored past its deadline, or the connection went.
     ///
-    /// The head may already be down when this arrives: the surface brings it down
-    /// on its own wall clock when the deadline passes in a silence no audio
-    /// crosses (`listen_released`), and this line follows whenever audio next
-    /// reaches the listener.
+    /// In a silence no audio crosses, this line follows the first status frame
+    /// from which the pod can no longer open a segment reaching back before the
+    /// deadline: one pre-roll to one pre-roll plus a status period after it, 1 to
+    /// 2 s. A head that speech inside the window is holding up (`ListenHeard`)
+    /// with nothing carved from that speech may come down on this line.
     ///
     /// Says nothing about whether a turn came of the window; that is read from
     /// `brain_dispatched`. The one ending this line does not cover is a window an

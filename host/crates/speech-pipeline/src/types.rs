@@ -429,16 +429,33 @@ pub enum LevelSource {
 }
 
 /// How loudly an utterance was addressed, and how loud the room was before it.
-/// Levels are dBFS of 16-bit PCM.
+/// Levels are dBFS of 16-bit PCM. Present whenever either half was measured.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct UtteranceLevel {
     /// The level of the speech that triggered the reply — the wake phrase of a
-    /// wake-gated utterance, the utterance's own speech otherwise.
-    pub speech_dbfs: f32,
-    /// The room as last heard with the pod silent and nobody speaking, before
-    /// this utterance; `None` when too little such audio has been heard.
-    pub ambient_dbfs: Option<f32>,
+    /// wake-gated utterance, the utterance's own speech otherwise. `None` when
+    /// the speech window was dead or empty.
+    pub speech_dbfs: Option<f32>,
+    /// The room before this utterance; `None` when the room has never been heard
+    /// on a usable block.
+    pub ambient: Option<AmbientReading>,
     pub source: LevelSource,
+}
+
+/// The room's level as read from the pod's 100 ms level blocks: the median of
+/// the newest blocks heard with the pod silent and nobody addressing it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AmbientReading {
+    /// The median level of the blocks used, dBFS.
+    pub dbfs: f32,
+    /// How many 100 ms blocks the reading rests on (at most 100).
+    pub blocks: u16,
+    /// Milliseconds from the end of the newest block used to the speech the
+    /// reading was taken for, grown by host time when `carried`.
+    pub age_ms: u32,
+    /// The reading is the last good one, carried because no block was usable
+    /// at this measurement.
+    pub carried: bool,
 }
 
 /// A self-contained reference to the recorded audio an utterance was carved from:

@@ -34,7 +34,7 @@ use crate::psk::parse_psk_hex;
 const SILERO_CHUNK_MS: u32 = 32;
 /// Samples per millisecond at the 16 kHz spine rate — the ms↔sample bridge for the
 /// preroll and for the `[wake]` timing knobs (which `replay` converts).
-pub(crate) const SAMPLES_PER_MS: u64 = 16;
+pub(crate) const SAMPLES_PER_MS: u64 = speech_pipeline::SPINE_FORMAT.sample_rate_hz as u64 / 1000;
 
 /// Room name used for a pod absent from the `[pods]` map.
 pub const UNMAPPED_ROOM: &str = "unmapped";
@@ -92,6 +92,11 @@ pub struct Config {
     /// bridge that carries them. `None` when the `[brenn]` table is absent.
     #[serde(default)]
     pub brenn: Option<BrennConfig>,
+    /// The parrot's listening rung. `None` when the `[echo]` table is absent —
+    /// the echo brain then ends every turn closed. Valid only with
+    /// `brain.mode = "echo"`.
+    #[serde(default)]
+    pub echo: Option<EchoConfig>,
     /// Speech-to-text configuration. `None` when the `[stt]` table is absent — no
     /// transcriber is wired and utterances mint with a null transcript. A present
     /// table enriches every utterance regardless of whether a brain consumes it.
@@ -114,6 +119,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// How long a capture window opened after a reply that asked to keep
+    /// listening stays open, in samples: the parrot's `[echo]` window, or the
+    /// presence linger of `[brenn]`. The two tables are exclusive (each requires
+    /// its own brain mode); with neither, no turn ends open and the length is
+    /// never read.
+    pub fn listen_window_samples(&self) -> u64 {
+        match (&self.echo, &self.brenn) {
+            (Some(echo), _) => echo.listen_window_samples(),
+            (None, Some(brenn)) => brenn.listen_window_samples(),
+            (None, None) => 0,
+        }
+    }
+
     /// Read, parse, and validate the TOML config at `path`. Read, parse, and
     /// validation errors all carry the path and precise context.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -164,6 +182,9 @@ impl Config {
         }
         if let Some(brenn) = &self.brenn {
             brenn.validate()?;
+        }
+        if let Some(echo) = &self.echo {
+            echo.validate()?;
         }
         if let Some(stt) = &self.stt {
             stt.validate()?;
@@ -240,6 +261,17 @@ impl Config {
             return Err(
                 "a [brenn] table requires brain.mode = \"brenn\" (nothing else \
                  dials the bus, so the table would be read by nothing)"
+                    .to_string(),
+            );
+        }
+        // The same for `[echo]`: only the parrot reads it, and under any other
+        // brain a window that never opens would be the only symptom.
+        if self.echo.is_some()
+            && self.brain.as_ref().map(|brain| brain.mode) != Some(BrainMode::Echo)
+        {
+            return Err(
+                "an [echo] table requires brain.mode = \"echo\" (only the echo brain \
+                 reads it, so the table would be read by nothing)"
                     .to_string(),
             );
         }
@@ -382,6 +414,8 @@ pub struct PodConfig {
 
 /// Largest accepted `[volume] max_db`: positive gain clips loud syllables, and
 /// past this nothing a synthesizer produces stays intelligible.
+// TODO(operator-volume-ceiling-24): whether a hard limit belongs here, and at what
+// value and on what ground, is the owner's decision.
 pub const MAX_VOLUME_CEILING_DB: f32 = 24.0;
 
 /// Reply volume configuration, in dB relative to the synthesizer's natural level.
@@ -458,6 +492,11 @@ impl VolumeConfig {
 /// `[volume.auto]`: the automatic-gain policy every pod starts from. Levels are
 /// dBFS; gains are dB.
 ///
+/// The automatic term follows the room alone: `k_ambient` dB per dB the room's
+/// reading is above `ambient_ref_dbfs`, and the same per dB below it, so a quiet
+/// room turns replies down and a loud one up, within the swing bounds. The
+/// reading counts fully for 30 s and not at all from 5 min on.
+///
 /// The swing bounds `min_db` / `max_db` limit the automatic term only, and are
 /// a different object from `[volume] min_db` / `max_db`, which clamp the applied
 /// total afterwards. No rule relates the two.
@@ -471,16 +510,12 @@ pub struct AutoVolumeConfig {
     /// microphone) or `any`.
     #[serde(default = "default_auto_level_source")]
     pub level_source: LevelAdmission,
-    /// dB of gain per dB of speech level above `speech_ref_dbfs`.
-    #[serde(default = "default_auto_k_speech")]
-    pub k_speech: f32,
-    /// The speech level at which the speech term is 0.
-    #[serde(default = "default_auto_speech_ref_dbfs")]
-    pub speech_ref_dbfs: f32,
-    /// dB of gain per dB of ambient level above `ambient_ref_dbfs`.
+    /// dB of gain per dB the room is above `ambient_ref_dbfs`, and of
+    /// attenuation per dB it is below.
     #[serde(default = "default_auto_k_ambient")]
     pub k_ambient: f32,
-    /// The ambient level above which the ambient term contributes.
+    /// The room level at which a reply plays at the held volume. A value tuned
+    /// when the term could only add attenuates in every room quieter than it.
     #[serde(default = "default_auto_ambient_ref_dbfs")]
     pub ambient_ref_dbfs: f32,
     /// Swing floor: the automatic term never subtracts more than this.
@@ -496,12 +531,6 @@ fn default_auto_enabled() -> bool {
 }
 fn default_auto_level_source() -> LevelAdmission {
     LevelAdmission::RawMic
-}
-fn default_auto_k_speech() -> f32 {
-    speech_pipeline::volume::DEFAULT_AUTO_K_SPEECH
-}
-fn default_auto_speech_ref_dbfs() -> f32 {
-    speech_pipeline::volume::DEFAULT_AUTO_SPEECH_REF_DBFS
 }
 fn default_auto_k_ambient() -> f32 {
     speech_pipeline::volume::DEFAULT_AUTO_K_AMBIENT
@@ -521,8 +550,6 @@ impl Default for AutoVolumeConfig {
         AutoVolumeConfig {
             enabled: default_auto_enabled(),
             level_source: default_auto_level_source(),
-            k_speech: default_auto_k_speech(),
-            speech_ref_dbfs: default_auto_speech_ref_dbfs(),
             k_ambient: default_auto_k_ambient(),
             ambient_ref_dbfs: default_auto_ambient_ref_dbfs(),
             min_db: default_auto_min_db(),
@@ -532,11 +559,10 @@ impl Default for AutoVolumeConfig {
 }
 
 impl AutoVolumeConfig {
-    /// `k_*` finite; references finite and in `[-100, 0]` dBFS; swing bounds
+    /// `k_ambient` finite; the reference finite and in `[-100, 0]` dBFS; swing bounds
     /// finite with `min_db <= max_db`.
     pub fn validate(&self) -> Result<(), String> {
         for (key, v) in [
-            ("volume.auto.k_speech", self.k_speech),
             ("volume.auto.k_ambient", self.k_ambient),
             ("volume.auto.min_db", self.min_db),
             ("volume.auto.max_db", self.max_db),
@@ -545,13 +571,11 @@ impl AutoVolumeConfig {
                 return Err(format!("{key} {v} must be finite"));
             }
         }
-        for (key, v) in [
-            ("volume.auto.speech_ref_dbfs", self.speech_ref_dbfs),
-            ("volume.auto.ambient_ref_dbfs", self.ambient_ref_dbfs),
-        ] {
-            if !(-100.0..=0.0).contains(&v) {
-                return Err(format!("{key} {v} must be in [-100, 0] dBFS"));
-            }
+        let r = self.ambient_ref_dbfs;
+        if !(-100.0..=0.0).contains(&r) {
+            return Err(format!(
+                "volume.auto.ambient_ref_dbfs {r} must be in [-100, 0] dBFS"
+            ));
         }
         if self.min_db > self.max_db {
             return Err(format!(
@@ -567,8 +591,6 @@ impl AutoVolumeConfig {
         AutoPolicy {
             enabled: self.enabled,
             level_source: self.level_source,
-            k_speech: self.k_speech,
-            speech_ref_dbfs: self.speech_ref_dbfs,
             k_ambient: self.k_ambient,
             ambient_ref_dbfs: self.ambient_ref_dbfs,
             min_db: self.min_db,
@@ -1163,6 +1185,38 @@ pub enum BrainMode {
     Brenn,
 }
 
+/// The parrot's listening rung: the echo brain ends every turn open, and the
+/// surface opens a capture window this long after each reply, so the follow-up
+/// path can be exercised end to end with no language model and nobody to answer
+/// a question.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EchoConfig {
+    /// How long the window after each reply stays open, in milliseconds.
+    /// Required; at least 1.
+    pub listen_window_ms: u64,
+}
+
+impl EchoConfig {
+    /// A zero window would open and end on the same sample: every reply would
+    /// claim to listen and none would.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.listen_window_ms == 0 {
+            return Err(
+                "echo.listen_window_ms must be at least 1 (a zero window hears nothing)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The window in samples at the capture rate, which is how the listener
+    /// measures it. Saturating, as `[brenn]`'s linger is.
+    pub fn listen_window_samples(&self) -> u64 {
+        self.listen_window_ms.saturating_mul(SAMPLES_PER_MS)
+    }
+}
+
 /// Bus-brain configuration: which channels the pod publishes on and subscribes
 /// to, how long it waits for an answer, and the bridge that carries all of it.
 ///
@@ -1470,8 +1524,8 @@ impl BrennConfig {
     /// the head's ending out to `presence_max_engaged_ms` and hands it back to
     /// the window, which is why nothing here re-dates the deadline.
     ///
-    /// In samples because the listener dates the window from its own audio
-    /// cursor. Saturating because the linger is untrusted TOML: an absurd value
+    /// In samples because the listener dates the window from the pod's capture
+    /// position. Saturating because the linger is untrusted TOML: an absurd value
     /// becomes a window that never expires rather than a wrapped count that
     /// expires at once.
     pub fn listen_window_samples(&self) -> u64 {
@@ -3399,9 +3453,8 @@ voice = "af_heart"
     #[test]
     fn volume_auto_table_reaches_the_book() {
         let config = Config::parse(&with_addr(
-            "[volume.auto]\nenabled = true\nlevel_source = \"any\"\nk_speech = 0.5\n\
-             speech_ref_dbfs = -28.0\nk_ambient = 0.25\nambient_ref_dbfs = -50.0\n\
-             min_db = -6.0\nmax_db = 3.0",
+            "[volume.auto]\nenabled = true\nlevel_source = \"any\"\n\
+             k_ambient = 0.25\nambient_ref_dbfs = -50.0\nmin_db = -6.0\nmax_db = 3.0",
         ))
         .expect("parse");
         assert!(config.validate().is_ok());
@@ -3412,14 +3465,12 @@ voice = "af_heart"
         assert_eq!(state.level_source, LevelAdmission::Any);
         assert_eq!(
             (
-                state.k_speech,
-                state.speech_ref_dbfs,
                 state.k_ambient,
                 state.ambient_ref_dbfs,
                 state.auto_min_db,
                 state.auto_max_db
             ),
-            (0.5, -28.0, 0.25, -50.0, -6.0, 3.0)
+            (0.25, -50.0, -6.0, 3.0)
         );
     }
 
@@ -3430,20 +3481,19 @@ voice = "af_heart"
                 "[volume.auto]\nmin_db = 3.0\nmax_db = 0.0",
                 "volume.auto.min_db",
             ),
-            ("[volume.auto]\nk_speech = nan", "volume.auto.k_speech"),
             ("[volume.auto]\nk_ambient = inf", "volume.auto.k_ambient"),
             ("[volume.auto]\nmax_db = inf", "volume.auto.max_db"),
             (
-                "[volume.auto]\nspeech_ref_dbfs = 3.0",
-                "volume.auto.speech_ref_dbfs",
+                "[volume.auto]\nambient_ref_dbfs = 3.0",
+                "volume.auto.ambient_ref_dbfs",
             ),
             (
                 "[volume.auto]\nambient_ref_dbfs = -101.0",
                 "volume.auto.ambient_ref_dbfs",
             ),
             (
-                "[volume.auto]\nspeech_ref_dbfs = nan",
-                "volume.auto.speech_ref_dbfs",
+                "[volume.auto]\nambient_ref_dbfs = nan",
+                "volume.auto.ambient_ref_dbfs",
             ),
         ] {
             let config = Config::parse(&with_addr(table)).expect("parse");
@@ -3454,6 +3504,19 @@ voice = "af_heart"
             Config::parse(&with_addr("[volume.auto]\nlevel_source = \"beam\"")).is_err(),
             "level_source is raw_mic or any"
         );
+    }
+
+    /// A config naming a speech-driven knob is refused at load with the key
+    /// named rather than silently ignored.
+    #[test]
+    fn volume_auto_refuses_the_removed_speech_knobs() {
+        for key in ["k_speech = 0.0", "speech_ref_dbfs = -52.0"] {
+            let err = Config::parse(&with_addr(&format!("[volume.auto]\n{key}")))
+                .expect_err(key)
+                .to_string();
+            let name = key.split(' ').next().unwrap();
+            assert!(err.contains(name), "{key}: {err}");
+        }
     }
 
     #[test]
@@ -3585,6 +3648,56 @@ voice = "af_heart"
         .expect("parse");
         assert_eq!(config.brain.as_ref().unwrap().mode, BrainMode::Echo);
         assert!(config.validate().is_ok());
+    }
+
+    /// The listening rung: `[echo]` under the echo brain sets the window every
+    /// reply opens, in samples at the capture rate.
+    #[test]
+    fn an_echo_table_sets_the_listen_window() {
+        let config = Config::parse(&with_addr(&format!(
+            "[brain]\nmode = \"echo\"\n[echo]\nlisten_window_ms = 8000\n{STT_TTS_TABLES}"
+        )))
+        .expect("parse");
+        assert!(config.validate().is_ok());
+        assert_eq!(config.listen_window_samples(), 128_000);
+
+        let without = Config::parse(&with_addr(&format!(
+            "[brain]\nmode = \"echo\"\n{STT_TTS_TABLES}"
+        )))
+        .expect("parse");
+        assert!(without.echo.is_none());
+        assert_eq!(without.listen_window_samples(), 0);
+    }
+
+    /// Only the parrot reads `[echo]`: under another brain, or none, the table is
+    /// refused rather than read by nothing.
+    #[test]
+    fn an_echo_table_under_another_brain_is_refused() {
+        for brain in ["[brain]\nmode = \"wav\"\nclip = \"a.wav\"\n", ""] {
+            let config = Config::parse(&with_addr(&format!(
+                "{brain}[echo]\nlisten_window_ms = 8000\n{STT_TTS_TABLES}"
+            )))
+            .expect("parse");
+            let err = config.validate().unwrap_err();
+            assert!(err.contains("[echo]"), "{brain:?}: {err}");
+            assert!(err.contains("brain.mode = \"echo\""), "{brain:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_echo_table_with_a_zero_window_or_no_window_is_refused() {
+        let zero = Config::parse(&with_addr(&format!(
+            "[brain]\nmode = \"echo\"\n[echo]\nlisten_window_ms = 0\n{STT_TTS_TABLES}"
+        )))
+        .expect("parse");
+        let err = zero.validate().unwrap_err();
+        assert!(err.contains("echo.listen_window_ms"), "{err}");
+
+        let missing = Config::parse(&with_addr(&format!(
+            "[brain]\nmode = \"echo\"\n[echo]\n{STT_TTS_TABLES}"
+        )));
+        let err = missing.expect_err("the window is required").to_string();
+        assert!(err.contains("listen_window_ms"), "{err}");
     }
 
     #[test]

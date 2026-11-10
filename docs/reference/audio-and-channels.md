@@ -162,3 +162,72 @@ architecture-arc-and-deferred-paths.md:88-92]
   product. (research-multi-beam.md:152-244) [documented]
 - TPA3139D2 wattage (10 W vs 5 W per conflicting sources) and thermal headroom
   on USB-5V power: **[unknown]**. (research-step0.md:352-355)
+
+## 7. The status frame (audio wire v4)
+
+A pod sends `StreamFrame::Status` (tag 7) about once a second (`STATUS_PERIOD_US`)
+for as long as it holds a connection to the host, idle or inside a segment, after its
+`Hello`. Defined in `firmware/crates/audio-pipeline/src/wire.rs`; built in
+`firmware/crates/pod-streamer/src/status.rs`.
+
+**Version rule.** `AUDIO_PROTOCOL_VERSION` is 4. The host reads uplinks from
+`AUDIO_PROTOCOL_MIN_READABLE` (3) to 4: a v3 uplink is a v4 uplink that never sends
+`Status`, so frame logs recorded under v3 still replay. A live pod still requires the
+host's `Hello` to match its own version exactly, so pod and host deploy together.
+
+**Position.**
+
+- `device_ts_us` — the pod's monotonic µs when the frame went to the encoder.
+- `capture_head` — the absolute index of the next sample to be captured, in the
+  `SegmentStart.base_sample_index` domain; `capture_head_ts_us` is when sample
+  `capture_head − 1` was captured.
+- `segment_reach` — how far behind `capture_head` a segment opened now would begin:
+  the pre-roll it would carry (16 000 samples once the ring holds a second, the held
+  length before that). `capture_head − segment_reach` is the position before which no
+  later segment begins, except for an onset already read by the gate and not yet taken
+  by the streamer when the frame was built (ordinarily one idle wake, 10 ms).
+
+**Level blocks.** The pod meters its **level channel** in 100 ms blocks
+(`LEVEL_BLOCK_SAMPLES` = 1 600 samples at 16 kHz) as it captures. The level channel is
+the raw microphone where `Hello` declares `StereoBeamRawMic` (the I2S right slot, §2),
+and the streamed channel otherwise. Block `n` covers samples
+`[n · 1600, (n + 1) · 1600)`, so block indices are in the same domain as
+`capture_head`. Each block is two bytes:
+
+- `half_db` — the block's mean-square level as −2·dBFS, rounded and clamped to
+  0..=200 (0 dBFS … −100 dBFS in 0.5 dB steps).
+- `flags` — bit 0 (`LEVEL_FLAG_PLAYING`): the pod's speaker output was active during
+  some sample of the block. On the ESP pod that is "DAC unmuted", which stays set
+  through playback starvation and for 200 ms after the end of audio.
+
+The pod keeps the last 300 finished blocks (`LEVEL_HISTORY_BLOCKS`, 30 s). Each frame
+carries the finished blocks the host has not yet been sent whole on this connection;
+the first frame after `Hello` carries the whole history, so a host that restarted has
+the last 30 s of room at once. A frame the link would not take is skipped and counted,
+and its blocks ride the next one.
+
+**Counters** (`PodCounters`) are cumulative since the pod booted and wrap at
+`u32::MAX`; a total lower than an earlier frame's means the pod rebooted. A counter
+the pod has no source for is `None`, never 0. The ESP pod does not measure
+`capture_xruns`; the Reachy pod measures `capture_xruns` and none of the other optional
+counters.
+
+**Gauges** (`PodGauges`), read when the frame is built; `None` is "not available on
+this pod or not readable now":
+
+- `heap_free`, `heap_min`, `heap_largest` — internal heap bytes (ESP only).
+- `rssi_dbm` — Wi-Fi RSSI (ESP only; `None` when the Wi-Fi stack lock is busy).
+- `gate_open` — whether the pod's speech gate was open; `gate_energy` — the largest
+  gate input since the previous frame.
+- `stack_free_min` — the least stack, in bytes, the sending thread (the streamer
+  thread) has had free since it started (ESP only). A frame reports the minimum as it
+  stood before that frame was encoded.
+
+A full frame is about 700 bytes; a steady-state frame, carrying ten blocks, under 100.
+
+**On the host.** `speech-surface` writes a `pod_status` JSONL line per connection on
+the first frame, whenever a counter moved or `gate_open` changed, and otherwise every
+10 s; its fields and what a reader may conclude from them are documented at
+`PodStatusLog::observe` (`host/crates/speech-surface/src/pod_status.rs`). A v4
+connection that sends no whole frame for 10 s is closed with a `pod_silent` line and
+`conn_closed.cause = "silent"`.

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// Wire-contract capacity: `Payload::Identify::tests` is typed as
 /// `HVec<TestName, MAX_TESTS>`.  This constant must never be decreased.
 /// It may be larger than `REGISTERED_TESTS.len()` (slack capacity is fine).
-pub const MAX_TESTS: usize = 32;
+pub const MAX_TESTS: usize = 48;
 
 /// The canonical, ordered registry of self-tests a conforming device advertises
 /// in `Payload::Identify` and the host harness expects (HIL check 3).
@@ -81,6 +81,9 @@ pub const REGISTERED_TESTS: &[TestName] = &[
     TestName::TlsPskWrongKeyRejected,
     TestName::Xvf3800OutputRouting,
     TestName::I2sRightSlotSanity,
+    TestName::LevelMeterMatchesRing,
+    TestName::LevelBlocksFlagPlayback,
+    TestName::PodStatusIdle,
 ];
 
 // ── `TlsInboundFrames` drain-budget tuning constants ──────────────────────────
@@ -242,6 +245,10 @@ pub enum Command {
     ///   `host`.
     /// - `tls_psk_bad_port`: TCP port of the TLS-PSK listener holding a *different* key
     ///   for the same identity, for the `TlsPskWrongKeyRejected` self-test.
+    /// - `pod_status_port`: TCP port of the TLS-PSK listener for the `PodStatusIdle`
+    ///   self-test (the device connects, sends `Hello`, and runs the streamer's idle
+    ///   status step; the host decodes and judges the status frames). The host IP is the
+    ///   same as `host`.
     SetTemporaryPeerConfig {
         host: [u8; 4],
         udp_port: u16,
@@ -253,6 +260,7 @@ pub enum Command {
         rtd_port: u16,
         tls_psk_port: u16,
         tls_psk_bad_port: u16,
+        pod_status_port: u16,
     },
     /// Provision the audio receiver address and port into device NVS (discriminant 3).
     ///
@@ -567,7 +575,7 @@ pub enum TestName {
     /// error. The *acoustic* result (audible 440 Hz at correct pitch) has no programmatic
     /// observable — there is no loopback — and is confirmed by the human running the test.
     ///
-    /// Result string: `"PASS src=speaker freq=440 amp=50 dur_ms=1500 codec=ok"` or
+    /// Result string: `"PASS src=speaker freq=440 amp=16 dur_ms=1500 codec=ok"` or
     /// `"FAIL src=speaker reason=<codec-init|amp-enable|i2s-write> …"`.
     ///
     /// Design: docs/adr/2026/06/20-audio-output-speaker-bringup/design.md §2.7.
@@ -809,6 +817,46 @@ pub enum TestName {
     ///
     /// Returns `TestData::I2sRightSlot`.
     I2sRightSlotSanity,
+    /// Level-meter identity self-test (discriminant 31).
+    ///
+    /// Waits for the capture ring's level history to finish ten new 100 ms blocks, then,
+    /// under the ring lock, recomputes each of them from the ring's own level-channel
+    /// samples (the raw-microphone slot) at the same indices and compares the result with
+    /// the meter's `half_db`. The meter and the ring hold the same samples, so the host
+    /// requires every block compared and a largest disagreement of zero steps. Kept
+    /// separate from [`TestName::LevelBlocksFlagPlayback`]: this one is about the level,
+    /// that one about the playing flag.
+    ///
+    /// Returns `TestData::LevelMeter`.
+    LevelMeterMatchesRing,
+    /// Level-block playing-flag identity self-test (discriminant 32).
+    ///
+    /// Feeds the saturating playback chunk through the production inbound ring for 2 s,
+    /// marks end-of-audio, and waits for the ring to drain: the feed window runs from the
+    /// first chunk accepted to the ring observed empty. Then reports, for the finished
+    /// level blocks wholly inside three windows — the second before the feed, the feed,
+    /// and a second starting one second after it — how many there were and how many
+    /// carry the playing flag. The host requires none flagged before, every one flagged
+    /// in the feed, and none flagged after.
+    ///
+    /// Returns `TestData::LevelPlaybackFlags`.
+    LevelBlocksFlagPlayback,
+    /// Pod status frame presence-and-cadence self-test (discriminant 33).
+    ///
+    /// Connects over TLS-PSK to the HIL-host status listener (the `peer` config's
+    /// `pod_status_port`), sends the audio `Hello`, and runs the streamer's production
+    /// idle status step against the live capture ring for 3.5 s, one step per idle tick.
+    /// The host decodes what arrives and asserts: `Hello` at the current audio protocol
+    /// version; at least three `Status` frames; the first carries more than ten level
+    /// blocks (the history); successive runs are contiguous; `capture_head` advances at
+    /// 16 000 samples per second of `device_ts_us` within 2 %; and every block without
+    /// the playing flag reads between −90 and −30 dBFS. That last bound is liveness in a
+    /// room that is not quiet, not a loudness identity; a reading outside it is shown to
+    /// a human before anything moves.
+    ///
+    /// Returns `TestData::PodStatusIdle`. Requires prior `WifiAssociate`,
+    /// `SetTemporaryPeerConfig` and an effective audio PSK.
+    PodStatusIdle,
 }
 
 // ── Response ──────────────────────────────────────────────────────────────────
@@ -1128,6 +1176,40 @@ pub enum TestData {
         ac1: i32,
         /// Indices in the window whose left and right samples differ.
         differing: u32,
+    },
+    LevelMeter {
+        /// The first level block compared.
+        first_block: u64,
+        /// Blocks compared.
+        blocks: u32,
+        /// Largest difference between the meter's `half_db` and the one recomputed from
+        /// the ring's samples, in half-dB steps.
+        max_diff_steps: u32,
+        /// Quietest block the meter reported, as `half_db` (larger is quieter).
+        quietest_half_db: u8,
+        /// Loudest block the meter reported, as `half_db`.
+        loudest_half_db: u8,
+    },
+    LevelPlaybackFlags {
+        /// Blocks wholly inside the second before the feed, and how many were flagged.
+        before_blocks: u32,
+        before_flagged: u32,
+        /// Blocks wholly inside the feed window, and how many were flagged.
+        feed_blocks: u32,
+        feed_flagged: u32,
+        /// Blocks wholly inside the second starting one second after the feed, and how
+        /// many were flagged.
+        after_blocks: u32,
+        after_flagged: u32,
+        /// Feed window length: first chunk accepted to the inbound ring observed empty
+        /// after the end-of-audio mark, in milliseconds.
+        feed_ms: u32,
+    },
+    PodStatusIdle {
+        /// Status frames the idle step dropped under backpressure.
+        status_skipped: u32,
+        /// How long the idle step ran, in milliseconds.
+        run_ms: u32,
     },
 }
 
@@ -1642,7 +1724,8 @@ mod tests {
     ///   CapturePeriodicLine=19, PlaybackDrainRate=20, PollReadinessBidir=21,
     ///   FullDuplexRxIntegrity=22, StreamRealtimeDuplex=23, PsramIdentity=24,
     ///   WifiPowerSaveCheck=25, TlsInboundBackpressure=26, TlsPskHandshake=27,
-    ///   TlsPskWrongKeyRejected=28, Xvf3800OutputRouting=29, I2sRightSlotSanity=30
+    ///   TlsPskWrongKeyRejected=28, Xvf3800OutputRouting=29, I2sRightSlotSanity=30,
+    ///   LevelMeterMatchesRing=31, LevelBlocksFlagPlayback=32, PodStatusIdle=33
     ///
     /// Ping encodes to all-0x01 COBS bytes (before the 0x00 delimiter) because all three
     /// postcard bytes are 0x00 (id=0, cmd=0, testname=0), and COBS replaces each zero with
@@ -1723,6 +1806,15 @@ mod tests {
                 TestName::I2sRightSlotSanity,
                 &[0x01, 0x01, 0x02, 0x1e, 0x00],
             ),
+            (
+                TestName::LevelMeterMatchesRing,
+                &[0x01, 0x01, 0x02, 0x1f, 0x00],
+            ),
+            (
+                TestName::LevelBlocksFlagPlayback,
+                &[0x01, 0x01, 0x02, 0x20, 0x00],
+            ),
+            (TestName::PodStatusIdle, &[0x01, 0x01, 0x02, 0x21, 0x00]),
         ];
         for (variant, expected) in cases {
             let req = Request {
@@ -2726,6 +2818,9 @@ mod tests {
             TlsPskWrongKeyRejected,
             Xvf3800OutputRouting,
             I2sRightSlotSanity,
+            LevelMeterMatchesRing,
+            LevelBlocksFlagPlayback,
+            PodStatusIdle,
         );
 
         // Step 2: every variant must be in REGISTERED_TESTS.
@@ -2769,7 +2864,7 @@ mod tests {
     ///
     /// This test uses `test_name_discriminant` from `device-protocol` (derived via
     /// `postcard::to_slice`, not a hand table), so it also exercises the derived helper.
-    /// Covers the whole registry through `I2sRightSlotSanity` (30).
+    /// Covers the whole registry through `PodStatusIdle` (33).
     #[test]
     fn discriminant_values_are_stable() {
         use super::test_name_discriminant;
@@ -2805,6 +2900,9 @@ mod tests {
             (TestName::TlsPskWrongKeyRejected, 28),
             (TestName::Xvf3800OutputRouting, 29),
             (TestName::I2sRightSlotSanity, 30),
+            (TestName::LevelMeterMatchesRing, 31),
+            (TestName::LevelBlocksFlagPlayback, 32),
+            (TestName::PodStatusIdle, 33),
         ];
         for (variant, expected) in pins {
             assert_eq!(
@@ -2853,7 +2951,7 @@ mod tests {
     ///
     /// Verifies discriminant 2 and that all fields (host, udp_port, tls_host, tls_port,
     /// inbound_frames_port, backpressure_port, poll_readiness_port, rtd_port,
-    /// tls_psk_port, tls_psk_bad_port) survive a COBS/postcard round-trip unchanged.
+    /// tls_psk_port, tls_psk_bad_port, pod_status_port) survive a COBS/postcard round-trip unchanged.
     #[test]
     fn set_temporary_peer_config_golden_roundtrip() {
         let req = Request {
@@ -2869,6 +2967,7 @@ mod tests {
                 rtd_port: 17385,
                 tls_psk_port: 17386,
                 tls_psk_bad_port: 17387,
+                pod_status_port: 17388,
             },
         };
         let mut buf = [0u8; 128];
@@ -2885,20 +2984,21 @@ mod tests {
         // (embedded zero → COBS-encoded), discriminant=0x02, host bytes, udp_port varint,
         // tls_host bytes, tls_port varint, inbound_frames_port varint,
         // backpressure_port varint, poll_readiness_port varint, rtd_port varint,
-        // tls_psk_port varint, tls_psk_bad_port varint.
+        // tls_psk_port varint, tls_psk_bad_port varint, pod_status_port varint.
         // postcard encodes u16 as a variable-length integer (not raw LE bytes).
         // id=0, SetTemporaryPeerConfig discriminant=2 in postcard,
         // host=[192,168,1,50], udp=9, tls_host=[1,1,1,1], tls_port=443,
         // inbound_frames_port=17382, backpressure_port=17383, poll_readiness_port=17384,
-        // rtd_port=17385, tls_psk_port=17386, tls_psk_bad_port=17387.
+        // rtd_port=17385, tls_psk_port=17386, tls_psk_bad_port=17387,
+        // pod_status_port=17388.
         // Postcard encodes u16 as a varint; 17382=0x43E6 → 0xE6,0x87,0x01, etc.
         // COBS: overhead byte 0x01 points to the embedded zero (id=0x00) at index 1;
-        // 0x1F (31) then points 31 bytes ahead to the trailing 0x00 frame delimiter
+        // 0x22 (34) then points 34 bytes ahead to the trailing 0x00 frame delimiter
         // (the rest of the payload has no embedded zeros).
         let expected: &[u8] = &[
-            0x01, 0x1f, 0x02, 0xc0, 0xa8, 0x01, 0x32, 0x09, 0x01, 0x01, 0x01, 0x01, 0xbb, 0x03,
+            0x01, 0x22, 0x02, 0xc0, 0xa8, 0x01, 0x32, 0x09, 0x01, 0x01, 0x01, 0x01, 0xbb, 0x03,
             0xe6, 0x87, 0x01, 0xe7, 0x87, 0x01, 0xe8, 0x87, 0x01, 0xe9, 0x87, 0x01, 0xea, 0x87,
-            0x01, 0xeb, 0x87, 0x01, 0x00,
+            0x01, 0xeb, 0x87, 0x01, 0xec, 0x87, 0x01, 0x00,
         ];
         assert_eq!(
             &buf[..len],
@@ -3037,6 +3137,9 @@ mod typed_report_tests {
             TestData::TlsPskRejected { .. } => 27,
             TestData::Xvf3800OutputRouting { .. } => 28,
             TestData::I2sRightSlot { .. } => 29,
+            TestData::LevelMeter { .. } => 30,
+            TestData::LevelPlaybackFlags { .. } => 31,
+            TestData::PodStatusIdle { .. } => 32,
         }
     }
 
@@ -3044,7 +3147,7 @@ mod typed_report_tests {
     /// intact. Adding a variant requires a case here; the pairing with
     /// [`canonical_discriminant`] is enforced by
     /// `test_data_cases_cover_every_discriminant`.
-    fn all_test_data_cases() -> [TestData; 30] {
+    fn all_test_data_cases() -> [TestData; 33] {
         let mut found = HVec::<u8, I2C_SCAN_MAX_ADDRS>::new();
         for a in 0x08u8..=0x77 {
             found.push(a).unwrap();
@@ -3220,6 +3323,26 @@ mod typed_report_tests {
                 samples: 16000,
                 ac1: 870,
                 differing: 15_998,
+            },
+            TestData::LevelMeter {
+                first_block: 1_234_567,
+                blocks: 10,
+                max_diff_steps: 0,
+                quietest_half_db: 152,
+                loudest_half_db: 131,
+            },
+            TestData::LevelPlaybackFlags {
+                before_blocks: 9,
+                before_flagged: 0,
+                feed_blocks: 38,
+                feed_flagged: 38,
+                after_blocks: 9,
+                after_flagged: 0,
+                feed_ms: 4_012,
+            },
+            TestData::PodStatusIdle {
+                status_skipped: 0,
+                run_ms: 3_500,
             },
         ]
     }

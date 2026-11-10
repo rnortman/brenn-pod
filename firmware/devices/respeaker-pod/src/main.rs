@@ -32,6 +32,8 @@ mod health;
 #[cfg(target_os = "espidf")]
 mod i2c;
 #[cfg(target_os = "espidf")]
+mod level_tests;
+#[cfg(target_os = "espidf")]
 mod netpoll;
 #[cfg(target_os = "espidf")]
 mod psram;
@@ -90,10 +92,7 @@ use wifi_diag::fmt_ipv4;
 #[cfg(target_os = "espidf")]
 use aic3104::AIC3104_ADDR;
 #[cfg(target_os = "espidf")]
-use capture::{
-    CAPTURE_RING, CaptureRing, DEVICE_PLAYBACK_FORMAT, run_i2s_waveform_sanity,
-    spawn_capture_thread,
-};
+use capture::{CAPTURE_RING, CaptureRing, run_i2s_waveform_sanity, spawn_capture_thread};
 #[cfg(target_os = "espidf")]
 use console::{LOGGER, UsbSerialTxSink, WRITER, write_frame};
 #[cfg(target_os = "espidf")]
@@ -560,6 +559,7 @@ fn main() {
             write_head: 0,
             anchor_sample: 0,
             anchor_ts_us: 0,
+            levels: audio_pipeline::level::LevelHistory::new(),
         };
         let mut guard = CAPTURE_RING
             .lock()
@@ -728,6 +728,7 @@ fn dispatch_request(req: Request) {
             rtd_port,
             tls_psk_port,
             tls_psk_bad_port,
+            pod_status_port,
         } => crate::hil_session::handle_set_temporary_peer_config(crate::hil_session::PeerConfig {
             host,
             udp_port,
@@ -739,6 +740,7 @@ fn dispatch_request(req: Request) {
             rtd_port,
             tls_psk_port,
             tls_psk_bad_port,
+            pod_status_port,
         }),
         Command::ProvisionAudio { host, port } => handle_provision_audio(host, port),
         Command::ProvisionAudioPsk { key } => handle_provision_audio_psk(key),

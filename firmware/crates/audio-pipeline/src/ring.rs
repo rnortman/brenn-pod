@@ -18,6 +18,8 @@
 //!
 //! Design reference: `docs/adr/2026/06/09-audio-transport/design.md` §2.3.
 
+use crate::level::LevelHistory;
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 /// Ring buffer duration in seconds (2 s at 16 kHz mono = 32 000 samples = 64 KB).
@@ -41,9 +43,9 @@ pub const PREROLL_SAMPLES: u64 = SAMPLE_RATE_HZ as u64;
 ///
 /// Generic over the backing buffer so each platform supplies its own allocation:
 /// `B` is expected to deref to `[i16]` of `RING_CAPACITY_SAMPLES` samples (the ESP pod
-/// passes a PSRAM buffer, a Linux pod a `Box<[i16]>`). No bound is declared here — the
-/// struct is plain state with no methods of its own, and the consumers that index
-/// `samples` carry the `Deref`/`DerefMut` bounds they need.
+/// passes a PSRAM buffer, a Linux pod a `Box<[i16]>`). No bound is declared on the
+/// struct; [`commit`](Self::commit) and the consumers that index `samples` carry the
+/// `Deref`/`DerefMut` bounds they need.
 ///
 /// A ring may carry a second channel in `aux`: a buffer of the same capacity, indexed
 /// by the same `write_head`, so sample `i` of both channels sits at the same slot and
@@ -51,9 +53,13 @@ pub const PREROLL_SAMPLES: u64 = SAMPLE_RATE_HZ as u64;
 /// at the same slot as `samples` before advancing the head; a ring with `aux: None` is
 /// mono.
 ///
+/// The ring also meters the room: [`levels`](Self::levels) holds 100 ms level blocks of
+/// the level channel (`aux` when the writer supplies it, `samples` otherwise),
+/// index-exact with the audio. Writers go through [`commit`](Self::commit), which
+/// stores a frame and meters it in one step.
+///
 /// Typical callers:
-/// - Capture thread: locks, writes samples (and `aux`), advances `write_head`, updates
-///   the anchor. Hold time is one chunk write (≤ 320 samples × 2 B per channel ≈
+/// - Capture thread: locks, commits samples (and `aux`), updates the anchor. Hold time is one chunk write (≤ 320 samples × 2 B per channel ≈
 ///   negligible).
 /// - Streamer / self-tests: lock, read samples and/or head and anchor, unlock.
 pub struct CaptureRing<B> {
@@ -69,6 +75,27 @@ pub struct CaptureRing<B> {
     /// Platform monotonic µs at the moment `anchor_sample` was captured. Only offsets
     /// within a segment are wire-visible, so the epoch is the platform's own.
     pub anchor_ts_us: u64,
+    /// Level blocks of every committed sample, the status frame's room history.
+    pub levels: LevelHistory,
+}
+
+impl<B: core::ops::DerefMut<Target = [i16]>> CaptureRing<B> {
+    /// Write one captured frame at the write head, meter it, and advance the head.
+    ///
+    /// `sample` goes to `samples` and `aux`, when given and the ring has a second
+    /// channel, to `aux`. The level sample is `aux` when given, else `sample`;
+    /// `playing` is whether the speaker output is active as the frame is captured.
+    /// The anchor is the caller's to refresh, once per chunk.
+    pub fn commit(&mut self, ridx: &RingIndex, sample: i16, aux: Option<i16>, playing: bool) {
+        let slot = ridx.slot(self.write_head);
+        self.samples[slot] = sample;
+        if let (Some(buf), Some(value)) = (self.aux.as_mut(), aux) {
+            buf[slot] = value;
+        }
+        self.levels
+            .push(self.write_head, aux.unwrap_or(sample), playing);
+        self.write_head += 1;
+    }
 }
 
 // ── Signal sanity ─────────────────────────────────────────────────────────────
@@ -667,6 +694,7 @@ mod tests {
             write_head: 0,
             anchor_sample: 0,
             anchor_ts_us: 0,
+            levels: LevelHistory::new(),
         };
         let r = RingIndex::new(ring.samples.len());
 
@@ -706,6 +734,7 @@ mod tests {
             write_head: 0,
             anchor_sample: 0,
             anchor_ts_us: 0,
+            levels: LevelHistory::new(),
         };
         let r = RingIndex::new(ring.samples.len());
         for i in 0..11u64 {
@@ -734,6 +763,7 @@ mod tests {
             write_head: 0,
             anchor_sample: 0,
             anchor_ts_us: 0,
+            levels: LevelHistory::new(),
         };
         ring.samples[3] = -1234;
         ring.write_head = 4;

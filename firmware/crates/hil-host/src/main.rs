@@ -53,6 +53,7 @@ fn main() {
 /// rtd_port=17385/tcp
 /// tls_psk_port=17386/tcp
 /// tls_psk_bad_port=17387/tcp
+/// pod_status_port=17388/tcp
 /// ```
 ///
 /// Values reflect overrides from `RESPEAKER_HIL_UDP_PORT` /
@@ -72,9 +73,10 @@ fn format_port_lines(
     rtd: u16,
     tls_psk: u16,
     tls_psk_bad: u16,
+    pod_status: u16,
 ) -> String {
     format!(
-        "udp_port={udp}/udp\ninbound_frames_port={inbound}/tcp\nbackpressure_port={backpressure}/tcp\npoll_readiness_port={poll_readiness}/tcp\nrtd_port={rtd}/tcp\ntls_psk_port={tls_psk}/tcp\ntls_psk_bad_port={tls_psk_bad}/tcp\n"
+        "udp_port={udp}/udp\ninbound_frames_port={inbound}/tcp\nbackpressure_port={backpressure}/tcp\npoll_readiness_port={poll_readiness}/tcp\nrtd_port={rtd}/tcp\ntls_psk_port={tls_psk}/tcp\ntls_psk_bad_port={tls_psk_bad}/tcp\npod_status_port={pod_status}/tcp\n"
     )
 }
 
@@ -91,6 +93,7 @@ fn print_ports() -> i32 {
                     secrets.rtd_port,
                     secrets.tls_psk_port,
                     secrets.tls_psk_bad_port,
+                    secrets.pod_status_port,
                 )
             );
             0
@@ -365,12 +368,11 @@ fn run_suite(
     println!("deser-error recovery check: PASS");
 
     // Check 4: Behavioral — run each registered self-test via RunTest.
-    // Only `Generic`-phase tests run in this uniform loop (see `test_meta`). `Network`- and
-    // `DedicatedLocal`-phase tests are dispatched in their own blocks after this loop: network
-    // tests need captured pod IP / bound server handles / per-test timeouts, and the
-    // dedicated-local tests each need a log-collecting send so the host can assert the periodic
-    // summary lines the generic loop's plain `send_command` does not collect (two of them also
-    // run a ~5 s feed needing the longer per-test timeout, which the generic loop cannot pass).
+    // Only `Generic`-phase tests run in this uniform loop (see `test_meta`), each with its
+    // `test_meta` timeout. `Network`- and `DedicatedLocal`-phase tests are dispatched in their
+    // own blocks after this loop: network tests need captured pod IP / bound server handles,
+    // and the dedicated-local tests each need a log-collecting send so the host can assert the
+    // periodic summary lines the generic loop's send does not collect.
     println!("Check 4 (behavioral): running self-tests...");
     for test_name in device_tests
         .iter()
@@ -384,12 +386,14 @@ fn run_suite(
         if !want(*test_name) && !speaker_prereq {
             continue;
         }
-        let resp = match harness.send_command(Command::RunTest(*test_name)) {
+        let resp = match harness
+            .send_command_timeout(Command::RunTest(*test_name), test_timeout(test_name))
+        {
             Ok(r) => r,
             Err(HarnessError::Timeout) => {
                 eprintln!(
                     "ERROR [AC9]: device not responding to RunTest({test_name:?}) — \
-                     wrong/old firmware?"
+                     wrong/old firmware, or the test exceeded its budget?"
                 );
                 return 1;
             }
@@ -439,6 +443,8 @@ fn run_suite(
             // hardware.)
             TestName::I2sWaveformSanity
             | TestName::I2sRightSlotSanity
+            | TestName::LevelMeterMatchesRing
+            | TestName::LevelBlocksFlagPlayback
             | TestName::SpeakerOutput
             | TestName::I2cBusScan
             | TestName::PsramIdentity
@@ -817,6 +823,7 @@ fn run_suite(
             rtd_port: peer_servers.rtd_port,
             tls_psk_port: peer_servers.tls_psk_port,
             tls_psk_bad_port: peer_servers.tls_psk_bad_port,
+            pod_status_port: peer_servers.pod_status_port,
         }) {
             Ok(r) => r,
             Err(HarnessError::Timeout) => {
@@ -915,6 +922,56 @@ fn run_suite(
             return 1;
         }
         println!("  self-test {test_name:?}: PASS");
+    }
+
+    // ── PodStatusIdle: the idle status step's frames on a live connection ─────
+    // Runs before StreamRealtimeDuplex, whose synthetic producer commits through the
+    // level meter: blocks of synthetic audio in the history would be judged as room.
+    if want(TestName::PodStatusIdle) {
+        let name = TestName::PodStatusIdle;
+        println!("  Running {name:?}...");
+        let dump_obs = || {
+            let obs = peer_servers.pod_status_observation.lock().unwrap().clone();
+            eprintln!("[pod-status] observation: {obs:?}");
+        };
+        let Ok(report) = run_test_report(
+            harness,
+            name,
+            "check pod-status listener reachability and device-side network state",
+        ) else {
+            dump_obs();
+            return 1;
+        };
+        // The device closes the connection as it returns; give the listener a moment to
+        // read the close before judging.
+        let obs = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let o = peer_servers.pod_status_observation.lock().unwrap().clone();
+                if o.closed || o.error.is_some() || Instant::now() >= deadline {
+                    break o;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        println!(
+            "  {name:?} observation: hello_version={:?} frames={} blocks={:?} other_frames={}",
+            obs.hello_version,
+            obs.statuses.len(),
+            obs.statuses
+                .iter()
+                .map(|f| f.blocks.len())
+                .collect::<Vec<_>>(),
+            obs.other_frames
+        );
+        if let Err(e) = eval_pod_status_idle(&report.data, &obs) {
+            eprintln!(
+                "FAIL [check 4 — behavioral]: {name:?} Status::Ok but host-side assertion failed: {e}"
+            );
+            dump_obs();
+            return 1;
+        }
+        println!("  self-test {name:?}: PASS");
     }
 
     // ── StreamRealtimeDuplex: streamer keeps up with real time (Scenario A) ───
@@ -1652,6 +1709,19 @@ fn check4_typed_gate_for(test_name: &TestName) -> Option<Check4TypedGate> {
                  sat_pct < {I2S_HOST_SATURATED_PCT}) and differ from the left"
             ),
         )),
+        TestName::LevelMeterMatchesRing => Some((
+            eval_level_meter_pass as fn(&TestData) -> bool,
+            format!(
+                "must recompute {LEVEL_METER_BLOCKS} blocks from the ring with zero steps of \
+                 disagreement"
+            ),
+        )),
+        TestName::LevelBlocksFlagPlayback => Some((
+            eval_level_playback_flags_pass as fn(&TestData) -> bool,
+            "must flag no block before the feed, every block inside it, and none from one \
+             second after it"
+                .to_string(),
+        )),
         TestName::Xvf3800OutputRouting => Some((
             eval_xvf3800_output_routing_pass as fn(&TestData) -> bool,
             format!(
@@ -1787,25 +1857,19 @@ fn craft_corrupt_frame() -> Vec<u8> {
     postcard::to_allocvec_cobs(&(0u32, 99u32)).expect("crafting corrupt frame must not fail")
 }
 
-/// Run one dedicated post-loop self-test block: send `RunTest(name)`, check status,
-/// extract the check-4 report, print it, and run the behavioral `eval`. `description`
-/// is the human banner suffix. Returns `Err(())` on any failure so the caller can
-/// `return 1`. Factors the shape shared by the credential-less network-phase blocks
-/// (WifiScan, WifiPowerSaveCheck) into one place.
-fn run_dedicated_test(
+/// Send `RunTest(name)` with its `test_meta` timeout, check its status, and extract and
+/// print its check-4 report. Every failure is reported here; `Err(())` lets the caller
+/// `return 1`. `timeout_hint` follows "device not responding" on a timeout and names
+/// what to look at.
+fn run_test_report(
     harness: &mut Harness,
     name: TestName,
-    description: &str,
-    eval: fn(&TestData) -> Result<(), String>,
-) -> Result<(), ()> {
-    println!("  Running {name:?} ({description})...");
-    let resp = match harness.send_command_timeout(Command::RunTest(name), RESPONSE_TIMEOUT) {
+    timeout_hint: &str,
+) -> Result<TestReport, ()> {
+    let resp = match harness.send_command_timeout(Command::RunTest(name), test_timeout(&name)) {
         Ok(r) => r,
         Err(HarnessError::Timeout) => {
-            eprintln!(
-                "ERROR [AC9]: device not responding to RunTest({name:?}) — \
-                 wrong/old firmware?"
-            );
+            eprintln!("ERROR [AC9]: device not responding to RunTest({name:?}) — {timeout_hint}");
             return Err(());
         }
         Err(e) => {
@@ -1813,21 +1877,33 @@ fn run_dedicated_test(
             return Err(());
         }
     };
-    if check_status(&resp, &format!("{name:?}")).is_err() {
-        return Err(());
-    }
+    check_status(&resp, &format!("self-test {name:?}"))?;
     match check4_test_report(&resp) {
         Ok(report) => {
             print_report(&name, &report);
-            if let Err(e) = eval(&report.data) {
-                eprintln!("FAIL [check 4 — behavioral]: {name:?} {e}");
-                return Err(());
-            }
+            Ok(report)
         }
         Err(e) => {
             eprintln!("FAIL [check 4 — behavioral]: {name:?} {e}");
-            return Err(());
+            Err(())
         }
+    }
+}
+
+/// Run one dedicated post-loop self-test block: [`run_test_report`], then the behavioral
+/// `eval`. `description` is the human banner suffix. Returns `Err(())` on any failure so
+/// the caller can `return 1`.
+fn run_dedicated_test(
+    harness: &mut Harness,
+    name: TestName,
+    description: &str,
+    eval: fn(&TestData) -> Result<(), String>,
+) -> Result<(), ()> {
+    println!("  Running {name:?} ({description})...");
+    let report = run_test_report(harness, name, "wrong/old firmware?")?;
+    if let Err(e) = eval(&report.data) {
+        eprintln!("FAIL [check 4 — behavioral]: {name:?} {e}");
+        return Err(());
     }
     println!("  self-test {name:?}: PASS");
     Ok(())
@@ -2315,6 +2391,67 @@ fn eval_i2s_right_slot_pass(data: &TestData) -> bool {
     true
 }
 
+/// Blocks `LevelMeterMatchesRing` recomputes. Mirrors the device's `METER_CHECK_BLOCKS`.
+const LEVEL_METER_BLOCKS: u32 = 10;
+
+/// Host-side gate for `LevelMeterMatchesRing`: every block the device waited for was
+/// recomputed from the ring, and none disagrees with the meter by even one half-dB step
+/// (the meter and the recomputation read the same samples).
+fn eval_level_meter_pass(data: &TestData) -> bool {
+    let TestData::LevelMeter {
+        first_block,
+        blocks,
+        max_diff_steps,
+        quietest_half_db: _,
+        loudest_half_db: _,
+    } = data
+    else {
+        return false;
+    };
+    if *blocks != LEVEL_METER_BLOCKS || *max_diff_steps != 0 {
+        eprintln!(
+            "FAIL [threshold]: level meter from block {first_block}: {blocks} blocks recomputed \
+             (want {LEVEL_METER_BLOCKS}), largest disagreement {max_diff_steps} half-dB steps \
+             (want 0)"
+        );
+        return false;
+    }
+    true
+}
+
+/// Host-side gate for `LevelBlocksFlagPlayback`: no block flagged in the second before
+/// the feed, every block wholly inside the feed flagged, none flagged in the second
+/// starting one second after it, and every window holding at least one block.
+fn eval_level_playback_flags_pass(data: &TestData) -> bool {
+    let TestData::LevelPlaybackFlags {
+        before_blocks,
+        before_flagged,
+        feed_blocks,
+        feed_flagged,
+        after_blocks,
+        after_flagged,
+        feed_ms,
+    } = data
+    else {
+        return false;
+    };
+    let ok = *before_blocks > 0
+        && *before_flagged == 0
+        && *feed_blocks > 0
+        && feed_flagged == feed_blocks
+        && *after_blocks > 0
+        && *after_flagged == 0;
+    if !ok {
+        eprintln!(
+            "FAIL [threshold]: playing flags before={before_flagged}/{before_blocks} \
+             feed={feed_flagged}/{feed_blocks} after={after_flagged}/{after_blocks} \
+             (feed_ms={feed_ms}); want 0/n, n/n, 0/n with every n > 0"
+        );
+        return false;
+    }
+    true
+}
+
 /// The right I2S slot's expected route as the XVF3800 reports it: category 3 (amplified
 /// microphone data with system delay), microphone 0. Mirrors the device's
 /// `RIGHT_SLOT_ROUTE`.
@@ -2454,22 +2591,19 @@ fn check_status(resp: &Response, label: &str) -> Result<(), ()> {
 /// Where a registered self-test is dispatched during check 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TestPhase {
-    /// Uniform check-4 loop: plain `send_command`, default timeout. The `timeout`
-    /// field on a `Generic` test is ignored (the generic loop does not pass it), so a
-    /// custom timeout there is dead configuration — `generic_phase_tests_use_default_timeout`
-    /// guards against it.
+    /// Uniform check-4 loop: one `RunTest` send with the test's `timeout`, then the
+    /// status and report checks.
     Generic,
-    /// Dedicated network block after the generic loop (needs captured pod IP, bound
-    /// server handles, and per-test timeouts beyond `RESPONSE_TIMEOUT`).
+    /// Dedicated network block after the generic loop (needs captured pod IP and bound
+    /// server handles).
     Network,
-    /// Dedicated local block: needs a log-collecting send (so the host can assert the
-    /// periodic summary lines the generic loop's plain `send_command` does not collect)
-    /// and/or a long feed with a per-test timeout.
+    /// Dedicated local block: needs a log-collecting send, so the host can assert the
+    /// periodic summary lines the generic loop's send does not collect.
     DedicatedLocal,
 }
 
-/// Per-test classification: which check-4 phase dispatches it and, for the dedicated
-/// blocks, the timeout to use with `send_command_timeout`.
+/// Per-test classification: which check-4 phase dispatches it and the timeout its
+/// `RunTest` is sent with.
 #[derive(Debug, Clone, Copy)]
 struct TestMeta {
     phase: TestPhase,
@@ -2481,8 +2615,7 @@ struct TestMeta {
 /// One exhaustive match with no `_` arm: adding a `TestName` variant is a compile error
 /// here, forcing a conscious (phase, timeout) decision. `Network` and `DedicatedLocal`
 /// tests are dispatched in their own blocks after the generic loop; `Generic` tests run
-/// in the uniform loop with plain `send_command` (their `timeout` is ignored, so it is
-/// always `RESPONSE_TIMEOUT`).
+/// in the uniform loop. Every phase sends with the test's `timeout`.
 const fn test_meta(t: &TestName) -> TestMeta {
     match t {
         // ── Network phase ──────────────────────────────────────────────────────
@@ -2552,6 +2685,14 @@ const fn test_meta(t: &TestName) -> TestMeta {
             // sees the typed TestReport.
             timeout: Duration::from_secs(20),
         },
+        TestName::PodStatusIdle => TestMeta {
+            phase: TestPhase::Network,
+            // Device worst case: bringing playback to rest (POD_STATUS_IDLE_SETTLE, 3 s)
+            // + TCP connect (TLS_PSK_CONNECT_TIMEOUT_SECS 3 s) + handshake
+            // (TLS_HANDSHAKE_TIMEOUT_SECS 3 s) + the 3.5 s run = 12.5 s, plus
+            // serial-round-trip margin, so the host always sees the typed TestReport.
+            timeout: Duration::from_secs(25),
+        },
         TestName::StreamRealtimeDuplex => TestMeta {
             phase: TestPhase::Network,
             // Two sequential ~5 s synthetic segments (Scenario A outbound-only, then Scenario B
@@ -2562,8 +2703,8 @@ const fn test_meta(t: &TestName) -> TestMeta {
             timeout: Duration::from_secs(45),
         },
         // WifiScan and WifiPowerSaveCheck are Network-phase but use the default timeout
-        // (both are credential-less, manually dispatched before provisioning; the quirk
-        // is pinned by `generic_phase_tests_use_default_timeout`'s explicit assertions).
+        // (both are credential-less, manually dispatched before provisioning, and need no
+        // more than a scan or a register read).
         TestName::WifiScan | TestName::WifiPowerSaveCheck => TestMeta {
             phase: TestPhase::Network,
             timeout: RESPONSE_TIMEOUT,
@@ -2594,7 +2735,15 @@ const fn test_meta(t: &TestName) -> TestMeta {
             // capture loop already warm and RX draining at cadence.
             timeout: Duration::from_secs(20),
         },
-        // ── Generic phase (uniform loop; timeout ignored, always default) ──────
+        // ── Generic phase (uniform loop) ───────────────────────────────────────
+        TestName::LevelBlocksFlagPlayback => TestMeta {
+            phase: TestPhase::Generic,
+            // Device worst case: an earlier test's full inbound ring draining (3 s) + the
+            // DAC settling (1.2 s) + the 2 s feed + its drain (3 s) + the after-window
+            // (2.5 s) = 11.7 s, past `RESPONSE_TIMEOUT`; plus serial-round-trip margin, so
+            // the host always sees the typed TestReport.
+            timeout: Duration::from_secs(20),
+        },
         TestName::Ping
         | TestName::Identify
         | TestName::GpioSelfTest
@@ -2608,7 +2757,8 @@ const fn test_meta(t: &TestName) -> TestMeta {
         | TestName::AmpAlwaysOnGpoInert
         | TestName::PsramIdentity
         | TestName::Xvf3800OutputRouting
-        | TestName::I2sRightSlotSanity => TestMeta {
+        | TestName::I2sRightSlotSanity
+        | TestName::LevelMeterMatchesRing => TestMeta {
             phase: TestPhase::Generic,
             timeout: RESPONSE_TIMEOUT,
         },
@@ -2677,6 +2827,9 @@ const DEFAULT_HIL_TLS_PSK_PORT: u16 = 17386;
 /// identity, used by `TlsPskWrongKeyRejected`. Separate port rather than a mode byte: the
 /// handshake fails before any application byte can select anything.
 const DEFAULT_HIL_TLS_PSK_BAD_PORT: u16 = 17387;
+/// Default fixed port for the `PodStatusIdle` TLS-PSK listener, which records the
+/// device's `Hello` and every `Status` frame for the host to judge.
+const DEFAULT_HIL_POD_STATUS_PORT: u16 = 17388;
 /// Number of 20 ms audio frames the device's synthetic producer commits after the pre-roll
 /// (250 × 20 ms = 5 s). Manual-sync copy of the device-side `RTD_PRODUCER_FRAMES` (the two
 /// crates share no const module); a drift surfaces as an integrity-count mismatch in
@@ -2808,6 +2961,9 @@ struct HilSecrets {
     /// Resolved TCP wrong-key TLS-PSK listener port for `TlsPskWrongKeyRejected`
     /// (override from RESPEAKER_HIL_TLS_PSK_BAD_PORT or DEFAULT_HIL_TLS_PSK_BAD_PORT).
     tls_psk_bad_port: u16,
+    /// Resolved TCP status listener port for `PodStatusIdle`
+    /// (override from RESPEAKER_HIL_POD_STATUS_PORT or DEFAULT_HIL_POD_STATUS_PORT).
+    pod_status_port: u16,
 }
 
 /// Parse a 4-byte IPv4 address from a dotted-decimal string (e.g. "1.2.3.4").
@@ -2989,6 +3145,12 @@ fn resolve_secrets(get: impl Fn(&str) -> Option<String>, secrets_path: &str) -> 
         DEFAULT_HIL_TLS_PSK_BAD_PORT,
         secrets_path,
     );
+    let pod_status_port = resolve_hil_port(
+        &get,
+        "RESPEAKER_HIL_POD_STATUS_PORT",
+        DEFAULT_HIL_POD_STATUS_PORT,
+        secrets_path,
+    );
 
     HilSecrets {
         wifi,
@@ -3000,6 +3162,7 @@ fn resolve_secrets(get: impl Fn(&str) -> Option<String>, secrets_path: &str) -> 
         rtd_port,
         tls_psk_port,
         tls_psk_bad_port,
+        pod_status_port,
     }
 }
 
@@ -3133,19 +3296,24 @@ fn psk_server_context(psk: &PodPsk) -> Result<openssl::ssl::SslContext, String> 
     Ok(builder.build())
 }
 
-/// Spawn a TLS-PSK echo listener on `port`, accepting only `psk`'s identity+key.
+/// Spawn a TLS-PSK listener on `port`, accepting only `psk`'s identity+key, and hand
+/// each accepted TCP connection to `serve` on the listener's thread, one at a time.
 ///
-/// After a completed handshake the listener echoes whatever it reads back through the
-/// tunnel, which is what `TlsPskHandshake` round-trips. A refused handshake is logged
-/// and the connection dropped — that is the expected outcome on the wrong-key
-/// listener, so it is a normal event there, not a warning.
-fn spawn_tls_psk_listener(
+/// `serve` performs the handshake (or has [`tls_accept`] / [`tls_psk_serve`] do it) and
+/// returns when it is done with the connection. The thread exits once `stop` is set.
+fn spawn_tls_psk_listener<F>(
     name: &'static str,
     port: u16,
     port_env_key: &str,
     psk: &PodPsk,
     stop: &Arc<Mutex<bool>>,
-) -> Result<thread::JoinHandle<()>, String> {
+    mut serve: F,
+) -> Result<thread::JoinHandle<()>, String>
+where
+    F: FnMut(&openssl::ssl::SslContext, std::net::TcpStream, &std::net::SocketAddr)
+        + Send
+        + 'static,
+{
     let ctx = psk_server_context(psk)?;
     let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| {
         format!(
@@ -3169,7 +3337,7 @@ fn spawn_tls_psk_listener(
                     Ok((stream, peer)) => {
                         println!("[{name}] accepted {peer} conn={conn}");
                         conn += 1;
-                        tls_psk_serve(&ctx, stream, &peer, name);
+                        serve(&ctx, stream, &peer);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -3185,6 +3353,29 @@ fn spawn_tls_psk_listener(
             }
         })
         .map_err(|e| format!("failed to spawn {name} thread: {e}"))
+}
+
+/// Spawn a TLS-PSK echo listener on `port`, accepting only `psk`'s identity+key.
+///
+/// After a completed handshake the listener echoes whatever it reads back through the
+/// tunnel, which is what `TlsPskHandshake` round-trips. A refused handshake is logged
+/// and the connection dropped — that is the expected outcome on the wrong-key
+/// listener, so it is a normal event there, not a warning.
+fn spawn_tls_psk_echo_listener(
+    name: &'static str,
+    port: u16,
+    port_env_key: &str,
+    psk: &PodPsk,
+    stop: &Arc<Mutex<bool>>,
+) -> Result<thread::JoinHandle<()>, String> {
+    spawn_tls_psk_listener(
+        name,
+        port,
+        port_env_key,
+        psk,
+        stop,
+        move |ctx, stream, peer| tls_psk_serve(ctx, stream, peer, name),
+    )
 }
 
 /// An established server-side TLS-PSK connection over a TCP socket. Every converted HIL
@@ -3340,6 +3531,8 @@ struct PeerServers {
     /// Fixed TCP TLS-PSK listener port holding a different key for the same identity
     /// (`TlsPskWrongKeyRejected`).
     tls_psk_bad_port: u16,
+    /// Fixed TCP status listener port (`PodStatusIdle`).
+    pod_status_port: u16,
     /// Observation recorded by the `StreamRealtimeDuplex` listener for the device's first
     /// (Scenario A, outbound-only) connection: pre-roll burst-drain timing, received sample
     /// count, and end reason. The runner reads this after the device returns its typed result.
@@ -3363,6 +3556,10 @@ struct PeerServers {
     tls_psk_thread: Option<thread::JoinHandle<()>>,
     /// TLS-PSK echo listener thread handle (wrong key for the same identity).
     tls_psk_bad_thread: Option<thread::JoinHandle<()>>,
+    /// What the `PodStatusIdle` listener decoded from the device's connection.
+    pod_status_observation: Arc<Mutex<PodStatusObservation>>,
+    /// TLS-PSK status listener thread handle (`PodStatusIdle`).
+    pod_status_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl PeerServers {
@@ -3380,6 +3577,7 @@ impl PeerServers {
             rtd_port,
             tls_psk_port,
             tls_psk_bad_port,
+            pod_status_port,
             ..
         } = *secrets;
         // Derive host self-IP: connect a UDP socket to pod_ip on an arbitrary port
@@ -3821,14 +4019,14 @@ impl PeerServers {
         // was provisioned with, the other a key it has never seen. Separate ports
         // rather than one listener with a mode byte, because the wrong-key handshake
         // fails before any application byte could select a mode.
-        let tls_psk_thread = spawn_tls_psk_listener(
+        let tls_psk_thread = spawn_tls_psk_echo_listener(
             "tls-psk-source",
             tls_psk_port,
             "RESPEAKER_HIL_TLS_PSK_PORT",
             psk,
             &stop,
         )?;
-        let tls_psk_bad_thread = spawn_tls_psk_listener(
+        let tls_psk_bad_thread = spawn_tls_psk_echo_listener(
             "tls-psk-bad-source",
             tls_psk_bad_port,
             "RESPEAKER_HIL_TLS_PSK_BAD_PORT",
@@ -3836,8 +4034,12 @@ impl PeerServers {
             &stop,
         )?;
 
+        let pod_status_observation = Arc::new(Mutex::new(PodStatusObservation::default()));
+        let pod_status_thread =
+            spawn_pod_status_listener(pod_status_port, psk, &stop, &pod_status_observation)?;
+
         println!(
-            "  PeerServers: host_ip={} udp_port={udp_port} inbound_frames_port={inbound_frames_port} backpressure_port={backpressure_port} poll_readiness_port={poll_readiness_port} rtd_port={rtd_port} tls_psk_port={tls_psk_port} tls_psk_bad_port={tls_psk_bad_port}",
+            "  PeerServers: host_ip={} udp_port={udp_port} inbound_frames_port={inbound_frames_port} backpressure_port={backpressure_port} poll_readiness_port={poll_readiness_port} rtd_port={rtd_port} tls_psk_port={tls_psk_port} tls_psk_bad_port={tls_psk_bad_port} pod_status_port={pod_status_port}",
             Ipv4Addr::from(host_ip)
         );
 
@@ -3850,6 +4052,7 @@ impl PeerServers {
             rtd_port,
             tls_psk_port,
             tls_psk_bad_port,
+            pod_status_port,
             rtd_observation,
             rtd_observation_b,
             stop,
@@ -3860,6 +4063,8 @@ impl PeerServers {
             rtd_thread: Some(rtd_thread),
             tls_psk_thread: Some(tls_psk_thread),
             tls_psk_bad_thread: Some(tls_psk_bad_thread),
+            pod_status_observation,
+            pod_status_thread: Some(pod_status_thread),
         })
     }
 }
@@ -4130,6 +4335,241 @@ fn backpressure_profile_a(
     // blocked record and the boundary frame completes (`Sent`) well inside the device's
     // 1.0 s per-frame ceiling, then read to EOF.
     backpressure_drain_to_eof(stream, peer, stop_bp)
+}
+
+/// One `Status` frame as the `PodStatusIdle` listener decoded it: the fields the host
+/// judges. The counters and the other gauges decoded with it; their values are not
+/// judged.
+#[derive(Debug, Clone)]
+struct StatusSeen {
+    device_ts_us: u64,
+    capture_head: u64,
+    first_block: u64,
+    blocks: Vec<audio_pipeline::wire::LevelBlock>,
+    /// The sending thread's least free stack, judged for presence only.
+    stack_free_min: Option<u32>,
+}
+
+/// What the `PodStatusIdle` listener decoded from the device's connection.
+#[derive(Debug, Clone, Default)]
+struct PodStatusObservation {
+    /// A device connection was accepted and its TLS handshake completed.
+    connected: bool,
+    /// The version the device's `Hello` declared, once it arrived.
+    hello_version: Option<u8>,
+    /// Every `Status` frame, in arrival order.
+    statuses: Vec<StatusSeen>,
+    /// Frames of any other kind.
+    other_frames: u32,
+    /// The device closed the connection at a frame boundary.
+    closed: bool,
+    /// A read or decode error, if the stream ended abnormally.
+    error: Option<String>,
+}
+
+/// Fewest `Status` frames the host requires from the device's 3.5 s run, which sends
+/// one at once and one a second after.
+const POD_STATUS_MIN_FRAMES: usize = 3;
+/// The device test's thread stack (`POD_STATUS_IDLE_STACK_BYTES` in the device's
+/// `net_tests.rs`): a stack watermark the frame reports lies strictly inside it.
+const POD_STATUS_THREAD_STACK_BYTES: u32 = 16_384;
+/// The first frame of a connection carries the history: more than this many blocks.
+const POD_STATUS_HISTORY_MIN_BLOCKS: usize = 10;
+/// `capture_head` must advance at this many samples per second of `device_ts_us`.
+const POD_STATUS_SAMPLE_RATE: f64 = audio_pipeline::ring::SAMPLE_RATE_HZ as f64;
+/// Allowed relative error of that rate.
+const POD_STATUS_RATE_TOLERANCE: f64 = 0.02;
+/// Liveness band for an unflagged block in a room that is not quiet, in dBFS. Not a
+/// loudness identity: a reading outside it is shown to a human, never widened to pass.
+const POD_STATUS_LIVE_DBFS: (f32, f32) = (-90.0, -30.0);
+
+/// Bind the `PodStatusIdle` TLS-PSK listener and spawn its thread. Each accepted
+/// connection is decoded into `obs` until the device closes it, it errors, or it goes
+/// quiet for longer than the device's run.
+fn spawn_pod_status_listener(
+    port: u16,
+    psk: &PodPsk,
+    stop: &Arc<Mutex<bool>>,
+    obs: &Arc<Mutex<PodStatusObservation>>,
+) -> Result<thread::JoinHandle<()>, String> {
+    const NAME: &str = "pod-status-listener";
+    let obs = Arc::clone(obs);
+    let serve_stop = Arc::clone(stop);
+    spawn_tls_psk_listener(
+        NAME,
+        port,
+        "RESPEAKER_HIL_POD_STATUS_PORT",
+        psk,
+        stop,
+        move |ctx, stream, peer| {
+            if let Some(mut tls) = tls_accept(ctx, stream, peer, NAME) {
+                pod_status_serve(&mut tls, &obs, &serve_stop);
+            }
+        },
+    )
+}
+
+/// Decode one `PodStatusIdle` connection into `obs`, replacing what a previous
+/// connection left there. Returns on EOF, on an error, or after the device has been
+/// silent for longer than its whole run.
+fn pod_status_serve(
+    stream: &mut TlsServerStream,
+    obs: &Arc<Mutex<PodStatusObservation>>,
+    stop: &Arc<Mutex<bool>>,
+) {
+    use audio_pipeline::wire::{MAX_FRAME_BYTES, StreamFrame, decode_frame};
+
+    if let Err(e) = stream.get_ref().set_nonblocking(true) {
+        eprintln!("WARN [pod-status-listener]: set_nonblocking failed: {e}");
+    }
+    *obs.lock().unwrap() = PodStatusObservation {
+        connected: true,
+        ..Default::default()
+    };
+    let mut reader = RtdFrameReader::new(MAX_FRAME_BYTES + 2);
+    let mut last_activity = Instant::now();
+    let inactivity_limit = Duration::from_secs(6);
+    loop {
+        if *stop.lock().unwrap() {
+            return;
+        }
+        let framed = match reader.poll_frame(stream) {
+            Ok(RtdRead::Frame(n)) => n,
+            Ok(RtdRead::WouldBlock) => {
+                if last_activity.elapsed() > inactivity_limit {
+                    obs.lock().unwrap().error =
+                        Some(format!("no frame for {} s", inactivity_limit.as_secs()));
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Ok(RtdRead::Eof) => {
+                obs.lock().unwrap().closed = true;
+                return;
+            }
+            Err(e) => {
+                obs.lock().unwrap().error = Some(format!("read: {e}"));
+                return;
+            }
+        };
+        last_activity = Instant::now();
+        let mut o = obs.lock().unwrap();
+        match decode_frame(&reader.buf[..framed]) {
+            Ok(StreamFrame::Hello(h)) => o.hello_version = Some(h.version),
+            Ok(StreamFrame::Status(st)) => o.statuses.push(StatusSeen {
+                device_ts_us: st.device_ts_us,
+                capture_head: st.capture_head,
+                first_block: st.levels.first_block,
+                blocks: st.levels.blocks.iter().copied().collect(),
+                stack_free_min: st.gauges.stack_free_min,
+            }),
+            Ok(_) => o.other_frames += 1,
+            Err(e) => {
+                o.error = Some(format!("decode: {e:?}"));
+                return;
+            }
+        }
+    }
+}
+
+/// Host-side gate for `PodStatusIdle` over what the listener decoded: `Hello` at the
+/// current version; at least [`POD_STATUS_MIN_FRAMES`] status frames; the first carries
+/// more than [`POD_STATUS_HISTORY_MIN_BLOCKS`] blocks; each run starts where the
+/// previous ended; `capture_head` advances at [`POD_STATUS_SAMPLE_RATE`] per second of
+/// `device_ts_us` within [`POD_STATUS_RATE_TOLERANCE`]; at least one block is unflagged,
+/// and every unflagged block reads inside [`POD_STATUS_LIVE_DBFS`].
+fn eval_pod_status_idle(data: &TestData, obs: &PodStatusObservation) -> Result<(), String> {
+    let TestData::PodStatusIdle {
+        status_skipped,
+        run_ms,
+    } = data
+    else {
+        return Err(format!("expected TestData::PodStatusIdle, got {data:?}"));
+    };
+    if !obs.connected {
+        return Err("the device never reached the pod-status listener".to_string());
+    }
+    if let Some(e) = &obs.error {
+        return Err(format!("listener error: {e}"));
+    }
+    let want = audio_pipeline::wire::AUDIO_PROTOCOL_VERSION;
+    if obs.hello_version != Some(want) {
+        return Err(format!(
+            "Hello version {:?}, want {want}",
+            obs.hello_version
+        ));
+    }
+    let frames = &obs.statuses;
+    if frames.len() < POD_STATUS_MIN_FRAMES {
+        return Err(format!(
+            "{} status frames in {run_ms} ms (skipped {status_skipped}), want at least \
+             {POD_STATUS_MIN_FRAMES}",
+            frames.len()
+        ));
+    }
+    if frames[0].blocks.len() <= POD_STATUS_HISTORY_MIN_BLOCKS {
+        return Err(format!(
+            "first status frame carries {} blocks, want more than \
+             {POD_STATUS_HISTORY_MIN_BLOCKS} (the history)",
+            frames[0].blocks.len()
+        ));
+    }
+    for (i, pair) in frames.windows(2).enumerate() {
+        let end = pair[0].first_block + pair[0].blocks.len() as u64;
+        if pair[1].first_block != end {
+            return Err(format!(
+                "status frame {} starts at block {}, the previous ended before block {end} \
+                 (runs must be contiguous: no gap, no overlap)",
+                i + 1,
+                pair[1].first_block
+            ));
+        }
+    }
+    let (first, last) = (&frames[0], &frames[frames.len() - 1]);
+    let span_us = last.device_ts_us.saturating_sub(first.device_ts_us);
+    if span_us == 0 {
+        return Err("status frames span no device time".to_string());
+    }
+    let advanced = last.capture_head.saturating_sub(first.capture_head);
+    let rate = advanced as f64 / (span_us as f64 / 1e6);
+    let rel = (rate - POD_STATUS_SAMPLE_RATE).abs() / POD_STATUS_SAMPLE_RATE;
+    if rel > POD_STATUS_RATE_TOLERANCE {
+        return Err(format!(
+            "capture_head advanced {advanced} samples over {span_us} µs of device time: \
+             {rate:.0} samples/s, want {POD_STATUS_SAMPLE_RATE} ± {:.0} %",
+            POD_STATUS_RATE_TOLERANCE * 100.0
+        ));
+    }
+    let (lo, hi) = POD_STATUS_LIVE_DBFS;
+    let mut unflagged = 0usize;
+    for frame in frames {
+        for (n, block) in frame.blocks.iter().enumerate() {
+            if block.playing() {
+                continue;
+            }
+            unflagged += 1;
+            let dbfs = block.dbfs();
+            if !(lo..=hi).contains(&dbfs) {
+                return Err(format!(
+                    "block {} reads {dbfs} dBFS with the speaker idle, outside the liveness \
+                     band {lo}…{hi} dBFS — an unexpected reading for human review",
+                    frame.first_block + n as u64
+                ));
+            }
+        }
+    }
+    if unflagged == 0 {
+        return Err("every block carries the playing flag: no room reading to judge".to_string());
+    }
+    // Presence, not margin: the reading is taken, on the thread that sent the frame.
+    match last.stack_free_min {
+        Some(n) if 0 < n && n < POD_STATUS_THREAD_STACK_BYTES => Ok(()),
+        other => Err(format!(
+            "last status frame's stack_free_min is {other:?}, want Some(n) with \
+             0 < n < {POD_STATUS_THREAD_STACK_BYTES} (the sending thread's stack)"
+        )),
+    }
 }
 
 /// Host-side observation recorded by the `StreamRealtimeDuplex` listener for one device
@@ -4612,6 +5052,11 @@ impl Drop for PeerServers {
             && let Err(e) = t.join()
         {
             eprintln!("WARN [peer-servers]: tls-psk-bad-source thread panicked: {e:?}");
+        }
+        if let Some(t) = self.pod_status_thread.take()
+            && let Err(e) = t.join()
+        {
+            eprintln!("WARN [peer-servers]: pod-status-listener thread panicked: {e:?}");
         }
     }
 }
@@ -6572,7 +7017,7 @@ mod tests {
     /// test's healthy data, so a swapped pairing fails here rather than on hardware.
     #[test]
     fn check4_typed_gate_pairs_each_test_with_its_own_predicate() {
-        let healthy: [(TestName, TestData); 10] = [
+        let healthy: [(TestName, TestData); 12] = [
             (
                 TestName::I2sWaveformSanity,
                 waveform_data(-32706, 32510, 680),
@@ -6606,6 +7051,11 @@ mod tests {
             (
                 TestName::Xvf3800OutputRouting,
                 routing_data(0x00, [8, 0], [3, 0]),
+            ),
+            (TestName::LevelMeterMatchesRing, level_meter_data(10, 0)),
+            (
+                TestName::LevelBlocksFlagPlayback,
+                playback_flags_data([(9, 0), (38, 38), (9, 0)]),
             ),
         ];
 
@@ -7738,6 +8188,180 @@ mod tests {
         }
     }
 
+    fn level_meter_data(blocks: u32, max_diff_steps: u32) -> TestData {
+        TestData::LevelMeter {
+            first_block: 4_000,
+            blocks,
+            max_diff_steps,
+            quietest_half_db: 150,
+            loudest_half_db: 128,
+        }
+    }
+
+    /// `(blocks, flagged)` for the before, feed and after windows.
+    fn playback_flags_data(w: [(u32, u32); 3]) -> TestData {
+        TestData::LevelPlaybackFlags {
+            before_blocks: w[0].0,
+            before_flagged: w[0].1,
+            feed_blocks: w[1].0,
+            feed_flagged: w[1].1,
+            after_blocks: w[2].0,
+            after_flagged: w[2].1,
+            feed_ms: 4_000,
+        }
+    }
+
+    /// Ten blocks with no disagreement pass; one step off, or fewer blocks, fails.
+    #[test]
+    fn level_meter_gate() {
+        assert!(eval_level_meter_pass(&level_meter_data(10, 0)));
+        assert!(!eval_level_meter_pass(&level_meter_data(10, 1)));
+        assert!(!eval_level_meter_pass(&level_meter_data(9, 0)));
+        assert!(!eval_level_meter_pass(&level_meter_data(0, 0)));
+        assert!(!eval_level_meter_pass(&waveform_data(-900, 880, 870)));
+    }
+
+    /// None flagged before, all in the feed, none after passes; a flag out of place, a
+    /// feed block missing its flag, or an empty window fails.
+    #[test]
+    fn level_playback_flags_gate() {
+        assert!(eval_level_playback_flags_pass(&playback_flags_data([
+            (9, 0),
+            (38, 38),
+            (9, 0)
+        ])));
+        for bad in [
+            [(9, 1), (38, 38), (9, 0)],
+            [(9, 0), (38, 37), (9, 0)],
+            [(9, 0), (38, 38), (9, 1)],
+            [(0, 0), (38, 38), (9, 0)],
+            [(9, 0), (0, 0), (9, 0)],
+            [(9, 0), (38, 38), (0, 0)],
+        ] {
+            assert!(
+                !eval_level_playback_flags_pass(&playback_flags_data(bad)),
+                "{bad:?} must fail"
+            );
+        }
+    }
+
+    /// A level block at `dbfs`, flagged playing when `playing`.
+    fn block_at(dbfs: f32, playing: bool) -> audio_pipeline::wire::LevelBlock {
+        audio_pipeline::wire::LevelBlock {
+            half_db: (-dbfs * 2.0) as u8,
+            flags: if playing {
+                audio_pipeline::wire::LEVEL_FLAG_PLAYING
+            } else {
+                0
+            },
+        }
+    }
+
+    /// A connection that sent `Hello` at the current version, then four frames a second
+    /// apart: the first carries 30 blocks of history, each later one the ten blocks since,
+    /// all at −70 dBFS, with `capture_head` advancing 16 000 samples a second.
+    fn healthy_status_observation() -> PodStatusObservation {
+        let mut statuses = Vec::new();
+        let mut next_block = 1_000u64;
+        for i in 0..4u64 {
+            let n = if i == 0 { 30 } else { 10 };
+            statuses.push(StatusSeen {
+                device_ts_us: 50_000_000 + i * 1_000_000,
+                capture_head: 1_600_000 + i * 16_000,
+                first_block: next_block,
+                blocks: vec![block_at(-70.0, false); n],
+                stack_free_min: Some(9_000 - i as u32 * 100),
+            });
+            next_block += n as u64;
+        }
+        PodStatusObservation {
+            connected: true,
+            hello_version: Some(audio_pipeline::wire::AUDIO_PROTOCOL_VERSION),
+            statuses,
+            other_frames: 0,
+            closed: true,
+            error: None,
+        }
+    }
+
+    const POD_STATUS_DATA: TestData = TestData::PodStatusIdle {
+        status_skipped: 0,
+        run_ms: 3_500,
+    };
+
+    #[test]
+    fn pod_status_idle_gate_accepts_a_healthy_connection() {
+        assert_eq!(
+            eval_pod_status_idle(&POD_STATUS_DATA, &healthy_status_observation()),
+            Ok(())
+        );
+        // Playing-flagged blocks are not judged against the liveness band.
+        let mut obs = healthy_status_observation();
+        obs.statuses[0].blocks[3] = block_at(-12.0, true);
+        assert_eq!(eval_pod_status_idle(&POD_STATUS_DATA, &obs), Ok(()));
+    }
+
+    #[test]
+    fn pod_status_idle_gate_rejects_each_failure_on_its_own() {
+        type Breaker = fn(&mut PodStatusObservation);
+        let cases: [(&str, Breaker); 14] = [
+            ("never connected", |o| o.connected = false),
+            ("listener error", |o| o.error = Some("read: reset".into())),
+            ("old Hello", |o| o.hello_version = Some(3)),
+            ("no Hello", |o| o.hello_version = None),
+            ("two frames", |o| o.statuses.truncate(2)),
+            ("no history", |o| o.statuses[0].blocks.truncate(10)),
+            ("gap", |o| o.statuses[2].first_block += 1),
+            ("overlap", |o| o.statuses[3].first_block -= 1),
+            ("slow clock", |o| o.statuses[3].capture_head -= 1_000),
+            ("too loud", |o| {
+                o.statuses[1].blocks[0] = block_at(-29.5, false)
+            }),
+            ("dead", |o| o.statuses[2].blocks[9] = block_at(-90.5, false)),
+            ("no stack reading", |o| o.statuses[3].stack_free_min = None),
+            ("zero stack reading", |o| {
+                o.statuses[3].stack_free_min = Some(0)
+            }),
+            ("stack reading past the thread's stack", |o| {
+                o.statuses[3].stack_free_min = Some(16_384)
+            }),
+        ];
+        for (what, break_it) in cases {
+            let mut obs = healthy_status_observation();
+            break_it(&mut obs);
+            assert!(
+                eval_pod_status_idle(&POD_STATUS_DATA, &obs).is_err(),
+                "{what} must fail"
+            );
+        }
+        let mut all_playing = healthy_status_observation();
+        for f in &mut all_playing.statuses {
+            for b in &mut f.blocks {
+                *b = block_at(-70.0, true);
+            }
+        }
+        assert!(
+            eval_pod_status_idle(&POD_STATUS_DATA, &all_playing).is_err(),
+            "with every block flagged there is no room reading to judge"
+        );
+        assert!(eval_pod_status_idle(&TestData::None, &healthy_status_observation()).is_err());
+    }
+
+    /// The band's edges are inclusive and the rate tolerance is 2 %.
+    #[test]
+    fn pod_status_idle_gate_holds_its_edges() {
+        let mut edges = healthy_status_observation();
+        edges.statuses[1].blocks[0] = block_at(-30.0, false);
+        edges.statuses[1].blocks[1] = block_at(-90.0, false);
+        assert_eq!(eval_pod_status_idle(&POD_STATUS_DATA, &edges), Ok(()));
+        // 3 s of device time: 48 000 ± 960 samples.
+        let mut fast = healthy_status_observation();
+        fast.statuses[3].capture_head += 950;
+        assert_eq!(eval_pod_status_idle(&POD_STATUS_DATA, &fast), Ok(()));
+        fast.statuses[3].capture_head += 20;
+        assert!(eval_pod_status_idle(&POD_STATUS_DATA, &fast).is_err());
+    }
+
     /// A live right slot that differs from the left passes; each liveness gate and the
     /// copy check fail it on its own.
     #[test]
@@ -8211,6 +8835,17 @@ mod tests {
         );
     }
 
+    /// LevelBlocksFlagPlayback waits out a full inbound ring, a 2 s feed and its drain, and a
+    /// one-second after-window: 20 s covers its 11.7 s device worst case.
+    #[test]
+    fn test_timeout_level_blocks_flag_playback_is_20s() {
+        assert_eq!(
+            test_timeout(&TestName::LevelBlocksFlagPlayback),
+            Duration::from_secs(20),
+            "LevelBlocksFlagPlayback must use a 20 s timeout (11.7 s device worst case + margin)"
+        );
+    }
+
     /// The remaining non-default Network timeouts are pinned to their exact values.
     ///
     /// `test_meta_phase_matches_expected_partition` checks only `phase` for Network tests,
@@ -8229,6 +8864,7 @@ mod tests {
             (TestName::StreamRealtimeDuplex, 45),
             (TestName::TlsPskHandshake, 25),
             (TestName::TlsPskWrongKeyRejected, 30),
+            (TestName::PodStatusIdle, 25),
         ] {
             assert_eq!(
                 test_timeout(&t),
@@ -8238,25 +8874,19 @@ mod tests {
         }
     }
 
-    /// Every `Generic`-phase test uses the default timeout.
-    ///
-    /// This encodes the real invariant: the generic check-4 loop dispatches with plain
-    /// `send_command`, which ignores per-test timeouts, so a custom timeout on a
-    /// `Generic` test would be dead configuration. Iterating `REGISTERED_TESTS` means a
-    /// future Generic variant is covered automatically. WifiScan and WifiPowerSaveCheck
-    /// are `Network`-phase (so the Generic iteration skips them) yet use the default
-    /// timeout — the two quirks — so each is pinned explicitly here to keep an assertion
-    /// on it.
+    /// The Generic-phase tests other than LevelBlocksFlagPlayback, and the two
+    /// credential-less Network tests, answer within the default timeout. Iterating
+    /// `REGISTERED_TESTS` means a future Generic variant must either fit the default or
+    /// be added here with its budget.
     #[test]
-    fn generic_phase_tests_use_default_timeout() {
+    fn default_timeout_tests_are_pinned() {
         use device_protocol::REGISTERED_TESTS;
         for t in REGISTERED_TESTS {
-            if test_meta(t).phase == TestPhase::Generic {
+            if test_meta(t).phase == TestPhase::Generic && *t != TestName::LevelBlocksFlagPlayback {
                 assert_eq!(
                     test_meta(t).timeout,
                     RESPONSE_TIMEOUT,
-                    "{t:?} is Generic-phase; its timeout is ignored by the loop and must \
-                     stay RESPONSE_TIMEOUT to avoid dead configuration"
+                    "{t:?} is a Generic-phase test with no budget of its own"
                 );
             }
         }
@@ -10438,6 +11068,7 @@ mod tests {
             TestName::StreamRealtimeDuplex,
             TestName::TlsPskHandshake,
             TestName::TlsPskWrongKeyRejected,
+            TestName::PodStatusIdle,
         ];
         // CapturePeriodicLine drives the local production capture thread, not a network
         // peer; it and the two ~5 s-feed drain tests run in dedicated collect-logs blocks.
@@ -11311,13 +11942,14 @@ mod tests {
             DEFAULT_HIL_RTD_PORT,
             DEFAULT_HIL_TLS_PSK_PORT,
             DEFAULT_HIL_TLS_PSK_BAD_PORT,
+            DEFAULT_HIL_POD_STATUS_PORT,
         );
         assert_eq!(
             output,
             format!(
-                "udp_port={DEFAULT_HIL_UDP_PORT}/udp\ninbound_frames_port={DEFAULT_HIL_INBOUND_FRAMES_PORT}/tcp\nbackpressure_port={DEFAULT_HIL_BACKPRESSURE_PORT}/tcp\npoll_readiness_port={DEFAULT_HIL_POLL_READINESS_PORT}/tcp\nrtd_port={DEFAULT_HIL_RTD_PORT}/tcp\ntls_psk_port={DEFAULT_HIL_TLS_PSK_PORT}/tcp\ntls_psk_bad_port={DEFAULT_HIL_TLS_PSK_BAD_PORT}/tcp\n"
+                "udp_port={DEFAULT_HIL_UDP_PORT}/udp\ninbound_frames_port={DEFAULT_HIL_INBOUND_FRAMES_PORT}/tcp\nbackpressure_port={DEFAULT_HIL_BACKPRESSURE_PORT}/tcp\npoll_readiness_port={DEFAULT_HIL_POLL_READINESS_PORT}/tcp\nrtd_port={DEFAULT_HIL_RTD_PORT}/tcp\ntls_psk_port={DEFAULT_HIL_TLS_PSK_PORT}/tcp\ntls_psk_bad_port={DEFAULT_HIL_TLS_PSK_BAD_PORT}/tcp\npod_status_port={DEFAULT_HIL_POD_STATUS_PORT}/tcp\n"
             ),
-            "--print-ports default output must be `udp_port=17380/udp\\ninbound_frames_port=17382/tcp\\nbackpressure_port=17383/tcp\\npoll_readiness_port=17384/tcp\\nrtd_port=17385/tcp\\ntls_psk_port=17386/tcp\\ntls_psk_bad_port=17387/tcp\\n`"
+            "--print-ports default output must be `udp_port=17380/udp\\ninbound_frames_port=17382/tcp\\nbackpressure_port=17383/tcp\\npoll_readiness_port=17384/tcp\\nrtd_port=17385/tcp\\ntls_psk_port=17386/tcp\\ntls_psk_bad_port=17387/tcp\\npod_status_port=17388/tcp\\n`"
         );
         // Verify the exact documented defaults.
         assert!(
@@ -11348,6 +11980,10 @@ mod tests {
             output.contains("tls_psk_bad_port=17387"),
             "default wrong-key TLS-PSK port line must be `tls_psk_bad_port=17387`"
         );
+        assert!(
+            output.contains("pod_status_port=17388"),
+            "default status listener port line must be `pod_status_port=17388`"
+        );
         // Each line carries its firewall protocol so the helper never encodes a
         // port-name-to-proto table: udp_port is the sole `/udp`, all others `/tcp`.
         assert!(
@@ -11365,8 +12001,8 @@ mod tests {
         );
         assert_eq!(
             output.matches("/tcp").count(),
-            6,
-            "all six non-echo-UDP ports must be emitted as `/tcp`"
+            7,
+            "all seven non-echo-UDP ports must be emitted as `/tcp`"
         );
     }
 
@@ -11377,7 +12013,8 @@ mod tests {
     /// helper opens the overridden port (not the default).
     #[test]
     fn print_ports_overrides_produce_correct_output() {
-        let output = super::format_port_lines(18000, 18002, 18003, 18004, 18005, 18006, 18007);
+        let output =
+            super::format_port_lines(18000, 18002, 18003, 18004, 18005, 18006, 18007, 18008);
         assert!(
             output.contains("udp_port=18000"),
             "overridden UDP port must appear verbatim in --print-ports output"
@@ -11406,6 +12043,10 @@ mod tests {
             output.contains("tls_psk_bad_port=18007"),
             "overridden wrong-key TLS-PSK port must appear verbatim in --print-ports output"
         );
+        assert!(
+            output.contains("pod_status_port=18008"),
+            "overridden status listener port must appear verbatim in --print-ports output"
+        );
     }
 
     /// `--print-ports` output via `resolve_secrets` uses the same resolved values
@@ -11428,6 +12069,7 @@ mod tests {
             secrets.rtd_port,
             secrets.tls_psk_port,
             secrets.tls_psk_bad_port,
+            secrets.pod_status_port,
         );
         assert!(
             output.contains("udp_port=19000"),

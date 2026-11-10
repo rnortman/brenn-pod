@@ -362,17 +362,21 @@ impl Router {
     /// the operator's bounds) — not its state when the reply played — `auto_db`
     /// the automatic term added to it under the policy the reply was queued
     /// under (inside the pod's swing bounds), `auto` why that term is what it is
-    /// (`applied`, `off`, `no_level`, `source_rejected`, or `overridden` when the
-    /// reply carried its own gain, which then replaces both held and automatic
-    /// terms), `override_db` the reply's own gain as asked (null when it carried
+    /// (`applied`; `off`; `no_level`, no room reading exists, measured or
+    /// carried; `stale`, a reading exists and is too old to count;
+    /// `source_rejected`; or `overridden` when the reply carried its own gain,
+    /// which then replaces both held and automatic terms), `ambient_weight` the
+    /// weight 0…1 the room reading's age gave it (null when no reading was
+    /// weighed), `override_db` the reply's own gain as asked (null when it carried
     /// none), and `applied_db` the gain the samples were actually scaled by —
     /// always inside `[min_db, max_db]` of `volume_configured`. `clipped_samples`
     /// of `samples` saturated at the `i16` rails; a reader may treat a non-zero
     /// count as audible clipping caused by positive gain. `level` is the answered
-    /// utterance's measured level that the automatic term read, present for
-    /// every reply to a measured utterance (null for an announcement, an offline
-    /// clip, or an utterance no live level reading covered — `auto` is then
-    /// `no_level` unless automatic gain is off or overridden).
+    /// utterance's measured level, whose `ambient` the automatic term read —
+    /// partial or carried readings included, as they are — present for every
+    /// reply to a measured utterance (null for an announcement, an offline clip,
+    /// or an utterance nothing was measured for — `auto` is then `no_level`
+    /// unless automatic gain is off or overridden).
     fn apply_gain(
         &self,
         pod: &PodId,
@@ -390,6 +394,7 @@ impl Router {
                 "held_db": gain.held_db(),
                 "auto_db": gain.auto_db(),
                 "auto": gain.auto(),
+                "ambient_weight": gain.ambient_weight(),
                 "override_db": gain.override_db(),
                 "applied_db": gain.applied_db(),
                 "clipped_samples": clipped,
@@ -689,6 +694,7 @@ async fn fan_out_playback_event(event: &PlaybackEvent, fanout: &PlaybackFanout) 
                     interruptible: job.as_ref().is_some_and(|j| j.interruptible),
                     may_wake: job.as_ref().is_some_and(|j| j.may_wake),
                     turn: job.as_ref().and_then(|j| j.in_reply_to),
+                    at: HostMicros::now(),
                 },
             )
             .await;
@@ -1185,9 +1191,9 @@ mod tests {
                 default_db: gain_db,
                 per_pod: HashMap::new(),
             },
-            // References fixed so the arithmetic in the tests reads against round numbers.
+            // The reference fixed so the arithmetic in the tests reads against round
+            // numbers.
             speech_pipeline::AutoPolicy {
-                speech_ref_dbfs: -30.0,
                 ambient_ref_dbfs: -55.0,
                 ..speech_pipeline::AutoPolicy::default()
             },
@@ -1231,8 +1237,13 @@ mod tests {
         )
         .unwrap();
         let level = UtteranceLevel {
-            speech_dbfs: -36.0,
-            ambient_dbfs: Some(-55.0),
+            speech_dbfs: Some(-36.0),
+            ambient: Some(speech_pipeline::AmbientReading {
+                dbfs: -58.0,
+                blocks: 40,
+                age_ms: 2_000,
+                carried: false,
+            }),
             source: LevelSource::RawMic,
         };
         let mut measured = pcm_cmd("p", 1, &[100, -100]);
@@ -1248,21 +1259,30 @@ mod tests {
             assert_eq!(line["held_db"], json!(gain.held_db()));
             assert_eq!(line["auto_db"], json!(gain.auto_db()));
             assert_eq!(line["auto"], json!(gain.auto()));
+            assert_eq!(line["ambient_weight"], json!(gain.ambient_weight()));
             assert_eq!(line["override_db"], json!(gain.override_db()));
             assert_eq!(line["applied_db"], json!(gain.applied_db()));
             assert_eq!(line["samples"], 2);
         }
         assert_eq!(lines[0]["utterance"], 1);
         assert_eq!(lines[0]["auto"], "applied");
-        assert_eq!(lines[0]["applied_db"], -16.0);
+        // The room 3 dB under the -55 reference attenuates by 3.
+        assert_eq!(lines[0]["auto_db"], -3.0);
+        assert_eq!(lines[0]["ambient_weight"], 1.0);
+        assert_eq!(lines[0]["applied_db"], -13.0);
         assert_eq!(
             lines[0]["level"],
-            json!({"speech_dbfs": -36.0, "ambient_dbfs": -55.0, "source": "raw_mic"})
+            json!({
+                "speech_dbfs": -36.0,
+                "ambient": {"dbfs": -58.0, "blocks": 40, "age_ms": 2_000, "carried": false},
+                "source": "raw_mic",
+            })
         );
         assert_eq!(lines[1]["auto"], "overridden");
         assert_eq!(lines[1]["override_db"], 40.0);
         assert_eq!(lines[1]["applied_db"], 6.0);
         assert!(lines[1]["level"].is_null());
+        assert!(lines[1]["ambient_weight"].is_null());
         assert_eq!(lines[1]["clipped_samples"], 0);
     }
 
@@ -2880,7 +2900,8 @@ mod tests {
             matches!(
                 seen.as_slice(),
                 [Feed::Listen {
-                    window_samples: TEST_LISTEN_WINDOW
+                    window_samples: TEST_LISTEN_WINDOW,
+                    ..
                 }]
             ),
             "one window, as long as the configuration says: {seen:?}",

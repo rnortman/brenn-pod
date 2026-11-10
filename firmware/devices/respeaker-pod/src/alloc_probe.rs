@@ -15,8 +15,12 @@
 use core::ffi::c_char;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-/// Total allocation failures observed since boot. Read cheaply from any context.
-static ALLOC_FAIL_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Total allocation failures observed since boot: the status frame's
+/// `alloc_failures` counter, so the count the hook keeps is the count the host reads.
+/// Read cheaply from any context.
+fn alloc_fail_count_cell() -> &'static AtomicU32 {
+    &crate::streamer::POD_STATS.alloc_failures
+}
 
 /// While set, [`failed_alloc_hook`] withholds its per-failure detail line (it still
 /// bumps the counter). The `PsramIdentity` malloc-stays-internal probe deliberately
@@ -52,11 +56,11 @@ const DETAIL_LIMIT: u32 = 8;
 
 /// Current allocation-failure count. Lock-free read for instrumentation sites.
 pub(crate) fn alloc_fail_count() -> u32 {
-    ALLOC_FAIL_COUNT.load(Ordering::Relaxed)
+    alloc_fail_count_cell().load(Ordering::Relaxed)
 }
 
 /// Remove the single deliberate allocation failure the `PsramIdentity` probe just caused from
-/// [`ALLOC_FAIL_COUNT`]. The probe's guaranteed-failing 1 MiB `malloc` fires
+/// [`alloc_fail_count_cell`]. The probe's guaranteed-failing 1 MiB `malloc` fires
 /// [`failed_alloc_hook`], which has already counted it by the time `malloc` returns null; this
 /// subtracts exactly that one known contribution so the counter stays a clean tripwire for
 /// *real* failures (which a zero-count ship gate scores on).
@@ -68,7 +72,7 @@ pub(crate) fn alloc_fail_count() -> u32 {
 /// exactly once, and only when the deliberate allocation actually failed (so the count is
 /// already ≥ 1, and the `fetch_sub` cannot underflow).
 pub(crate) fn discount_deliberate_failure() {
-    ALLOC_FAIL_COUNT.fetch_sub(1, Ordering::Relaxed);
+    alloc_fail_count_cell().fetch_sub(1, Ordering::Relaxed);
 }
 
 /// ESP-IDF failed-allocation hook, invoked in the failing allocator's context.
@@ -79,7 +83,7 @@ pub(crate) fn discount_deliberate_failure() {
 /// passed through to `ets_printf`, never dereferenced here.
 unsafe extern "C" fn failed_alloc_hook(size: usize, caps: u32, function_name: *const c_char) {
     // fetch_add returns the prior value; the first failure sees 0.
-    let prior = ALLOC_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+    let prior = alloc_fail_count_cell().fetch_add(1, Ordering::Relaxed);
     if prior < DETAIL_LIMIT && !DETAIL_SUPPRESSED.load(Ordering::Relaxed) {
         let name = if function_name.is_null() {
             c"<null>".as_ptr()

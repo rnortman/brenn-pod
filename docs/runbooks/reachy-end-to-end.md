@@ -175,6 +175,21 @@ What each table is doing:
 Unknown keys are fatal at startup rather than silently ignored, so a typo here shows up
 immediately as a parse error naming the field.
 
+**The listening parrot** (`config/parrot-listen.toml`) exercises the follow-up window with
+no language model and nobody to answer: copy `config/parrot.toml` to it and append
+
+```toml
+[echo]
+listen_window_ms = 8000
+```
+
+Every echoed reply then keeps listening for 8 s, so a second line said within that time
+is heard without the wake word and parroted back in turn; a line said after it is not.
+The `listen_opened` line's `deadline_sample − at_sample` is the window in samples
+(128 000 at 8 s), and a window nobody speaks into ends with `listen_expired` within about
+a second of its deadline. `[echo]` is refused under any brain mode but `echo`. Run it as
+step 3 runs `parrot.toml`, with the config path changed.
+
 ## Step 2 — provision the pod: one command
 
 The Reachy payload built by brenn-reachy carries the pod's link itself: its build runs

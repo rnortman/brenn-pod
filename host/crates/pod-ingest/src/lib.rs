@@ -17,7 +17,7 @@ pub use readback::{SpliceOutcome, SpliceStop, splice_log_into};
 pub use segref::{ResolveError, Resolved, SegmentRef, resolve_open};
 pub use session::{
     CaptureLayout, ChannelSource, CloseCause, Codec, CrossCheck, EndReason, FormatConstraint,
-    FsmStats, Gap, ProtocolErrorKind, ResumeLedger, SegmentClose, SessionEvent, SessionFsm,
-    TelemetryKind,
+    FsmStats, Gap, LevelBlock, PodCounters, PodGauges, ProtocolErrorKind, ResumeLedger,
+    SegmentClose, SessionEvent, SessionFsm, TelemetryKind,
 };
 pub use synth::{SynthError, SynthFrame, SynthParams, synth_session};

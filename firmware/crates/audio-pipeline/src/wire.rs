@@ -6,7 +6,8 @@
 //!
 //! **Bidirectional use.** The same framing and `StreamFrame` type are used in both
 //! directions on the TCP connection.  The device→server direction carries the full
-//! set of variants (`Hello`, `SegmentStart`, `Audio`, `Telemetry`, `SegmentEnd`).
+//! set of variants (`Hello`, `SegmentStart`, `Audio`, `Telemetry`, `SegmentEnd`,
+//! `Status`).
 //! The server→device direction carries a leading `Hello` followed by `Audio` frames:
 //! the server MUST send a `Hello` as its **first** inbound frame so the device can
 //! validate the playback format (sample rate / bit depth / channels / codec) before
@@ -16,8 +17,9 @@
 //! non-conforming peer: the device assumes its fixed 16 kHz / 16-bit / mono S16_LE
 //! format and warns that the handshake was missing (see the device-side inbound path).
 //!
-//! **Version:** `Hello::version` must equal `AUDIO_PROTOCOL_VERSION`; a mismatch is
-//! a fatal protocol error on the receiver side.  The version guards schema changes;
+//! **Version:** the device requires the host's `Hello::version` to equal
+//! `AUDIO_PROTOCOL_VERSION`; the host reads any uplink from `AUDIO_PROTOCOL_MIN_READABLE`
+//! to `AUDIO_PROTOCOL_VERSION`.  Anything else is a fatal protocol error.  The version guards schema changes;
 //! it is not bumped when the server begins sending `Audio` frames back on the
 //! previously silent server→device direction, because the wire schema is unchanged.
 
@@ -34,7 +36,13 @@ use serde::{Deserialize, Serialize};
 /// (tag 6) — the explicit end-of-audio marker and the flush/stop control frame for
 /// the device-side mute policy and barge-in.  A v2 peer would die on the first
 /// unknown tag mid-stream, so the version is now checked fatally on *both* ends.
-pub const AUDIO_PROTOCOL_VERSION: u8 = 3;
+/// v4: appended `StreamFrame::Status` (tag 7), the device's once-a-second status frame.
+pub const AUDIO_PROTOCOL_VERSION: u8 = 4;
+
+/// The oldest uplink a receiver still reads. A v3 uplink is a v4 uplink that never
+/// sends `Status`, so frame logs recorded under v3 stay readable. The device still
+/// requires an exact match on the host's `Hello`.
+pub const AUDIO_PROTOCOL_MIN_READABLE: u8 = 3;
 
 /// Maximum postcard payload size (bytes), excluding the 2-byte length prefix.
 /// A received frame length field exceeding this is a protocol violation.
@@ -81,6 +89,11 @@ pub enum StreamFrame {
     /// (flush/stop, for barge-in).  Empty body today; struct-typed so fields can
     /// be appended later without re-tagging.
     FlushPlayback(FlushPlayback),
+    /// Device → receiver, about once a second for as long as the connection is up,
+    /// inside a segment or not. See [`Status`].
+    // TODO(pod-log-over-wifi): the pod's warn-and-above log lines would travel to the
+    // host beside this frame.
+    Status(Status),
 }
 
 // ── Frame bodies ──────────────────────────────────────────────────────────────
@@ -279,6 +292,150 @@ pub struct EndOfAudio {}
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct FlushPlayback {}
 
+/// Samples per level block: 100 ms at 16 kHz.
+pub const LEVEL_BLOCK_SAMPLES: u32 = 1_600;
+
+/// Level blocks the device holds and can re-send: 30 s.
+pub const LEVEL_HISTORY_BLOCKS: usize = 300;
+
+/// Device µs between status frames.
+pub const STATUS_PERIOD_US: u64 = 1_000_000;
+
+/// [`LevelBlock::flags`] bit: the device's speaker output was active during some
+/// sample of the block.
+pub const LEVEL_FLAG_PLAYING: u8 = 1 << 0;
+
+/// Body of [`StreamFrame::Status`]: the device's position, its room level history and
+/// its health, sent whether or not a segment is open.
+///
+/// A receiver may conclude from a `Status` that the device was alive and capturing at
+/// `device_ts_us`. Every counter is cumulative since boot, so a lost frame loses no
+/// count, and a total lower than an earlier frame's means the device rebooted.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct Status {
+    /// Device monotonic µs when the frame was built.
+    pub device_ts_us: u64,
+    /// The capture ring's write head when the frame was built: the absolute index of
+    /// the next sample to be captured, in the `SegmentStart.base_sample_index` domain.
+    pub capture_head: u64,
+    /// Device µs at which sample `capture_head - 1` was captured.
+    pub capture_head_ts_us: u64,
+    /// Finished level blocks the receiver has not yet been sent on this connection
+    /// (the whole held history on the first frame after `Hello`).
+    pub levels: LevelRun,
+    /// Cumulative event counts since boot.
+    pub counters: PodCounters,
+    /// Point-in-time readings.
+    pub gauges: PodGauges,
+    /// How far behind `capture_head` a segment opened now would begin: the pre-roll
+    /// it would carry. A segment whose onset the gate reads after this frame was
+    /// built has a `base_sample_index` no earlier than `capture_head -
+    /// segment_reach`. An onset the gate had already read when this frame was built,
+    /// and the streamer had not yet taken, begins its segment earlier than that by
+    /// the samples captured in between: one idle wake in the ordinary case, with no
+    /// bound stated here. A receiver may treat `capture_head - segment_reach` as the
+    /// position before which no later segment begins, and may end on it something
+    /// that waits for earlier audio, knowing it ends that much early at worst.
+    pub segment_reach: u32,
+}
+
+/// Consecutive level blocks. Block `n` covers samples
+/// `[n * LEVEL_BLOCK_SAMPLES, (n + 1) * LEVEL_BLOCK_SAMPLES)`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Default)]
+pub struct LevelRun {
+    /// Block index of `blocks[0]`.
+    pub first_block: u64,
+    /// Blocks `first_block`, `first_block + 1`, … in order.
+    pub blocks: HVec<LevelBlock, LEVEL_HISTORY_BLOCKS>,
+}
+
+/// One 100 ms reading of the device's level channel: the raw microphone where `Hello`
+/// declares [`ChannelSource::StereoBeamRawMic`], the streamed channel otherwise.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub struct LevelBlock {
+    /// Mean-square level of the block as −2·dBFS rounded, clamped to 0..=200
+    /// (0 dBFS … −100 dBFS in 0.5 dB steps).
+    pub half_db: u8,
+    /// [`LEVEL_FLAG_PLAYING`] and future bits.
+    pub flags: u8,
+}
+
+impl LevelBlock {
+    /// The block's level in dBFS.
+    pub fn dbfs(self) -> f32 {
+        -(self.half_db as f32) / 2.0
+    }
+
+    /// Whether the speaker output was active during some sample of the block.
+    pub fn playing(self) -> bool {
+        self.flags & LEVEL_FLAG_PLAYING != 0
+    }
+}
+
+/// Cumulative counts since boot, each wrapping at `u32::MAX`.
+///
+/// A count one device has no source for is `None` from that device: "this device does
+/// not measure it" never reads as "it measured none".
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Default)]
+pub struct PodCounters {
+    /// Capture frames the I2S clock produced and the reader did not get.
+    pub capture_deficit_frames: Option<u32>,
+    /// Capture overruns the driver reported and the reader recovered from; each one is
+    /// a hole of unknown length in the captured audio.
+    pub capture_xruns: Option<u32>,
+    /// Times playback ran dry mid-stream.
+    pub playback_underruns: u32,
+    /// Output writes that failed and were survived.
+    pub playback_write_failures: Option<u32>,
+    /// Times the inbound playback ring was full and the sender was held back.
+    pub playback_full_stalls: u32,
+    /// Inbound audio chunks dropped.
+    pub playback_discards: Option<u32>,
+    /// Gate openings the streamer took as the start of a segment. One that did not
+    /// become a segment was lost before its `SegmentStart` reached the host (no
+    /// connection, or the link would not take the frame): `onsets − segments_opened`
+    /// counts those utterances.
+    pub onsets: u32,
+    /// Segments the streamer opened.
+    pub segments_opened: u32,
+    /// Segments the streamer lost before their `SegmentEnd` (socket lost, fault).
+    pub segments_dropped: u32,
+    /// Segments ended because the capture ring lapped the read cursor.
+    pub ring_overruns: u32,
+    /// Gate → streamer messages dropped because the channel was full.
+    pub gate_msg_drops: u32,
+    /// Connections established.
+    pub connects: u32,
+    /// Connection attempts that failed.
+    pub connect_failures: u32,
+    /// Status frames not sent because the link would not take them.
+    pub status_skipped: u32,
+    /// Failed allocations.
+    pub alloc_failures: Option<u32>,
+}
+
+/// Readings taken when the frame was built. `None` is "not available on this device or
+/// not readable just now", never zero.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy, Default)]
+pub struct PodGauges {
+    /// Free heap bytes.
+    pub heap_free: Option<u32>,
+    /// Lowest free heap bytes since boot.
+    pub heap_min: Option<u32>,
+    /// Largest free heap block in bytes.
+    pub heap_largest: Option<u32>,
+    /// Wi-Fi RSSI in dBm.
+    pub rssi_dbm: Option<i8>,
+    /// Whether the speech gate was open.
+    pub gate_open: bool,
+    /// The largest gate input seen since the previous status frame; `None` when no
+    /// gate read succeeded in that time.
+    pub gate_energy: Option<f32>,
+    /// The least stack, in bytes, the thread sending this frame has had free since it
+    /// started. `None`: this pod does not measure it.
+    pub stack_free_min: Option<u32>,
+}
+
 // ── Framing codec ─────────────────────────────────────────────────────────────
 
 /// Encode a `StreamFrame` into `buf` as a `u16` LE length prefix followed by the
@@ -342,6 +499,7 @@ const STREAM_FRAME_TAG_TELEMETRY: u32 = 3;
 const STREAM_FRAME_TAG_SEGMENT_END: u32 = 4;
 const STREAM_FRAME_TAG_END_OF_AUDIO: u32 = 5;
 const STREAM_FRAME_TAG_FLUSH_PLAYBACK: u32 = 6;
+const STREAM_FRAME_TAG_STATUS: u32 = 7;
 
 /// Outcome of a borrowing inbound decode: classifies the frame and, for `Audio`,
 /// borrows the PCM directly out of the caller's buffer (no owned `AudioFrame`, no
@@ -388,7 +546,8 @@ pub enum InboundFrame<'a> {
     /// The server's flush/stop control frame (`StreamFrame::FlushPlayback`, tag 6).
     /// Empty body, so nothing is decoded — the tag classification is the whole signal.
     Flush,
-    /// Any other non-`Audio` variant (`SegmentStart`, `Telemetry`, `SegmentEnd`).
+    /// Any other non-`Audio` variant (`SegmentStart`, `Telemetry`, `SegmentEnd`,
+    /// `Status`).
     /// The device ignores these on the inbound direction, so the body is not decoded;
     /// the raw enum tag is carried so the caller can log *which* variant was skipped
     /// (diagnosability for an unexpected mid-stream control frame).
@@ -570,12 +729,14 @@ pub fn decode_inbound(buf: &[u8]) -> Result<InboundFrame<'_>, DecodeError> {
             // Empty-body control frames the device acts on directly — no body to walk.
             STREAM_FRAME_TAG_END_OF_AUDIO => Ok(InboundFrame::EndOfAudio),
             STREAM_FRAME_TAG_FLUSH_PLAYBACK => Ok(InboundFrame::Flush),
-            // SegmentStart / Telemetry / SegmentEnd — device ignores inbound.  Validate
-            // only that the tag is a known variant; do not walk the body (the consume
-            // loop advances by the framed length, which is already known).
+            // SegmentStart / Telemetry / SegmentEnd / Status — uplink-only, ignored
+            // inbound.  Validate only that the tag is a known variant; do not walk the
+            // body (the consume loop advances by the framed length, which is already
+            // known).
             STREAM_FRAME_TAG_SEGMENT_START
             | STREAM_FRAME_TAG_TELEMETRY
-            | STREAM_FRAME_TAG_SEGMENT_END => Ok(InboundFrame::Other(tag)),
+            | STREAM_FRAME_TAG_SEGMENT_END
+            | STREAM_FRAME_TAG_STATUS => Ok(InboundFrame::Other(tag)),
             _ => Err(DecodeError::PostcardError),
         };
     }
@@ -1041,6 +1202,151 @@ mod tests {
             &[0x06],
             "FlushPlayback payload must be the single tag byte 6 (empty body)"
         );
+    }
+
+    // ── Status (v4) ───────────────────────────────────────────────────────────
+
+    /// A status frame carrying `n` blocks from `first_block`, with every optional
+    /// counter and gauge `Some` when `first_block` is even and `None` when odd, so the
+    /// round-trip cases cover both.
+    fn status(first_block: u64, n: usize) -> Status {
+        let some = first_block.is_multiple_of(2);
+        let opt = |v: u32| if some { Some(v) } else { None };
+        let mut blocks = HVec::new();
+        for i in 0..n {
+            blocks
+                .push(LevelBlock {
+                    half_db: (i % 201) as u8,
+                    flags: if i % 3 == 0 { LEVEL_FLAG_PLAYING } else { 0 },
+                })
+                .unwrap();
+        }
+        Status {
+            device_ts_us: 123_456_789,
+            capture_head: 292_876_480,
+            capture_head_ts_us: 123_456_700,
+            levels: LevelRun {
+                first_block,
+                blocks,
+            },
+            counters: PodCounters {
+                capture_deficit_frames: opt(7),
+                capture_xruns: opt(1),
+                playback_underruns: 3,
+                playback_write_failures: opt(u32::MAX),
+                playback_full_stalls: 9,
+                playback_discards: opt(0),
+                onsets: 44,
+                segments_opened: 41,
+                segments_dropped: 2,
+                ring_overruns: 0,
+                gate_msg_drops: 5,
+                connects: 6,
+                connect_failures: 1,
+                status_skipped: 4,
+                alloc_failures: opt(0),
+            },
+            gauges: PodGauges {
+                heap_free: opt(81_234),
+                heap_min: opt(60_000),
+                heap_largest: opt(31_744),
+                rssi_dbm: if some { Some(-61) } else { None },
+                gate_open: some,
+                gate_energy: if some { Some(0.41) } else { None },
+                stack_free_min: opt(9_216),
+            },
+            segment_reach: if some { 16_000 } else { 4_321 },
+        }
+    }
+
+    #[test]
+    fn status_roundtrips_at_0_10_and_300_blocks_with_options_some_and_none() {
+        for first_block in [182_000u64, 182_001] {
+            for n in [0, 10, LEVEL_HISTORY_BLOCKS] {
+                let frame = StreamFrame::Status(status(first_block, n));
+                assert_eq!(
+                    roundtrip(&frame),
+                    frame,
+                    "first_block {first_block}, {n} blocks"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_status_frame_fits_max_frame_bytes() {
+        // Worst case: every varint at its widest and a full history.
+        let mut s = status(u64::MAX, LEVEL_HISTORY_BLOCKS);
+        s.device_ts_us = u64::MAX;
+        s.capture_head = u64::MAX;
+        s.capture_head_ts_us = u64::MAX;
+        s.segment_reach = u32::MAX;
+        s.counters = PodCounters {
+            capture_deficit_frames: Some(u32::MAX),
+            capture_xruns: Some(u32::MAX),
+            playback_underruns: u32::MAX,
+            playback_write_failures: Some(u32::MAX),
+            playback_full_stalls: u32::MAX,
+            playback_discards: Some(u32::MAX),
+            onsets: u32::MAX,
+            segments_opened: u32::MAX,
+            segments_dropped: u32::MAX,
+            ring_overruns: u32::MAX,
+            gate_msg_drops: u32::MAX,
+            connects: u32::MAX,
+            connect_failures: u32::MAX,
+            status_skipped: u32::MAX,
+            alloc_failures: Some(u32::MAX),
+        };
+        s.gauges = PodGauges {
+            heap_free: Some(u32::MAX),
+            heap_min: Some(u32::MAX),
+            heap_largest: Some(u32::MAX),
+            rssi_dbm: Some(i8::MIN),
+            gate_open: true,
+            gate_energy: Some(f32::MAX),
+            stack_free_min: Some(u32::MAX),
+        };
+        for b in s.levels.blocks.iter_mut() {
+            *b = LevelBlock {
+                half_db: 200,
+                flags: 0xFF,
+            };
+        }
+        let frame = StreamFrame::Status(s);
+        let mut buf = [0u8; MAX_FRAME_BYTES + 2];
+        let n = encode_frame(&frame, &mut buf).expect("a full status frame must encode");
+        assert!(n - 2 <= MAX_FRAME_BYTES, "payload {} bytes", n - 2);
+        assert_eq!(decode_frame(&buf[..n]).unwrap(), frame);
+    }
+
+    #[test]
+    fn level_block_reads_back_dbfs_and_playing() {
+        let b = LevelBlock {
+            half_db: 157,
+            flags: LEVEL_FLAG_PLAYING,
+        };
+        assert_eq!(b.dbfs(), -78.5);
+        assert!(b.playing());
+        assert!(
+            !LevelBlock {
+                half_db: 0,
+                flags: 0
+            }
+            .playing()
+        );
+    }
+
+    #[test]
+    fn decode_inbound_ignores_status() {
+        let bytes = frame_bytes(&StreamFrame::Status(status(4, 10)));
+        assert_eq!(decode_inbound(&bytes), Ok(InboundFrame::Other(7)));
+    }
+
+    #[test]
+    fn min_readable_version_is_three() {
+        assert_eq!(AUDIO_PROTOCOL_VERSION, 4);
+        assert_eq!(AUDIO_PROTOCOL_MIN_READABLE, 3);
     }
 
     #[test]
@@ -1519,7 +1825,7 @@ mod tests {
         // constant, so a reorder fails loudly here (host `make check`) instead of as a
         // wire-protocol misclassification on-device.  Each constant is < 128, so its
         // varint encoding is exactly one byte == the constant value.
-        let cases: [(StreamFrame, u32); 7] = [
+        let cases: [(StreamFrame, u32); 8] = [
             (
                 StreamFrame::Hello(Hello {
                     version: AUDIO_PROTOCOL_VERSION,
@@ -1575,6 +1881,7 @@ mod tests {
                 StreamFrame::FlushPlayback(FlushPlayback {}),
                 STREAM_FRAME_TAG_FLUSH_PLAYBACK,
             ),
+            (StreamFrame::Status(status(0, 0)), STREAM_FRAME_TAG_STATUS),
         ];
         for (frame, expected_tag) in cases {
             let bytes = frame_bytes(&frame);

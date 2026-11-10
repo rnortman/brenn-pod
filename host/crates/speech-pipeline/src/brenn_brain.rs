@@ -321,8 +321,6 @@ static CUE_SPEED: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("speed
 static VOLUME_DB: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("db"));
 static VOLUME_HOLD: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("hold"));
 static VOLUME_AUTO: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("auto"));
-static VOLUME_K_SPEECH: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("k_speech"));
-static VOLUME_SPEECH_REF: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("speech_ref"));
 static VOLUME_K_AMBIENT: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("k_ambient"));
 static VOLUME_AMBIENT_REF: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("ambient_ref"));
 static VOLUME_MIN: LazyLock<MarkerAttr> = LazyLock::new(|| MarkerAttr::new("min"));
@@ -417,8 +415,6 @@ fn parse_volume(attrs: &str) -> Option<VolumeTag> {
         persistent: VolumeCommand {
             hold_db: VOLUME_HOLD.number(attrs).ok()?,
             auto,
-            k_speech: VOLUME_K_SPEECH.number(attrs).ok()?,
-            speech_ref_dbfs: VOLUME_SPEECH_REF.number(attrs).ok()?,
             k_ambient: VOLUME_K_AMBIENT.number(attrs).ok()?,
             ambient_ref_dbfs: VOLUME_AMBIENT_REF.number(attrs).ok()?,
             auto_min_db: VOLUME_MIN.number(attrs).ok()?,
@@ -578,13 +574,13 @@ produced, negative is quieter, positive is louder. The operator allows
   <volume db=\"N\"/>         play this message's speech at N dB. This message only.
   <volume hold=\"N\"/>       set the pod's standing volume to N dB. It stays until you
                            change it or the pod restarts.
-  <volume auto=\"on\"/>      let the pod adjust the volume to how loudly it was
-                           addressed (\"off\" turns that off). Starts {auto_state}.
-  <volume k_speech=\"K\" speech_ref=\"R\" k_ambient=\"A\" ambient_ref=\"B\"/>
-                           tune the automatic adjustment: K dB louder per dB the
-                           speech was above R dBFS, plus A dB per dB the room was
-                           above B dBFS. Defaults: K {k_speech}, R {speech_ref},
-                           A {k_ambient}, B {ambient_ref}.
+  <volume auto=\"on\"/>      let the pod adjust the volume to how loud the room is
+                           (\"off\" turns that off). Starts {auto_state}.
+  <volume k_ambient=\"A\" ambient_ref=\"B\"/>
+                           tune the automatic adjustment: A dB louder per dB the
+                           room is above B dBFS, and A dB quieter per dB it is
+                           below. B is the room level at which speech plays at the
+                           standing volume. Defaults: A {k_ambient}, B {ambient_ref}.
   <volume min=\"L\" max=\"H\"/> limit how far the automatic adjustment may move the
                            volume, L below to H above the standing volume.
                            Defaults: {auto_min} and {auto_max}. L must not exceed H.
@@ -597,27 +593,29 @@ carries it: earlier messages of the same reply keep the volume they were sent
 under, so put the marker in the message where the change should start.
 
 Every utterance carries a `volume` object with the pod's current state:
-`held_db` (the standing volume), `auto`, `level_source`, `k_speech`,
-`speech_ref_dbfs`, `k_ambient`, `ambient_ref_dbfs`, `auto_min_db`,
-`auto_max_db`, and the operator's `min_db` and `max_db`. Read it rather than
-assuming your last marker took effect.
+`held_db` (the standing volume), `auto`, `level_source`, `k_ambient`,
+`ambient_ref_dbfs`, `auto_min_db`, `auto_max_db`, and the operator's `min_db`
+and `max_db`. Read it rather than assuming your last marker took effect.
 
 Every utterance also carries a `level` object saying how loudly you were
-addressed, when the pod's level channel was live: `speech_dbfs` (in dB below
-full scale: the wake phrase for an utterance that followed one, the utterance's
-own speech for a follow-up or an interruption), `ambient_dbfs` (the room as last
-heard with the pod silent and nobody speaking; null when too little was heard),
-and `source` — `raw_mic`, an unprocessed microphone, or `beam`, the processed
-speech channel, whose loudness is flattened and means little. It is absent when
-nothing was measured. The automatic adjustment reads this same object; with
-`level_source` `raw_mic` it ignores a `beam` reading.
+addressed and how loud the room was: `speech_dbfs` (how loudly you were
+addressed, in dB below full scale: the wake phrase for an utterance that
+followed one, the utterance's own speech for a follow-up or an interruption;
+null when it could not be measured; it does not drive the volume), `ambient`
+(`dbfs`: the room's level over up to the last ten seconds in which the pod was
+silent and nobody was addressing it; `blocks`: how many 100 ms readings that
+rests on; `age_ms`: how old the newest of them is; `carried`: true when nothing
+recent was usable and this is the last good reading; null when the room has
+never been heard), and `source` — `raw_mic`, an unprocessed microphone, or
+`beam`, the processed speech channel, whose loudness is flattened and means
+little. It is absent when nothing was measured. The automatic adjustment reads
+`ambient`; with `level_source` `raw_mic` it ignores a `beam` reading, and a
+reading five minutes old or more no longer counts.
 
 ",
         min = v.bounds.min_db(),
         max = v.bounds.max_db(),
         auto_state = if a.enabled { "on" } else { "off" },
-        k_speech = a.k_speech,
-        speech_ref = a.speech_ref_dbfs,
         k_ambient = a.k_ambient,
         ambient_ref = a.ambient_ref_dbfs,
         auto_min = a.min_db,
@@ -1186,8 +1184,8 @@ impl Brain for BrennBrain {
 mod tests {
     use super::*;
     use crate::types::{
-        BargeInContext, InterruptProgress, LevelSource, SpeakerId, Transcript, UtteranceId,
-        test_utterance,
+        AmbientReading, BargeInContext, InterruptProgress, LevelSource, SpeakerId, Transcript,
+        UtteranceId, test_utterance,
     };
     use crate::volume::GainResolution;
     use serde_json::{Value, json};
@@ -1252,20 +1250,29 @@ mod tests {
     fn utterance_body_carries_the_measured_level_when_there_is_one() {
         let u = Utterance {
             level: Some(UtteranceLevel {
-                speech_dbfs: -27.5,
-                ambient_dbfs: Some(-58.25),
+                speech_dbfs: Some(-27.5),
+                ambient: Some(AmbientReading {
+                    dbfs: -58.25,
+                    blocks: 100,
+                    age_ms: 300,
+                    carried: false,
+                }),
                 source: LevelSource::RawMic,
             }),
             ..test_utterance()
         };
         assert_eq!(
             parsed(&utterance_body(&u, "hi", &VolumeState::default()))["level"],
-            json!({"speech_dbfs": -27.5, "ambient_dbfs": -58.25, "source": "raw_mic"})
+            json!({
+                "speech_dbfs": -27.5,
+                "ambient": {"dbfs": -58.25, "blocks": 100, "age_ms": 300, "carried": false},
+                "source": "raw_mic",
+            })
         );
         let quiet_room_unknown = Utterance {
             level: Some(UtteranceLevel {
-                speech_dbfs: -40.0,
-                ambient_dbfs: None,
+                speech_dbfs: Some(-40.0),
+                ambient: None,
                 source: LevelSource::Beam,
             }),
             ..test_utterance()
@@ -1276,7 +1283,29 @@ mod tests {
                 "hi",
                 &VolumeState::default()
             ))["level"],
-            json!({"speech_dbfs": -40.0, "ambient_dbfs": null, "source": "beam"})
+            json!({"speech_dbfs": -40.0, "ambient": null, "source": "beam"})
+        );
+        // A dead speech window keeps the room.
+        let speech_unmeasured = Utterance {
+            level: Some(UtteranceLevel {
+                speech_dbfs: None,
+                ambient: Some(AmbientReading {
+                    dbfs: -70.0,
+                    blocks: 3,
+                    age_ms: 40_000,
+                    carried: true,
+                }),
+                source: LevelSource::RawMic,
+            }),
+            ..test_utterance()
+        };
+        assert_eq!(
+            parsed(&utterance_body(
+                &speech_unmeasured,
+                "hi",
+                &VolumeState::default()
+            ))["level"]["speech_dbfs"],
+            Value::Null
         );
     }
 
@@ -1710,24 +1739,33 @@ mod tests {
         );
         assert_eq!(volume("<volume auto=\"on\"/>").persistent.auto, Some(true));
         assert_eq!(volume("<volume auto='off'/>").persistent.auto, Some(false));
-        let policy = volume(
-            "<volume k_speech=\"0.5\" speech_ref=\"-28\" k_ambient=0.25 ambient_ref=\"-50\"/>",
-        )
-        .persistent;
+        let policy = volume("<volume k_ambient=0.25 ambient_ref=\"-50\"/>").persistent;
         assert_eq!(
-            (
-                policy.k_speech,
-                policy.speech_ref_dbfs,
-                policy.k_ambient,
-                policy.ambient_ref_dbfs
-            ),
-            (Some(0.5), Some(-28.0), Some(0.25), Some(-50.0))
+            (policy.k_ambient, policy.ambient_ref_dbfs),
+            (Some(0.25), Some(-50.0))
         );
         let swing = volume("<volume min=\"-5\" max='5'>").persistent;
         assert_eq!(
             (swing.auto_min_db, swing.auto_max_db),
             (Some(-5.0), Some(5.0))
         );
+    }
+
+    /// The speech-driven knobs are not attributes: beside a live attribute they
+    /// are ignored, and alone they leave nothing to read, so the marker is
+    /// stripped and reported as unknown.
+    #[test]
+    fn the_removed_speech_knobs_are_not_read() {
+        assert_eq!(
+            volume("<volume k_speech=\"1\" k_ambient=\"0.5\"/>").persistent,
+            VolumeCommand {
+                k_ambient: Some(0.5),
+                ..VolumeCommand::default()
+            }
+        );
+        for raw in ["<volume k_speech=\"1\"/>", "<volume speech_ref=\"-40\"/>"] {
+            assert_eq!(tags(raw), [Tag::Unknown { raw: raw.into() }], "{raw}");
+        }
     }
 
     #[test]
@@ -1839,11 +1877,12 @@ mod tests {
             "<volume db=\"N\"/>",
             "<volume hold=\"N\"/>",
             "<volume auto=\"on\"/>",
-            "k_speech=\"K\" speech_ref=\"R\" k_ambient=\"A\" ambient_ref=\"B\"",
+            "<volume k_ambient=\"A\" ambient_ref=\"B\"/>",
             "<volume min=\"L\" max=\"H\"/>",
             "`level` object",
             "`speech_dbfs`",
-            "`ambient_dbfs`",
+            "`ambient`",
+            "`carried`",
             "`raw_mic`",
             "\"type\": \"wake\"",
             "\"type\": \"utterance\"",
@@ -1928,8 +1967,8 @@ mod tests {
                     bounds: OperatorBounds::new(-24.0, 3.0).unwrap(),
                     auto: AutoPolicy {
                         enabled: true,
-                        k_speech: 0.5,
-                        speech_ref_dbfs: -40.0,
+                        k_ambient: 0.5,
+                        ambient_ref_dbfs: -40.0,
                         min_db: -9.0,
                         ..AutoPolicy::default()
                     },
@@ -1939,7 +1978,14 @@ mod tests {
         );
         assert!(help.contains("The operator allows\n-24 to 3 dB"), "{help}");
         assert!(help.contains("Starts on."));
-        assert!(help.contains("Defaults: K 0.5, R -40,"), "{help}");
+        assert!(help.contains("Defaults: A 0.5, B -40."), "{help}");
+        assert!(
+            help.contains("A dB quieter per dB it is"),
+            "both directions: {help}"
+        );
+        for removed in ["k_speech", "speech_ref"] {
+            assert!(!help.contains(removed), "help text still names {removed:?}");
+        }
         assert!(help.contains("Defaults: -9 and 6."));
         for field in ["`volume` object", "held_db", "auto_min_db", "max_db"] {
             assert!(help.contains(field), "help text is missing {field:?}");
@@ -1947,7 +1993,7 @@ mod tests {
         for rule in [
             "Every utterance also carries a `level` object",
             "own speech for a follow-up or an interruption",
-            "heard with the pod silent and nobody speaking",
+            "silent and nobody was addressing it",
             "A standing change takes effect from the message that",
             "earlier messages of the same reply keep the volume they were sent",
         ] {

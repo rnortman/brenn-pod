@@ -84,6 +84,7 @@ pub(crate) fn spawn_telemetry_vad_thread(tx: std::sync::mpsc::SyncSender<Streame
                 write_head: &ring_write_head,
                 now_us: &esp_monotonic_us,
                 capture_quiesced: &capture_quiesced,
+                stats: &crate::streamer::POD_STATS,
             };
             run_telemetry_loop(
                 core,

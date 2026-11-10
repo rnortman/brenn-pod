@@ -63,6 +63,7 @@ use crate::pipeline::{BargeWiring, BrainWiring, ListenWiring, PipelineFatal, Unr
 use crate::playback_router::{
     self, FeedFn, PlaybackFanout, RouterStats, RouterStatsSnapshot, playback_event_adapter,
 };
+use crate::pod_status::PodStatusLog;
 use crate::prune::{PruneOutcome, PruneRequest, prune};
 use crate::recorder::{OpenLogs, Recorder, RecorderShared};
 use crate::scripter::{ScriptHandle, ScriptInbox, ScriptSink};
@@ -81,6 +82,14 @@ const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 /// half-open TCP connection with no FIN/RST) is closed as a read error rather
 /// than parking on the read forever. Whole frames are small, so this is ample.
 const PAYLOAD_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a pod that sends status frames may send nothing before the host
+/// writes `pod_silent` and closes the connection: ten missed status periods.
+const STATUS_SILENCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The first wire version whose pods send a status frame every second. An older
+/// session may legitimately send nothing between utterances.
+const FIRST_STATUS_VERSION: u8 = 4;
 
 /// Backoff after a failed `accept()`. A persistent resource error (fd
 /// exhaustion: EMFILE/ENFILE/ENOBUFS) recurs immediately, so retrying with no
@@ -388,6 +397,9 @@ pub struct Server {
     config: Arc<Config>,
     jsonl: JsonlHandle,
     tls: TlsAccept,
+    /// How long a pod that sends status frames may send nothing before its
+    /// connection is closed as `silent`.
+    status_silence: Duration,
     sinks: Sinks,
     alerts: Option<AlertInbox>,
     announcements: Option<AnnounceInbox>,
@@ -461,6 +473,7 @@ impl Server {
                 ssl: Arc::new(ssl),
                 deadline: TLS_HANDSHAKE_DEADLINE,
             },
+            status_silence: STATUS_SILENCE_TIMEOUT,
             sinks: Sinks::default(),
             alerts: None,
             announcements: None,
@@ -520,6 +533,12 @@ impl Server {
     #[cfg(test)]
     fn with_handshake_deadline(mut self, deadline: Duration) -> Self {
         self.tls.deadline = deadline;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_status_silence(mut self, silence: Duration) -> Self {
+        self.status_silence = silence;
         self
     }
 
@@ -603,6 +622,7 @@ impl Server {
             config,
             jsonl,
             tls,
+            status_silence,
             sinks,
             alerts,
             announcements,
@@ -760,15 +780,12 @@ impl Server {
 
         // How both openers open a `<listen/>` reply's capture window: built once
         // and shared, so the window's length cannot depend on which of them
-        // fired. No `[brenn]` table means no turn can end open, so the length is
-        // never read; the wiring exists because the feed does.
+        // fired. With neither `[brenn]` nor `[echo]` no turn can end open, so the
+        // length is never read; the wiring exists because the feed does.
         let listen = listener_handle.as_ref().map(|listener| {
             Arc::new(ListenWiring {
                 feed: feed_fn(listener),
-                window_samples: config
-                    .brenn
-                    .as_ref()
-                    .map_or(0, |brenn| brenn.listen_window_samples()),
+                window_samples: config.listen_window_samples(),
             })
         });
 
@@ -1180,6 +1197,7 @@ impl Server {
         // refcount traffic, not a copy of state.
         let conn_deps = ConnDeps {
             tls,
+            status_silence,
             config: config.clone(),
             jsonl: jsonl.clone(),
             ledger: ledger.clone(),
@@ -1576,6 +1594,56 @@ fn feed_fn(listener: &Arc<ListenerHandle>) -> FeedFn {
     })
 }
 
+/// How a frame's length-prefix read ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PrefixRead {
+    /// The two bytes arrived.
+    Read,
+    /// Nothing arrived within the deadline.
+    TimedOut,
+    /// The peer closed the stream.
+    Eof,
+    /// The read failed.
+    Failed,
+}
+
+/// Read a frame's two-byte length prefix into `buf`, giving up after `deadline`
+/// when one is given.
+async fn read_len_prefix<R: tokio::io::AsyncRead + Unpin>(
+    rd: &mut R,
+    buf: &mut [u8; 2],
+    deadline: Option<Duration>,
+) -> PrefixRead {
+    let read = match deadline {
+        Some(d) => match tokio::time::timeout(d, rd.read_exact(buf)).await {
+            Ok(r) => r,
+            Err(_elapsed) => return PrefixRead::TimedOut,
+        },
+        None => rd.read_exact(buf).await,
+    };
+    match read {
+        Ok(_) => PrefixRead::Read,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => PrefixRead::Eof,
+        Err(_) => PrefixRead::Failed,
+    }
+}
+
+/// The between-frames wait for a connection. Before `Hello` it is bounded so an
+/// unidentified peer cannot pin an accept-gate permit. After `Hello` a pod whose
+/// version sends status frames is bounded by `status_silence`
+/// ([`STATUS_SILENCE_TIMEOUT`] in service); an older pod may legitimately fall
+/// silent between utterances, so its wait is unbounded.
+fn between_frames_deadline(
+    hello_version: Option<u8>,
+    status_silence: Duration,
+) -> Option<Duration> {
+    match hello_version {
+        None => Some(HELLO_DEADLINE),
+        Some(v) if v >= FIRST_STATUS_VERSION => Some(status_silence),
+        Some(_) => None,
+    }
+}
+
 /// Forward one session event to the listener as a [`Feed`], when a listener is
 /// wired. The listener taps the live pre-assembly stream: `HelloAccepted` opens a
 /// fresh per-pod epoch (the connection sequence, unique across reconnects), audio
@@ -1586,7 +1654,8 @@ fn feed_fn(listener: &Arc<ListenerHandle>) -> FeedFn {
 ///
 /// Awaited by the read loop: marker delivery is reliable, so a saturated feed
 /// channel backpressures this pod's reads (bounded by the marker timeout) rather
-/// than losing the marker. Audio still drops on a full channel and never waits.
+/// than losing the marker. Audio still drops on a full channel and never waits; a
+/// status frame waits only briefly (see `FeedSender::feed`).
 async fn tap_listener(
     listener: Option<&Arc<ListenerHandle>>,
     pod: &mut Option<PodId>,
@@ -1741,8 +1810,20 @@ fn build_brain(
                 // router, both wired separately — the brain itself needs only the
                 // shared event adapter, stats, and the volume book its replies'
                 // gains are resolved from.
-                jsonl.emit("brain_echo", &json!({}));
+                // `listen_window_ms` non-null: every reply this brain gives asks to
+                // keep listening, and a capture window that long opens after each
+                // one; null: every turn ends closed.
+                let listen_window_ms = config.echo.as_ref().map(|echo| echo.listen_window_ms);
+                jsonl.emit(
+                    "brain_echo",
+                    &json!({ "listen_window_ms": listen_window_ms }),
+                );
                 let brain = EchoBrain::new(events.clone(), stats.clone(), volume);
+                let brain = if listen_window_ms.is_some() {
+                    brain.listening()
+                } else {
+                    brain
+                };
                 Ok((Some(Arc::new(brain) as Arc<dyn Brain>), events, stats, None))
             }
             BrainMode::Brenn => {
@@ -2575,6 +2656,7 @@ async fn tls_handshake(
 #[derive(Clone)]
 struct ConnDeps {
     tls: TlsAccept,
+    status_silence: Duration,
     config: Arc<Config>,
     jsonl: JsonlHandle,
     ledger: Arc<Mutex<ResumeLedger>>,
@@ -2606,6 +2688,7 @@ async fn connection(
 ) {
     let ConnDeps {
         tls,
+        status_silence,
         config,
         jsonl,
         ledger,
@@ -2717,37 +2800,51 @@ async fn connection(
     // telemetry outside segments shows up in the *periodic* `stage_health` line
     // rather than only when its connection finally ends.
     let mut telemetry_reported: u64 = 0;
+    // The accepted `Hello`'s wire version, set when the pod registers; it decides
+    // whether the pod's silence between frames is bounded.
+    let mut hello_version: Option<u8> = None;
+    // When the last whole frame arrived, for `pod_silent.silent_ms`.
+    let mut last_frame_at = tokio::time::Instant::now();
+    let mut pod_status_log = PodStatusLog::default();
 
     'read: loop {
         let mut len_bytes = [0u8; 2];
         // The between-frames park point: a supersede cancels here while the pod
-        // is quiet, so watch the token alongside the length-prefix read. Before
-        // `Hello` the wait is also deadline-bounded — an unidentified peer must
-        // not pin an accept-gate permit — but after `Hello` a registered pod may
-        // legitimately fall silent between utterances, so the read is unbounded.
-        let read = if registered_pod.is_some() {
-            tokio::select! {
-                _ = shutdown.cancelled() => { close_cause = CloseCause::Shutdown; break 'read; }
-                _ = cancel.cancelled() => { close_cause = CloseCause::Superseded; break 'read; }
-                r = rd.read_exact(&mut len_bytes) => r,
-            }
-        } else {
-            tokio::select! {
-                _ = shutdown.cancelled() => { close_cause = CloseCause::Shutdown; break 'read; }
-                _ = cancel.cancelled() => { close_cause = CloseCause::Superseded; break 'read; }
-                r = tokio::time::timeout(HELLO_DEADLINE, rd.read_exact(&mut len_bytes)) => match r {
-                    Ok(inner) => inner,
-                    Err(_elapsed) => { close_cause = CloseCause::ReadError; break 'read; }
-                },
-            }
+        // is quiet, so watch the token alongside the length-prefix read.
+        let read = tokio::select! {
+            _ = shutdown.cancelled() => { close_cause = CloseCause::Shutdown; break 'read; }
+            _ = cancel.cancelled() => { close_cause = CloseCause::Superseded; break 'read; }
+            r = read_len_prefix(
+                &mut rd,
+                &mut len_bytes,
+                between_frames_deadline(hello_version, status_silence),
+            ) => r,
         };
         match read {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            PrefixRead::Read => {}
+            PrefixRead::TimedOut if hello_version.is_some() => {
+                // `pod_silent { pod, silent_ms }`: the pod sends a status frame
+                // every second, and nothing at all arrived from it for `silent_ms`.
+                // A reader may conclude that the pod, or its path to the host, was
+                // not delivering for that long, and that the host closed the
+                // connection (`conn_closed` with cause `silent`) right after. A
+                // live pod reconnects; one that does not is down or unreachable.
+                jsonl.emit(
+                    "pod_silent",
+                    &json!({
+                        "pod": registered_pod.as_deref(),
+                        "silent_ms": u64::try_from(last_frame_at.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                    }),
+                );
+                close_cause = CloseCause::Silent;
+                break 'read;
+            }
+            PrefixRead::Eof => {
                 close_cause = CloseCause::Eof;
                 break 'read;
             }
-            Err(_) => {
+            PrefixRead::TimedOut | PrefixRead::Failed => {
                 close_cause = CloseCause::ReadError;
                 break 'read;
             }
@@ -2775,6 +2872,7 @@ async fn connection(
             break 'read;
         }
 
+        last_frame_at = tokio::time::Instant::now();
         let host_rx = HostMicros::now();
 
         // Honor the process-wide recording latch: once any connection's write
@@ -2813,6 +2911,14 @@ async fn connection(
         // between-segment flush/roll boundary must still fire at that close.
         let mut saw_segment_closed = false;
         for ev in &events {
+            // Written before the listener tap, so the health record never waits on
+            // the listener.
+            if matches!(ev, SessionEvent::Status { .. }) {
+                // TODO(pod-status-mqtt): publish each pod's status from the host.
+                if let Some(line) = pod_status_log.observe(fsm.pod_id(), ev) {
+                    jsonl.emit("pod_status", &line);
+                }
+            }
             // Tap the live pre-assembly stream to the continuous listener (a no-op
             // when none is wired), before the assembler consumes the same event.
             tap_listener(listener.as_ref(), &mut listener_pod, ev, conn_seq).await;
@@ -2824,7 +2930,10 @@ async fn connection(
             }
             match ev {
                 SessionEvent::HelloAccepted {
-                    pod_id, capture, ..
+                    pod_id,
+                    capture,
+                    version,
+                    ..
                 } => {
                     // Identity binding: the pod id the FSM accepted off the wire
                     // must be the identity the handshake authenticated. Checked
@@ -2888,6 +2997,7 @@ async fn connection(
                         )
                     };
                     registered_pod = Some(pod_id.clone());
+                    hello_version = Some(*version);
                     if let Some(old) = superseded {
                         jsonl.emit(
                             "conn_superseded",
@@ -2990,7 +3100,9 @@ async fn connection(
                         fatal = true;
                     }
                 }
-                SessionEvent::Audio { .. } | SessionEvent::Telemetry { .. } => {}
+                SessionEvent::Audio { .. }
+                | SessionEvent::Telemetry { .. }
+                | SessionEvent::Status { .. } => {}
                 SessionEvent::SegmentClosed { .. } => {
                     saw_segment_closed = true;
                 }
@@ -3449,6 +3561,7 @@ mod tests {
             pod_id: "p".into(),
             host_rx: HostMicros(0),
             capture: CaptureLayout { channels, source },
+            version: audio_pipeline::wire::AUDIO_PROTOCOL_VERSION,
         };
         let opened = |segment_id| SessionEvent::SegmentOpened {
             segment_id,
@@ -3521,6 +3634,63 @@ mod tests {
             ],
         );
         assert!(silent.is_empty());
+    }
+
+    /// The wait between frames: bounded before `Hello`, bounded by the silence
+    /// deadline for a pod that sends status, unbounded for an older pod.
+    #[test]
+    fn between_frames_deadline_follows_the_hello_version() {
+        let silence = Duration::from_millis(1234);
+        assert_eq!(between_frames_deadline(None, silence), Some(HELLO_DEADLINE));
+        assert_eq!(between_frames_deadline(Some(3), silence), None);
+        assert_eq!(between_frames_deadline(Some(4), silence), Some(silence));
+        assert_eq!(STATUS_SILENCE_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_pod_times_out_at_the_deadline() {
+        let (mut rd, _wr) = tokio::io::duplex(64);
+        let start = tokio::time::Instant::now();
+        let mut buf = [0u8; 2];
+        let got = read_len_prefix(&mut rd, &mut buf, Some(STATUS_SILENCE_TIMEOUT)).await;
+        assert_eq!(got, PrefixRead::TimedOut);
+        assert_eq!(start.elapsed(), STATUS_SILENCE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prefix_inside_the_deadline_is_read() {
+        let (mut rd, mut wr) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(9)).await;
+            wr.write_all(&[7, 0]).await.unwrap();
+            // Held open so the reader sees bytes, not EOF.
+            std::future::pending::<()>().await;
+        });
+        let mut buf = [0u8; 2];
+        let got = read_len_prefix(&mut rd, &mut buf, Some(STATUS_SILENCE_TIMEOUT)).await;
+        assert_eq!(got, PrefixRead::Read);
+        assert_eq!(buf, [7, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unbounded_wait_outlasts_the_silence_deadline() {
+        let (mut rd, _wr) = tokio::io::duplex(64);
+        let mut buf = [0u8; 2];
+        let outer = tokio::time::timeout(
+            Duration::from_secs(600),
+            read_len_prefix(&mut rd, &mut buf, None),
+        )
+        .await;
+        assert!(outer.is_err(), "the read ended on its own: {outer:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_peer_reads_as_eof() {
+        let (mut rd, wr) = tokio::io::duplex(64);
+        drop(wr);
+        let mut buf = [0u8; 2];
+        let got = read_len_prefix(&mut rd, &mut buf, Some(STATUS_SILENCE_TIMEOUT)).await;
+        assert_eq!(got, PrefixRead::Eof);
     }
 
     use audio_pipeline::wire::{
@@ -4273,8 +4443,68 @@ mod tests {
         drop(handle);
         join.await.unwrap();
         let lines = read_lines(&path);
-        assert_eq!(events_named(&lines, "brain_echo").len(), 1);
+        let echo = events_named(&lines, "brain_echo");
+        assert_eq!(echo.len(), 1);
+        assert!(echo[0]["listen_window_ms"].is_null(), "{}", echo[0]);
         assert!(events_named(&lines, "brain_clip_loaded").is_empty());
+    }
+
+    /// The listening rung: the line names the window, and the brain built ends
+    /// its turns open.
+    #[tokio::test]
+    async fn build_brain_echo_with_a_window_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "listen_addr = \"127.0.0.1:0\"\n\
+             [record]\nenabled = false\ndir = {:?}\n\
+             [brain]\nmode = \"echo\"\n\
+             [echo]\nlisten_window_ms = 8000\n",
+            dir.path().join("store").to_str().unwrap(),
+        );
+        let cfg = Arc::new(test_config(&text).expect("config parses"));
+        let (handle, join, path) = jsonl_file(dir.path()).await;
+
+        let (brain, _, _stats, _brenn) =
+            build_brain(&cfg, &handle, None, Default::default()).unwrap();
+        let brain = brain.expect("an echo brain");
+        use speech_pipeline::{
+            AudioSpan, DoaTrack, EndpointCause, PodId, ResponseSink, RoomId, StageTimings,
+            Transcript, TurnEnd, Utterance, UtteranceId,
+        };
+        let utterance = Utterance {
+            id: UtteranceId(1),
+            pod: PodId("pod-x".into()),
+            room: RoomId("r".into()),
+            speaker: None,
+            doa: DoaTrack(Vec::new()),
+            audio_ref: AudioSpan {
+                log: "pod-x_0.framelog".into(),
+                start_sample: 0,
+                end_sample: 16_000,
+                segments: Vec::new(),
+            },
+            transcript: Some(Transcript {
+                text: "hello".into(),
+                confidence: None,
+            }),
+            timings: StageTimings::default(),
+            endpoint_cause: EndpointCause::SoftEndpoint,
+            wake: None,
+            barge_in: None,
+            over_playback: false,
+            level: None,
+        };
+        let (tx, _rx) = futures::channel::mpsc::channel(1);
+        let end = brain.handle(utterance, ResponseSink::new(tx)).await;
+        assert_eq!(end, TurnEnd::Open);
+
+        drop(brain);
+        drop(handle);
+        join.await.unwrap();
+        let lines = read_lines(&path);
+        let echo = events_named(&lines, "brain_echo");
+        assert_eq!(echo.len(), 1);
+        assert_eq!(echo[0]["listen_window_ms"], 8000);
     }
 
     /// A bus-brain configuration as text, with `extra` folded into the
@@ -6981,6 +7211,97 @@ mod tests {
         // The current connection's close removes its own entry.
         playback_deregister(&reg, "pod-a", 2);
         assert!(!reg.lock().unwrap().contains_key("pod-a"));
+    }
+
+    /// A v4 pod's status frame becomes a `pod_status` line, and a pod that then
+    /// sends nothing for the silence deadline is on the record as `pod_silent` and
+    /// its connection closes as `silent`. Runs in real time over a real TLS
+    /// connection, so the deadline is shortened to 1 s; its service value is pinned
+    /// by `between_frames_deadline_follows_the_hello_version`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_is_logged_and_a_silent_pod_is_closed() {
+        use audio_pipeline::wire::{LevelBlock, LevelRun, PodCounters, PodGauges, Status};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let jsonl_path = dir.path().join("events.jsonl");
+        let (handle, join) =
+            jsonl::spawn_quiet(&crate::config::JsonlSink::File(jsonl_path.clone()))
+                .await
+                .unwrap();
+        const SILENCE: Duration = Duration::from_secs(1);
+        let (server, addr, stop, stop_rx) =
+            bind_with_stop(config(&store, false), handle.clone(), None).await;
+        let server = server.with_status_silence(SILENCE);
+        let run_join = tokio::spawn(async move {
+            server
+                .run(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+                .expect("run");
+        });
+
+        let mut blocks = heapless::Vec::new();
+        for _ in 0..5 {
+            blocks
+                .push(LevelBlock {
+                    half_db: 156,
+                    flags: 0,
+                })
+                .unwrap();
+        }
+        let status = StreamFrame::Status(Status {
+            device_ts_us: 7_000_000,
+            capture_head: 112_000,
+            capture_head_ts_us: 6_999_000,
+            levels: LevelRun {
+                first_block: 65,
+                blocks,
+            },
+            counters: PodCounters {
+                connects: 1,
+                ..PodCounters::default()
+            },
+            gauges: PodGauges {
+                gate_open: true,
+                ..PodGauges::default()
+            },
+            segment_reach: 16_000,
+        });
+
+        let mut client = connect_pod(addr).await;
+        let sent_at = std::time::Instant::now();
+        for f in [hello(ChannelSource::AsrBeam), status] {
+            client.write_all(&framed(&f)).await.unwrap();
+        }
+        let line = wait_for_event(&jsonl_path, "pod_status", |v| v["event"] == "pod_status").await;
+        assert_eq!(line["pod"], TEST_POD_ID);
+        assert_eq!(line["capture_head"], 112_000);
+        assert_eq!(line["counters"]["connects"], 1);
+        assert!(line["counters"]["alloc_failures"].is_null());
+        assert_eq!(line["gauges"]["gate_open"], true);
+        assert_eq!(line["levels"]["blocks"], 5);
+        assert_eq!(line["levels"]["p50_dbfs"], -78.0);
+
+        // Quiet well inside the deadline: nothing said yet.
+        tokio::time::sleep((SILENCE / 2).saturating_sub(sent_at.elapsed())).await;
+        assert!(events_named(&read_lines(&jsonl_path), "pod_silent").is_empty());
+
+        let silent =
+            wait_for_event(&jsonl_path, "pod_silent", |v| v["event"] == "pod_silent").await;
+        assert_eq!(silent["pod"], TEST_POD_ID);
+        let silent_ms = silent["silent_ms"].as_u64().unwrap();
+        assert!((1_000..3_000).contains(&silent_ms), "{silent_ms}");
+        let closed =
+            wait_for_event(&jsonl_path, "conn_closed", |v| v["event"] == "conn_closed").await;
+        assert_eq!(closed["cause"], "silent");
+
+        stop.send(()).unwrap();
+        run_join.await.unwrap();
+        drop(client);
+        drop(handle);
+        join.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

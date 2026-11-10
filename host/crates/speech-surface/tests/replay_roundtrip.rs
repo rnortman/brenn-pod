@@ -45,6 +45,55 @@ fn generated_fixture_matches_committed_bytes() {
     );
 }
 
+/// The fixture as it was recorded under wire v3, before `Status` existed. Kept
+/// byte-for-byte so a capture on disk from a v3 pod stays readable.
+const V3_FIXTURE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/short-capture-v3.framelog"
+);
+
+/// A v3 frame log reads back through the live decode and session path: its
+/// `Hello` is accepted as v3, every record decodes, and no protocol error is
+/// raised.
+#[test]
+fn v3_fixture_still_reads() {
+    use pod_ingest::{FrameLogReader, LogItem, ResumeLedger, SessionEvent, SessionFsm};
+
+    let reader = FrameLogReader::open(Path::new(V3_FIXTURE_PATH)).expect("open v3 fixture");
+    let mut fsm = SessionFsm::new(speech_pipeline::SPINE_FORMAT, ResumeLedger::shared());
+    let mut events = Vec::new();
+    for item in reader {
+        let LogItem::Record { host_rx, payload } = item.expect("read v3 record") else {
+            panic!("the v3 fixture has no torn tail");
+        };
+        let frame = audio_pipeline::wire::decode_frame(&payload).expect("decode v3 frame");
+        events.extend(fsm.feed(frame, host_rx));
+    }
+    assert!(
+        matches!(
+            events.first(),
+            Some(SessionEvent::HelloAccepted { version: 3, .. })
+        ),
+        "{:?}",
+        events.first()
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::ProtocolError { .. })),
+        "a v3 log raises no protocol error"
+    );
+    let facts = common::fixture_facts();
+    let samples: u64 = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Audio { pcm, .. } => Some(pcm.len() as u64),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(samples, facts.seg_a.samples + facts.seg_b.samples);
+}
+
 /// End-to-end round trip with recording off: spawn the real daemon, replay the
 /// committed fixture through the real `replay-pod`, and assert the full JSONL
 /// vocabulary — session/segment lifecycle, ingest-stage timings, and DoA/energy

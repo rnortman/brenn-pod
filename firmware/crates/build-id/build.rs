@@ -12,6 +12,11 @@ use std::process::Command;
 
 fn main() {
     // Re-run whenever HEAD or the current branch's ref moves, so the stamp tracks HEAD.
+    // TODO(build-id-dirty-flag-stale): these triggers cover a moving ref only, so the
+    // dirty flag below is not re-evaluated when tracked files change under an unmoved
+    // ref; a build then carries the flag of this script's last run in its target dir.
+    // In a linked worktree they watch the main checkout's `HEAD` and branch, not the
+    // worktree's, so the commit below can be stale there too.
     emit_git_ref_rerun_triggers();
 
     // Derive git commit hash.
@@ -80,9 +85,11 @@ fn main() {
 ///   loose↔packed transition itself re-triggers because cargo tracks the (non-)existence
 ///   of every declared path.
 ///
-/// The git directory is resolved via `git rev-parse --git-common-dir` so this works
-/// under worktrees (where `.git` is a file pointing elsewhere and refs live in the
-/// common dir). Declaring a path that does not currently exist is safe.
+/// The git directory is resolved via `git rev-parse --git-common-dir`, so in a linked
+/// worktree (where `.git` is a file pointing elsewhere) the paths watched, including
+/// `HEAD` and the branch read from it, are the main checkout's, not the worktree's own
+/// (`<common>/worktrees/<name>/HEAD`). Declaring a path that does not currently exist
+/// is safe.
 fn emit_git_ref_rerun_triggers() {
     let git_dir = Command::new("git")
         .args(["rev-parse", "--git-common-dir"])

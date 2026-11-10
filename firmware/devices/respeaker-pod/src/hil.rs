@@ -103,6 +103,9 @@ pub(crate) fn run_handler(name: TestName) -> (Status, Payload) {
         TestName::TlsPskWrongKeyRejected => crate::net_tests::run_tls_psk_wrong_key_rejected(),
         TestName::Xvf3800OutputRouting => crate::routing::run_xvf3800_output_routing(),
         TestName::I2sRightSlotSanity => crate::capture::run_i2s_right_slot_sanity(),
+        TestName::LevelMeterMatchesRing => crate::level_tests::run_level_meter_matches_ring(),
+        TestName::LevelBlocksFlagPlayback => crate::level_tests::run_level_blocks_flag_playback(),
+        TestName::PodStatusIdle => crate::net_tests::run_pod_status_idle(),
     }
 }
 

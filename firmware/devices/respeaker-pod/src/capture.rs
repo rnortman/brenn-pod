@@ -20,6 +20,8 @@ use audio_pipeline::playback::{
 #[cfg(target_os = "espidf")]
 use audio_pipeline::ring::{RAW_MIC_GUARDS, RING_CAPACITY_SAMPLES, RingIndex, WaveformAccum};
 #[cfg(target_os = "espidf")]
+use audio_pipeline::stats::PodStats;
+#[cfg(target_os = "espidf")]
 use device_protocol::{Payload, Status, log_tokens};
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -111,7 +113,7 @@ pub(crate) const I2S_SAMPLE_RATE_HZ: u32 = 16_000;
 /// device cannot retune per stream: an inbound `Hello` declaring any other rate, depth,
 /// channel count, or codec is unrecoverable garble. `consume_frames` passes this as the
 /// `expected` format to `check_inbound_format` and drops the connection on a mismatch.
-pub(crate) use audio_pipeline::wire::DEVICE_PLAYBACK_FORMAT;
+use audio_pipeline::wire::DEVICE_PLAYBACK_FORMAT;
 
 /// Compile-time lock: the shared format's sample rate must equal the device's own I2S
 /// clock. A drift in either fails the device build instead of a live HIL round-trip.
@@ -1173,6 +1175,14 @@ pub(crate) fn spawn_capture_thread(
                     } else {
                         rx_deficit_warned = false;
                     }
+                    // The window's losses join the status frame's cumulative counters
+                    // before the window's locals reset.
+                    let stats = &crate::streamer::POD_STATS;
+                    // TODO(capture-deficit-bench-sample): what causes a loss, and
+                    // whether its rate is expected, is not known.
+                    PodStats::add(&stats.capture_deficit_frames, rx_deficit);
+                    PodStats::add(&stats.playback_underruns, tx_preroll_rearms);
+                    PodStats::add(&stats.playback_write_failures, tx_write_stats.failures);
                     tx_chunks_written = 0;
                     tx_write_stats = TxWriteStats::default();
                     tx_empty_polls = 0;
@@ -1246,16 +1256,14 @@ pub(crate) fn spawn_capture_thread(
                         });
                         let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
 
+                        // The right slot is the raw microphone, the level channel.
+                        // `dac_active` stays true through starvation and the mute
+                        // tail, the conservative side for the room meter.
                         for i in 0..frames {
                             let base = i * 8;
                             let frame = &dma_buf[base..base + 8];
                             let (left, right) = slot_pair(frame);
-                            let slot = ridx.slot(ring.write_head);
-                            ring.samples[slot] = left;
-                            if let Some(aux) = ring.aux.as_mut() {
-                                aux[slot] = right;
-                            }
-                            ring.write_head += 1;
+                            ring.commit(&ridx, left, Some(right), dac_active);
                         }
 
                         ring.anchor_sample = ring.write_head.saturating_sub(1);

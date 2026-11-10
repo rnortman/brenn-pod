@@ -10,7 +10,9 @@ pub mod endpointer;
 pub mod event;
 mod ort_util;
 pub mod oww_stream;
+mod pod_clock;
 pub mod ring;
+mod room;
 pub mod runtime;
 pub mod silero;
 pub mod stats;
@@ -29,8 +31,8 @@ pub use oww_stream::{
 };
 pub use ring::PcmRing;
 pub use runtime::{
-    BargeInConfig, BargeMode, FeedSender, Listener, ListenerConfig, ListenerHandle, ListenerState,
-    ListenerStats, ListenerStatsSnapshot,
+    BargeInConfig, BargeMode, FeedSender, HandleError, Listener, ListenerConfig, ListenerHandle,
+    ListenerState, ListenerStats, ListenerStatsSnapshot,
 };
 pub use silero::{SileroConfig, SileroModel, SileroVad};
 pub use stats::{MODEL_STATS_FLUSH_CHUNKS, ScoreDistribution, ScoreStats, ScoreSummary};

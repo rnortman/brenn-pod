@@ -16,6 +16,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 
+use audio_pipeline::stats::PodStats;
 use audio_pipeline::vad::{VadSource, VadStateMachine, VadTransition, vad_hangover_ticks_ms};
 use audio_pipeline::wire::{Telemetry as WireTelemetry, TelemetryKind};
 use xvf3800_ctrl::{
@@ -183,6 +184,9 @@ pub struct TelemetryCtx<'a> {
     /// ring nobody is filling); an already-open gate still releases through the
     /// normal hangover path.
     pub capture_quiesced: &'a dyn Fn() -> bool,
+    /// Where the gate publishes its state for the status frame, and where a message
+    /// dropped on a full channel is counted (`gate_msg_drops`).
+    pub stats: &'a PodStats,
 }
 
 /// Energy sample handed to the VAD FSM: the max across the four beams.
@@ -234,6 +238,10 @@ impl TelemetryCore {
     /// count as silence and time out an open gate). The DoA read still happens
     /// on its tick regardless, so a one-off SPENERGY failure does not shift the
     /// DoA cadence.
+    ///
+    /// Every tick publishes the gate's state and its input to `ctx.stats`. A tick
+    /// whose read failed, or whose input was replaced by silence because capture is
+    /// quiesced, publishes no input: neither is a reading of the room.
     pub fn poll_tick<B: TelemetryBus>(
         &mut self,
         bus: &mut B,
@@ -242,13 +250,19 @@ impl TelemetryCore {
         let sp_values = bus.read(Reading::SpEnergy);
         let now_us = (ctx.now_us)();
 
+        let mut gate_input = None;
         let transition = sp_values.map(|sp| {
             let max_energy = if (ctx.capture_quiesced)() {
                 // NEG_INFINITY sits below every representable threshold under
                 // either FSM comparison.
                 f32::NEG_INFINITY
             } else {
-                sp.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                // TODO(gate-misses-speech-over-steady-noise): a line spoken over
+                // steady noise the gate has already opened and closed on opens no
+                // segment.
+                let max = sp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                gate_input = Some(max);
+                max
             };
             let transition = self.vad.update(&MaxBeamEnergy(max_energy));
             match transition {
@@ -262,6 +276,7 @@ impl TelemetryCore {
             }
             transition
         });
+        ctx.stats.publish_gate(self.vad.is_open(), gate_input);
 
         if self.tick.is_multiple_of(DOA_EVERY_N_TICKS) {
             // Read on cadence whether or not a segment is open, so the transaction
@@ -305,7 +320,7 @@ impl TelemetryCore {
             .try_send(StreamerMsg::VadOpened { write_head })
             .is_err()
         {
-            self.telemetry_drops = self.telemetry_drops.saturating_add(1);
+            self.note_drop(ctx);
             log::warn!(
                 "telemetry: VadOpened dropped — streamer channel full; \
                  utterance will be lost (drops so far this boot: {})",
@@ -323,12 +338,19 @@ impl TelemetryCore {
         self.segment_open = false;
         ctx.vad_closed_flag.store(true, Ordering::Release);
         if ctx.tx.try_send(StreamerMsg::VadClosed).is_err() {
-            self.telemetry_drops = self.telemetry_drops.saturating_add(1);
+            self.note_drop(ctx);
             log::warn!(
                 "telemetry: VadClosed channel message dropped — \
                  streamer will detect close via VAD_CLOSED_FLAG"
             );
         }
+    }
+
+    /// A message the channel would not take: counted here and in the device's
+    /// `gate_msg_drops`.
+    fn note_drop(&mut self, ctx: &TelemetryCtx<'_>) {
+        self.telemetry_drops = self.telemetry_drops.saturating_add(1);
+        PodStats::bump(&ctx.stats.gate_msg_drops);
     }
 
     /// Offer one telemetry frame to the streamer. A full channel is counted and
@@ -353,9 +375,7 @@ impl TelemetryCore {
         };
         match ctx.tx.try_send(StreamerMsg::Telemetry(tel)) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.telemetry_drops = self.telemetry_drops.saturating_add(1);
-            }
+            Err(TrySendError::Full(_)) => self.note_drop(ctx),
             Err(TrySendError::Disconnected(_)) => {
                 log::warn!(
                     "telemetry: streamer channel disconnected ({})",
@@ -393,6 +413,7 @@ pub fn run_telemetry_loop<B: TelemetryBus>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audio_pipeline::stats::CounterSources;
     use std::cell::RefCell;
     use std::sync::mpsc::{Receiver, sync_channel};
 
@@ -544,6 +565,7 @@ mod tests {
         write_head: u64,
         now_us: u64,
         quiesced: bool,
+        stats: PodStats,
     }
 
     impl Harness {
@@ -556,6 +578,13 @@ mod tests {
                 write_head: 4_242,
                 now_us: 7_000_000,
                 quiesced: false,
+                stats: PodStats::new(CounterSources {
+                    capture_deficit_frames: false,
+                    capture_xruns: false,
+                    playback_write_failures: false,
+                    playback_discards: false,
+                    alloc_failures: false,
+                }),
             }
         }
 
@@ -625,6 +654,7 @@ mod tests {
                 write_head: &|| $h.write_head,
                 now_us: &|| $h.now_us,
                 capture_quiesced: &|| $h.quiesced,
+                stats: &$h.stats,
             }
         };
     }
@@ -761,6 +791,51 @@ mod tests {
         );
     }
 
+    /// Every tick publishes whether the gate is open and its input; the largest
+    /// input since the last take is what the status frame reads.
+    #[test]
+    fn each_tick_publishes_the_gate_and_its_input() {
+        let h = Harness::new();
+        let mut bus = FakeBus::scripted(
+            vec![Some([0.0, 0.3, 0.0, 0.0]), Some(LOUD), Some(LOUD)],
+            Some(AZ),
+        );
+        let mut core = TelemetryCore::new(THRESHOLD, HANGOVER_MS);
+        let ctx = harness_ctx!(h);
+
+        core.poll_tick(&mut bus, &ctx);
+        assert_eq!(h.stats.take_gate(), (false, Some(0.3)));
+        core.poll_tick(&mut bus, &ctx);
+        core.poll_tick(&mut bus, &ctx);
+        assert!(core.segment_open());
+        assert_eq!(
+            h.stats.take_gate(),
+            (true, Some(5.0)),
+            "the gate opened, and its largest input since the last take"
+        );
+    }
+
+    /// A failed read and a quiesced tick publish the gate's state but no input.
+    #[test]
+    fn a_failed_or_quiesced_tick_publishes_no_input() {
+        let mut h = Harness::new();
+        let mut bus = FakeBus::scripted(vec![None, Some(LOUD)], Some(AZ));
+        let mut core = TelemetryCore::new(THRESHOLD, HANGOVER_MS);
+        {
+            let ctx = harness_ctx!(h);
+            core.poll_tick(&mut bus, &ctx);
+        }
+        assert_eq!(h.stats.take_gate(), (false, None), "the read failed");
+        h.quiesced = true;
+        let ctx = harness_ctx!(h);
+        core.poll_tick(&mut bus, &ctx);
+        assert_eq!(
+            h.stats.take_gate(),
+            (false, None),
+            "a quiesced tick is fed silence, which is not a reading"
+        );
+    }
+
     /// Telemetry is forwarded only while a segment is open, stamped with the
     /// injected clock, and the opening tick's own SPENERGY goes out too.
     #[test]
@@ -869,6 +944,11 @@ mod tests {
             core.telemetry_drops(),
             before + 1,
             "a bounced VadClosed must be counted"
+        );
+        assert_eq!(
+            h.stats.snapshot().gate_msg_drops,
+            core.telemetry_drops(),
+            "every drop reaches the device counter too"
         );
         assert!(
             h.flag.load(Ordering::Acquire),

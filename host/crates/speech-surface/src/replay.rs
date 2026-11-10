@@ -43,7 +43,8 @@ pub(crate) fn feed_end_cause(close: &SegmentClose) -> SegmentEndCause {
 /// identity across the connection. `HelloAccepted` establishes `pod` and opens a
 /// fresh epoch, naming the connection's level source; audio streams through with
 /// its frame level, segment boundaries likewise; azimuth telemetry becomes a
-/// `Feed::Doa`; other telemetry and protocol errors produce no feed. The single
+/// `Feed::Doa`; a status frame becomes a `Feed::PodStatus`; other telemetry and
+/// protocol errors produce no feed. The single
 /// mapping shared by the live `tap_listener` and the offline replay engine, so
 /// the two can never drift.
 pub(crate) fn session_event_to_feed(
@@ -104,6 +105,20 @@ pub(crate) fn session_event_to_feed(
         } => Some(Feed::Doa {
             sample_offset: *sample_offset,
             azimuths: *values,
+        }),
+        SessionEvent::Status {
+            host_rx,
+            capture_head,
+            first_block,
+            levels,
+            segment_reach,
+            ..
+        } => Some(Feed::PodStatus {
+            host_rx: *host_rx,
+            capture_head: *capture_head,
+            segment_reach: *segment_reach,
+            first_block: *first_block,
+            levels: levels.clone(),
         }),
         _ => None,
     }
@@ -371,7 +386,7 @@ fn drive(
         {
             let emitted = state
                 .handle(id, feed, oww, silero)
-                .map_err(ReplayError::Listener)?;
+                .map_err(|e| ReplayError::Listener(e.error))?;
             out.extend(emitted);
         }
     }
@@ -414,6 +429,51 @@ mod tests {
         );
     }
 
+    /// A status frame reaches the listener with the pod's position, the receipt
+    /// time and its level blocks as they arrived.
+    #[test]
+    fn status_feeds_the_listener_its_position_and_blocks() {
+        use pod_ingest::{LevelBlock, PodCounters, PodGauges};
+        let levels = vec![
+            LevelBlock {
+                half_db: 150,
+                flags: 0,
+            },
+            LevelBlock {
+                half_db: 90,
+                flags: 1,
+            },
+        ];
+        let ev = SessionEvent::Status {
+            host_rx: HostMicros(9_000),
+            device_ts: DeviceMicros(5_000),
+            capture_head: 64_123,
+            capture_head_device_ts: DeviceMicros(4_990),
+            first_block: 38,
+            levels: levels.clone(),
+            counters: PodCounters::default(),
+            gauges: PodGauges::default(),
+            segment_reach: 12_345,
+        };
+        let mut pod = Some(PodId(String::from("pod-x")));
+        match session_event_to_feed(&ev, &mut pod, 1) {
+            Some(Feed::PodStatus {
+                host_rx,
+                capture_head,
+                segment_reach,
+                first_block,
+                levels: got,
+            }) => {
+                assert_eq!(host_rx, HostMicros(9_000));
+                assert_eq!(capture_head, 64_123);
+                assert_eq!(segment_reach, 12_345);
+                assert_eq!(first_block, 38);
+                assert_eq!(got, levels);
+            }
+            other => panic!("status maps to PodStatus: {other:?}"),
+        }
+    }
+
     /// A beam + raw-mic session names the raw mic as its level source and meters
     /// the raw-mic channel; a mono session names the beam and meters the beam.
     #[test]
@@ -423,6 +483,7 @@ mod tests {
             pod_id: "pod-x".into(),
             host_rx: HostMicros(0),
             capture: CaptureLayout { channels, source },
+            version: audio_pipeline::wire::AUDIO_PROTOCOL_VERSION,
         };
         let audio = |aux| SessionEvent::Audio {
             segment_id: 1,

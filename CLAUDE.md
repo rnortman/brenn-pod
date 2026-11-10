@@ -8,6 +8,13 @@ A Rust firmware platform for home-built smart-home devices, and the devices buil
 
 Product-grade code — write every line as if it ships. Full charter: `README.md`.
 
+## Real-World Robustness
+
+We are building a system to be robust in the real world, and the real world violates
+every assumption you make about it. Not just occasionally, but constantly. You do not
+make assumptions about the real world behaving nicely, or your real-world system
+fails, period.
+
 ## Hardware Bring-Up
 
 - We bring up new hardware — or untried features of hardware we already use — by writing **HIL self-tests that ASSERT the expected behavior and letting them FAIL**, not by writing throwaway probe code. The failure output is the discovery. This is the default; reach for a throwaway probe only when an assertion genuinely cannot express the question.

@@ -15,6 +15,7 @@ use crate::tls_link::{PSK_LEN, TlsConnectParams, TlsStream, tls_connect_psk};
 use crate::wifi::{jitter_seed, monotonic_secs, snapshot_wifi_state, wifi_is_up_nonblocking};
 use crate::{CAPTURE_RING, build_inbound_stream_sink};
 use audio_pipeline::ring::RingIndex;
+use audio_pipeline::stats::{CounterSources, PodStats};
 use audio_pipeline::stream_send::{SendOutcome, WRITE_TIMEOUT_MS};
 use audio_pipeline::wire::ChannelSource;
 use pod_streamer::idle::{ParkOutcome, park_drain, should_log_provisioning_failure};
@@ -24,9 +25,47 @@ use pod_streamer::run::{
 };
 use pod_streamer::segment::ObsEvent;
 pub(crate) use pod_streamer::segment::StreamerMsg;
+use pod_streamer::status::PlatformGauges;
 use std::sync::Mutex;
 use std::time::Duration;
 use wifi_diag::{fmt_ipv4, fmt_wifi_snapshot};
+
+/// This pod's counters, read into every status frame.
+///
+/// A counter whose source this pod has not wired is declared unsourced, so it is
+/// reported as not measured rather than as a count of zero. I2S reports no capture
+/// overrun event, so `capture_xruns` is unsourced.
+pub(crate) static POD_STATS: PodStats = PodStats::new(ESP_COUNTER_SOURCES);
+
+/// Which optional counters this pod has a source for: all but `capture_xruns`.
+pub(crate) const ESP_COUNTER_SOURCES: CounterSources = CounterSources {
+    capture_deficit_frames: true,
+    capture_xruns: false,
+    playback_write_failures: true,
+    playback_discards: true,
+    alloc_failures: true,
+};
+
+/// The status frame's platform readings: internal heap, Wi-Fi RSSI, and the calling
+/// task's stack high-water mark. RSSI is `None` when the Wi-Fi stack lock is busy or the
+/// read fails. The closure runs on the thread that builds and sends the frame, so the
+/// watermark is that thread's.
+pub(crate) fn esp_status_gauges() -> PlatformGauges {
+    let (heap_free, heap_min, heap_largest) = crate::health::heap_waypoint();
+    // SAFETY: pure-read FreeRTOS query; NULL handle queries the calling task. ESP-IDF
+    // reports the high-water mark in bytes.
+    let stack_free_min =
+        unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
+    PlatformGauges {
+        heap_free: Some(heap_free),
+        heap_min: Some(heap_min),
+        heap_largest: Some(heap_largest),
+        rssi_dbm: snapshot_wifi_state()
+            .rssi
+            .and_then(|r| i8::try_from(r).ok()),
+        stack_free_min: Some(stack_free_min),
+    }
+}
 
 /// How often the streamer re-reads audio provisioning from NVS while it is absent.
 ///
@@ -336,9 +375,10 @@ pub(crate) fn spawn_streamer_thread() {
         .name("streamer".into())
         // The ECDHE-PSK handshake runs on this thread and mbedTLS ECC wants
         // several KB of stack beyond what the segment loop needs. Sized to err
-        // safe: an overflow trips the armed end-of-stack watchpoint, and the
-        // health report's stack HWM is what says how much of this is used.
-        // TODO(tls-link-bench-measure): confirm or tune against a bench run.
+        // safe: an overflow trips the armed end-of-stack watchpoint. Measured
+        // low-water mark (`gauges.stack_free_min`) after 13 h up, four TLS-PSK
+        // handshakes and 77 segments with replies: 18 820 bytes free, 9 852 used.
+        // TODO(tls-link-bench-measure): trim or confirm against that watermark.
         .stack_size(28672)
         .spawn(move || {
             // ── Take the channel receiver ────────────────────────────────────
@@ -402,13 +442,14 @@ pub(crate) fn spawn_streamer_thread() {
                 fmt_ipv4(audio_ip), audio_port, pod_id.as_str()
             );
 
+            let gauges = esp_status_gauges;
             let platform = EspPlatform {
                 peer: std::net::SocketAddr::from((audio_ip, audio_port)),
                 pod_id,
                 psk: audio_psk,
             };
             let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
-            let mut inbound_sink = build_inbound_stream_sink();
+            let mut inbound_sink = build_inbound_stream_sink().with_stats(&POD_STATS);
             let mut obs = segment_obs_event;
             let mut runtime = StreamerRuntime {
                 rx: &rx,
@@ -422,6 +463,8 @@ pub(crate) fn spawn_streamer_thread() {
                 obs: &mut obs,
                 inbound_obs: &mut crate::inbound::HeapWaypointObs,
                 jitter_seed: jitter_seed(),
+                stats: &POD_STATS,
+                gauges: &gauges,
             };
 
             // The shared idle/segment loop runs for the life of the pod; it

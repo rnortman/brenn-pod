@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use audio_pipeline::wire::{AUDIO_PROTOCOL_VERSION, StreamFrame};
+use audio_pipeline::wire::{AUDIO_PROTOCOL_MIN_READABLE, AUDIO_PROTOCOL_VERSION, StreamFrame};
 
 use serde::Serialize;
 
@@ -27,7 +27,9 @@ use crate::clock::{DeviceMicros, HostMicros};
 // Re-export the wire types that appear in `SessionFsm`'s public API so
 // downstream crates consume them via `pod-ingest` and need no `audio-pipeline`
 // edge of their own.
-pub use audio_pipeline::wire::{ChannelSource, Codec, EndReason, TelemetryKind};
+pub use audio_pipeline::wire::{
+    ChannelSource, Codec, EndReason, LevelBlock, LevelRun, PodCounters, PodGauges, TelemetryKind,
+};
 
 /// Per-pod cap on retained truncated-segment ids. Segment ids are per-boot
 /// monotonic, so an un-resumed entry would otherwise accumulate forever across
@@ -236,6 +238,9 @@ pub enum CloseCause {
     Shutdown,
     /// A duplicate `SegmentStart` force-truncated the open segment.
     ForcedByNewStart,
+    /// A pod that sends status frames sent nothing for the host's silence
+    /// deadline, and the host closed the connection.
+    Silent,
 }
 
 /// How a segment ended.
@@ -268,7 +273,8 @@ pub enum SegmentClose {
 pub enum ProtocolErrorKind {
     /// First frame on the connection was not `Hello` (fatal).
     NotHelloFirst,
-    /// `Hello.version` did not match `AUDIO_PROTOCOL_VERSION` (fatal).
+    /// `Hello.version` was outside `AUDIO_PROTOCOL_MIN_READABLE..=AUDIO_PROTOCOL_VERSION`
+    /// (fatal).
     VersionMismatch {
         /// The version the peer declared.
         got: u8,
@@ -319,6 +325,9 @@ pub enum SessionEvent {
         host_rx: HostMicros,
         /// The channel layout the accepted `Hello` declared.
         capture: CaptureLayout,
+        /// The wire version the pod declared, within the readable range. A v3 pod
+        /// sends no `Status`.
+        version: u8,
     },
     /// A segment opened.
     SegmentOpened {
@@ -375,6 +384,29 @@ pub enum SessionEvent {
         close: SegmentClose,
         /// Host time of the close.
         host_rx: HostMicros,
+    },
+    /// A device status frame, in or out of a segment.
+    Status {
+        /// Host receive time of the frame.
+        host_rx: HostMicros,
+        /// Device-clock time the frame was built.
+        device_ts: DeviceMicros,
+        /// The device's capture write head: the index of the next sample it will
+        /// capture.
+        capture_head: u64,
+        /// Device-clock time sample `capture_head - 1` was captured.
+        capture_head_device_ts: DeviceMicros,
+        /// Block index of `levels[0]`.
+        first_block: u64,
+        /// Consecutive level blocks not sent before on this connection.
+        levels: Vec<LevelBlock>,
+        /// Cumulative device counters.
+        counters: PodCounters,
+        /// Device readings at build time.
+        gauges: PodGauges,
+        /// How far behind `capture_head` a segment the device opened now would begin
+        /// (the wire field's meaning, carried unchanged).
+        segment_reach: u32,
     },
     /// A protocol violation.
     ProtocolError {
@@ -524,7 +556,7 @@ impl SessionFsm {
             self.fatal(ProtocolErrorKind::NotHelloFirst, host_rx, out);
             return;
         };
-        if hello.version != AUDIO_PROTOCOL_VERSION {
+        if !(AUDIO_PROTOCOL_MIN_READABLE..=AUDIO_PROTOCOL_VERSION).contains(&hello.version) {
             self.fatal(
                 ProtocolErrorKind::VersionMismatch { got: hello.version },
                 host_rx,
@@ -550,6 +582,7 @@ impl SessionFsm {
                 channels: hello.channels,
                 source: hello.channel_source,
             },
+            version: hello.version,
         });
     }
 
@@ -575,6 +608,7 @@ impl SessionFsm {
             StreamFrame::EndOfAudio(_) | StreamFrame::FlushPlayback(_) => {
                 self.nonfatal(ProtocolErrorKind::ControlFrameOnUplink, host_rx, out);
             }
+            StreamFrame::Status(st) => out.push(status_event(st, host_rx)),
         }
     }
 
@@ -683,6 +717,7 @@ impl SessionFsm {
             StreamFrame::EndOfAudio(_) | StreamFrame::FlushPlayback(_) => {
                 self.nonfatal(ProtocolErrorKind::ControlFrameOnUplink, host_rx, out);
             }
+            StreamFrame::Status(st) => out.push(status_event(st, host_rx)),
         }
     }
 
@@ -802,6 +837,22 @@ impl SessionFsm {
             fatal: false,
             host_rx,
         });
+    }
+}
+
+/// The event for a `Status` frame. Status is independent of segments, so nothing
+/// about the session's state is checked or changed.
+fn status_event(st: audio_pipeline::wire::Status, host_rx: HostMicros) -> SessionEvent {
+    SessionEvent::Status {
+        host_rx,
+        device_ts: DeviceMicros(st.device_ts_us),
+        capture_head: st.capture_head,
+        capture_head_device_ts: DeviceMicros(st.capture_head_ts_us),
+        first_block: st.levels.first_block,
+        levels: st.levels.blocks.to_vec(),
+        counters: st.counters,
+        gauges: st.gauges,
+        segment_reach: st.segment_reach,
     }
 }
 
@@ -1040,6 +1091,118 @@ mod tests {
         );
     }
 
+    fn hello_versioned(version: u8) -> StreamFrame {
+        let StreamFrame::Hello(mut h) = hello(ChannelSource::AsrBeam) else {
+            unreachable!()
+        };
+        h.version = version;
+        StreamFrame::Hello(h)
+    }
+
+    #[test]
+    fn versions_three_and_four_are_read_and_others_are_fatal() {
+        for version in [3u8, 4] {
+            let mut fsm = SessionFsm::new(SPINE, new_ledger());
+            let ev = fsm.feed(hello_versioned(version), hx(1));
+            assert!(
+                matches!(
+                    ev.as_slice(),
+                    [SessionEvent::HelloAccepted { version: v, .. }] if *v == version
+                ),
+                "v{version}: {ev:?}"
+            );
+        }
+        for version in [2u8, 5] {
+            let mut fsm = SessionFsm::new(SPINE, new_ledger());
+            let ev = fsm.feed(hello_versioned(version), hx(1));
+            assert_eq!(
+                ev,
+                vec![SessionEvent::ProtocolError {
+                    kind: ProtocolErrorKind::VersionMismatch { got: version },
+                    fatal: true,
+                    host_rx: hx(1),
+                }],
+                "v{version}"
+            );
+        }
+    }
+
+    fn status_frame(capture_head: u64) -> StreamFrame {
+        let mut blocks = HVec::new();
+        blocks
+            .push(LevelBlock {
+                half_db: 156,
+                flags: 0,
+            })
+            .unwrap();
+        StreamFrame::Status(audio_pipeline::wire::Status {
+            device_ts_us: 9_000_000,
+            capture_head,
+            capture_head_ts_us: 8_999_990,
+            levels: LevelRun {
+                first_block: capture_head / 1_600 - 1,
+                blocks,
+            },
+            counters: PodCounters {
+                playback_underruns: 2,
+                ..PodCounters::default()
+            },
+            gauges: PodGauges {
+                gate_open: true,
+                ..PodGauges::default()
+            },
+            segment_reach: 16_000,
+        })
+    }
+
+    fn expect_status(ev: &[SessionEvent], capture_head: u64, host_rx: HostMicros) {
+        match ev {
+            [
+                SessionEvent::Status {
+                    host_rx: rx,
+                    device_ts,
+                    capture_head: head,
+                    capture_head_device_ts,
+                    first_block,
+                    levels,
+                    counters,
+                    gauges,
+                    segment_reach,
+                },
+            ] => {
+                assert_eq!(*rx, host_rx);
+                assert_eq!(*device_ts, DeviceMicros(9_000_000));
+                assert_eq!(*head, capture_head);
+                assert_eq!(*capture_head_device_ts, DeviceMicros(8_999_990));
+                assert_eq!(*first_block, capture_head / 1_600 - 1);
+                assert_eq!(levels.len(), 1);
+                assert_eq!(counters.playback_underruns, 2);
+                assert!(gauges.gate_open);
+                assert_eq!(*segment_reach, 16_000);
+            }
+            other => panic!("expected one Status event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_is_accepted_idle_and_in_a_segment_without_touching_it() {
+        let mut fsm = accepted_fsm(new_ledger());
+        expect_status(&fsm.feed(status_frame(160_000), hx(10)), 160_000, hx(10));
+        assert!(!fsm.segment_open(), "status opens nothing");
+
+        fsm.feed(seg_start(1, 0, 0), hx(11));
+        fsm.feed(audio(1, 0, 320, 0), hx(12));
+        expect_status(&fsm.feed(status_frame(176_000), hx(13)), 176_000, hx(13));
+        assert!(fsm.segment_open(), "status closes nothing");
+        // The segment's continuity is unaffected: the next frame is not a gap.
+        let ev = fsm.feed(audio(1, 320, 320, 20_000), hx(14));
+        assert!(
+            matches!(ev.as_slice(), [SessionEvent::Audio { gap: None, .. }]),
+            "{ev:?}"
+        );
+        assert_eq!(fsm.stats().nonfatal_violations, 0);
+    }
+
     #[test]
     fn format_gate_rejects_stereo_and_wrong_rate_and_channels() {
         // `codec` is checked in `format_ok` too, but `Codec` has a single
@@ -1125,6 +1288,7 @@ mod tests {
                     channels: 2,
                     source: ChannelSource::StereoBeamRawMic,
                 },
+                version: AUDIO_PROTOCOL_VERSION,
             }]
         );
         // Rejected: every other pairing involving two channels or the stereo labels.

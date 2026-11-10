@@ -24,6 +24,7 @@ pub fn db_to_linear(db: f32) -> f32 {
 ///
 /// A non-finite `db` is a caller bug; it is treated as 0 dB rather than turning a
 /// reply into silence or full-scale noise.
+// TODO(reply-gain-no-limiter): limit the peak rather than hard-clip it.
 pub fn apply_gain_db(pcm: &Arc<[i16]>, db: f32) -> (Arc<[i16]>, u32) {
     if db == 0.0 || !db.is_finite() {
         return (Arc::clone(pcm), 0);

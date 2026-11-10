@@ -18,6 +18,7 @@ pub mod link;
 pub mod netpoll;
 pub mod run;
 pub mod segment;
+pub mod status;
 pub mod telemetry;
 
 #[cfg(test)]

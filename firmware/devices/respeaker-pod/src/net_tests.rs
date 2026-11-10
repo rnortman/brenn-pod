@@ -893,20 +893,21 @@ fn log_test_start_rssi() {
 /// HIL main task's 16 KB stack, already carrying the command-dispatch and `run_handler`
 /// chain, overflows and faults on-device — hence the dedicated thread.
 ///
-/// Sizing (measured 2026-07-11): the worst-case used depth is 9_980 bytes, derived from the
-/// post-segment result-line `min(shwm)` (`RTD_TEST_STACK_BYTES − min(shwm)`); the run reached
-/// Scenario B, so HWM monotonicity — a FreeRTOS HWM is a task-lifetime minimum — makes that
-/// post-segment sample cover the inbound-Hello-decode window where the peak lives. Budget =
-/// round_up_1KiB(used + 4_096) = round_up_1KiB(14_076) = 14_336.
+/// Sizing (measured 2026-11-09 on pod-fbe2f8, on the image of the commit that set this
+/// value, before it was set): three `RESPEAKER_HIL_ONLY=StreamRealtimeDuplex` runs on a
+/// 14_336-byte stack read `shwm` 2_652, 2_824 and 2_616 on
+/// the post-segment result line. The run reaches Scenario B, and a FreeRTOS HWM is a
+/// task-lifetime minimum, so the post-segment sample covers the inbound-Hello-decode window
+/// where the peak lives. Worst-case used depth = 14_336 − 2_616 = 11_720. Budget =
+/// round_up_1KiB(used + 4_096) = round_up_1KiB(15_816) = 16_384, which leaves the least
+/// reading 4_664 free, 568 above `RTD_STACK_HWM_FLOOR`.
 ///
-/// The 4_096-byte fixed floor is the whole margin. The 9_980 value is a single post-slim cold
-/// measurement; the expectation that it is stable rests on the pre-slim determinism evidence
-/// (constant stack HWM across all instrumented runs, warm and cold) plus the permanent
-/// post-segment stack-HWM assertion (`RTD_STACK_HWM_FLOOR`) that guards any regression. So no
-/// proportional (`used/2`) transient branch is carried — the assertion, not a padding
-/// multiplier, catches a depth regression.
+/// The 4_096-byte margin the rule adds is what `RTD_STACK_HWM_FLOOR` asserts: the test fails
+/// as soon as the rule stops being met, which is when this constant is due a re-bake with
+/// human review. No proportional (`used/2`) transient branch is carried — the assertion, not
+/// a padding multiplier, catches a depth regression.
 #[cfg(target_os = "espidf")]
-const RTD_TEST_STACK_BYTES: usize = 14_336;
+const RTD_TEST_STACK_BYTES: usize = 16_384;
 
 /// Stack for the synthetic `rtd-producer` thread. Its body is a lock-write-sleep loop plus
 /// one heap sample per tick — no logging, no deep call chain — so the 3072-byte FreeRTOS
@@ -937,15 +938,17 @@ const _: () = assert!(RTD_HEAP_LOW_FLOOR == 24_576);
 #[cfg(target_os = "espidf")]
 const _: () = assert!(device_protocol::HEAP_MIN_EVER_FLOOR <= RTD_HEAP_LOW_FLOOR);
 
-/// Near-overflow floor for the rtd-test thread's own stack HWM (bytes), mirroring
-/// `device_protocol::STACK_HWM_FLOOR`, sampled device-side after each segment and asserted once after
-/// both scenarios complete (the min-accumulator carries a self-healed Scenario-A breach into
-/// the final check). FreeRTOS HWM is a task-lifetime minimum, so a post-segment sample
-/// necessarily covers the inbound-decode window inside the segment. With the `used + 4_096` budget the expected remaining margin
-/// at the deterministic peak is ~4 KB, so 1_024 trips only after a >3 KB depth regression —
-/// a real signal, not noise.
+/// Floor for the rtd-test thread's own stack HWM (bytes): the sizing rule's margin, not a
+/// near-overflow alarm. `RTD_TEST_STACK_BYTES` is sized as `round_up_1KiB(used + 4_096)`, and
+/// that rule holds exactly while `shwm >= 4_096`, so the test fails when the loop has grown
+/// enough to put the stack under its own rule. On the 16_384 stack that is roughly 550 to
+/// 1_000 bytes of growth, against a run-to-run spread of 56 to 160 bytes in the readings on
+/// record. Sampled device-side after each segment and asserted once after both scenarios
+/// complete (the min-accumulator carries a self-healed Scenario-A breach into the final
+/// check). FreeRTOS HWM is a task-lifetime minimum, so a post-segment sample necessarily
+/// covers the inbound-decode window inside the segment.
 #[cfg(target_os = "espidf")]
-const RTD_STACK_HWM_FLOOR: u32 = 1_024;
+const RTD_STACK_HWM_FLOOR: u32 = 4_096;
 
 /// Per-scenario resource measurements returned by `rtd_run_one_segment`.
 #[derive(Clone, Copy, Default)]
@@ -1362,9 +1365,8 @@ fn rtd_run_one_segment(
     use crate::capture::CAPTURE_RING;
     use crate::netpoll::EspPoll;
     use audio_pipeline::ring::{PREROLL_SAMPLES, RING_CAPACITY_SAMPLES, RingIndex};
-    use audio_pipeline::wire::{
-        AUDIO_PROTOCOL_VERSION, AUDIO_SAMPLES_PER_FRAME, Hello, SegmentStart, StreamFrame,
-    };
+    use audio_pipeline::wire::{AUDIO_SAMPLES_PER_FRAME, SegmentStart, StreamFrame};
+    use pod_streamer::run::hello_frame;
     use pod_streamer::segment::{SegmentDeps, StreamerMsg, run_segment};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
@@ -1424,15 +1426,7 @@ fn rtd_run_one_segment(
         Err(e) => return Err(format!("tls connect/handshake failed: {e:?}")),
     };
 
-    let hello = StreamFrame::Hello(Hello {
-        version: AUDIO_PROTOCOL_VERSION,
-        pod_id: heapless::String::new(),
-        sample_rate_hz: crate::DEVICE_PLAYBACK_FORMAT.sample_rate_hz,
-        bits_per_sample: crate::DEVICE_PLAYBACK_FORMAT.bits_per_sample,
-        channels: crate::streamer::ESP_CAPTURE_FORMAT.channels,
-        codec: crate::DEVICE_PLAYBACK_FORMAT.codec,
-        channel_source: crate::streamer::ESP_CAPTURE_FORMAT.channel_source,
-    });
+    let hello = hello_frame("", crate::streamer::ESP_CAPTURE_FORMAT);
     rtd_send_blocking(&mut socket, &hello, &mut *io.scratch, "Hello")?;
     let seg_start = StreamFrame::SegmentStart(SegmentStart {
         segment_id: 0,
@@ -1553,6 +1547,7 @@ fn rtd_run_one_segment(
             now_instant: &Instant::now,
             obs: &mut obs,
             inbound_obs: &mut crate::inbound::HeapWaypointObs,
+            status: None,
         };
         run_segment(&mut deps, 0, read_cursor)
     };
@@ -1582,13 +1577,8 @@ fn rtd_run_one_segment(
 /// carries two distinct channels at the full payload size.
 #[cfg(target_os = "espidf")]
 fn rtd_commit_sample(r: &mut crate::capture::CaptureRing, ridx: &audio_pipeline::ring::RingIndex) {
-    let slot = ridx.slot(r.write_head);
     let left = (r.write_head % 4096) as i16;
-    r.samples[slot] = left;
-    if let Some(aux) = r.aux.as_mut() {
-        aux[slot] = !left;
-    }
-    r.write_head += 1;
+    r.commit(ridx, left, Some(!left), false);
 }
 
 /// Send one onset frame through the tunnel with `send_frame_bp`'s poll-driven
@@ -1609,6 +1599,142 @@ fn rtd_send_blocking(
         )),
         Err(e) => Err(format!("onset send {what} failed: {e:?}")),
     }
+}
+
+// ── PodStatusIdle HIL self-test ───────────────────────────────────────────
+
+/// How long `PodStatusIdle` runs the idle status step: three status periods and a
+/// half, so the host sees at least three frames after the first.
+#[cfg(target_os = "espidf")]
+const POD_STATUS_IDLE_RUN_MS: u64 = 3_500;
+
+/// How long `PodStatusIdle` waits for the playback path to fall idle before it
+/// connects: an earlier test may have left the DAC unmuted with a backlog and no
+/// end-of-audio mark, and every block would then carry the playing flag.
+#[cfg(target_os = "espidf")]
+const POD_STATUS_IDLE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Stack for the `PodStatusIdle` thread. The idle step builds one `Status` (about
+/// 700 bytes with its level run) and encodes it through the TLS write path, the same
+/// work the streamer thread does on its 28 KB stack; 16 KB holds it with the TLS
+/// connect on top. The host's gate (`POD_STATUS_THREAD_STACK_BYTES` in `hil-host`)
+/// requires the frames' `stack_free_min` to lie inside this stack; the two are equal.
+#[cfg(target_os = "espidf")]
+const POD_STATUS_IDLE_STACK_BYTES: usize = 16_384;
+
+/// Pod status frame presence-and-cadence self-test.
+///
+/// Brings the playback path to rest (end-of-audio mark, inbound ring empty), then
+/// connects over TLS-PSK to the HIL-host status listener, sends the audio `Hello`, and
+/// drives `pod_streamer::run::idle_status_step` — the streamer loop's own idle status
+/// step — against the live `CAPTURE_RING` once per idle tick for
+/// `POD_STATUS_IDLE_RUN_MS`. Capture is not quiesced: the frames carry the room as the
+/// production streamer would send it. The host decodes the frames and owns every
+/// assertion; this handler reports how many frames the step skipped and how long it
+/// ran.
+///
+/// The counters come from a `PodStats` of the test's own, with this pod's sources, so
+/// the self-test's frames are not counted as the pod's. Requires prior `WifiAssociate`,
+/// `SetTemporaryPeerConfig` (session `pod_status_port`) and an effective audio PSK.
+#[cfg(target_os = "espidf")]
+pub(crate) fn run_pod_status_idle() -> (Status, Payload) {
+    let spawn = std::thread::Builder::new()
+        .name("pod-status-test".to_string())
+        .stack_size(POD_STATUS_IDLE_STACK_BYTES)
+        .spawn(run_pod_status_idle_inner);
+    match spawn {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| test_report_fail("FAIL src=pod-status test thread panicked")),
+        Err(e) => test_report_fail_detail("pod-status test thread spawn failed", &e),
+    }
+}
+
+#[cfg(target_os = "espidf")]
+fn run_pod_status_idle_inner() -> (Status, Payload) {
+    use crate::capture::CAPTURE_RING;
+    use audio_pipeline::ring::{RING_CAPACITY_SAMPLES, RingIndex};
+    use audio_pipeline::stats::PodStats;
+    use audio_pipeline::wire::MAX_FRAME_BYTES;
+    use pod_streamer::run::{LinkState, hello_frame, idle_status_step};
+    use pod_streamer::status::StatusSource;
+    use std::time::{Duration, Instant};
+
+    let TlsPskInputs {
+        peer_ip,
+        peer_port,
+        psk,
+        pod_id,
+    } = match tls_psk_inputs(|p| p.pod_status_port) {
+        Ok(v) => v,
+        Err(fail) => return fail,
+    };
+    if !crate::level_tests::bring_playback_to_rest(POD_STATUS_IDLE_SETTLE) {
+        return test_report_fail_fmt(format_args!(
+            "FAIL src=pod-status reason=playback-not-idle waited_ms={}",
+            POD_STATUS_IDLE_SETTLE.as_millis()
+        ));
+    }
+    let peer = std::net::SocketAddr::from((peer_ip, peer_port));
+    log::info!("pod-status: connecting to {peer}");
+    let mut socket = match crate::tls_link::tls_connect_psk(&crate::tls_link::TlsConnectParams {
+        peer: &peer,
+        pod_id: pod_id.as_str(),
+        key: &psk,
+        connect_timeout: Duration::from_secs(TLS_PSK_CONNECT_TIMEOUT_SECS),
+        write_timeout: Duration::from_secs(10),
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            return test_report_fail_fmt(format_args!(
+                "FAIL src=pod-status tls connect/handshake failed: {e:?}"
+            ));
+        }
+    };
+
+    let hello = hello_frame(pod_id.as_str(), crate::streamer::ESP_CAPTURE_FORMAT);
+    let mut scratch = vec![0u8; MAX_FRAME_BYTES + 2];
+    if let Err(reason) = rtd_send_blocking(&mut socket, &hello, &mut scratch, "Hello") {
+        return test_report_fail_fmt(format_args!("FAIL src=pod-status {reason}"));
+    }
+    drop(scratch);
+
+    let stats = PodStats::new(crate::streamer::ESP_COUNTER_SOURCES);
+    let source = StatusSource {
+        stats: &stats,
+        gauges: &crate::streamer::esp_status_gauges,
+    };
+    let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
+    let now_instant = Instant::now;
+    let mut sink = CountingSink::new();
+    let mut link = LinkState::new(0);
+    link.note_socket_established(socket, &mut sink);
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(POD_STATUS_IDLE_RUN_MS) {
+        if let Err(e) = idle_status_step(
+            &mut link,
+            &CAPTURE_RING,
+            &ridx,
+            &source,
+            now_us(),
+            &now_instant,
+        ) {
+            return test_report_fail_fmt(format_args!(
+                "FAIL src=pod-status idle status step dropped the connection after {} ms: {e:?}",
+                started.elapsed().as_millis()
+            ));
+        }
+        esp_idf_svc::hal::delay::FreeRtos::delay_ms(
+            pod_streamer::netpoll::IDLE_TICK.as_millis() as u32
+        );
+    }
+    let run_ms = started.elapsed().as_millis() as u32;
+    link.note_socket_lost(&mut sink);
+    test_report_ok(TestData::PodStatusIdle {
+        status_skipped: stats.snapshot().status_skipped,
+        run_ms,
+    })
 }
 
 // ── TLS-PSK audio-link self-tests ─────────────────────────────────────────────

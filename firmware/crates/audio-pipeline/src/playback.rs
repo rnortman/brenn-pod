@@ -23,6 +23,8 @@
 //! keeps the producer-injecting `with_producer` as its sole constructor; `main.rs` wraps it
 //! with a thin free function that resolves the static (design §6.2, §2.10).
 
+use crate::stats::PodStats;
+
 /// Bytes per 32-bit stereo I2S frame (2 slots × 4 bytes).
 pub const I2S_TX_FRAME_BYTES: usize = 8;
 
@@ -1273,6 +1275,11 @@ pub struct I2sStreamSink {
     /// §6.2(b)). Prevents a wedged consumer from flooding the log with one warn per held frame.
     consumer_stall_warned: bool,
     log_countdown: LogCountdown,
+    /// The device's status counters, when this sink feeds them: each `full_stalls` event
+    /// also adds to [`PodStats::playback_full_stalls`] and each discarded audio frame to
+    /// [`PodStats::playback_discards`]. `None` for a sink whose events are not the pod's
+    /// own playback (a self-test's).
+    stats: Option<&'static PodStats>,
 }
 
 impl I2sStreamSink {
@@ -1295,7 +1302,14 @@ impl I2sStreamSink {
             stalls_since_tail_advanced: 0,
             consumer_stall_warned: false,
             log_countdown: LogCountdown::new(PLAYBACK_LOG_CADENCE_FRAMES),
+            stats: None,
         }
+    }
+
+    /// The same sink, also counting its stalls and discards into `stats`.
+    pub fn with_stats(mut self, stats: &'static PodStats) -> Self {
+        self.stats = Some(stats);
+        self
     }
 }
 
@@ -1379,6 +1393,9 @@ impl PlaybackSink for I2sStreamSink {
                     // self-test (an unpaced flood through the production socket → ring path,
                     // asserting `full_stalls > 0`, an exact frame count, and a clean EOF).
                     self.full_stalls = self.full_stalls.wrapping_add(1);
+                    if let Some(stats) = self.stats {
+                        PodStats::bump(&stats.playback_full_stalls);
+                    }
                     // Tick the periodic log *before* the early return (quality-2): under
                     // sustained backpressure every `accept` returns `Full` here, so a log gated
                     // only on the enqueued path below would go silent during exactly the overload
@@ -1396,6 +1413,9 @@ impl PlaybackSink for I2sStreamSink {
             // state — design §6.2 — so this no-producer arm is the only data-loss path.)
             None => {
                 self.dead_channel_discards = self.dead_channel_discards.wrapping_add(1);
+                if let Some(stats) = self.stats {
+                    PodStats::bump(&stats.playback_discards);
+                }
                 Accepted::Enqueued
             }
         };
@@ -1936,6 +1956,46 @@ mod tests {
             N + 1,
             "the retried frame is counted exactly once, on successful write"
         );
+    }
+
+    /// A sink given the pod's counters adds each stall and each discarded audio frame to
+    /// them; a no-producer reset discards no audio and adds nothing.
+    #[test]
+    fn i2s_stream_sink_counts_stalls_and_discards_into_the_pod_stats() {
+        use crate::stats::{CounterSources, PodStats};
+        let stats: &'static PodStats =
+            std::boxed::Box::leak(std::boxed::Box::new(PodStats::new(CounterSources {
+                capture_deficit_frames: true,
+                capture_xruns: false,
+                playback_write_failures: true,
+                playback_discards: true,
+                alloc_failures: true,
+            })));
+
+        let (producer, _consumer) = InboundPcmRing::new(WIRE_BYTES_PER_SAMPLE).split();
+        let mut sink = I2sStreamSink::with_producer(Some(producer)).with_stats(stats);
+        assert_eq!(sink.accept(&[0x00, 0x00]), Accepted::Enqueued);
+        assert_eq!(sink.accept(&[0x00, 0x00]), Accepted::Full);
+        assert_eq!(sink.accept(&[0x00, 0x00]), Accepted::Full);
+        assert_eq!(stats.snapshot().playback_full_stalls, 2);
+
+        let mut unwired = I2sStreamSink::with_producer(None).with_stats(stats);
+        assert_eq!(unwired.accept(&[0x00, 0x00]), Accepted::Enqueued);
+        unwired.stream_reset();
+        let snap = stats.snapshot();
+        assert_eq!(snap.playback_discards, Some(1), "one audio frame was lost");
+        assert_eq!(snap.playback_full_stalls, 2, "a discard is not a stall");
+    }
+
+    /// A sink built without counters touches none.
+    #[test]
+    fn i2s_stream_sink_without_stats_counts_only_itself() {
+        let (producer, _consumer) = InboundPcmRing::new(WIRE_BYTES_PER_SAMPLE).split();
+        let mut sink = I2sStreamSink::with_producer(Some(producer));
+        assert_eq!(sink.accept(&[0x00, 0x00]), Accepted::Enqueued);
+        assert_eq!(sink.accept(&[0x00, 0x00]), Accepted::Full);
+        assert_eq!(sink.full_stalls, 1);
+        assert!(sink.stats.is_none());
     }
 
     // ── stream_reset (ring reset) unit tests ──────────────────────────────────

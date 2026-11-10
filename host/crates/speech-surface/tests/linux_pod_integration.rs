@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use audio_pipeline::inbound::{InboundObserver, InboundWaypoint};
 use audio_pipeline::playback::{Accepted, PlaybackSink};
 use audio_pipeline::ring::{CaptureRing, RING_CAPACITY_SAMPLES, RingIndex, SAMPLE_RATE_HZ};
+use audio_pipeline::stats::{CounterSources, PodStats};
 use audio_pipeline::wire::{
     AUDIO_PROTOCOL_VERSION, AudioFrame, ChannelSource, DEVICE_PLAYBACK_FORMAT, EndOfAudio, Hello,
     MAX_AUDIO_PAYLOAD, PlaybackFormat, StreamFrame, Telemetry as WireTelemetry, decode_frame,
@@ -38,6 +39,7 @@ use pod_ingest::{
 };
 use pod_streamer::run::{StreamerExit, StreamerRuntime, run_streamer_loop};
 use pod_streamer::segment::{ObsEvent, StreamerMsg};
+use pod_streamer::status::PlatformGauges;
 use psk_link::link::LinkPlatform;
 use speech_pipeline::SPINE_FORMAT;
 use speech_surface::psk::{PSK_LEN, test_server_context};
@@ -522,6 +524,7 @@ fn ring_with(written: u64) -> Mutex<Option<CaptureRing<Box<[i16]>>>> {
         write_head: written,
         anchor_sample: written.saturating_sub(1),
         anchor_ts_us: DEVICE_ANCHOR_TS_US,
+        levels: audio_pipeline::level::LevelHistory::new(),
     }))
 }
 
@@ -545,6 +548,13 @@ fn start_pod(addr: SocketAddr, key: [u8; PSK_LEN]) -> PodUnderTest {
         let epoch = Instant::now();
         let now_us = move || DEVICE_ANCHOR_TS_US + epoch.elapsed().as_micros() as u64;
         let platform = LinkPlatform::new(POD_ID.to_string(), addr, key);
+        let stats = PodStats::new(CounterSources {
+            capture_deficit_frames: false,
+            capture_xruns: false,
+            playback_write_failures: false,
+            playback_discards: false,
+            alloc_failures: false,
+        });
 
         let exit = {
             let mut obs =
@@ -561,6 +571,8 @@ fn start_pod(addr: SocketAddr, key: [u8; PSK_LEN]) -> PodUnderTest {
                 obs: &mut obs,
                 inbound_obs: &mut inbound_obs,
                 jitter_seed: 0x5eed,
+                stats: &stats,
+                gauges: &PlatformGauges::default,
             };
             run_streamer_loop(&platform, &mut rt)
         };

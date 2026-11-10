@@ -42,6 +42,9 @@ pub(crate) struct FakeLink {
     /// which is a different thing from one that only ever blocks.
     pub(crate) write_err_after: Option<u32>,
     pub(crate) writes: u32,
+    /// Every `write` call, accepted or not, on a counter a test keeps after the
+    /// link moves into the loop.
+    pub(crate) write_calls: Rc<Cell<u32>>,
     pub(crate) read_queue: VecDeque<u8>,
     /// Upper bound on bytes one `read` returns, so a test can meter frames in.
     pub(crate) read_chunk: usize,
@@ -79,6 +82,7 @@ impl FakeLink {
             write_default: usize::MAX,
             write_err_after: None,
             writes: 0,
+            write_calls: Rc::new(Cell::new(0)),
             read_queue: VecDeque::new(),
             read_chunk: usize::MAX,
             reads: 0,
@@ -118,6 +122,7 @@ impl io::Read for FakeLink {
 impl io::Write for FakeLink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.writes += 1;
+        self.write_calls.set(self.write_calls.get() + 1);
         if self.write_err_after.is_some_and(|ok| self.writes > ok) {
             return Err(io::Error::other("scripted write error"));
         }
@@ -334,6 +339,7 @@ pub(crate) fn ring_with(written: u64, anchor_ts_us: u64) -> Mutex<Option<Capture
         write_head: written,
         anchor_sample: written.saturating_sub(1),
         anchor_ts_us,
+        levels: audio_pipeline::level::LevelHistory::new(),
     }))
 }
 

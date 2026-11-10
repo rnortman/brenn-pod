@@ -254,9 +254,11 @@ impl SegmentAssembler {
                     None
                 }
             },
-            // Handshake and protocol-error events are the caller's concern, not
-            // the assembler's.
-            SessionEvent::HelloAccepted { .. } | SessionEvent::ProtocolError { .. } => None,
+            // Handshake, status and protocol-error events are the caller's concern,
+            // not the assembler's: status is independent of segments.
+            SessionEvent::HelloAccepted { .. }
+            | SessionEvent::Status { .. }
+            | SessionEvent::ProtocolError { .. } => None,
         }
     }
 

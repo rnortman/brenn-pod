@@ -212,7 +212,8 @@ pub(crate) struct ListenWiring {
     /// The same listener feed the playback fan-out drives the floor with.
     pub(crate) feed: FeedFn,
     /// How long the window stays open, in samples at the capture rate. Dated by
-    /// the listener from its own cursor, so nothing here is a wall clock.
+    /// the listener from the pod's capture position at the host time the window
+    /// is asked for, which this stamps.
     pub(crate) window_samples: u64,
 }
 
@@ -224,6 +225,7 @@ impl ListenWiring {
             pod,
             Feed::Listen {
                 window_samples: self.window_samples,
+                at: HostMicros::now(),
             },
         )
         .await;
@@ -235,7 +237,14 @@ impl ListenWiring {
     /// decision and not this task's — the pipeline knows what the gate did, the
     /// listener knows what the window was.
     pub(crate) async fn declined(&self, pod: PodId, id: ListenerUtteranceId) {
-        (self.feed)(pod, Feed::CandidateDeclined { id }).await;
+        (self.feed)(
+            pod,
+            Feed::CandidateDeclined {
+                id,
+                at: HostMicros::now(),
+            },
+        )
+        .await;
     }
 
     /// Report that the candidate `id` was dispatched as a turn, so the listener
@@ -378,10 +387,11 @@ struct HoldRelease {
 /// Wall-clock fallback for a restored capture window, the [`HoldRelease`] of the
 /// microphone. The listener's window is in the sample domain too, and its deadline
 /// falling in a silence no audio crosses is the ordinary quiet room rather than a
-/// pathology: the cursor stops, the expiry is not observed, and the head that
-/// speech inside the window held up has nothing to bring it down. This is the
-/// head's own deadline for the window, and it moves only the head — the microphone
-/// stays the listener's, whose `ListenExpired` still arrives when audio next does.
+/// pathology: the expiry is observed only on a later status frame, and until then
+/// the head that speech inside the window held up has nothing to bring it down.
+/// This is the head's own deadline for the window, and it moves only the head — the microphone
+/// stays the listener's, whose `ListenExpired` arrives on the pod's first status
+/// frame from which no later segment can reach back before the deadline.
 struct ListenRelease {
     /// When the window's grant is treated as over for the head.
     at: tokio::time::Instant,
@@ -597,7 +607,12 @@ fn release_due(
     for (pod, state) in pods.iter_mut() {
         if let Some(release) = state.hold_release.take_if(|r| !r.speaking && r.at <= now) {
             // Distinguishable in the records from a head that came down on
-            // `arm_expired`, and joined to its `wake_held` by the deadline.
+            // `arm_expired`, and joined to its `wake_held` by the deadline. This is
+            // the head's record, not the grant's: the listener's `arm_expired` for
+            // the same grant follows, with the cause that ended it, once the
+            // listener's own clock is past the deadline — at the first status frame
+            // past the pod's segment reach in a silent room — or sooner at a
+            // reconnect or a fresh wake.
             jsonl.emit(
                 "wake_hold_released",
                 &json!({ "pod": pod.0, "deadline_sample": release.deadline_sample }),
@@ -607,8 +622,8 @@ fn release_due(
             }
         }
         if let Some(release) = state.listen_release.take_if(|r| r.at <= now) {
-            // The restored window's deadline passed on the wall clock with no audio
-            // arriving to carry the listener's cursor past it, and the head was
+            // The restored window's deadline passed on the wall clock before
+            // anything carried the listener's pod clock past it, and the head was
             // brought down for that reason without waiting for the listener. A
             // reader is entitled to conclude that this window's grant has ended —
             // speech is no longer heard without a wake word on its account, its
@@ -617,8 +632,9 @@ fn release_due(
             // yet resolved by an `utterance`, an `arm_expired` or a
             // `wake_hold_released` is that hold's own grant and its own record.
             //
-            // The listener's `listen_expired` for the same window follows when
-            // audio next arrives, at a reply start, or at a reconnect, so the
+            // The listener's `listen_expired` for the same window follows at the
+            // pod's next status frame or audio, at a reply start, or at a
+            // reconnect, so the
             // window's own lines stay balanced; this one is the head's record,
             // not the window's. Distinguishable from a head that came down on
             // `listen_expired`, and joined to its `listen_restored` by the
@@ -1131,10 +1147,16 @@ async fn handle_listener(
             pod,
             epoch,
             deadline_sample,
+            at_sample,
         } => {
             jsonl.emit(
                 "listen_opened",
-                &json!({ "pod": pod.0, "epoch": epoch, "deadline_sample": deadline_sample }),
+                &json!({
+                    "pod": pod.0,
+                    "epoch": epoch,
+                    "deadline_sample": deadline_sample,
+                    "at_sample": at_sample,
+                }),
             );
         }
         ListenerEvent::ListenRestored {
@@ -1166,11 +1188,13 @@ async fn handle_listener(
             // real time would be a fiction.
             //
             // Nothing is armed with no time left: the listener ran its own expiry
-            // check at this restore and kept the window, so the room is not idle —
-            // audio is arriving, its clock is live, and a zero-length arm would
-            // stow the head now over an onset run or a resumed answer the carve
-            // will accept. Nothing is armed under a standing hold either: the head
-            // is on the hold's schedule, which has an ending of its own.
+            // check at this restore and kept the window, because speech is under
+            // way that the carve will accept, or because a segment the pod could
+            // still open reaches back before the deadline. A zero-length arm would
+            // stow the head now over that speech; the listener ends the window
+            // itself, at the carve or at its first status frame past that reach.
+            // Nothing is armed under a standing hold either: the head is on the
+            // hold's schedule, which has an ending of its own.
             if scripter.is_some()
                 && state.hold_release.is_none()
                 && let Some(at) = wall_clock_after(deadline_sample, at_sample)
@@ -1334,10 +1358,14 @@ async fn handle_listener(
             }
             // The restored grant owns the head's ending, as a hold does.
             state.listen_release = None;
-            // Dated from what is left of the grant at the listener's cursor.
+            // Dated from what is left of the grant at the pod's position at the
+            // restore.
             // Nothing is armed with no time left: the listener ran its own expiry
-            // check at the restore and kept the grant, so speech is running and the
-            // carve will take it.
+            // check at the restore and kept the grant, because speech is running
+            // that the carve will take, or because a segment the pod could still
+            // open reaches back before the deadline. Either way the listener ends
+            // the grant itself, at the carve or with an `arm_expired` at its first
+            // status frame past that reach.
             if scripter.is_some()
                 && let Some(at) = wall_clock_after(deadline_sample, at_sample)
             {
@@ -4341,7 +4369,7 @@ mod tests {
 
         assert!(cmds.is_empty(), "{cmds:?}");
         assert!(
-            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id, .. }] if *id == uid(1)),
             "{:?}",
             fed.lock().unwrap()
         );
@@ -4553,8 +4581,13 @@ mod tests {
     #[tokio::test]
     async fn the_wake_level_is_minted_onto_the_utterance_and_its_reply() {
         let level = speech_pipeline::UtteranceLevel {
-            speech_dbfs: -27.5,
-            ambient_dbfs: Some(-58.5),
+            speech_dbfs: Some(-27.5),
+            ambient: Some(speech_pipeline::AmbientReading {
+                dbfs: -58.5,
+                blocks: 100,
+                age_ms: 300,
+                carried: false,
+            }),
             source: speech_pipeline::LevelSource::RawMic,
         };
         let wake = WakeConfirmation {
@@ -4571,7 +4604,11 @@ mod tests {
         let utt = lines.iter().find(|l| l["event"] == "utterance").unwrap();
         assert_eq!(
             utt["level"],
-            json!({"speech_dbfs": -27.5, "ambient_dbfs": -58.5, "source": "raw_mic"}),
+            json!({
+                "speech_dbfs": -27.5,
+                "ambient": {"dbfs": -58.5, "blocks": 100, "age_ms": 300, "carried": false},
+                "source": "raw_mic",
+            }),
             "{lines:?}"
         );
         assert_eq!(cmds.len(), 1, "{cmds:?}");
@@ -4591,8 +4628,13 @@ mod tests {
     #[tokio::test]
     async fn a_wakeless_carves_level_is_minted_onto_the_utterance_and_its_reply() {
         let level = speech_pipeline::UtteranceLevel {
-            speech_dbfs: -31.0,
-            ambient_dbfs: Some(-57.0),
+            speech_dbfs: Some(-31.0),
+            ambient: Some(speech_pipeline::AmbientReading {
+                dbfs: -57.0,
+                blocks: 100,
+                age_ms: 300,
+                carried: false,
+            }),
             source: speech_pipeline::LevelSource::RawMic,
         };
         let follow_up = CarvedUtterance {
@@ -4611,7 +4653,11 @@ mod tests {
         assert!(utt["wake"].is_null(), "{lines:?}");
         assert_eq!(
             utt["level"],
-            json!({"speech_dbfs": -31.0, "ambient_dbfs": -57.0, "source": "raw_mic"}),
+            json!({
+                "speech_dbfs": -31.0,
+                "ambient": {"dbfs": -57.0, "blocks": 100, "age_ms": 300, "carried": false},
+                "source": "raw_mic",
+            }),
             "{lines:?}"
         );
         assert_eq!(cmds.len(), 1, "{cmds:?}");
@@ -4944,7 +4990,7 @@ mod tests {
     }
 
     /// A restored grant arms the head's release for what is left of it, dated
-    /// from the listener's cursor at the restore; when it fires, the head comes
+    /// from the pod's position at the restore; when it fires, the head comes
     /// down now.
     #[tokio::test(start_paused = true)]
     async fn a_restored_wake_arms_its_release_from_what_is_left() {
@@ -6180,7 +6226,8 @@ mod tests {
                 [
                     Feed::CandidateDispatched { id },
                     Feed::Listen {
-                        window_samples: TEST_LISTEN_WINDOW
+                        window_samples: TEST_LISTEN_WINDOW,
+                        ..
                     }
                 ] if *id == uid(1)
             ),
@@ -6659,6 +6706,7 @@ mod tests {
                     pod: pod(),
                     epoch: 1,
                     deadline_sample: 128_000,
+                    at_sample: 0,
                 }),
                 PipelineItem::Listener(ListenerEvent::ListenRestored {
                     pod: pod(),
@@ -6907,6 +6955,7 @@ mod tests {
                     pod: pod(),
                     epoch: 1,
                     deadline_sample: 128_000,
+                    at_sample: 0,
                 }),
                 PipelineItem::Listener(ListenerEvent::ListenRestored {
                     pod: pod(),
@@ -6938,6 +6987,7 @@ mod tests {
         assert_eq!(opened["pod"], pod().0);
         assert_eq!(opened["epoch"], 1);
         assert_eq!(opened["deadline_sample"], 128_000);
+        assert_eq!(opened["at_sample"], 0);
         let restored = found("listen_restored");
         assert_eq!(restored["pod"], pod().0);
         assert_eq!(restored["epoch"], 1);
@@ -7017,7 +7067,7 @@ mod tests {
             "and the utterance line carries the provenance: {lines:?}"
         );
         assert!(
-            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id, .. }] if *id == uid(1)),
             "the window the phantom spent is handed back",
         );
         assert!(
@@ -7138,7 +7188,7 @@ mod tests {
                     assert!(
                         matches!(
                             handed_back.as_slice(),
-                            [Feed::CandidateDeclined { id }] if *id == uid(1)
+                            [Feed::CandidateDeclined { id, .. }] if *id == uid(1)
                         ),
                         "the candidate goes back whatever the decline's reason. \
                          Whether a window comes back is the listener's call, and \
@@ -7476,7 +7526,7 @@ mod tests {
             "an empty follow-up is not a confidence decline"
         );
         assert!(
-            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id, .. }] if *id == uid(1)),
             "and the window the noise spent is handed back — the whole point: {:?}",
             fed.lock().unwrap(),
         );
@@ -7579,7 +7629,7 @@ mod tests {
             events_seen.lock().unwrap()
         );
         assert!(
-            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+            matches!(fed.lock().unwrap().as_slice(), [Feed::CandidateDeclined { id, .. }] if *id == uid(1)),
             "the candidate became no turn: {:?}",
             fed.lock().unwrap(),
         );
@@ -7681,7 +7731,7 @@ mod tests {
         ] {
             let fed = fed_by_the_gate(carve, transcriber).await;
             assert!(
-                matches!(fed.as_slice(), [Feed::CandidateDeclined { id }] if *id == uid(1)),
+                matches!(fed.as_slice(), [Feed::CandidateDeclined { id, .. }] if *id == uid(1)),
                 "{what} is handed back by its own id: {fed:?}"
             );
         }

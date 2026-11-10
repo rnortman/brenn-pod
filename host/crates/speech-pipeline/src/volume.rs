@@ -25,29 +25,42 @@ pub const DEFAULT_GAIN_DB: f32 = 0.0;
 
 /// Default: automatic gain is off until the config or the brain turns it on.
 pub const DEFAULT_AUTO_ENABLED: bool = false;
-/// Default dB of gain per dB of speech level above the reference.
-pub const DEFAULT_AUTO_K_SPEECH: f32 = 1.0;
-/// Default speech level at which the automatic term adds 0 dB, dBFS. The raw-mic
-/// channel's reading of a normal speaking voice at about 0.8 m from the array:
-/// four normal utterances in the acceptance session measured −51.5, −53.7, −52.4
-/// and −50.1 (80th percentile of 20 ms frame rms of the wake phrase, top-16 units).
-/// With `k_speech = 1` the same session's raised voice (−46.2) maps to +5.8 dB, 0.2 dB
-/// under the +6 swing ceiling, and its whisper (−62.4) to −10.4 dB, 1.6 dB above the
-/// −12 swing floor: the demonstrated 16.2 dB range sits inside the 18 dB swing,
-/// unclipped at both ends.
-pub const DEFAULT_AUTO_SPEECH_REF_DBFS: f32 = -52.0;
-/// Default dB of gain per dB of ambient level above its reference.
-pub const DEFAULT_AUTO_K_AMBIENT: f32 = 0.0;
-/// Default ambient level above which the ambient term contributes, dBFS. The
-/// raw-mic channel's quiet-room floor: 20th percentile of frame rms −76.5 … −79.8
-/// across the acceptance session, rms ≈ 4 LSB (−78.3 dBFS) over eleven 250 ms device
-/// windows. A louder room raises the term from here: the room's air purifier on
-/// high read −75.6; pink noise at −20 dBFS digital from a speaker 1.2 m away read −64.
+/// Default dB of gain per dB the room is above its reference, and of attenuation
+/// per dB it is below.
+pub const DEFAULT_AUTO_K_AMBIENT: f32 = 1.0;
+/// Default room level at which a reply plays at the held volume, dBFS: the
+/// raw-mic channel's quiet-room floor, so by default a quiet room plays at the
+/// held volume and a louder one boosts. The room reading is the median of
+/// 100 ms raw-mic blocks over the 10 s before the speech. On pod-fbe2f8 on
+/// 2026-11-09, in a room that was not controlled, a quiet room read −77.0
+/// (three takes, −77.5 … −74.25); pink noise at −30 and −20 dBFS digital from a
+/// speaker 1.2 m away read −71.5 and −62.5. These are one evening in one room,
+/// not a property of the meter.
 pub const DEFAULT_AUTO_AMBIENT_REF_DBFS: f32 = -78.0;
 /// Default swing floor: the automatic term never subtracts more than this, dB.
 pub const DEFAULT_AUTO_MIN_DB: f32 = -12.0;
 /// Default swing ceiling: the automatic term never adds more than this, dB.
 pub const DEFAULT_AUTO_MAX_DB: f32 = 6.0;
+
+/// An ambient reading up to this old is the room, at full weight.
+pub const AMBIENT_FRESH_MS: u32 = 30_000;
+/// An ambient reading this old or older is not evidence of the room: weight 0.
+/// Between [`AMBIENT_FRESH_MS`] and this the weight falls linearly from 1 to 0.
+pub const AMBIENT_STALE_MS: u32 = 300_000;
+
+/// How much an ambient reading `age_ms` old counts, 0…1.
+pub fn ambient_weight(age_ms: u32) -> f32 {
+    if age_ms <= AMBIENT_FRESH_MS {
+        1.0
+    } else if age_ms >= AMBIENT_STALE_MS {
+        0.0
+    } else {
+        // Both spans are under 2^24, so the `f32` division is exact enough.
+        #[allow(clippy::cast_precision_loss)]
+        let w = (AMBIENT_STALE_MS - age_ms) as f32 / (AMBIENT_STALE_MS - AMBIENT_FRESH_MS) as f32;
+        w
+    }
+}
 
 /// The operator's hard bounds on any applied gain. Constructed only through
 /// [`OperatorBounds::new`], so a value of this type always has finite bounds with
@@ -128,7 +141,8 @@ impl LevelAdmission {
 }
 
 /// One pod's automatic-gain policy: whether it runs, which levels it reads, the
-/// linear map from levels to a gain term, and the swing bounds on that term.
+/// linear map from the room's level to a gain term, and the swing bounds on that
+/// term.
 ///
 /// The swing bounds limit the automatic term only; the operator's bounds clamp
 /// the applied total afterwards, so the swing bounds need not lie inside them.
@@ -136,13 +150,10 @@ impl LevelAdmission {
 pub struct AutoPolicy {
     pub enabled: bool,
     pub level_source: LevelAdmission,
-    /// dB of gain per dB of speech level above `speech_ref_dbfs`.
-    pub k_speech: f32,
-    /// The speech level at which the speech term is 0, dBFS.
-    pub speech_ref_dbfs: f32,
-    /// dB of gain per dB of ambient level above `ambient_ref_dbfs`.
+    /// dB of gain per dB the room is above `ambient_ref_dbfs`, and of
+    /// attenuation per dB it is below.
     pub k_ambient: f32,
-    /// The ambient level above which the ambient term contributes, dBFS.
+    /// The room level at which a reply plays at the held volume, dBFS.
     pub ambient_ref_dbfs: f32,
     /// Swing floor of the automatic term, dB.
     pub min_db: f32,
@@ -155,8 +166,6 @@ impl Default for AutoPolicy {
         Self {
             enabled: DEFAULT_AUTO_ENABLED,
             level_source: LevelAdmission::RawMic,
-            k_speech: DEFAULT_AUTO_K_SPEECH,
-            speech_ref_dbfs: DEFAULT_AUTO_SPEECH_REF_DBFS,
             k_ambient: DEFAULT_AUTO_K_AMBIENT,
             ambient_ref_dbfs: DEFAULT_AUTO_AMBIENT_REF_DBFS,
             min_db: DEFAULT_AUTO_MIN_DB,
@@ -170,8 +179,6 @@ impl AutoPolicy {
     /// keeps every pod's policy in.
     pub fn is_well_formed(&self) -> bool {
         [
-            self.k_speech,
-            self.speech_ref_dbfs,
             self.k_ambient,
             self.ambient_ref_dbfs,
             self.min_db,
@@ -182,38 +189,40 @@ impl AutoPolicy {
             && self.min_db <= self.max_db
     }
 
-    /// The automatic term for a reply whose utterance measured `level`, and why
-    /// it is what it is:
+    /// The automatic term for a reply whose utterance measured `level`, the
+    /// weight its ambient reading carried, and why the term is what it is:
     ///
-    /// `k_speech·(speech − speech_ref) + k_ambient·max(0, ambient − ambient_ref)`
-    /// (the ambient part 0 when no ambient was measured), held inside the swing
-    /// bounds. 0 when the policy is off, no level was measured, or the level's
-    /// source is not admitted.
+    /// `k_ambient · (ambient − ambient_ref) · weight(age)`, held inside the swing
+    /// bounds — a room louder than the reference boosts, a quieter one
+    /// attenuates. 0 when the policy is off, no ambient reading exists, the
+    /// level's source is not admitted, or the reading is too old to count
+    /// ([`ambient_weight`] 0). The weight is `Some` exactly when a reading was
+    /// weighed.
     ///
     /// Computed in `f64`: every input is a finite `f32` (the book keeps the
-    /// policy well formed, and a measured level is floored), and no product or
-    /// sum of finite `f32`s overflows an `f64`, so the term is always finite —
-    /// even for a brain-set `k_speech` near `f32::MAX`, where `f32` arithmetic
-    /// would reach infinity or NaN.
-    // TODO(far-field-auto-volume-cue): the speech term under-drives a reply to a
-    // speaker far from the pod; which cue serves a far-field speaker is undecided until
-    // a far-field session is run.
-    pub fn term(&self, level: Option<&UtteranceLevel>) -> (f32, AutoStatus) {
+    /// policy well formed, and a measured level is floored), and no product of
+    /// finite `f32`s overflows an `f64`, so the term is always finite — even for
+    /// a brain-set `k_ambient` near `f32::MAX`, where `f32` arithmetic would
+    /// reach infinity.
+    pub fn term(&self, level: Option<&UtteranceLevel>) -> (f32, Option<f32>, AutoStatus) {
         if !self.enabled {
-            return (0.0, AutoStatus::Off);
+            return (0.0, None, AutoStatus::Off);
         }
         let Some(level) = level else {
-            return (0.0, AutoStatus::NoLevel);
+            return (0.0, None, AutoStatus::NoLevel);
         };
         if !self.level_source.admits(level.source) {
-            return (0.0, AutoStatus::SourceRejected);
+            return (0.0, None, AutoStatus::SourceRejected);
+        }
+        let Some(ambient) = level.ambient else {
+            return (0.0, None, AutoStatus::NoLevel);
+        };
+        let weight = ambient_weight(ambient.age_ms);
+        if weight == 0.0 {
+            return (0.0, Some(weight), AutoStatus::Stale);
         }
         let f = f64::from;
-        let speech = f(self.k_speech) * (f(level.speech_dbfs) - f(self.speech_ref_dbfs));
-        let ambient = level.ambient_dbfs.map_or(0.0, |a| {
-            f(self.k_ambient) * (f(a) - f(self.ambient_ref_dbfs)).max(0.0)
-        });
-        let raw = speech + ambient;
+        let raw = f(self.k_ambient) * (f(ambient.dbfs) - f(self.ambient_ref_dbfs)) * f(weight);
         debug_assert!(
             raw.is_finite(),
             "auto term {raw} from a non-finite input: policy {self:?}, level {level:?}"
@@ -223,7 +232,7 @@ impl AutoPolicy {
         // enough and finite.
         #[allow(clippy::cast_possible_truncation)]
         let term = raw.max(f(self.min_db)).min(f(self.max_db)) as f32;
-        (term, AutoStatus::Applied)
+        (term, Some(weight), AutoStatus::Applied)
     }
 }
 
@@ -235,8 +244,11 @@ pub enum AutoStatus {
     Applied,
     /// The pod's automatic gain is disabled.
     Off,
-    /// No usable level was measured for the utterance being answered.
+    /// No ambient reading, measured or carried, exists for the utterance being
+    /// answered.
     NoLevel,
+    /// An ambient reading exists and is too old to count: its weight is 0.
+    Stale,
     /// A level was measured, on a source the policy does not admit.
     SourceRejected,
     /// The reply carried its own gain, which replaces the held and automatic
@@ -255,10 +267,6 @@ pub struct VolumeCommand {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub k_speech: Option<f32>,
-    #[serde(rename = "speech_ref", skip_serializing_if = "Option::is_none")]
-    pub speech_ref_dbfs: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub k_ambient: Option<f32>,
     #[serde(rename = "ambient_ref", skip_serializing_if = "Option::is_none")]
     pub ambient_ref_dbfs: Option<f32>,
@@ -274,11 +282,9 @@ impl VolumeCommand {
         *self == Self::default()
     }
 
-    fn numbers(&self) -> [Option<f32>; 7] {
+    fn numbers(&self) -> [Option<f32>; 5] {
         [
             self.hold_db,
-            self.k_speech,
-            self.speech_ref_dbfs,
             self.k_ambient,
             self.ambient_ref_dbfs,
             self.auto_min_db,
@@ -304,8 +310,6 @@ pub struct VolumeState {
     pub held_db: f32,
     pub auto: bool,
     pub level_source: LevelAdmission,
-    pub k_speech: f32,
-    pub speech_ref_dbfs: f32,
     pub k_ambient: f32,
     pub ambient_ref_dbfs: f32,
     pub auto_min_db: f32,
@@ -340,6 +344,7 @@ pub struct GainResolution {
     held_db: f32,
     auto_db: f32,
     auto: AutoStatus,
+    ambient_weight: Option<f32>,
     override_db: Option<f32>,
     applied_db: f32,
 }
@@ -358,6 +363,12 @@ impl GainResolution {
     /// Why `auto_db` is what it is.
     pub fn auto(&self) -> AutoStatus {
         self.auto
+    }
+
+    /// The weight (0…1) the ambient reading's age gave it, when a reading was
+    /// weighed.
+    pub fn ambient_weight(&self) -> Option<f32> {
+        self.ambient_weight
     }
 
     /// The reply's own override, as asked (before clamping), when it carried
@@ -380,6 +391,8 @@ impl GainResolution {
 /// created lazily from the pod's baseline and the auto defaults the first time
 /// the pod is touched; it lives in memory only, so a restart returns every pod
 /// to its configured state.
+// TODO(volume-state-lost-on-restart): what the brain sets by voice does not outlive
+// the daemon.
 #[derive(Debug, Clone, Default)]
 pub struct VolumeBook {
     bounds: OperatorBounds,
@@ -456,8 +469,6 @@ impl VolumeBook {
             held_db: p.held_db,
             auto: p.auto.enabled,
             level_source: p.auto.level_source,
-            k_speech: p.auto.k_speech,
-            speech_ref_dbfs: p.auto.speech_ref_dbfs,
             k_ambient: p.auto.k_ambient,
             ambient_ref_dbfs: p.auto.ambient_ref_dbfs,
             auto_min_db: p.auto.min_db,
@@ -489,8 +500,6 @@ impl VolumeBook {
         }
         let a = &mut next.auto;
         a.enabled = cmd.auto.unwrap_or(a.enabled);
-        a.k_speech = cmd.k_speech.unwrap_or(a.k_speech);
-        a.speech_ref_dbfs = cmd.speech_ref_dbfs.unwrap_or(a.speech_ref_dbfs);
         a.k_ambient = cmd.k_ambient.unwrap_or(a.k_ambient);
         a.ambient_ref_dbfs = cmd.ambient_ref_dbfs.unwrap_or(a.ambient_ref_dbfs);
         a.min_db = cmd.auto_min_db.unwrap_or(a.min_db);
@@ -519,17 +528,18 @@ impl VolumeBook {
     ) -> GainResolution {
         let bounds = self.bounds;
         let p = self.pod(pod);
-        let (auto_db, auto, applied_db) = match override_db {
-            Some(db) => (0.0, AutoStatus::Overridden, bounds.clamp(db)),
+        let (auto_db, ambient_weight, auto, applied_db) = match override_db {
+            Some(db) => (0.0, None, AutoStatus::Overridden, bounds.clamp(db)),
             None => {
-                let (auto_db, auto) = p.auto.term(level);
-                (auto_db, auto, bounds.clamp(p.held_db + auto_db))
+                let (auto_db, weight, auto) = p.auto.term(level);
+                (auto_db, weight, auto, bounds.clamp(p.held_db + auto_db))
             }
         };
         GainResolution {
             held_db: p.held_db,
             auto_db,
             auto,
+            ambient_weight,
             override_db,
             applied_db,
         }
@@ -557,6 +567,7 @@ pub fn resolve_shared(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AmbientReading;
 
     fn pod(id: &str) -> PodId {
         PodId(id.to_string())
@@ -572,19 +583,29 @@ mod tests {
                     .map(|(k, v)| ((*k).to_string(), *v))
                     .collect(),
             },
-            // References fixed so the arithmetic in the tests reads against round numbers.
+            // The reference fixed so the arithmetic in the tests reads against round
+            // numbers.
             AutoPolicy {
-                speech_ref_dbfs: -30.0,
                 ambient_ref_dbfs: -55.0,
                 ..AutoPolicy::default()
             },
         )
     }
 
-    fn level(speech: f32, ambient: Option<f32>, source: LevelSource) -> UtteranceLevel {
+    /// A fresh ambient reading at `dbfs`, with no speech reading.
+    fn room(dbfs: f32, source: LevelSource) -> UtteranceLevel {
+        aged(dbfs, 500, source)
+    }
+
+    fn aged(dbfs: f32, age_ms: u32, source: LevelSource) -> UtteranceLevel {
         UtteranceLevel {
-            speech_dbfs: speech,
-            ambient_dbfs: ambient,
+            speech_dbfs: None,
+            ambient: Some(AmbientReading {
+                dbfs,
+                blocks: 100,
+                age_ms,
+                carried: false,
+            }),
             source,
         }
     }
@@ -617,18 +638,14 @@ mod tests {
         assert_eq!(s.level_source, LevelAdmission::RawMic);
     }
 
-    /// The auto-policy defaults are the bench values, and the acceptance session's
-    /// whisper and raised voice resolve inside the swing under them, unclipped.
+    /// The auto-policy defaults, pinned so a retune is visible in test output
+    /// rather than only in a diff; under them the room drives the term both ways.
     #[test]
-    fn the_auto_defaults_are_the_bench_values() {
-        // Pinned so a retune is visible in test output rather than only in a diff.
-        assert_eq!(DEFAULT_AUTO_SPEECH_REF_DBFS, -52.0);
+    fn the_auto_defaults_are_pinned() {
         assert_eq!(DEFAULT_AUTO_AMBIENT_REF_DBFS, -78.0);
-        assert_eq!(DEFAULT_AUTO_K_SPEECH, 1.0);
-        assert_eq!(DEFAULT_AUTO_K_AMBIENT, 0.0);
+        assert_eq!(DEFAULT_AUTO_K_AMBIENT, 1.0);
+        assert_eq!((AMBIENT_FRESH_MS, AMBIENT_STALE_MS), (30_000, 300_000));
 
-        // The one test that reads the defaults: built from `AutoPolicy::default()`, not
-        // through `book()`, whose references are fixed.
         let b = VolumeBook::new(
             OperatorBounds::default(),
             GainBaselines::default(),
@@ -637,21 +654,15 @@ mod tests {
                 ..AutoPolicy::default()
             },
         );
-        let resolve = |speech: f32, ambient: f32| {
-            b.resolve(
-                &pod("p"),
-                None,
-                Some(&level(speech, Some(ambient), LevelSource::RawMic)),
-            )
-        };
-        let whisper = resolve(-62.4, -76.5);
-        let raised = resolve(-46.2, -77.1);
-        for (r, expected) in [(&whisper, -10.4), (&raised, 5.8)] {
-            assert_eq!(r.auto, AutoStatus::Applied);
-            assert!((r.auto_db - expected).abs() < 1e-4, "{r:?} vs {expected}");
-            assert!(r.auto_db > DEFAULT_AUTO_MIN_DB && r.auto_db < DEFAULT_AUTO_MAX_DB);
-            assert_eq!(r.applied_db, r.auto_db);
-        }
+        let resolve =
+            |dbfs: f32| b.resolve(&pod("p"), None, Some(&room(dbfs, LevelSource::RawMic)));
+        assert_eq!(
+            resolve(-78.0).auto_db,
+            0.0,
+            "the quiet room plays at the held volume"
+        );
+        assert_eq!(resolve(-74.0).auto_db, 4.0);
+        assert_eq!(resolve(-81.0).auto_db, -3.0);
     }
 
     #[test]
@@ -678,6 +689,7 @@ mod tests {
                 held_db: -4.0,
                 auto_db: 0.0,
                 auto: AutoStatus::Off,
+                ambient_weight: None,
                 override_db: None,
                 applied_db: -4.0,
             }
@@ -691,6 +703,7 @@ mod tests {
         assert_eq!(r.applied_db, -12.0);
         assert_eq!(r.held_db, -4.0);
         assert_eq!(r.auto, AutoStatus::Overridden);
+        assert_eq!(r.ambient_weight, None);
         assert_eq!(b.resolve(&pod("p"), Some(60.0), None).applied_db, 6.0);
         let low = b.resolve(&pod("p"), Some(-90.0), None);
         assert_eq!(low.applied_db, -30.0);
@@ -705,7 +718,7 @@ mod tests {
     fn resolve_never_panics_at_degenerate_bounds() {
         let mut b = book(0.0, 0.0, 12.0, &[]);
         b.apply(&pod("p"), &auto_on()).unwrap();
-        let loud = level(0.0, Some(0.0), LevelSource::RawMic);
+        let loud = room(0.0, LevelSource::RawMic);
         for o in [None, Some(f32::NAN), Some(-1e30), Some(1e30), Some(0.0)] {
             for l in [None, Some(&loud)] {
                 assert_eq!(b.resolve(&pod("p"), o, l).applied_db, 0.0);
@@ -713,52 +726,78 @@ mod tests {
         }
     }
 
+    /// The term is symmetric about the reference: a quieter room attenuates and a
+    /// louder one boosts, each inside the swing.
     #[test]
-    fn auto_term_follows_the_speech_level_inside_the_swing() {
+    fn the_room_drives_the_term_both_ways_inside_the_swing() {
         let mut b = book(-30.0, 6.0, 0.0, &[]);
         b.apply(&pod("p"), &auto_on()).unwrap();
-        // 4 dB louder than the -30 reference with k_speech 1 adds 4 dB.
-        let r = b.resolve(
-            &pod("p"),
-            None,
-            Some(&level(-26.0, None, LevelSource::RawMic)),
+        let resolve = |b: &VolumeBook, dbfs: f32| {
+            b.resolve(&pod("p"), None, Some(&room(dbfs, LevelSource::RawMic)))
+        };
+        let r = resolve(&b, -63.0);
+        assert_eq!(
+            (r.auto_db, r.auto, r.applied_db, r.ambient_weight),
+            (-8.0, AutoStatus::Applied, -8.0, Some(1.0)),
+            "8 dB below the reference gives -8"
         );
         assert_eq!(
-            (r.auto_db, r.auto, r.applied_db),
-            (4.0, AutoStatus::Applied, 4.0)
+            resolve(&b, -47.0).auto_db,
+            6.0,
+            "8 dB above hits the +6 ceiling"
         );
-        // A whisper 30 dB under the reference is held at the -12 swing floor.
-        let r = b.resolve(
-            &pod("p"),
-            None,
-            Some(&level(-60.0, None, LevelSource::RawMic)),
+        assert_eq!(
+            resolve(&b, -85.0).auto_db,
+            -12.0,
+            "the -12 floor is reachable"
         );
-        assert_eq!(r.auto_db, -12.0);
-        // A shout is held at the +6 swing ceiling.
-        let r = b.resolve(
-            &pod("p"),
-            None,
-            Some(&level(0.0, None, LevelSource::RawMic)),
-        );
-        assert_eq!(r.auto_db, 6.0);
-    }
-
-    #[test]
-    fn auto_ambient_term_adds_only_above_its_reference() {
-        let mut b = book(-30.0, 6.0, 0.0, &[]);
+        assert_eq!(resolve(&b, -55.0).auto_db, 0.0);
         b.apply(
             &pod("p"),
             &VolumeCommand {
-                auto: Some(true),
                 k_ambient: Some(0.5),
                 ..VolumeCommand::default()
             },
         )
         .unwrap();
-        let at_ref = level(-30.0, Some(-70.0), LevelSource::RawMic);
-        assert_eq!(b.resolve(&pod("p"), None, Some(&at_ref)).auto_db, 0.0);
-        let noisy = level(-30.0, Some(-45.0), LevelSource::RawMic);
-        assert_eq!(b.resolve(&pod("p"), None, Some(&noisy)).auto_db, 5.0);
+        assert_eq!(resolve(&b, -45.0).auto_db, 5.0);
+        assert_eq!(resolve(&b, -65.0).auto_db, -5.0);
+    }
+
+    /// A reading counts fully up to 30 s, half at 165 s, and not at all at 300 s,
+    /// where the status says so.
+    #[test]
+    fn an_old_reading_eases_toward_no_adjustment() {
+        assert_eq!(ambient_weight(0), 1.0);
+        assert_eq!(ambient_weight(30_000), 1.0);
+        assert!((ambient_weight(165_000) - 0.5).abs() < 1e-6);
+        assert_eq!(ambient_weight(300_000), 0.0);
+        assert_eq!(ambient_weight(u32::MAX), 0.0);
+
+        let mut b = book(-30.0, 6.0, -2.0, &[]);
+        b.apply(&pod("p"), &auto_on()).unwrap();
+        let at = |age_ms: u32| {
+            b.resolve(
+                &pod("p"),
+                None,
+                Some(&aged(-63.0, age_ms, LevelSource::RawMic)),
+            )
+        };
+        let fresh = at(30_000);
+        assert_eq!((fresh.auto_db, fresh.auto), (-8.0, AutoStatus::Applied));
+        let half = at(165_000);
+        assert!((half.auto_db - -4.0).abs() < 1e-4, "{half:?}");
+        assert_eq!(half.auto, AutoStatus::Applied);
+        let stale = at(300_000);
+        assert_eq!(
+            (
+                stale.auto_db,
+                stale.auto,
+                stale.ambient_weight,
+                stale.applied_db
+            ),
+            (0.0, AutoStatus::Stale, Some(0.0), -2.0)
+        );
     }
 
     #[test]
@@ -768,31 +807,24 @@ mod tests {
             &pod("p"),
             &VolumeCommand {
                 auto: Some(true),
-                k_speech: Some(f32::MAX),
-                k_ambient: Some(-f32::MAX),
+                k_ambient: Some(f32::MAX),
                 ..VolumeCommand::default()
             },
         )
         .unwrap();
-        // In `f32` the first reading overflows the speech term to +inf.
-        let loud = level(-10.0, None, LevelSource::RawMic);
+        // In `f32` both products overflow to ±inf.
+        let loud = room(-10.0, LevelSource::RawMic);
         let r = b.resolve(&pod("p"), None, Some(&loud));
         assert_eq!((r.auto_db, r.auto), (6.0, AutoStatus::Applied));
-        // In `f32` the speech term is +inf and the ambient term -inf, summing to
-        // NaN; in `f64` the term is -25 × `f32::MAX`.
-        let loud_in_noise = level(-10.0, Some(-10.0), LevelSource::RawMic);
-        let r = b.resolve(&pod("p"), None, Some(&loud_in_noise));
-        assert_eq!((r.auto_db, r.auto), (-12.0, AutoStatus::Applied));
-        // In `f32` both terms overflow to -inf.
-        let quiet_in_noise = level(-50.0, Some(-10.0), LevelSource::RawMic);
-        let r = b.resolve(&pod("p"), None, Some(&quiet_in_noise));
+        let quiet = room(-90.0, LevelSource::RawMic);
+        let r = b.resolve(&pod("p"), None, Some(&quiet));
         assert_eq!((r.auto_db, r.auto), (-12.0, AutoStatus::Applied));
     }
 
     #[test]
-    fn auto_contributes_nothing_off_without_level_or_from_a_rejected_source() {
+    fn auto_contributes_nothing_off_without_ambient_or_from_a_rejected_source() {
         let mut b = book(-30.0, 6.0, -2.0, &[]);
-        let beam = level(-10.0, None, LevelSource::Beam);
+        let beam = room(-10.0, LevelSource::Beam);
         let r = b.resolve(&pod("p"), None, Some(&beam));
         assert_eq!((r.auto_db, r.auto), (0.0, AutoStatus::Off));
         b.apply(&pod("p"), &auto_on()).unwrap();
@@ -801,6 +833,14 @@ mod tests {
             (r.auto_db, r.auto, r.applied_db),
             (0.0, AutoStatus::NoLevel, -2.0)
         );
+        // A speech reading alone does not drive the volume.
+        let speech_only = UtteranceLevel {
+            speech_dbfs: Some(-20.0),
+            ambient: None,
+            source: LevelSource::RawMic,
+        };
+        let r = b.resolve(&pod("p"), None, Some(&speech_only));
+        assert_eq!((r.auto_db, r.auto), (0.0, AutoStatus::NoLevel));
         let r = b.resolve(&pod("p"), None, Some(&beam));
         assert_eq!((r.auto_db, r.auto), (0.0, AutoStatus::SourceRejected));
         // `any` admits the beam.
@@ -819,6 +859,22 @@ mod tests {
         );
     }
 
+    /// The speech level is information only: two readings that differ only in it
+    /// resolve alike.
+    #[test]
+    fn the_speech_level_does_not_move_the_term() {
+        let mut b = book(-30.0, 6.0, 0.0, &[]);
+        b.apply(&pod("p"), &auto_on()).unwrap();
+        let mut whisper = room(-60.0, LevelSource::RawMic);
+        whisper.speech_dbfs = Some(-70.0);
+        let mut shout = whisper;
+        shout.speech_dbfs = Some(-5.0);
+        assert_eq!(
+            b.resolve(&pod("p"), None, Some(&whisper)),
+            b.resolve(&pod("p"), None, Some(&shout))
+        );
+    }
+
     #[test]
     fn a_swing_ceiling_above_the_operator_ceiling_still_applies_the_operator_ceiling() {
         let mut b = book(-30.0, 6.0, 0.0, &[]);
@@ -831,11 +887,7 @@ mod tests {
             },
         )
         .unwrap();
-        let r = b.resolve(
-            &pod("p"),
-            None,
-            Some(&level(0.0, None, LevelSource::RawMic)),
-        );
+        let r = b.resolve(&pod("p"), None, Some(&room(-25.0, LevelSource::RawMic)));
         assert_eq!(r.auto_db, 30.0);
         assert_eq!(r.applied_db, 6.0);
     }
@@ -903,7 +955,7 @@ mod tests {
     fn a_non_finite_value_is_refused() {
         let mut b = VolumeBook::default();
         let cmd = VolumeCommand {
-            k_speech: Some(f32::INFINITY),
+            k_ambient: Some(f32::INFINITY),
             ..VolumeCommand::default()
         };
         assert_eq!(b.apply(&pod("p"), &cmd), Err(VolumeRefusal::NonFinite));
@@ -946,13 +998,13 @@ mod tests {
         let cmd = VolumeCommand {
             hold_db: Some(-10.0),
             auto: Some(true),
-            speech_ref_dbfs: Some(-28.0),
+            ambient_ref_dbfs: Some(-60.0),
             auto_min_db: Some(-6.0),
             ..VolumeCommand::default()
         };
         assert_eq!(
             serde_json::to_value(cmd).unwrap(),
-            serde_json::json!({"hold": -10.0, "auto": true, "speech_ref": -28.0, "min": -6.0})
+            serde_json::json!({"hold": -10.0, "auto": true, "ambient_ref": -60.0, "min": -6.0})
         );
         assert!(VolumeCommand::default().is_empty());
         assert!(!cmd.is_empty());
@@ -986,8 +1038,6 @@ mod tests {
                 let cmd = VolumeCommand {
                     hold_db: value(&mut next),
                     auto: (next() % 3 == 0).then_some(next() % 2 == 0),
-                    k_speech: value(&mut next),
-                    speech_ref_dbfs: value(&mut next),
                     k_ambient: value(&mut next),
                     ambient_ref_dbfs: value(&mut next),
                     auto_min_db: value(&mut next),
@@ -1001,9 +1051,9 @@ mod tests {
                 // floors it); markers are where non-finite values can arrive.
                 let measured =
                     |next: &mut dyn FnMut() -> u32| value(next).filter(|v| v.is_finite());
-                let l = level(
-                    measured(&mut next).unwrap_or(-30.0),
-                    measured(&mut next),
+                let l = aged(
+                    measured(&mut next).unwrap_or(-60.0),
+                    next() % 400_000,
                     LevelSource::RawMic,
                 );
                 let r = b.resolve(&pod("p"), value(&mut next), Some(&l));

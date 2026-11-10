@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use audio_pipeline::inbound::{FrameAccumulator, InboundConnectionState};
 use audio_pipeline::playback::PlaybackSink;
-use audio_pipeline::ring::{CaptureRing, RingIndex};
+use audio_pipeline::ring::{CaptureRing, PREROLL_SAMPLES, RingIndex};
 use audio_pipeline::wire::SegmentStart;
 use wifi_reconnect::Backoff;
 
@@ -180,8 +180,6 @@ pub struct SegmentOnset {
     /// Ring write head at the moment the VAD gate opened, as reported by the
     /// telemetry thread.
     pub vad_write_head: u64,
-    /// History to include ahead of the onset, in samples.
-    pub preroll_samples: u64,
 }
 
 /// A segment's opening frame plus the ring cursor its drain starts from.
@@ -192,12 +190,22 @@ pub struct SegmentPlan {
     pub start: SegmentStart,
 }
 
+/// The ring position a segment whose onset is at write head `head` starts from:
+/// `head` backed off by `PREROLL_SAMPLES`, clamped to the oldest sample the ring
+/// still holds.
+///
+/// The one place the onset pre-roll is decided: [`plan_segment_start`] opens
+/// segments from it and the status frame's `segment_reach` is read from it.
+pub fn onset_preroll_cursor(ridx: &RingIndex, head: u64) -> u64 {
+    ridx.preroll_cursor(head, PREROLL_SAMPLES)
+}
+
 /// Place a new segment's pre-roll cursor and date it.
 ///
-/// The cursor is the onset write head backed off by the pre-roll, clamped to the
-/// oldest sample the ring still holds, so a segment opened before the ring has
-/// filled carries whatever history exists. `preroll_samples` on the wire is the
-/// history actually available, not the history requested.
+/// The cursor is [`onset_preroll_cursor`] at the onset write head, so a segment
+/// opened before the ring has filled carries whatever history exists.
+/// `preroll_samples` on the wire is the history actually available, not the
+/// history requested.
 ///
 /// `base_device_ts_us` extrapolates back from the ring's clock anchor at the
 /// shared sample rate — the same rule the engine dates every frame by. An anchor
@@ -213,7 +221,7 @@ pub fn plan_segment_start<B>(
     ridx: &RingIndex,
     onset: &SegmentOnset,
 ) -> SegmentPlan {
-    let cursor = ridx.preroll_cursor(onset.vad_write_head, onset.preroll_samples);
+    let cursor = onset_preroll_cursor(ridx, onset.vad_write_head);
     let base_device_ts_us = if ring.anchor_sample >= cursor {
         frame_ts_us(ring.anchor_sample, ring.anchor_ts_us, cursor)
     } else {
@@ -238,6 +246,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
+    use audio_pipeline::level::LevelHistory;
     use audio_pipeline::ring::RING_CAPACITY_SAMPLES;
 
     use crate::test_support::{RecordingSink, SinkMark, dirty_inbound};
@@ -613,11 +622,12 @@ mod tests {
             write_head,
             anchor_sample,
             anchor_ts_us,
+            levels: LevelHistory::new(),
         }
     }
 
     /// The steady-state case: a full pre-roll of history is available, so the
-    /// cursor sits exactly `preroll_samples` behind the onset and the wire
+    /// cursor sits exactly `PREROLL_SAMPLES` behind the onset and the wire
     /// reports the full pre-roll.
     #[test]
     fn segment_plan_backs_the_cursor_off_by_a_full_preroll() {
@@ -626,7 +636,6 @@ mod tests {
         let onset = SegmentOnset {
             segment_id: 3,
             vad_write_head: 40_000,
-            preroll_samples: 16_000,
         };
 
         let plan = plan_segment_start(&ring, &ridx, &onset);
@@ -648,7 +657,6 @@ mod tests {
         let onset = SegmentOnset {
             segment_id: 0,
             vad_write_head: 31_400,
-            preroll_samples: 16_000,
         };
 
         let plan = plan_segment_start(&ring, &ridx, &onset);
@@ -669,7 +677,6 @@ mod tests {
         let onset = SegmentOnset {
             segment_id: 1,
             vad_write_head: 4_000,
-            preroll_samples: 16_000,
         };
 
         let plan = plan_segment_start(&ring, &ridx, &onset);
@@ -691,7 +698,6 @@ mod tests {
         let onset = SegmentOnset {
             segment_id: 2,
             vad_write_head: 40_000,
-            preroll_samples: 16_000,
         };
 
         let plan = plan_segment_start(&ring, &ridx, &onset);
@@ -712,7 +718,6 @@ mod tests {
         let onset = SegmentOnset {
             segment_id: 0,
             vad_write_head: 0,
-            preroll_samples: 16_000,
         };
 
         let plan = plan_segment_start(&ring, &ridx, &onset);

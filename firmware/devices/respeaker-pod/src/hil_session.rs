@@ -45,6 +45,8 @@ pub(crate) struct PeerConfig {
     pub(crate) tls_psk_port: u16,
     /// TLS-PSK listener holding a different key for this pod's identity.
     pub(crate) tls_psk_bad_port: u16,
+    /// `PodStatusIdle` status listener port.
+    pub(crate) pod_status_port: u16,
 }
 
 /// The whole volatile session. No `Debug`: it holds the audio PSK.
@@ -240,6 +242,7 @@ mod tests {
             rtd_port: 7005,
             tls_psk_port: 7006,
             tls_psk_bad_port: 7007,
+            pod_status_port: 7008,
         }
     }
 
@@ -274,6 +277,7 @@ mod tests {
         assert_eq!(got.host, [10, 0, 0, 5]);
         assert_eq!(got.rtd_port, 7005);
         assert_eq!(got.tls_psk_bad_port, 7007);
+        assert_eq!(got.pod_status_port, 7008);
     }
 
     #[test]

@@ -464,16 +464,15 @@ pub(crate) static INBOUND_PCM_CONSUMER: Mutex<Option<InboundRingConsumer>> = Mut
 
 // ── Speaker-output tone defaults ─────────────────────────────────────────────
 //
-// 440 Hz / 50% amplitude / 1500 ms, matching the host `PlaybackConfig` defaults
-// (`audio-receiver/src/playback.rs`). Named constants so volume/duration are
-// trivially tunable at the bench.
+// 440 Hz / 16% of full scale (−16 dBFS peak) / 1500 ms. Named constants so
+// volume/duration are trivially tunable at the bench.
 
 /// Default tone frequency for the `SpeakerOutput` HIL test (Hz).
 #[cfg(target_os = "espidf")]
 const SPEAKER_TONE_FREQ_HZ: f32 = 440.0;
 /// Default tone amplitude for the `SpeakerOutput` HIL test (0.0..=1.0 of full scale).
 #[cfg(target_os = "espidf")]
-const SPEAKER_TONE_AMPLITUDE: f32 = 0.5;
+const SPEAKER_TONE_AMPLITUDE: f32 = 0.16;
 /// Default tone duration for the `SpeakerOutput` HIL test (ms).
 #[cfg(target_os = "espidf")]
 const SPEAKER_TONE_DURATION_MS: u32 = 1500;
@@ -1090,7 +1089,7 @@ const FULL_DUPLEX_RX_FEED_MS: u64 = 5_000;
 /// `run_full_duplex_rx_integrity` (asserts the mic-RX deficit is zero): both need the same
 /// saturating feed and differ only in which periodic-line telemetry the host scores.
 #[cfg(target_os = "espidf")]
-fn feed_saturating_playback(feed_ms: u64) -> (u32, u32) {
+pub(crate) fn feed_saturating_playback(feed_ms: u64) -> (u32, u32) {
     use std::time::Instant;
 
     // Non-silent PCM chunk (same shape as CapturePeriodicLine).

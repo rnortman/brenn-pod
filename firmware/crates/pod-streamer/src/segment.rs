@@ -28,6 +28,7 @@ use audio_pipeline::inbound::{
 use audio_pipeline::pace::{advance_pace_us, pace_wait_us};
 use audio_pipeline::playback::PlaybackSink;
 use audio_pipeline::ring::{CaptureRing, RingIndex, SAMPLE_RATE_HZ};
+use audio_pipeline::stats::PodStats;
 use audio_pipeline::stream_send::{
     FrameWriteState, SendOutcome, StepOutcome, write_frame_classified,
 };
@@ -41,6 +42,7 @@ use crate::netpoll::{
     INBOUND_STEPS_PER_WAKE, NetPoll, OUTBOUND_FRAMES_PER_WAKE, Readiness, poll_timeout,
     poll_writable,
 };
+use crate::status::{BegunStatus, StatusBuild, StatusSchedule, StatusSource, begin_status_frame};
 
 // ── Streamer message channel ──────────────────────────────────────────────────
 
@@ -159,11 +161,13 @@ pub fn send_frame_bp_counted<P: NetPoll + ?Sized>(
 
 /// Tags the single in-flight outbound frame so post-send bookkeeping knows what to
 /// do: `Audio` bumps delivered counters, `SegmentEnd` exits the segment loop,
-/// `Telemetry` completes silently.
+/// `Telemetry` completes silently, `Status` advances the connection's level cursor to
+/// `end_block`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutboundKind {
     Audio { samples: u32 },
     Telemetry,
+    Status { end_block: u64 },
     SegmentEnd,
 }
 
@@ -216,6 +220,15 @@ fn push_pcm_samples<B: Deref<Target = [i16]>>(
     }
 }
 
+/// The connection's status cadence and what a status frame is built from, lent to a
+/// segment so the frame keeps its once-a-second beat while audio streams.
+pub struct SegmentStatus<'a> {
+    /// The counters and gauges.
+    pub source: StatusSource<'a>,
+    /// The connection's cadence and level cursor, which the segment advances.
+    pub schedule: &'a mut StatusSchedule,
+}
+
 /// The full mutable dependency set of the post-SegmentStart streaming span.
 ///
 /// Groups everything the `'stream` loop touches so [`run_segment`] can be driven
@@ -262,6 +275,10 @@ pub struct SegmentDeps<'a, B> {
     /// Observer for the shared inbound path (its own waypoints and the accepted
     /// playback format).
     pub inbound_obs: &'a mut dyn InboundObserver,
+    /// Status emission and the device counters a segment adds to, or `None` for a
+    /// caller that sends no status and keeps no counters (a harness driving one
+    /// segment).
+    pub status: Option<SegmentStatus<'a>>,
 }
 
 /// How a [`run_segment`] call terminated. The caller maps each onto reconnect
@@ -279,7 +296,14 @@ pub enum SegmentExit {
 }
 
 /// Run one capture segment: drain the ring into `AudioFrame`s, interleave
-/// `Telemetry`, drain inbound playback, and close with `SegmentEnd`.
+/// `Telemetry` and `Status`, drain inbound playback, and close with `SegmentEnd`.
+///
+/// Outbound priority is `SegmentEnd`, then telemetry, then an owed status frame, then
+/// audio. At most one status frame is owed, and it is built when it is sent, so it
+/// carries the position and the level blocks of the wake it goes out on. A period that
+/// passes with the frame still owed is counted in `status_skipped`, so a stalled socket
+/// cannot grow a backlog of them. Two frames of a segment can therefore be stamped less
+/// than a period apart (the first sent late, the second on time).
 ///
 /// The socket in `deps` is connected with `SegmentStart` already sent, and
 /// `read_cursor` is the pre-roll cursor. Returns a [`SegmentExit`] the caller
@@ -325,6 +349,9 @@ where
     let mut spin_backoff_deadline: Option<Instant> = None;
     let mut pending_telemetry: std::collections::VecDeque<WireTelemetry> =
         std::collections::VecDeque::new();
+    // A status frame is owed. Never a `Status` value: the frame is built and encoded
+    // inside `begin_status_frame`, so this loop's own stack frame holds none.
+    let mut status_owed = false;
 
     // ── Intra-segment observability waypoints ────────────────────────
     // Time-bracket the transient heap dive within a segment so a gradual aggregate
@@ -345,6 +372,16 @@ where
             if now_us.saturating_sub(last_periodic_wp_us) >= PRODUCTION_OBS_PERIOD_US {
                 last_periodic_wp_us = now_us;
                 (deps.obs)(ObsEvent::Production);
+            }
+            if let Some(st) = deps.status.as_mut()
+                && st.schedule.is_due(now_us)
+            {
+                if status_owed {
+                    // A whole period passed with the owed frame unsent.
+                    PodStats::bump(&st.source.stats.status_skipped);
+                }
+                status_owed = true;
+                st.schedule.note_due(now_us);
             }
         }
         // The loop never sleeps while either direction has actionable work: each
@@ -483,6 +520,11 @@ where
             if outbound.is_none() {
                 // ── Selector: SegmentEnd → telemetry → mic AudioFrame → partial-at-close ──
                 if let Some(reason) = segment_end {
+                    if reason == EndReason::Overrun
+                        && let Some(st) = deps.status.as_ref()
+                    {
+                        PodStats::bump(&st.source.stats.ring_overruns);
+                    }
                     let now_us = (deps.now_us)();
                     let seg_end = StreamFrame::SegmentEnd(SegmentEnd {
                         segment_id,
@@ -523,6 +565,35 @@ where
                             // Local fault: no bytes written, the stream stays
                             // frame-aligned, so the connection remains usable.
                             return SegmentExit::SegmentDroppedSocketKept;
+                        }
+                    }
+                } else if status_owed && let Some(st) = deps.status.as_ref() {
+                    status_owed = false;
+                    let begun = begin_status_frame(
+                        &StatusBuild {
+                            ring: deps.ring,
+                            ridx: deps.ridx,
+                            source: st.source,
+                            schedule: st.schedule,
+                            now_us: (deps.now_us)(),
+                            now_instant: deps.now_instant,
+                        },
+                        deps.outbound_buf.as_mut_slice(),
+                    );
+                    match begun {
+                        Ok(BegunStatus { write, end_block }) => {
+                            outbound = Some((write, OutboundKind::Status { end_block }))
+                        }
+                        Err(e) => {
+                            // Local fault, no byte written: the frame is skipped and its
+                            // blocks ride the next one.
+                            log::warn!(
+                                "streamer: Status encode failed (seg {}): {:?} — skipping it",
+                                segment_id,
+                                e
+                            );
+                            PodStats::bump(&st.source.stats.status_skipped);
+                            continue 'outbound;
                         }
                     }
                 } else {
@@ -719,6 +790,12 @@ where
                         OutboundKind::Telemetry => {
                             outbound = None;
                         }
+                        OutboundKind::Status { end_block } => {
+                            if let Some(st) = deps.status.as_mut() {
+                                st.schedule.note_sent(end_block);
+                            }
+                            outbound = None;
+                        }
                         OutboundKind::SegmentEnd => {
                             log::info!(
                                 "streamer: segment {} ended frames={} samples={} pace_resyncs={}",
@@ -766,10 +843,15 @@ where
         }
 
         // ── Write watchdog: enforce budget/ceiling once per wake for an in-flight frame ──
-        if let Some((state, _)) = outbound.as_mut() {
+        if let Some((state, kind)) = outbound.as_mut() {
             match state.check_deadlines(deps.now_instant) {
                 None => {}
                 Some(Ok(SendOutcome::BackpressureAligned)) => {
+                    if matches!(kind, OutboundKind::Status { .. })
+                        && let Some(st) = deps.status.as_ref()
+                    {
+                        PodStats::bump(&st.source.stats.status_skipped);
+                    }
                     log::warn!(
                         "streamer: outbound backpressure mid-segment (seg {}) — dropping segment, keeping socket",
                         segment_id
@@ -800,14 +882,19 @@ where
 mod tests {
     use super::*;
     use crate::link::PollInterest;
+    use crate::status::{PlatformGauges, status_end_block};
     use crate::test_support::{
         FakeLink, FakePoll, RecordingInboundObs, RecordingSink, decode_stream, free_running_clock,
         inbound_audio, inbound_hello, ring_with, wire_bytes,
     };
     use audio_pipeline::inbound::InboundWaypoint;
     use audio_pipeline::ring::RING_CAPACITY_SAMPLES;
+    use audio_pipeline::stats::CounterSources;
     use audio_pipeline::stream_send::SPIN_GUARD_THRESHOLD;
-    use audio_pipeline::wire::{DEVICE_PLAYBACK_FORMAT, MAX_FRAME_BYTES, TelemetryKind};
+    use audio_pipeline::wire::{
+        DEVICE_PLAYBACK_FORMAT, LEVEL_BLOCK_SAMPLES, MAX_FRAME_BYTES, STATUS_PERIOD_US,
+        TelemetryKind,
+    };
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::Ordering;
 
@@ -821,6 +908,9 @@ mod tests {
         state: InboundConnectionState,
         inbound_obs: RecordingInboundObs,
         buf: Vec<u8>,
+        /// The device counters, when the run sends status; `None` runs without.
+        stats: Option<PodStats>,
+        schedule: StatusSchedule,
     }
 
     impl Harness {
@@ -840,7 +930,38 @@ mod tests {
                 state: InboundConnectionState::new(),
                 inbound_obs: RecordingInboundObs::new(),
                 buf: vec![0u8; buf_bytes],
+                stats: None,
+                schedule: StatusSchedule::new(),
             }
+        }
+
+        /// A harness whose segment sends status, with a fresh connection's cursor.
+        fn with_status() -> Self {
+            Self {
+                stats: Some(PodStats::new(CounterSources {
+                    capture_deficit_frames: false,
+                    capture_xruns: false,
+                    playback_write_failures: false,
+                    playback_discards: false,
+                    alloc_failures: false,
+                })),
+                ..Self::new()
+            }
+        }
+
+        fn stat(&self, counter: impl Fn(&PodStats) -> &std::sync::atomic::AtomicU32) -> u32 {
+            counter(self.stats.as_ref().expect("a status harness")).load(Ordering::Relaxed)
+        }
+    }
+
+    /// Meter `samples` more samples of a constant into `ring` through the production
+    /// writer, so its level history holds finished blocks.
+    fn meter(ring: &Mutex<Option<CaptureRing<Box<[i16]>>>>, samples: u64) {
+        let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
+        let mut guard = ring.lock().unwrap();
+        let ring = guard.as_mut().unwrap();
+        for _ in 0..samples {
+            ring.commit(&ridx, 500, None, false);
         }
     }
 
@@ -878,8 +999,16 @@ mod tests {
         read_cursor: u64,
     ) -> Run {
         let events = RefCell::new(Vec::new());
+        let gauges = PlatformGauges::default;
         let exit = {
             let mut obs = |event: ObsEvent| events.borrow_mut().push(event);
+            let status = h.stats.as_ref().map(|stats| SegmentStatus {
+                source: StatusSource {
+                    stats,
+                    gauges: &gauges,
+                },
+                schedule: &mut h.schedule,
+            });
             let mut deps = SegmentDeps {
                 socket: &mut h.link,
                 rx,
@@ -895,6 +1024,7 @@ mod tests {
                 now_instant: instants,
                 obs: &mut obs,
                 inbound_obs: &mut h.inbound_obs,
+                status,
             };
             run_segment(&mut deps, 7, read_cursor)
         };
@@ -1122,6 +1252,179 @@ mod tests {
             [StreamFrame::SegmentEnd(e)] => assert_eq!(e.reason, EndReason::Overrun),
             other => panic!("expected a lone SegmentEnd(Overrun), got {other:?}"),
         }
+    }
+
+    /// An overrun close is counted once in `ring_overruns`.
+    #[test]
+    fn an_overrun_close_is_counted() {
+        let ring = ring_with(RING_CAPACITY_SAMPLES as u64 + 5_000, 2_000_000);
+        let (_tx, rx) = std::sync::mpsc::channel::<StreamerMsg>();
+        let mut h = Harness::with_status();
+        let poll = FakePoll::always_writable();
+
+        let out = run(&mut h, &ring, &rx, &poll, &free_running_clock(), 0);
+
+        assert_eq!(out.exit, SegmentExit::Completed);
+        assert_eq!(h.stat(|s| &s.ring_overruns), 1);
+        assert!(matches!(
+            out.frames.last(),
+            Some(StreamFrame::SegmentEnd(e)) if e.reason == EndReason::Overrun
+        ));
+    }
+
+    // ── Status interleave ─────────────────────────────────────────────────────
+
+    /// A due status frame goes out after queued telemetry and before audio, carries
+    /// the connection's unsent level blocks, and advances the cursor once written.
+    #[test]
+    fn status_rides_after_telemetry_and_before_audio() {
+        let ring = ring_with(0, 2_000_000);
+        meter(
+            &ring,
+            3 * LEVEL_BLOCK_SAMPLES as u64 + AUDIO_SAMPLES_PER_FRAME as u64,
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<StreamerMsg>();
+        tx.send(StreamerMsg::Telemetry(WireTelemetry {
+            device_ts_us: 1,
+            kind: TelemetryKind::SpEnergy { values: [0.0; 4] },
+        }))
+        .expect("channel accepts telemetry");
+        let mut h = Harness::with_status();
+        h.vad_closed.store(true, Ordering::Release);
+        let poll = FakePoll::always_writable();
+        let cursor = 3 * LEVEL_BLOCK_SAMPLES as u64;
+
+        let out = run(&mut h, &ring, &rx, &poll, &free_running_clock(), cursor);
+
+        assert_eq!(out.exit, SegmentExit::Completed);
+        match out.frames.as_slice() {
+            [
+                StreamFrame::Telemetry(_),
+                StreamFrame::Status(st),
+                StreamFrame::Audio(_),
+                StreamFrame::SegmentEnd(_),
+            ] => {
+                assert_eq!(st.levels.first_block, 0);
+                assert_eq!(st.levels.blocks.len(), 3);
+                assert_eq!(st.capture_head, cursor + AUDIO_SAMPLES_PER_FRAME as u64);
+                assert_eq!(
+                    u64::from(st.segment_reach),
+                    st.capture_head,
+                    "a ring younger than the pre-roll: a segment would reach back to its start"
+                );
+            }
+            other => panic!("expected telemetry, status, audio, end; got {other:?}"),
+        }
+        assert_eq!(
+            h.schedule.next_block(),
+            3,
+            "the written frame moved the cursor"
+        );
+        assert_eq!(h.stat(|s| &s.status_skipped), 0);
+    }
+
+    /// A run without status sources sends none.
+    #[test]
+    fn a_segment_without_status_sources_sends_no_status() {
+        let ring = ring_with(AUDIO_SAMPLES_PER_FRAME as u64, 2_000_000);
+        let (_tx, rx) = std::sync::mpsc::channel::<StreamerMsg>();
+        let mut h = Harness::new();
+        h.vad_closed.store(true, Ordering::Release);
+        let poll = FakePoll::always_writable();
+
+        let out = run(&mut h, &ring, &rx, &poll, &free_running_clock(), 0);
+
+        assert!(
+            !out.frames
+                .iter()
+                .any(|f| matches!(f, StreamFrame::Status(_)))
+        );
+    }
+
+    /// While the socket holds an audio frame back for more than two periods, the status
+    /// frame that came due is owed, not built: exactly one goes out when the socket
+    /// opens, read on the wake it is encoded on — its position, its timestamp and its
+    /// level run are that wake's — and every whole period that passed with it owed is
+    /// counted in `status_skipped`.
+    #[test]
+    fn an_owed_status_is_built_when_it_is_sent() {
+        const P: u64 = STATUS_PERIOD_US;
+        let ring = ring_with(0, 2_000_000);
+        meter(&ring, 2 * LEVEL_BLOCK_SAMPLES as u64);
+        let (_tx, rx) = std::sync::mpsc::channel::<StreamerMsg>();
+        let mut h = Harness::with_status();
+        h.vad_closed.store(true, Ordering::Release);
+        // The first frame is not due until 2P, after the audio frame is in flight.
+        h.schedule.note_due(P);
+        // Six refused writes: the audio frame stalls across 2P, 3P and 4P.
+        h.link.write_script = [0, 0, 0, 0, 0, 0].into_iter().collect();
+        let poll = FakePoll::always_writable();
+        // Each read of the µs clock moves it half a period on. Reads 4 to 8, all inside
+        // the stall, each capture one more level block, so the ring moves on between the
+        // wake the frame comes due on and the wake it is sent on. `heads` records the
+        // ring's head as each clock value is handed out.
+        let reads = Cell::new(0u64);
+        let heads: RefCell<Vec<(u64, u64)>> = RefCell::new(Vec::new());
+        let clock = || {
+            reads.set(reads.get() + 1);
+            if (4..=8).contains(&reads.get()) {
+                meter(&ring, LEVEL_BLOCK_SAMPLES as u64);
+            }
+            let now = reads.get() * (P / 2);
+            let head = ring.lock().unwrap().as_ref().unwrap().write_head;
+            heads.borrow_mut().push((now, head));
+            now
+        };
+        let cursor = 2 * LEVEL_BLOCK_SAMPLES as u64 - AUDIO_SAMPLES_PER_FRAME as u64;
+
+        let out = run(&mut h, &ring, &rx, &poll, &clock, cursor);
+
+        assert_eq!(out.exit, SegmentExit::Completed);
+        let (st, rest) = match out.frames.as_slice() {
+            [
+                StreamFrame::Audio(first),
+                StreamFrame::Status(st),
+                rest @ ..,
+            ] if first.first_sample_index == cursor => (st, rest),
+            other => panic!("expected the stalled audio frame, then one status; got {other:?}"),
+        };
+        assert!(
+            matches!(rest.first(), Some(StreamFrame::Audio(_))),
+            "one status frame, not a burst: {rest:?}"
+        );
+        let head_at = |now: u64| {
+            heads
+                .borrow()
+                .iter()
+                .find(|(t, _)| *t == now)
+                .map(|(_, h)| *h)
+                .expect("a clock value handed out")
+        };
+        assert!(
+            st.device_ts_us >= 4 * P,
+            "sent more than two periods after it came due at 2P: {}",
+            st.device_ts_us
+        );
+        assert_eq!(
+            st.capture_head,
+            head_at(st.device_ts_us),
+            "the position of the wake it was encoded on"
+        );
+        assert!(
+            st.capture_head > head_at(2 * P),
+            "not the position of the wake it came due on"
+        );
+        assert_eq!(st.levels.first_block, 0);
+        assert_eq!(
+            status_end_block(st),
+            st.capture_head / LEVEL_BLOCK_SAMPLES as u64,
+            "the run reaches the newest finished block"
+        );
+        // The frame came due at 2P; the wake that sent it read the clock half a period
+        // before encoding. Every due instant after 2P up to that wake found it still owed.
+        let whole_periods_unsent = (st.device_ts_us - P / 2) / P - 2;
+        assert!(whole_periods_unsent >= 2);
+        assert_eq!(h.stat(|s| &s.status_skipped), whole_periods_unsent as u32);
     }
 
     // ── Injected seams ────────────────────────────────────────────────────────

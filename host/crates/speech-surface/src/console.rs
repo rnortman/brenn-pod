@@ -500,7 +500,7 @@ fn narrate(event: &str, fields: &Value) -> Option<String> {
         "conn_superseded" => Some(narrate_conn_superseded(fields)),
         "conn_closed" => Some(narrate_conn_closed(fields)),
         "brain_absent" => Some("brain: none".to_string()),
-        "brain_echo" => Some("brain: echo".to_string()),
+        "brain_echo" => Some(narrate_brain_echo(fields)),
         "brain_clip_loaded" => Some(narrate_brain_clip(fields)),
         "stt_absent" => Some("stt: none".to_string()),
         "stt_configured" => Some(narrate_stt_configured(fields)),
@@ -585,11 +585,22 @@ fn narrate_stt_unreachable_reply(fields: &Value) -> String {
     format!("stt unreachable — offline clip {clip} for {pod} #{seq}")
 }
 
-/// The configured brain as prose. `brain_absent` / `brain_echo` are fixed
-/// labels (`brain: none` / `brain: echo`); `brain_clip_loaded` names the clip
-/// and its duration, taken from the event's own `duration_ms` (the single source
-/// the emit site already computed): `brain: clip ./ack.wav (1.9s)`. The clip path
-/// degrades to `?` and the duration to `?` when absent or the wrong type.
+/// The echo brain as prose: `brain: echo`, or `brain: echo, listening 8.0s after
+/// each reply` when it ends every turn open.
+fn narrate_brain_echo(fields: &Value) -> String {
+    match fields.get("listen_window_ms").and_then(Value::as_u64) {
+        Some(_) => format!(
+            "brain: echo, listening {} after each reply",
+            fmt_duration_ms(fields.get("listen_window_ms"), 1)
+        ),
+        None => "brain: echo".to_string(),
+    }
+}
+
+/// The configured brain as prose. `brain_absent` is a fixed label (`brain:
+/// none`), `brain_echo` is narrated by [`narrate_brain_echo`];
+/// `brain_clip_loaded` names the clip and its duration, taken from the event's
+/// own `duration_ms`: `brain: clip ./ack.wav (1.9s)`. The clip path degrades to `?` and the duration to `?` when absent or the wrong type.
 fn narrate_brain_clip(fields: &Value) -> String {
     let clip = fmt_str(fields.get("clip"));
     let dur = fmt_duration_ms(fields.get("duration_ms"), 1);
@@ -2613,6 +2624,17 @@ mod tests {
         let echo = r.render(0, "brain_echo", &json!({})).unwrap();
         assert!(echo.ends_with("brain: echo"), "{echo}");
         assert!(!echo.contains("!!!"), "{echo}");
+        let quiet = r
+            .render(0, "brain_echo", &json!({ "listen_window_ms": null }))
+            .unwrap();
+        assert!(quiet.ends_with("brain: echo"), "{quiet}");
+        let listening = r
+            .render(0, "brain_echo", &json!({ "listen_window_ms": 8000 }))
+            .unwrap();
+        assert!(
+            listening.ends_with("brain: echo, listening 8.0s after each reply"),
+            "{listening}"
+        );
         let absent = r
             .render(
                 0,

@@ -29,12 +29,14 @@ use crate::console::{ENCODE_FAILURES, TX_WRITE_FAILURES, WRITER_STATE_ANOMALIES}
 const SUPERVISOR_STACK_HWM_FLOOR: u32 = 512;
 
 /// Minimum acceptable stack high-water mark for the streamer thread (bytes).
-/// The thread is spawned with a 20480-byte stack (`spawn_streamer_thread`); it hosts the
-/// `run_segment` drain loop and its per-frame wire-encode chain — the thread whose
-/// previously-unmeasured sizing seeded the RTD heap-churn defect. PROVISIONAL 512-byte
+/// The thread is spawned with a 28672-byte stack (`spawn_streamer_thread`); it hosts the
+/// `run_segment` drain loop and its per-frame wire-encode chain. PROVISIONAL 512-byte
 /// near-overflow alarm (mirrors `SUPERVISOR_STACK_HWM_FLOOR`), baked from the first HIL
 /// observation. If the HWM ever drops below it, raise `stack_size` in
-/// `spawn_streamer_thread` rather than lowering this floor.
+/// `spawn_streamer_thread` rather than lowering this floor. This check runs before the
+/// thread has made a TLS handshake or run a segment; the thread's margin after real
+/// segments is `gauges.stack_free_min` on the host's `pod_status` line, and 512 is the
+/// near-overflow alarm only.
 const STREAMER_STACK_HWM_FLOOR: u32 = 512;
 
 /// Read the current free heap and the boot-wide minimum-ever free heap as a pair,
