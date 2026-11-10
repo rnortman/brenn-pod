@@ -248,8 +248,9 @@ pub struct CarvedUtterance {
     /// own speech from its onset to its end otherwise — a barge, a follow-up, or
     /// any carve under `Bypass`. The ambient half is the room read from the
     /// pod's level blocks before the speech, or the last good reading carried.
-    /// `None` when neither half was measured. Measured at the first carve; a
-    /// continuation keeps it.
+    /// Always present: every carve is measured, and the halves inside it are
+    /// `None` when nothing yielded them, with `room` saying why for the ambient
+    /// half. Measured at the first carve; a continuation keeps it.
     pub level: Option<UtteranceLevel>,
     /// Why this utterance's audio ends where it does.
     pub cause: EndpointCause,
@@ -324,8 +325,10 @@ pub enum ListenerEvent {
         /// the array heard the phrase from, not where the talker is: turning that into
         /// a bearing needs the array's attitude, which the listener does not have.
         doa: Vec<DoaSample>,
-        /// How loudly the phrase was spoken and how loud the room was before it;
-        /// `None` when neither was measured.
+        /// How loudly the phrase was spoken and how loud the room was before it.
+        /// Always present: every detection is measured, and the halves inside it
+        /// are `None` when nothing yielded them, with `room` saying why for the
+        /// ambient half.
         level: Option<UtteranceLevel>,
     },
     /// A wake phrase crossed threshold and was discarded unheard, because the pod
@@ -555,6 +558,71 @@ pub enum ListenerEvent {
     /// beginning is that turn's, `brain_dispatched` is the record, and no line
     /// ends a window the turn already answered.
     ListenExpired { pod: PodId, epoch: u64 },
+    /// This pod's report of when it was playing and this host's record of when
+    /// it sent the pod audio disagree by more than either's known error. It does
+    /// not say which of the two is wrong, and a reader may not conclude it from
+    /// this line. Either way the room reading stays on the safe side: a block
+    /// either record calls playback is left out of it. The line is the alarm,
+    /// not a correction and not a diagnosis; its absence says only that no
+    /// disagreement past the slack was seen.
+    ///
+    /// The slack covers the pod playing on after this host's playback ends (an
+    /// abort with audio banked, an underrun, a reconnect in the middle of a
+    /// reply) and every kind of job this host writes. It does not cover this
+    /// host's record of a playback arriving late or being lost on a wedged
+    /// listener channel; that has its own counter,
+    /// `ListenerStatsSnapshot::marker_send_timeouts`.
+    ///
+    /// What each [`FlagDisputeKind`] entitles a reader to conclude is on the
+    /// kind.
+    PlayingFlagDisputed {
+        pod: PodId,
+        epoch: u64,
+        kind: FlagDisputeKind,
+        /// [`FlagDisputeKind::FlagWithoutPlayback`]: the blocks counted since
+        /// the previous line for this connection. [`FlagDisputeKind::PlaybackWithoutFlag`]:
+        /// the blocks inside the playback, none of them flagged.
+        blocks: u32,
+        /// [`FlagDisputeKind::FlagWithoutPlayback`]: the first sample of the
+        /// newest block counted. [`FlagDisputeKind::PlaybackWithoutFlag`]: the
+        /// sample at which this host's playback began. In the connection's
+        /// index domain.
+        at_sample: u64,
+    },
+}
+
+/// Which way a [`ListenerEvent::PlayingFlagDisputed`] disagreement runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlagDisputeKind {
+    /// The pod flagged blocks as playing while this host had sent it nothing
+    /// for more than the slack (5 s of the pod's capture) before them, counting
+    /// from the connection's first position and from the end of this host's
+    /// newest playback. Blocks from before the connection's first position are
+    /// never judged: this host has no record of what the pod was sent then.
+    ///
+    /// A reader may conclude that the counted blocks were left out of this
+    /// pod's room readings, so automatic volume is working from older blocks,
+    /// a carried reading, or none (`level.room` on a reply's lines says which);
+    /// and that either the pod is flagging blocks in which this host sent it
+    /// nothing, or this host's record of a playback is late or lost. A line
+    /// that repeats minute after minute while `marker_send_timeouts` stands
+    /// still is the pod's. Written on the first such block of a connection,
+    /// then at most once per minute of the pod's capture in which there were
+    /// any.
+    FlagWithoutPlayback,
+    /// This host played to the pod for 1.5 s or more and none of the pod's
+    /// blocks wholly inside that playback, its first second skipped for the
+    /// pod's pre-roll hold, was flagged; at least five such blocks were held.
+    /// Judged once per playback, on the first status frame reaching past its
+    /// end.
+    ///
+    /// A reader may conclude that those blocks were left out of the room
+    /// reading on this host's record alone, and that either the pod did not
+    /// mark its output or this host's record is wider than what was played (a
+    /// lost end-of-playback marker leaves the record open until the next reply
+    /// ends).
+    PlaybackWithoutFlag,
 }
 
 /// Which model a [`ListenerEvent::ModelStats`] summarizes.

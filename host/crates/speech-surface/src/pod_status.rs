@@ -101,8 +101,12 @@ impl PodStatusLog {
     /// - `levels` summarises every 100 ms room-level block received since the
     ///   previous line: how many (`blocks`), their 10th, 50th and 90th percentile in
     ///   dBFS (`null` when `blocks` is 0), and how many carried the pod's playing
-    ///   flag (`playing`). Taken together the lines are the continuous record of the
-    ///   room.
+    ///   flag (`playing`): blocks in which the pod reports audio going to its
+    ///   speaker. A reader may take a `playing` count that stays above 0 with no
+    ///   reply in progress as a pod reporting playback this host did not send it,
+    ///   and will find `playing_flag_disputed` on the record once that has lasted
+    ///   past 5 s of the pod's capture. Taken together the lines are the continuous
+    ///   record of the room.
     /// - `frames` is how many status frames the line covers.
     ///
     /// A line is written on a connection's first status frame, whenever a counter

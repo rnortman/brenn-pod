@@ -606,9 +606,13 @@ null when it could not be measured; it does not drive the volume), `ambient`
 silent and nobody was addressing it; `blocks`: how many 100 ms readings that
 rests on; `age_ms`: how old the newest of them is; `carried`: true when nothing
 recent was usable and this is the last good reading; null when the room has
-never been heard), and `source` — `raw_mic`, an unprocessed microphone, or
+never been heard), `source` — `raw_mic`, an unprocessed microphone, or
 `beam`, the processed speech channel, whose loudness is flattened and means
-little. It is absent when nothing was measured. The automatic adjustment reads
+little — and `room`: `held` counts the 100 ms readings on hand from before
+you spoke, and `playing`, `addressed` and `dead` how many of them were set
+aside because the pod was speaking, because someone was addressing it, or
+because the microphone was dead; when `ambient` is null, it is why. It is
+absent when no measurement was taken. The automatic adjustment reads
 `ambient`; with `level_source` `raw_mic` it ignores a `beam` reading, and a
 reading five minutes old or more no longer counts.
 
@@ -1184,8 +1188,8 @@ impl Brain for BrennBrain {
 mod tests {
     use super::*;
     use crate::types::{
-        AmbientReading, BargeInContext, InterruptProgress, LevelSource, SpeakerId, Transcript,
-        UtteranceId, test_utterance,
+        AmbientReading, BargeInContext, InterruptProgress, LevelSource, RoomSurvey, SpeakerId,
+        Transcript, UtteranceId, test_utterance,
     };
     use crate::volume::GainResolution;
     use serde_json::{Value, json};
@@ -1258,6 +1262,12 @@ mod tests {
                     carried: false,
                 }),
                 source: LevelSource::RawMic,
+                room: RoomSurvey {
+                    held: 140,
+                    playing: 30,
+                    addressed: 8,
+                    dead: 2,
+                },
             }),
             ..test_utterance()
         };
@@ -1267,6 +1277,7 @@ mod tests {
                 "speech_dbfs": -27.5,
                 "ambient": {"dbfs": -58.25, "blocks": 100, "age_ms": 300, "carried": false},
                 "source": "raw_mic",
+                "room": {"held": 140, "playing": 30, "addressed": 8, "dead": 2},
             })
         );
         let quiet_room_unknown = Utterance {
@@ -1274,6 +1285,11 @@ mod tests {
                 speech_dbfs: Some(-40.0),
                 ambient: None,
                 source: LevelSource::Beam,
+                room: RoomSurvey {
+                    held: 600,
+                    playing: 600,
+                    ..RoomSurvey::default()
+                },
             }),
             ..test_utterance()
         };
@@ -1283,7 +1299,12 @@ mod tests {
                 "hi",
                 &VolumeState::default()
             ))["level"],
-            json!({"speech_dbfs": -40.0, "ambient": null, "source": "beam"})
+            json!({
+                "speech_dbfs": -40.0,
+                "ambient": null,
+                "source": "beam",
+                "room": {"held": 600, "playing": 600, "addressed": 0, "dead": 0},
+            })
         );
         // A dead speech window keeps the room.
         let speech_unmeasured = Utterance {
@@ -1296,6 +1317,7 @@ mod tests {
                     carried: true,
                 }),
                 source: LevelSource::RawMic,
+                room: RoomSurvey::default(),
             }),
             ..test_utterance()
         };
@@ -1884,6 +1906,11 @@ mod tests {
             "`ambient`",
             "`carried`",
             "`raw_mic`",
+            "`room`",
+            "`held`",
+            "`playing`",
+            "`addressed`",
+            "`dead`",
             "\"type\": \"wake\"",
             "\"type\": \"utterance\"",
             "\"type\": \"interruption\"",

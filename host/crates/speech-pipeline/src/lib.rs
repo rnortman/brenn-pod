@@ -44,8 +44,8 @@ pub use level::{DEAD_CHANNEL_DBFS, FrameLevel, LEVEL_FLOOR_DBFS};
 pub use listener::{
     ArmExpiryCause, BargeCause, BargeInConfig, BargeMode, CarveTiming, CarvedUtterance, DoaSample,
     EndpointEvent, EndpointState, EndpointTransition, Endpointer, EndpointerConfig, Feed,
-    FeedSender, HandleError, Listener, ListenerConfig, ListenerEvent, ListenerHandle,
-    ListenerState, ListenerStats, ListenerStatsSnapshot, ListenerUtteranceId,
+    FeedSender, FlagDisputeKind, HandleError, Listener, ListenerConfig, ListenerEvent,
+    ListenerHandle, ListenerState, ListenerStats, ListenerStatsSnapshot, ListenerUtteranceId,
     MODEL_STATS_FLUSH_CHUNKS, OwwModels, OwwStream, PcmRing, PushReport, ScoreDistribution,
     ScoreStats, ScoreSummary, ScoredChunk, SileroConfig, SileroModel, SileroVad, StatsFlushCause,
     StatsModel, TransitionCause, UnscoredRun, WAKE_READINESS_SAMPLES, WakeDetected, WakePolicy,
@@ -64,10 +64,10 @@ pub use traits::{
 pub use types::{
     AmbientReading, AudioSpan, BargeInContext, Codec, ConfidenceGate, ContextSegment, Cue,
     DoaTrack, EndpointCause, GateReject, InterruptProgress, LevelSource, MAX_CONTEXT_SEGMENTS,
-    MAX_RESOLVE_SAMPLES, PodId, ResolvedSpanAudio, RoomId, SPINE_FORMAT, Segment, SegmentEndCause,
-    SegmentEndInfo, SegmentTelemetry, SpanResolveError, SpeakBody, SpeakCmd, SpeakerId,
-    StageTimings, TrackingEvent, Transcript, TranscriptConfidence, Utterance, UtteranceId,
-    UtteranceLevel, WakeConfirmation, signed_offset_us, stage_delta_us,
+    MAX_RESOLVE_SAMPLES, PodId, ResolvedSpanAudio, RoomId, RoomSurvey, SPINE_FORMAT, Segment,
+    SegmentEndCause, SegmentEndInfo, SegmentTelemetry, SpanResolveError, SpeakBody, SpeakCmd,
+    SpeakerId, StageTimings, TrackingEvent, Transcript, TranscriptConfidence, Utterance,
+    UtteranceId, UtteranceLevel, WakeConfirmation, signed_offset_us, stage_delta_us,
 };
 pub use volume::{
     AutoPolicy, AutoStatus, GainBaselines, GainResolution, LevelAdmission, OperatorBounds,

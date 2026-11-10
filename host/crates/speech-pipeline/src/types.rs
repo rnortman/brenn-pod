@@ -213,8 +213,8 @@ pub struct SpeakCmd {
     /// reach it.
     pub gain: GainResolution,
     /// The originating utterance's measured levels, the input `gain`'s
-    /// automatic term read. `None` only for an announcement, an offline clip,
-    /// or a carve no live level reading covered.
+    /// automatic term read. `None` only for an announcement or an offline clip;
+    /// a reply to a live utterance always carries it.
     pub level: Option<UtteranceLevel>,
 }
 
@@ -413,8 +413,9 @@ pub struct WakeConfirmation {
     pub score: f32,
     pub wake_end_sample: usize,
     pub stt_trim_samples: usize,
-    /// How loudly the wake phrase was spoken, measured at its detection; `None`
-    /// when no live level reading covered it.
+    /// How loudly the wake phrase was spoken, measured at its detection. The
+    /// listener always sets it; the halves inside are `None` when nothing
+    /// yielded them.
     pub level: Option<UtteranceLevel>,
 }
 
@@ -429,7 +430,8 @@ pub enum LevelSource {
 }
 
 /// How loudly an utterance was addressed, and how loud the room was before it.
-/// Levels are dBFS of 16-bit PCM. Present whenever either half was measured.
+/// Levels are dBFS of 16-bit PCM. Present whenever a measurement was taken,
+/// whether or not either half yielded a level.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct UtteranceLevel {
     /// The level of the speech that triggered the reply — the wake phrase of a
@@ -440,6 +442,27 @@ pub struct UtteranceLevel {
     /// on a usable block.
     pub ambient: Option<AmbientReading>,
     pub source: LevelSource,
+    /// What the room estimator found in the blocks it holds from before the
+    /// speech, whether or not they yielded a reading. When `ambient` is `None`
+    /// or carried, this is why.
+    pub room: RoomSurvey,
+}
+
+/// The pod's level blocks on hand at a measurement, and why any were not read
+/// as the room. A block set aside for more than one reason is counted under the
+/// first that applies, in field order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomSurvey {
+    /// Level blocks held that end before the speech's guard.
+    pub held: u16,
+    /// Of those, how many were set aside as the pod's own output: flagged by the
+    /// pod, inside the tail after a flagged block, or inside this host's
+    /// playback and its tail.
+    pub playing: u16,
+    /// … as speech addressed to the pod.
+    pub addressed: u16,
+    /// … as a dead channel.
+    pub dead: u16,
 }
 
 /// The room's level as read from the pod's 100 ms level blocks: the median of
@@ -675,8 +698,9 @@ pub struct Utterance {
     pub over_playback: bool,
     /// How loudly this utterance was addressed — the wake phrase that opened
     /// it, or its own speech when no wake did (a barge, a follow-up, any
-    /// utterance under `Bypass`) — and how loud the room was before it. `None`
-    /// only when no live level reading covered the speech.
+    /// utterance under `Bypass`) — and how loud the room was before it. The
+    /// listener always sets it; the halves inside are `None` when nothing
+    /// yielded them.
     pub level: Option<UtteranceLevel>,
 }
 

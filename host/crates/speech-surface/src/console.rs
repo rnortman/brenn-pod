@@ -169,6 +169,9 @@ const CALM_DESPITE_TOKEN: &[&str] = &[
 ///   it left cleanly or not.
 /// - `brenn_delivery_gap`: responses were lost on the bus before reaching this
 ///   pod, so a turn was answered with part of its speech missing.
+/// - `playing_flag_disputed`: the pod's report of when it was playing and this
+///   host's record of what it sent disagree, so automatic volume may be working
+///   without a room reading, or the pod is marking its output wrong.
 /// - `cue_refused`: a reply asked the head for a movement this deployment
 ///   cannot make — an invented name, a stale library copy, a speed outside the
 ///   wire's range, or no configured vocabulary or head at all — and the head
@@ -179,6 +182,7 @@ const LOUD_WITHOUT_TOKEN: &[&str] = &[
     "brenn_bridge_exit",
     "brenn_delivery_gap",
     "cue_refused",
+    "playing_flag_disputed",
 ];
 
 /// Long string fields (transcript, error detail) truncate here; the file keeps
@@ -3266,6 +3270,7 @@ mod tests {
         ("playback_written", Class::Calm),
         ("playback_audible", Class::Calm),
         ("playback_writer_dead", Class::Loud),
+        ("playing_flag_disputed", Class::Loud),
         ("motion_script", Class::Calm),
         ("presence_absent", Class::Calm),
         ("script_input_dropped", Class::Loud),

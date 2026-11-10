@@ -196,9 +196,21 @@ and the streamed channel otherwise. Block `n` covers samples
 
 - `half_db` — the block's mean-square level as −2·dBFS, rounded and clamped to
   0..=200 (0 dBFS … −100 dBFS in 0.5 dB steps).
-- `flags` — bit 0 (`LEVEL_FLAG_PLAYING`): the pod's speaker output was active during
-  some sample of the block. On the ESP pod that is "DAC unmuted", which stays set
-  through playback starvation and for 200 ms after the end of audio.
+- `flags` — bit 0 (`LEVEL_FLAG_PLAYING`): audio was handed to the pod's speaker output
+  during the block, or within the pod's hold before it. The hold is each pod's own, a
+  fixed time of at most 200 ms after the last hand-over: 200 ms on the ESP pod (counted
+  from the last audio its TX DMA accepted), none on Reachy. With nothing handed to the
+  output the flag clears within the hold, however the stream ended and whether or not
+  it ended at all. It says nothing about the DAC or the amplifier.
+
+  What a receiver may conclude: a flagged block may contain the pod's own output. An
+  unflagged block had no audio handed to the speaker during it, and may still contain
+  the end of what was handed over before it, for the output's buffering depth — the
+  flag marks the hand-over, not the sound. On a pod with no hold the flag may also
+  clear up to one capture period before the last hand-over ended, and further, up to
+  that pod's capture buffering, when its capture is running late. A receiver that needs
+  blocks free of the pod's output applies its own tail after the last flagged block;
+  that tail covers both.
 
 The pod keeps the last 300 finished blocks (`LEVEL_HISTORY_BLOCKS`, 30 s). Each frame
 carries the finished blocks the host has not yet been sent whole on this connection;

@@ -22,8 +22,8 @@ pub use endpointer::{
     EndpointEvent, EndpointState, EndpointTransition, Endpointer, EndpointerConfig, TransitionCause,
 };
 pub use event::{
-    ArmExpiryCause, BargeCause, CarveTiming, CarvedUtterance, DoaSample, Feed, ListenerEvent,
-    ListenerUtteranceId, StatsFlushCause, StatsModel, WakePolicy,
+    ArmExpiryCause, BargeCause, CarveTiming, CarvedUtterance, DoaSample, Feed, FlagDisputeKind,
+    ListenerEvent, ListenerUtteranceId, StatsFlushCause, StatsModel, WakePolicy,
 };
 pub use oww_stream::{
     OwwConfig, OwwModels, OwwStream, PushReport, ScoredChunk, UnscoredRun, WAKE_READINESS_SAMPLES,

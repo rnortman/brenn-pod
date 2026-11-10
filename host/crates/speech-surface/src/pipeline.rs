@@ -135,7 +135,8 @@ impl PipelineItem {
                 | ListenOpened { pod, .. }
                 | ListenRestored { pod, .. }
                 | ListenHeard { pod, .. }
-                | ListenExpired { pod, .. } => pod,
+                | ListenExpired { pod, .. }
+                | PlayingFlagDisputed { pod, .. } => pod,
             },
         }
     }
@@ -167,6 +168,7 @@ impl PipelineItem {
                 ListenRestored { .. } => "listen_restored",
                 ListenHeard { .. } => "listen_heard",
                 ListenExpired { .. } => "listen_expired",
+                PlayingFlagDisputed { .. } => "playing_flag_disputed",
             },
         }
     }
@@ -1246,6 +1248,27 @@ async fn handle_listener(
             if let Some(scripter) = scripter {
                 scripter.send(ScriptInput::ListenExpired(pod.clone()));
             }
+        }
+        ListenerEvent::PlayingFlagDisputed {
+            pod,
+            epoch,
+            kind,
+            blocks,
+            at_sample,
+        } => {
+            // The line is the whole of it: the room reading already left out
+            // every block either record calls playback. Not gated on the epoch,
+            // since a superseded connection's disagreement was still seen.
+            jsonl.emit(
+                "playing_flag_disputed",
+                &json!({
+                    "pod": pod.0,
+                    "epoch": epoch,
+                    "kind": kind,
+                    "blocks": blocks,
+                    "at_sample": at_sample,
+                }),
+            );
         }
         ListenerEvent::Superseded { pod, utterance_id } => {
             // Emitted before the abort so a supersede is correlatable by utterance
@@ -4589,6 +4612,12 @@ mod tests {
                 carried: false,
             }),
             source: speech_pipeline::LevelSource::RawMic,
+            room: speech_pipeline::RoomSurvey {
+                held: 250,
+                playing: 150,
+                addressed: 0,
+                dead: 0,
+            },
         };
         let wake = WakeConfirmation {
             score: 0.8,
@@ -4608,6 +4637,7 @@ mod tests {
                 "speech_dbfs": -27.5,
                 "ambient": {"dbfs": -58.5, "blocks": 100, "age_ms": 300, "carried": false},
                 "source": "raw_mic",
+                "room": {"held": 250, "playing": 150, "addressed": 0, "dead": 0},
             }),
             "{lines:?}"
         );
@@ -4636,6 +4666,12 @@ mod tests {
                 carried: false,
             }),
             source: speech_pipeline::LevelSource::RawMic,
+            room: speech_pipeline::RoomSurvey {
+                held: 130,
+                playing: 30,
+                addressed: 0,
+                dead: 0,
+            },
         };
         let follow_up = CarvedUtterance {
             follow_up: true,
@@ -4657,6 +4693,7 @@ mod tests {
                 "speech_dbfs": -31.0,
                 "ambient": {"dbfs": -57.0, "blocks": 100, "age_ms": 300, "carried": false},
                 "source": "raw_mic",
+                "room": {"held": 130, "playing": 30, "addressed": 0, "dead": 0},
             }),
             "{lines:?}"
         );
@@ -6686,6 +6723,83 @@ mod tests {
         );
         drop(jsonl);
         writer.await.unwrap();
+    }
+
+    /// The dispute line carries the pod, the epoch, which way the records
+    /// disagree, the count and where; it is written whatever epoch it carries,
+    /// since a superseded connection's disagreement was still seen.
+    #[tokio::test]
+    async fn a_playing_flag_dispute_is_written_as_its_line() {
+        let (lines, _) = Harness::new()
+            .run(vec![
+                wake_detected(2, 8),
+                PipelineItem::Listener(ListenerEvent::PlayingFlagDisputed {
+                    pod: pod(),
+                    epoch: 1,
+                    kind: speech_pipeline::FlagDisputeKind::FlagWithoutPlayback,
+                    blocks: 300,
+                    at_sample: 151_512_000,
+                }),
+                PipelineItem::Listener(ListenerEvent::PlayingFlagDisputed {
+                    pod: pod(),
+                    epoch: 2,
+                    kind: speech_pipeline::FlagDisputeKind::PlaybackWithoutFlag,
+                    blocks: 20,
+                    at_sample: 160_000,
+                }),
+            ])
+            .await;
+        let disputes: Vec<_> = lines
+            .iter()
+            .filter(|l| l["event"] == "playing_flag_disputed")
+            .collect();
+        assert_eq!(disputes.len(), 2, "{lines:?}");
+        for (line, (epoch, kind, blocks, at_sample)) in disputes.iter().zip([
+            (1, "flag_without_playback", 300, 151_512_000u64),
+            (2, "playback_without_flag", 20, 160_000),
+        ]) {
+            assert_eq!(line["pod"], pod().0);
+            assert_eq!(line["epoch"], epoch);
+            assert_eq!(line["kind"], kind);
+            assert_eq!(line["blocks"], blocks);
+            assert_eq!(line["at_sample"], at_sample);
+        }
+    }
+
+    /// The wake line's `level` carries the room survey: an empty reading says
+    /// on the line why it is empty.
+    #[tokio::test]
+    async fn the_wake_line_carries_the_room_survey() {
+        let level = speech_pipeline::UtteranceLevel {
+            speech_dbfs: Some(-30.0),
+            ambient: None,
+            source: speech_pipeline::LevelSource::RawMic,
+            room: speech_pipeline::RoomSurvey {
+                held: 600,
+                playing: 600,
+                addressed: 0,
+                dead: 0,
+            },
+        };
+        let (lines, _) = Harness::new()
+            .run(vec![PipelineItem::Listener(ListenerEvent::WakeDetected {
+                pod: pod(),
+                epoch: 1,
+                score: 0.9,
+                wake_end_sample: 8_000,
+                doa: Vec::new(),
+                level: Some(level),
+            })])
+            .await;
+        let wake = lines
+            .iter()
+            .find(|l| l["event"] == "wake_detected")
+            .expect("a wake_detected line");
+        assert!(wake["level"]["ambient"].is_null(), "{wake}");
+        assert_eq!(
+            wake["level"]["room"],
+            json!({"held": 600, "playing": 600, "addressed": 0, "dead": 0})
+        );
     }
 
     /// The window's two accounting lines are lines and nothing else, so they are

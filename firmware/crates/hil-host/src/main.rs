@@ -445,6 +445,7 @@ fn run_suite(
             | TestName::I2sRightSlotSanity
             | TestName::LevelMeterMatchesRing
             | TestName::LevelBlocksFlagPlayback
+            | TestName::LevelBlocksFlagStreamReset
             | TestName::SpeakerOutput
             | TestName::I2cBusScan
             | TestName::PsramIdentity
@@ -955,12 +956,17 @@ fn run_suite(
             }
         };
         println!(
-            "  {name:?} observation: hello_version={:?} frames={} blocks={:?} other_frames={}",
+            "  {name:?} observation: hello_version={:?} frames={} blocks={:?} playing={:?} \
+             other_frames={}",
             obs.hello_version,
             obs.statuses.len(),
             obs.statuses
                 .iter()
                 .map(|f| f.blocks.len())
+                .collect::<Vec<_>>(),
+            obs.statuses
+                .iter()
+                .map(|f| f.blocks.iter().filter(|b| b.playing()).count())
                 .collect::<Vec<_>>(),
             obs.other_frames
         );
@@ -1716,7 +1722,7 @@ fn check4_typed_gate_for(test_name: &TestName) -> Option<Check4TypedGate> {
                  disagreement"
             ),
         )),
-        TestName::LevelBlocksFlagPlayback => Some((
+        TestName::LevelBlocksFlagPlayback | TestName::LevelBlocksFlagStreamReset => Some((
             eval_level_playback_flags_pass as fn(&TestData) -> bool,
             "must flag no block before the feed, every block inside it, and none from one \
              second after it"
@@ -2419,9 +2425,10 @@ fn eval_level_meter_pass(data: &TestData) -> bool {
     true
 }
 
-/// Host-side gate for `LevelBlocksFlagPlayback`: no block flagged in the second before
-/// the feed, every block wholly inside the feed flagged, none flagged in the second
-/// starting one second after it, and every window holding at least one block.
+/// Host-side gate for `LevelBlocksFlagPlayback` and `LevelBlocksFlagStreamReset`: no
+/// block flagged in the second before the feed, every block wholly inside the feed
+/// flagged, none flagged in the second starting one second after it, and every window
+/// holding at least one block.
 fn eval_level_playback_flags_pass(data: &TestData) -> bool {
     let TestData::LevelPlaybackFlags {
         before_blocks,
@@ -2736,12 +2743,14 @@ const fn test_meta(t: &TestName) -> TestMeta {
             timeout: Duration::from_secs(20),
         },
         // ── Generic phase (uniform loop) ───────────────────────────────────────
-        TestName::LevelBlocksFlagPlayback => TestMeta {
+        TestName::LevelBlocksFlagPlayback | TestName::LevelBlocksFlagStreamReset => TestMeta {
             phase: TestPhase::Generic,
             // Device worst case: an earlier test's full inbound ring draining (3 s) + the
-            // DAC settling (1.2 s) + the 2 s feed + its drain (3 s) + the after-window
-            // (2.5 s) = 11.7 s, past `RESPONSE_TIMEOUT`; plus serial-round-trip margin, so
-            // the host always sees the typed TestReport.
+            // flag settling (1.44 s) + capture warmup straight after a boot (4 s) + the 2 s
+            // feed + its drain (3 s) + the after-window (2.5 s) = 15.94 s, past
+            // `RESPONSE_TIMEOUT`; plus serial-round-trip margin, so the host always sees
+            // the typed TestReport. The stream-reset variant has no drain after its feed
+            // and fits the same budget.
             timeout: Duration::from_secs(20),
         },
         TestName::Ping
@@ -4478,7 +4487,15 @@ fn pod_status_serve(
 /// more than [`POD_STATUS_HISTORY_MIN_BLOCKS`] blocks; each run starts where the
 /// previous ended; `capture_head` advances at [`POD_STATUS_SAMPLE_RATE`] per second of
 /// `device_ts_us` within [`POD_STATUS_RATE_TOLERANCE`]; at least one block is unflagged,
-/// and every unflagged block reads inside [`POD_STATUS_LIVE_DBFS`].
+/// and every unflagged block reads inside [`POD_STATUS_LIVE_DBFS`]; and no block in any
+/// frame after the first carries the playing flag.
+///
+/// The first frame's history is not judged for the flag: earlier tests legitimately
+/// played into it. The later frames are the idle pod after the inbound ring emptied with
+/// no end-of-audio mark. That gate means something only when a feed went through the
+/// production sink since the last boot with no stream reset after it — in the suite, the
+/// two level-flag tests run before this one; with no feed since boot the flag was never
+/// set and a pass proves nothing about it.
 fn eval_pod_status_idle(data: &TestData, obs: &PodStatusObservation) -> Result<(), String> {
     let TestData::PodStatusIdle {
         status_skipped,
@@ -4540,6 +4557,18 @@ fn eval_pod_status_idle(data: &TestData, obs: &PodStatusObservation) -> Result<(
              {rate:.0} samples/s, want {POD_STATUS_SAMPLE_RATE} ± {:.0} %",
             POD_STATUS_RATE_TOLERANCE * 100.0
         ));
+    }
+    for frame in &frames[1..] {
+        if let Some(n) = frame.blocks.iter().position(|b| b.playing()) {
+            let flagged = frame.blocks.iter().filter(|b| b.playing()).count();
+            return Err(format!(
+                "block {} carries the playing flag in a frame after the history ({flagged} of \
+                 {} flagged in that frame): the inbound ring was empty before the connection, \
+                 so nothing was going to the speaker",
+                frame.first_block + n as u64,
+                frame.blocks.len()
+            ));
+        }
     }
     let (lo, hi) = POD_STATUS_LIVE_DBFS;
     let mut unflagged = 0usize;
@@ -7073,6 +7102,11 @@ mod tests {
                 );
             }
         }
+        // The stream-reset flag test reports the same data under the same gate.
+        let (pred, _) = check4_typed_gate_for(&TestName::LevelBlocksFlagStreamReset)
+            .expect("LevelBlocksFlagStreamReset must have a typed gate");
+        assert!(pred(&playback_flags_data([(9, 0), (38, 38), (9, 0)])));
+        assert!(!pred(&playback_flags_data([(9, 0), (38, 38), (9, 9)])));
     }
 
     #[test]
@@ -8295,16 +8329,20 @@ mod tests {
             eval_pod_status_idle(&POD_STATUS_DATA, &healthy_status_observation()),
             Ok(())
         );
-        // Playing-flagged blocks are not judged against the liveness band.
+        // Playing-flagged blocks in the history are judged neither against the liveness
+        // band nor for the flag.
         let mut obs = healthy_status_observation();
         obs.statuses[0].blocks[3] = block_at(-12.0, true);
+        for b in &mut obs.statuses[0].blocks[20..] {
+            *b = block_at(-70.0, true);
+        }
         assert_eq!(eval_pod_status_idle(&POD_STATUS_DATA, &obs), Ok(()));
     }
 
     #[test]
     fn pod_status_idle_gate_rejects_each_failure_on_its_own() {
         type Breaker = fn(&mut PodStatusObservation);
-        let cases: [(&str, Breaker); 14] = [
+        let cases: [(&str, Breaker); 16] = [
             ("never connected", |o| o.connected = false),
             ("listener error", |o| o.error = Some("read: reset".into())),
             ("old Hello", |o| o.hello_version = Some(3)),
@@ -8324,6 +8362,12 @@ mod tests {
             }),
             ("stack reading past the thread's stack", |o| {
                 o.statuses[3].stack_free_min = Some(16_384)
+            }),
+            ("flagged after the history", |o| {
+                o.statuses[1].blocks[0] = block_at(-70.0, true)
+            }),
+            ("flagged in the last frame", |o| {
+                o.statuses[3].blocks[9] = block_at(-70.0, true)
             }),
         ];
         for (what, break_it) in cases {
@@ -8835,15 +8879,20 @@ mod tests {
         );
     }
 
-    /// LevelBlocksFlagPlayback waits out a full inbound ring, a 2 s feed and its drain, and a
-    /// one-second after-window: 20 s covers its 11.7 s device worst case.
+    /// The level-flag tests wait out a full inbound ring, capture warmup, a 2 s feed and its
+    /// drain, and a one-second after-window: 20 s covers their 15.7 s device worst case.
     #[test]
     fn test_timeout_level_blocks_flag_playback_is_20s() {
-        assert_eq!(
-            test_timeout(&TestName::LevelBlocksFlagPlayback),
-            Duration::from_secs(20),
-            "LevelBlocksFlagPlayback must use a 20 s timeout (11.7 s device worst case + margin)"
-        );
+        for t in [
+            TestName::LevelBlocksFlagPlayback,
+            TestName::LevelBlocksFlagStreamReset,
+        ] {
+            assert_eq!(
+                test_timeout(&t),
+                Duration::from_secs(20),
+                "{t:?} must use a 20 s timeout (15.7 s device worst case + margin)"
+            );
+        }
     }
 
     /// The remaining non-default Network timeouts are pinned to their exact values.
@@ -8874,7 +8923,7 @@ mod tests {
         }
     }
 
-    /// The Generic-phase tests other than LevelBlocksFlagPlayback, and the two
+    /// The Generic-phase tests other than the two level-flag tests, and the two
     /// credential-less Network tests, answer within the default timeout. Iterating
     /// `REGISTERED_TESTS` means a future Generic variant must either fit the default or
     /// be added here with its budget.
@@ -8882,7 +8931,12 @@ mod tests {
     fn default_timeout_tests_are_pinned() {
         use device_protocol::REGISTERED_TESTS;
         for t in REGISTERED_TESTS {
-            if test_meta(t).phase == TestPhase::Generic && *t != TestName::LevelBlocksFlagPlayback {
+            if test_meta(t).phase == TestPhase::Generic
+                && !matches!(
+                    t,
+                    TestName::LevelBlocksFlagPlayback | TestName::LevelBlocksFlagStreamReset
+                )
+            {
                 assert_eq!(
                     test_meta(t).timeout,
                     RESPONSE_TIMEOUT,

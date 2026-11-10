@@ -301,8 +301,9 @@ pub const LEVEL_HISTORY_BLOCKS: usize = 300;
 /// Device µs between status frames.
 pub const STATUS_PERIOD_US: u64 = 1_000_000;
 
-/// [`LevelBlock::flags`] bit: the device's speaker output was active during some
-/// sample of the block.
+/// [`LevelBlock::flags`] bit: audio was handed to the device's speaker output during
+/// the block, or within the device's hold before it. What a receiver may conclude is on
+/// [`LevelBlock::playing`].
 pub const LEVEL_FLAG_PLAYING: u8 = 1 << 0;
 
 /// Body of [`StreamFrame::Status`]: the device's position, its room level history and
@@ -356,7 +357,7 @@ pub struct LevelBlock {
     /// Mean-square level of the block as −2·dBFS rounded, clamped to 0..=200
     /// (0 dBFS … −100 dBFS in 0.5 dB steps).
     pub half_db: u8,
-    /// [`LEVEL_FLAG_PLAYING`] and future bits.
+    /// [`LEVEL_FLAG_PLAYING`] and future bits; see [`LevelBlock::playing`].
     pub flags: u8,
 }
 
@@ -366,7 +367,25 @@ impl LevelBlock {
         -(self.half_db as f32) / 2.0
     }
 
-    /// Whether the speaker output was active during some sample of the block.
+    /// Whether the block carries [`LEVEL_FLAG_PLAYING`]: audio was handed to the device's
+    /// speaker output during the block, or within the device's hold before it. The hold
+    /// is each device's own, a fixed time of at most 200 ms after the last hand-over: 200 ms
+    /// on the ESP pod, none on Reachy. With nothing handed to the output the flag clears
+    /// within the hold, however the stream ended and whether or not it ended at all.
+    ///
+    /// What a receiver may conclude:
+    ///
+    /// - A flagged block may contain the device's own output.
+    /// - An unflagged block had no audio handed to the speaker output during it. It may
+    ///   still contain the end of what was handed over before it, for the output's
+    ///   buffering depth: the flag marks the hand-over, not the sound.
+    /// - On a device with no hold the flag may clear up to one capture period before the
+    ///   last hand-over ended, and further, up to that device's capture buffering, when
+    ///   its capture is running late; there the first unflagged blocks may also overlap
+    ///   the hand-over's end.
+    /// - A receiver that needs blocks free of the device's output applies its own tail
+    ///   after the last flagged block; that tail is what covers both of the above.
+    /// - Neither state says anything about the DAC or the amplifier.
     pub fn playing(self) -> bool {
         self.flags & LEVEL_FLAG_PLAYING != 0
     }

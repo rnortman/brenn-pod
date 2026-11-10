@@ -83,6 +83,7 @@ pub const REGISTERED_TESTS: &[TestName] = &[
     TestName::I2sRightSlotSanity,
     TestName::LevelMeterMatchesRing,
     TestName::LevelBlocksFlagPlayback,
+    TestName::LevelBlocksFlagStreamReset,
     TestName::PodStatusIdle,
 ];
 
@@ -831,8 +832,9 @@ pub enum TestName {
     LevelMeterMatchesRing,
     /// Level-block playing-flag identity self-test (discriminant 32).
     ///
-    /// Feeds the saturating playback chunk through the production inbound ring for 2 s,
-    /// marks end-of-audio, and waits for the ring to drain: the feed window runs from the
+    /// Feeds the saturating playback chunk through the production inbound ring for 2 s
+    /// and waits for the ring to drain, with no end-of-audio mark anywhere: the stream
+    /// ends the way one does when its end is never marked. The feed window runs from the
     /// first chunk accepted to the ring observed empty. Then reports, for the finished
     /// level blocks wholly inside three windows — the second before the feed, the feed,
     /// and a second starting one second after it — how many there were and how many
@@ -850,13 +852,32 @@ pub enum TestName {
     /// version; at least three `Status` frames; the first carries more than ten level
     /// blocks (the history); successive runs are contiguous; `capture_head` advances at
     /// 16 000 samples per second of `device_ts_us` within 2 %; and every block without
-    /// the playing flag reads between −90 and −30 dBFS. That last bound is liveness in a
+    /// the playing flag reads between −90 and −30 dBFS. That bound is liveness in a
     /// room that is not quiet, not a loudness identity; a reading outside it is shown to
-    /// a human before anything moves.
+    /// a human before anything moves. The device waits for the inbound ring to be empty
+    /// before it connects, issuing no end-of-audio mark, and the host requires that no
+    /// block in any frame after the first carries the playing flag; the first frame's
+    /// history is not judged for the flag, and its flagged count is reported. That gate
+    /// means something only after a feed through the production sink since the last boot
+    /// with no stream reset after it, as the two level-flag tests make before it in the
+    /// suite.
     ///
     /// Returns `TestData::PodStatusIdle`. Requires prior `WifiAssociate`,
     /// `SetTemporaryPeerConfig` and an effective audio PSK.
     PodStatusIdle,
+    /// Level-block playing-flag identity self-test across a stream reset (discriminant 34).
+    ///
+    /// Feeds the saturating playback chunk through the production inbound ring for 2 s,
+    /// then, with audio still banked, resets the stream through the production sink — the
+    /// call a successful reconnect makes — so the bank is discarded and nothing follows.
+    /// No end-of-audio mark is issued. The feed window runs from the first chunk accepted
+    /// to the reset; the after window is the second starting one second after the reset.
+    /// Reports the same three windows and gate as
+    /// [`TestName::LevelBlocksFlagPlayback`]; fails on the device if the ring was already
+    /// empty at the reset.
+    ///
+    /// Returns `TestData::LevelPlaybackFlags`.
+    LevelBlocksFlagStreamReset,
 }
 
 // ── Response ──────────────────────────────────────────────────────────────────
@@ -1725,7 +1746,8 @@ mod tests {
     ///   FullDuplexRxIntegrity=22, StreamRealtimeDuplex=23, PsramIdentity=24,
     ///   WifiPowerSaveCheck=25, TlsInboundBackpressure=26, TlsPskHandshake=27,
     ///   TlsPskWrongKeyRejected=28, Xvf3800OutputRouting=29, I2sRightSlotSanity=30,
-    ///   LevelMeterMatchesRing=31, LevelBlocksFlagPlayback=32, PodStatusIdle=33
+    ///   LevelMeterMatchesRing=31, LevelBlocksFlagPlayback=32, PodStatusIdle=33,
+    ///   LevelBlocksFlagStreamReset=34
     ///
     /// Ping encodes to all-0x01 COBS bytes (before the 0x00 delimiter) because all three
     /// postcard bytes are 0x00 (id=0, cmd=0, testname=0), and COBS replaces each zero with
@@ -1815,6 +1837,10 @@ mod tests {
                 &[0x01, 0x01, 0x02, 0x20, 0x00],
             ),
             (TestName::PodStatusIdle, &[0x01, 0x01, 0x02, 0x21, 0x00]),
+            (
+                TestName::LevelBlocksFlagStreamReset,
+                &[0x01, 0x01, 0x02, 0x22, 0x00],
+            ),
         ];
         for (variant, expected) in cases {
             let req = Request {
@@ -2821,6 +2847,7 @@ mod tests {
             LevelMeterMatchesRing,
             LevelBlocksFlagPlayback,
             PodStatusIdle,
+            LevelBlocksFlagStreamReset,
         );
 
         // Step 2: every variant must be in REGISTERED_TESTS.
@@ -2864,7 +2891,7 @@ mod tests {
     ///
     /// This test uses `test_name_discriminant` from `device-protocol` (derived via
     /// `postcard::to_slice`, not a hand table), so it also exercises the derived helper.
-    /// Covers the whole registry through `PodStatusIdle` (33).
+    /// Covers the whole registry through `LevelBlocksFlagStreamReset` (34).
     #[test]
     fn discriminant_values_are_stable() {
         use super::test_name_discriminant;
@@ -2903,6 +2930,7 @@ mod tests {
             (TestName::LevelMeterMatchesRing, 31),
             (TestName::LevelBlocksFlagPlayback, 32),
             (TestName::PodStatusIdle, 33),
+            (TestName::LevelBlocksFlagStreamReset, 34),
         ];
         for (variant, expected) in pins {
             assert_eq!(

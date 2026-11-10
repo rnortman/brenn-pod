@@ -730,7 +730,7 @@ impl ListenerState {
             oww_stats: ScoreStats::default(),
             doa: VecDeque::with_capacity(DOA_RING_CAPACITY),
             levels: VecDeque::with_capacity(LEVEL_RING_CAPACITY),
-            room: RoomHistory::default(),
+            room: RoomHistory::new(config.mute_tail_samples),
             level_source: LevelSource::Beam,
             #[cfg(test)]
             fail_next_scoring: None,
@@ -797,8 +797,17 @@ impl ListenerState {
                 let mut events = Vec::new();
                 self.clock.anchor_status(capture_head, host_rx);
                 self.segment_reach = u64::from(segment_reach);
+                self.note_position(host_rx);
                 self.date_undated(pod, host_rx, &mut events);
-                self.room.ingest(first_block, &levels);
+                for dispute in self.room.ingest(first_block, &levels) {
+                    events.push(ListenerEvent::PlayingFlagDisputed {
+                        pod: pod.clone(),
+                        epoch: self.epoch,
+                        kind: dispute.kind,
+                        blocks: dispute.blocks,
+                        at_sample: dispute.at_sample,
+                    });
+                }
                 // A wake grant or a window nobody speaks into ends here, in a room
                 // silent enough that no audio arrives to carry the per-chunk checks
                 // past its deadline: once the pod has said it will open no later
@@ -859,6 +868,7 @@ impl ListenerState {
                 self.clock
                     .anchor_audio(first_sample_index + pcm.len() as u64, host_rx);
                 let mut events = Vec::new();
+                self.note_position(host_rx);
                 self.date_undated(pod, host_rx, &mut events);
                 // Recorded before the frame is scored, so a detection this frame
                 // completes measures a window that includes it.
@@ -1021,10 +1031,25 @@ impl ListenerState {
         });
     }
 
+    /// Give the room history this connection's position once the clock has an
+    /// anchor. At the first, a playback floor already up opens its span there:
+    /// this host has been playing to the pod since before it knew where the
+    /// pod's capture was.
+    fn note_position(&mut self, at: HostMicros) {
+        let Some(now) = self.now_sample(at) else {
+            return;
+        };
+        if self.room.note_position(now) && self.playback.active {
+            self.room.playback_started(now);
+        }
+    }
+
     /// Date what waited for this connection's position, now that the clock has an
     /// anchor: the mute tail runs from here, and the window opens here with its
     /// line. Both are late by the time the position took to arrive, which is the
-    /// side that loses no follow-up and scores no echo.
+    /// side that loses no follow-up and scores no echo. A floor that went up and
+    /// down before the position leaves a zero-length played span here, so the
+    /// room reading's tail runs from the same place.
     fn date_undated(&mut self, pod: &PodId, at: HostMicros, events: &mut Vec<ListenerEvent>) {
         if self.undated == Undated::default() {
             return;
@@ -1035,6 +1060,7 @@ impl ListenerState {
         let undated = std::mem::take(&mut self.undated);
         if undated.tail {
             self.tail_until_sample = now.saturating_add(self.config.mute_tail_samples);
+            self.room.played_before(now);
         }
         if let Some(window_samples) = undated.listen {
             self.open_listen(pod, now, window_samples, events);
@@ -1668,18 +1694,28 @@ impl ListenerState {
         }
         // The floor going down is the pacer's estimate that the audio is heard out,
         // so the microphone is trusted again only past the tail: under the mute,
-        // for scoring. The room reading has its own tail, on the pod's playing
-        // flag. The tail is the pod's next `mute_tail_samples` of capture, not a
-        // stretch the last segment already passed.
+        // for scoring. The tail is the pod's next `mute_tail_samples` of capture,
+        // not a stretch the last segment already passed. The room reading keeps
+        // the floor's span as one of its two records of the pod playing, with the
+        // same tail after it; the other is the pod's own flag.
         if self.playback.active && !active {
             match self.now_sample(at) {
                 Some(now) => {
                     self.tail_until_sample = now.saturating_add(self.config.mute_tail_samples);
+                    self.room.playback_ended(now);
                 }
-                // No position on this connection yet: the tail runs from the one it
-                // gets (`date_undated`).
+                // No position on this connection yet: the tail and the span run
+                // from the one it gets (`date_undated`).
                 None => self.undated.tail = true,
             }
+        }
+        // A floor coming up opens its span now; with no position yet, at the
+        // position when it comes (`note_position`).
+        if !self.playback.active
+            && active
+            && let Some(now) = self.now_sample(at)
+        {
+            self.room.playback_started(now);
         }
         self.playback = PlaybackFloor {
             active,
@@ -1784,7 +1820,8 @@ impl ListenerState {
 
     /// How loudly speech in `[speech_lo, speech_hi)` was spoken, and how loud the
     /// room was before speech that began at `room_lo` (at or before `speech_lo`),
-    /// measured at host time `at`. `None` when neither half was measured.
+    /// measured at host time `at`, with the survey of the room's blocks that says
+    /// what the room reading rests on, or why there is none.
     ///
     /// `speech_dbfs` is the 80th percentile of the frame ring's levels with first
     /// sample in the window; `None` when no frame lies there, or when every frame
@@ -1798,7 +1835,7 @@ impl ListenerState {
         speech_hi: u64,
         room_lo: u64,
         at: HostMicros,
-    ) -> Option<UtteranceLevel> {
+    ) -> UtteranceLevel {
         let mut speech: Vec<f32> = self
             .levels
             .iter()
@@ -1810,17 +1847,18 @@ impl ListenerState {
         } else {
             percentile(&mut speech, WAKE_SPEECH_PERCENTILE)
         };
-        let ambient = self.room.read(room_lo.min(speech_lo), at);
-        (speech_dbfs.is_some() || ambient.is_some()).then_some(UtteranceLevel {
+        let (ambient, room) = self.room.read(room_lo.min(speech_lo), at);
+        UtteranceLevel {
             speech_dbfs,
             ambient,
             source: self.level_source,
-        })
+            room,
+        }
     }
 
     /// The level of a phrase ending at `wake_end`: its last second, and the room
     /// before the earlier of that second and the speech the endpointer is in.
-    fn wake_level(&mut self, wake_end: u64, at: HostMicros) -> Option<UtteranceLevel> {
+    fn wake_level(&mut self, wake_end: u64, at: HostMicros) -> UtteranceLevel {
         let lo = wake_end.saturating_sub(WAKE_SPEECH_WINDOW_SAMPLES);
         let room_lo = self.endpointer.speech_start().map_or(lo, |s| s.min(lo));
         self.level_of(lo, wake_end, room_lo, at)
@@ -1864,7 +1902,7 @@ impl ListenerState {
         // no command answered in between. A grant waiting on that arm, standing
         // or spent, goes with it: the repeated wake word starts the turn over.
         self.expire_unconsumed_arm(pod, wake_end_sample, ArmExpiryCause::FreshWake, events);
-        let level = self.wake_level(wake_end_sample, host_rx);
+        let level = Some(self.wake_level(wake_end_sample, host_rx));
         let arm = WakeArm {
             score,
             wake_end_sample,
@@ -2296,7 +2334,7 @@ impl ListenerState {
                         let onset = start
                             .saturating_add(self.config.endpointer.preroll_pad_samples)
                             .min(end);
-                        self.level_of(onset, end, start, host_rx)
+                        Some(self.level_of(onset, end, start, host_rx))
                     }
                 };
                 self.utterance_seq += 1;
@@ -2822,6 +2860,8 @@ impl ListenerStats {
                 | ListenerEvent::WakeRestored { .. }
                 | ListenerEvent::ListenHeard { .. }
                 | ListenerEvent::ListenExpired { .. } => {}
+                // The line is the record; nothing in the listener acts on it.
+                ListenerEvent::PlayingFlagDisputed { .. } => {}
             }
         }
     }
@@ -3087,7 +3127,7 @@ mod tests {
     use crate::test_support::{
         WAKE_PREROLL_SAMPLES, oww_models, primed_wake_pcm, silero_model, wake_phrase_pcm,
     };
-    use crate::types::AmbientReading;
+    use crate::types::{AmbientReading, RoomSurvey};
 
     fn pod() -> PodId {
         PodId("pod-x".into())
@@ -3191,9 +3231,7 @@ mod tests {
     #[test]
     fn wake_level_reads_speech_from_the_last_second_and_ambient_before_it() {
         let mut state = state_with_room(40_000, 24_000, -60.0, -25.0);
-        let level = state
-            .wake_level(40_000, UNCLOCKED)
-            .expect("a live window measures");
+        let level = state.wake_level(40_000, UNCLOCKED);
         assert_eq!(level.speech_dbfs, Some(-25.0));
         // Blocks 0..12 end by 24 000 − 4 800.
         assert_eq!(level.ambient, room_reading(-60.0, 12, 300));
@@ -3219,7 +3257,7 @@ mod tests {
         status_blocks(&mut state, 0, 9, -55.0, false);
         status_blocks(&mut state, 9, 1, -30.0, false);
         status_blocks(&mut state, 10, 10, -20.0, false);
-        let level = state.wake_level(32_000, UNCLOCKED).expect("live");
+        let level = state.wake_level(32_000, UNCLOCKED);
         assert_eq!(level.speech_dbfs, Some(-20.0));
         assert_eq!(level.ambient, room_reading(-55.0, 7, 300));
         assert_eq!(
@@ -3233,31 +3271,41 @@ mod tests {
     #[test]
     fn wake_level_has_no_ambient_before_any_block() {
         let mut state = state_with_levels(40_000, 24_000, -60.0, -25.0);
-        let level = state
-            .wake_level(40_000, UNCLOCKED)
-            .expect("speech measures");
+        let level = state.wake_level(40_000, UNCLOCKED);
         assert_eq!(level.speech_dbfs, Some(-25.0));
         assert_eq!(level.ambient, None);
     }
 
     /// A dead speech window keeps the room reading; dead blocks are no room
-    /// reading; nothing measured at all is no level.
+    /// reading; nothing measured at all is still a level, whose survey says
+    /// what the room estimator had to go on.
     #[test]
     fn wake_level_keeps_each_half_without_the_other() {
         let mut dead_speech = state_with_levels(40_000, 0, -100.0, -100.0);
         status_blocks(&mut dead_speech, 0, 12, -60.0, false);
-        let level = dead_speech.wake_level(40_000, UNCLOCKED).expect("the room");
+        let level = dead_speech.wake_level(40_000, UNCLOCKED);
         assert_eq!(level.speech_dbfs, None);
         assert_eq!(level.ambient, room_reading(-60.0, 12, 300));
 
         let mut dead_room = state_with_room(40_000, 24_000, -100.0, -25.0);
-        let level = dead_room.wake_level(40_000, UNCLOCKED).unwrap();
+        let level = dead_room.wake_level(40_000, UNCLOCKED);
         assert_eq!((level.speech_dbfs, level.ambient), (Some(-25.0), None));
+        assert_eq!(
+            level.room,
+            RoomSurvey {
+                held: 12,
+                dead: 12,
+                ..RoomSurvey::default()
+            }
+        );
 
         let mut dead = state_with_levels(40_000, 0, -100.0, -100.0);
-        assert_eq!(dead.wake_level(40_000, UNCLOCKED), None);
+        let level = dead.wake_level(40_000, UNCLOCKED);
+        assert_eq!((level.speech_dbfs, level.ambient), (None, None));
         let mut empty = ListenerState::new(test_config(WakePolicy::WakeGated));
-        assert_eq!(empty.wake_level(40_000, UNCLOCKED), None);
+        let level = empty.wake_level(40_000, UNCLOCKED);
+        assert_eq!((level.speech_dbfs, level.ambient), (None, None));
+        assert_eq!(level.room, RoomSurvey::default(), "nothing held");
     }
 
     /// The room is read from before the speech the endpointer is in when that
@@ -3270,7 +3318,7 @@ mod tests {
         drive(&mut state, 0.9, 3, &mut cursor);
         let start = state.endpointer.speech_start().expect("speech running");
         assert!(start < 20_000, "{start}");
-        let level = state.wake_level(80_000, UNCLOCKED).unwrap();
+        let level = state.wake_level(80_000, UNCLOCKED);
         let ambient = level.ambient.expect("the room before the sentence");
         assert_eq!(ambient.dbfs, -60.0);
         assert!(u64::from(ambient.blocks) * 1_600 <= start, "{ambient:?}");
@@ -3307,6 +3355,10 @@ mod tests {
             speech_dbfs: Some(-25.0),
             ambient: room_reading(-60.0, 12, 300),
             source: LevelSource::RawMic,
+            room: RoomSurvey {
+                held: 12,
+                ..RoomSurvey::default()
+            },
         };
         let detected = events
             .iter()
@@ -3388,12 +3440,16 @@ mod tests {
                 speech_dbfs: Some(-20.0),
                 ambient: room_reading(-60.0, 5, ((start - 5 * 1_600) / 16) as u32),
                 source: LevelSource::RawMic,
+                room: RoomSurvey {
+                    held: 5,
+                    ..RoomSurvey::default()
+                },
             })
         );
     }
 
     /// A carve whose speech window holds only dead frames carries the room
-    /// alone, and nothing at all when no block has been heard.
+    /// alone, and neither half when no block has been heard.
     #[test]
     fn a_dead_speech_window_keeps_the_room() {
         for heard in [false, true] {
@@ -3407,13 +3463,12 @@ mod tests {
             events.extend(drive_heard(&mut state, 0.1, -100.0, 3, &mut cursor));
             let carved = soft_endpoints(&events);
             assert_eq!(carved.len(), 1, "{events:?}");
-            let level = carved[0].level;
+            let level = carved[0].level.expect("a carve is measured");
+            assert_eq!(level.speech_dbfs, None);
             if heard {
-                let level = level.expect("the room half");
-                assert_eq!(level.speech_dbfs, None);
                 assert_eq!(level.ambient.map(|a| a.dbfs), Some(-60.0));
             } else {
-                assert_eq!(level, None);
+                assert_eq!(level.ambient, None);
             }
         }
     }
@@ -3517,7 +3572,7 @@ mod tests {
         // Block 12 holds the reply's first samples.
         status_blocks(&mut state, 0, 12, -60.0, false);
         status_blocks(&mut state, 12, 26, -20.0, true);
-        let level = state.wake_level(60_000, UNCLOCKED).expect("measured");
+        let level = state.wake_level(60_000, UNCLOCKED);
         assert_eq!(level.speech_dbfs, Some(-25.0));
         assert_eq!(
             level.ambient,
@@ -3573,7 +3628,7 @@ mod tests {
         let mut oww = oww_models();
         let mut silero = silero_model();
         let mut state = state_with_room(40_000, 24_000, -60.0, -25.0);
-        let measured = state.wake_level(40_000, HostMicros(1_000_000)).unwrap();
+        let measured = state.wake_level(40_000, HostMicros(1_000_000));
         state
             .handle(
                 &pod(),
@@ -3588,11 +3643,303 @@ mod tests {
         for start in (0..40_000u64).step_by(320) {
             state.push_level(start, FrameLevel { dbfs: -25.0 });
         }
-        let level = state.wake_level(40_000, HostMicros(3_000_000)).unwrap();
+        let level = state.wake_level(40_000, HostMicros(3_000_000));
         let carried = level.ambient.expect("carried across the reconnect");
         assert!(carried.carried);
         assert_eq!(carried.dbfs, measured.ambient.unwrap().dbfs);
         assert_eq!(carried.age_ms, measured.ambient.unwrap().age_ms + 2_000);
+    }
+
+    /// Host time `ms` into a status-frame case.
+    fn host_ms(ms: u64) -> HostMicros {
+        HostMicros(1_700_000_000_000_000 + ms * 1_000)
+    }
+
+    /// A status frame received at `ms`, the pod's capture head at the same
+    /// position (16 samples a millisecond from 0), carrying blocks from
+    /// `first_block` to the head at -70 dBFS, or -30 where `loud`, flagged
+    /// where `flagged`.
+    fn status_at(
+        state: &mut ListenerState,
+        ms: u64,
+        first_block: u64,
+        loud: impl Fn(u64) -> bool,
+        flagged: impl Fn(u64) -> bool,
+    ) -> Vec<ListenerEvent> {
+        let head = ms * 16;
+        let levels = (first_block..head / 1_600)
+            .map(|i| level_block(if loud(i) { -30.0 } else { -70.0 }, flagged(i)))
+            .collect();
+        state
+            .handle(
+                &pod(),
+                Feed::PodStatus {
+                    host_rx: host_ms(ms),
+                    capture_head: head,
+                    segment_reach: 0,
+                    first_block,
+                    levels,
+                },
+                &mut oww_models(),
+                &mut silero_model(),
+            )
+            .expect("status feed")
+    }
+
+    /// This host's playback floor up or down at `ms`, as the surface reports it.
+    fn floor_at(state: &mut ListenerState, up: bool, ms: u64) {
+        state
+            .handle(
+                &pod(),
+                Feed::PlaybackState {
+                    active: up,
+                    interruptible: true,
+                    may_wake: false,
+                    turn: up.then_some(UtteranceId(77)),
+                    at: host_ms(ms),
+                },
+                &mut oww_models(),
+                &mut silero_model(),
+            )
+            .expect("playback feed");
+    }
+
+    fn connect(state: &mut ListenerState, epoch: u64) {
+        state
+            .handle(
+                &pod(),
+                Feed::Connected {
+                    epoch,
+                    level_source: LevelSource::RawMic,
+                },
+                &mut oww_models(),
+                &mut silero_model(),
+            )
+            .expect("connect");
+    }
+
+    /// Every `PlayingFlagDisputed` in `events`, as `(kind, blocks, at_sample)`.
+    fn disputes(events: &[ListenerEvent]) -> Vec<(super::super::event::FlagDisputeKind, u32, u64)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ListenerEvent::PlayingFlagDisputed {
+                    kind,
+                    blocks,
+                    at_sample,
+                    ..
+                } => Some((*kind, *blocks, *at_sample)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn never(_: u64) -> bool {
+        false
+    }
+
+    /// A reply whose floor rises and falls between two status frames is a
+    /// played span at the pod clock's positions, and the room read after it
+    /// leaves the span and its tail out though the pod flagged none of it.
+    #[test]
+    fn a_reply_between_status_frames_is_left_out_on_this_hosts_record() {
+        let mut state = level_state(test_config(WakePolicy::WakeGated));
+        connect(&mut state, 1);
+        assert_eq!(
+            disputes(&status_at(&mut state, 10_000, 0, never, never)),
+            []
+        );
+        // Floor up at sample 168 000 (block 105), down at 200 000 (block 125).
+        floor_at(&mut state, true, 10_500);
+        floor_at(&mut state, false, 12_500);
+        let reply = |i: u64| (105..125).contains(&i);
+        let events = status_at(&mut state, 13_000, 100, reply, never);
+        // The pod flagged none of a 2 s reply: on the record, once.
+        assert_eq!(
+            disputes(&events),
+            [(
+                super::super::event::FlagDisputeKind::PlaybackWithoutFlag,
+                10,
+                168_000
+            )]
+        );
+        assert_eq!(
+            disputes(&status_at(&mut state, 16_000, 130, never, never)),
+            []
+        );
+        let level = state.wake_level(256_000, host_ms(16_000));
+        let ambient = level.ambient.expect("the room");
+        assert_eq!((ambient.dbfs, ambient.carried), (-70.0, false));
+        // Blocks 105 through 129: the span and its 400 ms tail, through the
+        // block that begins on the tail's last sample.
+        assert_eq!(level.room.playing, 25, "{:?}", level.room);
+        // Held: every block ending by the phrase's second less the guard.
+        assert_eq!(level.room.held, 147);
+    }
+
+    /// A floor already up when the connection gets its first position opens
+    /// its span there; one that went up and down before it leaves a
+    /// zero-length span there, whose tail is the exclusion.
+    #[test]
+    fn a_floor_before_the_first_position_is_dated_at_it() {
+        let mut state = level_state(test_config(WakePolicy::WakeGated));
+        connect(&mut state, 1);
+        floor_at(&mut state, true, 1_000);
+        status_at(&mut state, 2_000, 0, never, never);
+        floor_at(&mut state, false, 3_000);
+        status_at(&mut state, 6_000, 20, never, never);
+        let level = state.wake_level(96_000, host_ms(6_000));
+        // Span [32 000, 48 000] and its tail to 54 400: blocks 20 through 34.
+        assert_eq!(level.room.playing, 15, "{:?}", level.room);
+
+        let mut state = level_state(test_config(WakePolicy::WakeGated));
+        connect(&mut state, 1);
+        floor_at(&mut state, true, 1_000);
+        floor_at(&mut state, false, 1_500);
+        status_at(&mut state, 2_000, 0, never, never);
+        assert_eq!(state.tail_until_sample, 32_000 + 6_400);
+        status_at(&mut state, 6_000, 20, never, never);
+        let level = state.wake_level(96_000, host_ms(6_000));
+        // The tail from 32 000 to 38 400: blocks 20 through 24.
+        assert_eq!(level.room.playing, 5, "{:?}", level.room);
+    }
+
+    /// A new connection forgets the old one's spans and first position: a
+    /// span left open does not exclude the new connection's blocks, and the
+    /// slack runs from the new first position.
+    #[test]
+    fn a_new_connection_clears_spans_and_the_first_position() {
+        let mut state = level_state(test_config(WakePolicy::WakeGated));
+        connect(&mut state, 1);
+        status_at(&mut state, 1_000, 0, never, never);
+        floor_at(&mut state, true, 1_100);
+        connect(&mut state, 2);
+        // The pod rebooted: its capture restarted.
+        status_at(&mut state, 4_000, 0, never, never);
+        let level = state.wake_level(64_000, host_ms(4_000));
+        assert_eq!(level.room.playing, 0, "{:?}", level.room);
+        assert!(level.ambient.is_some_and(|a| !a.carried));
+        // The new first position is 64 000; a flagged block more than 5 s past
+        // it is unexplained.
+        let events = status_at(&mut state, 10_000, 40, never, |i| i >= 90);
+        assert_eq!(
+            disputes(&events),
+            [(
+                super::super::event::FlagDisputeKind::FlagWithoutPlayback,
+                1,
+                91 * 1_600
+            )]
+        );
+    }
+
+    /// Flagged blocks with no playback on this host's record: none judged in
+    /// the first frame's history or within 5 s of the first position; past
+    /// that, one line at the first, none for the next minute of blocks, and one
+    /// more after it carrying their count. While the floor is up, and within
+    /// 5 s after it drops, none.
+    #[test]
+    fn flags_without_playback_are_reported_once_a_minute() {
+        use super::super::event::FlagDisputeKind::FlagWithoutPlayback;
+        let mut state = level_state(test_config(WakePolicy::WakeGated));
+        connect(&mut state, 1);
+        let all = |_: u64| true;
+        // The history: 300 blocks before the first position at 480 000.
+        assert_eq!(disputes(&status_at(&mut state, 30_000, 0, never, all)), []);
+        assert_eq!(
+            disputes(&status_at(&mut state, 35_000, 300, never, all)),
+            []
+        );
+        // Block 350 begins exactly 5 s past the position; 351 is past it.
+        let events = status_at(&mut state, 36_000, 350, never, all);
+        assert_eq!(disputes(&events), [(FlagWithoutPlayback, 1, 351 * 1_600)]);
+        // The next minute of blocks: counted, no line until block 951, a minute
+        // after the first line's block, which writes all 600 since it.
+        assert_eq!(
+            disputes(&status_at(&mut state, 95_000, 360, never, all)),
+            []
+        );
+        let events = status_at(&mut state, 96_000, 950, never, all);
+        assert_eq!(disputes(&events), [(FlagWithoutPlayback, 600, 951 * 1_600)]);
+
+        // While the floor is up nothing is judged. The eight counted after the
+        // last line, through block 959, are written a minute after it.
+        floor_at(&mut state, true, 96_000);
+        let events = status_at(&mut state, 200_000, 960, never, all);
+        assert_eq!(disputes(&events), [(FlagWithoutPlayback, 8, 959 * 1_600)]);
+        // Nothing within 5 s after the floor drops (block 2 050 begins on its
+        // last sample); past that, counted from block 2 051 and written on the
+        // minute's pacing from the last line, at block 2 151.
+        floor_at(&mut state, false, 200_000);
+        assert_eq!(
+            disputes(&status_at(&mut state, 205_000, 2_000, never, all)),
+            []
+        );
+        let events = status_at(&mut state, 245_000, 2_050, never, all);
+        assert_eq!(
+            disputes(&events),
+            [(FlagWithoutPlayback, 101, 2_151 * 1_600)]
+        );
+    }
+
+    /// A host restart or a Wi-Fi drop in the middle of a reply: the new
+    /// connection's pod is still flagging the last of it. No line, and the
+    /// flagged blocks and their tail stay out of the room.
+    #[test]
+    fn a_reconnect_in_the_middle_of_a_reply_writes_no_line() {
+        let mut state = level_state(test_config(WakePolicy::WakeGated));
+        connect(&mut state, 1);
+        status_at(&mut state, 10_000, 0, never, never);
+        floor_at(&mut state, true, 10_500);
+        connect(&mut state, 2);
+        // The first frame's history; the reply's blocks from 105 flagged.
+        let mut events = status_at(&mut state, 11_000, 80, never, |i| i >= 105);
+        // Flagged for the 300 ms after the first position (176 000), then not.
+        events.extend(status_at(&mut state, 12_000, 110, never, |i| i < 113));
+        events.extend(status_at(&mut state, 20_000, 120, never, never));
+        assert_eq!(disputes(&events), []);
+        let level = state.wake_level(320_000, host_ms(20_000));
+        // Blocks 105 through 112 flagged, 113 through 116 their tail.
+        assert_eq!(level.room.playing, 12, "{:?}", level.room);
+        assert!(level.ambient.is_some_and(|a| !a.carried && a.dbfs == -70.0));
+    }
+
+    /// A span of this host's playback with no flagged block in it is reported
+    /// once, by the first frame reaching past its end; one flagged block in it,
+    /// or a span shorter than 1.5 s, is not.
+    #[test]
+    fn playback_without_flags_is_reported_once_per_span() {
+        use super::super::event::FlagDisputeKind::PlaybackWithoutFlag;
+        let run = |span_ms: u64, flagged: &dyn Fn(u64) -> bool| {
+            let mut state = level_state(test_config(WakePolicy::WakeGated));
+            connect(&mut state, 1);
+            let mut events = status_at(&mut state, 10_000, 0, never, never);
+            floor_at(&mut state, true, 10_000);
+            let end = 10_000 + span_ms;
+            events.extend(status_at(&mut state, end, 100, never, flagged));
+            floor_at(&mut state, false, end);
+            let first = disputes(&events);
+            assert_eq!(first, [], "nothing judged before the span is past");
+            let past = disputes(&status_at(
+                &mut state,
+                end + 1_000,
+                end * 16 / 1_600,
+                never,
+                never,
+            ));
+            let later = disputes(&status_at(
+                &mut state,
+                end + 2_000,
+                (end + 1_000) * 16 / 1_600,
+                never,
+                never,
+            ));
+            assert_eq!(later, [], "judged once");
+            past
+        };
+        // 3 s from 160 000: blocks 110 through 129 lie past its first second.
+        assert_eq!(run(3_000, &never), [(PlaybackWithoutFlag, 20, 160_000)]);
+        assert_eq!(run(3_000, &|i| i == 115), []);
+        assert_eq!(run(1_000, &never), []);
     }
 
     /// A wake-gated carve carries its arm's level, not a fresh reading of its

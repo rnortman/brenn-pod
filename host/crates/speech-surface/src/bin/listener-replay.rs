@@ -287,6 +287,8 @@ fn replay_log(path: &Path, listener: &mut ReplayListener) -> Result<LogCounts, R
             | ListenerEvent::ListenRestored { .. }
             | ListenerEvent::ListenHeard { .. }
             | ListenerEvent::ListenExpired { .. } => {}
+            // A framelog carries no status frames, so no level block is judged.
+            ListenerEvent::PlayingFlagDisputed { .. } => {}
         }
     }
 

@@ -122,7 +122,7 @@ use speaker::{
     STREAM_EOA_MUTE_DELAY_MS, TX_WEDGE_WARN_US, build_inbound_stream_sink, is_tx_wedged,
     run_capture_periodic_line, run_full_duplex_rx_integrity, run_playback_drain_rate,
     run_playback_sequence, run_speaker_output, rx_deficit_frames, should_rearm_preroll,
-    speaker_stream_init, write_silence_frames,
+    speaker_playing, speaker_stream_init, write_silence_frames,
 };
 #[cfg(target_os = "espidf")]
 use streamer::{

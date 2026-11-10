@@ -47,8 +47,8 @@ use crate::{
     CAPTURE_I2S_BUF_BYTES, I2S_DMA_DESC_NUM, I2S_DMA_FRAME_NUM, INBOUND_PCM_CONSUMER,
     PLAYBACK_DAC_UNMUTE_SETTLE_FRAMES, PLAYBACK_PREROLL_MAX_WAIT_MS, PlaybackPhase,
     PlaybackRequest, STREAM_EOA_MUTE_DELAY_MS, TX_WEDGE_WARN_US, is_tx_wedged,
-    run_playback_sequence, rx_deficit_frames, should_rearm_preroll, speaker_stream_init,
-    write_silence_frames,
+    run_playback_sequence, rx_deficit_frames, should_rearm_preroll, speaker_playing,
+    speaker_stream_init, write_silence_frames,
 };
 #[cfg(target_os = "espidf")]
 use device_protocol::{TestData, test_report_fail, test_report_fail_fmt, test_report_ok};
@@ -332,15 +332,21 @@ impl TxStager {
     /// (latched, so a persistent stall of either signature cannot flood the RT capture thread).
     /// Backpressure still propagates to TCP via the ring regardless — this only surfaces a stuck
     /// DMA/codec or persistent write fault.
+    ///
+    /// Returns `true` exactly when the TX DMA accepted at least one byte of the staged inbound
+    /// audio on this call — audio handed to the speaker output, which is what the capture
+    /// ring's playing flag follows. `false` when nothing was staged and on every zero-move
+    /// outcome (a full DMA, a backpressure timeout, a driver fault): staged residue the DMA
+    /// refuses is audio that is not reaching the speaker.
     #[cfg(target_os = "espidf")]
     fn push(
         &mut self,
         driver: &mut I2sDriver<'static, I2sBiDir>,
         speaker_ready: bool,
         stats: &mut TxWriteStats,
-    ) {
+    ) -> bool {
         if self.cursor >= self.len {
-            return;
+            return false;
         }
         let write_start = std::time::Instant::now();
         let result = driver.write(
@@ -361,7 +367,7 @@ impl TxStager {
                 self.cursor += accepted;
                 self.wedge_since = None;
                 self.wedge_warned = false;
-                return;
+                return true;
             }
             Ok(_) => {
                 // Full DMA accepted nothing: fall through to the shared zero-move wedge check.
@@ -393,6 +399,7 @@ impl TxStager {
             );
             self.wedge_warned = true;
         }
+        false
     }
 }
 
@@ -584,6 +591,15 @@ pub(crate) fn spawn_capture_thread(
             let mut last_pcm_write: Option<std::time::Instant> = None;
             let mut mute_armed = false;
 
+            // ── The capture ring's playing flag ─────────────────────────────
+            // `last_tx_accept`: when the TX DMA last accepted inbound audio (a `push` that
+            // returned true), or when a tone test last returned. The flag committed with each
+            // capture pass is `speaker_playing` of its age: it follows audio handed to the
+            // speaker output and clears SPEAKER_PLAYING_HOLD_MS after the last hand-over,
+            // however the stream ended. It is independent of the DAC mute state above, and
+            // nothing clears it: not the mute, a generation change or a connection event.
+            let mut last_tx_accept: Option<std::time::Instant> = None;
+
             // ── Once-until-recovery fault-log guards ─────────────────────────
             // Persistent faults (stuck I2C, unresponsive codec) would otherwise log per
             // chunk (~1600 lines/s). Each flag logs the transition into failure once,
@@ -724,6 +740,8 @@ pub(crate) fn spawn_capture_thread(
                         tone_test_this_window = true;
                         let outcome =
                             run_playback_sequence(&mut driver, request.params, &mut tx_buf);
+                        // A tone has just gone to the same TX DMA.
+                        last_tx_accept = Some(std::time::Instant::now());
                         // Teardown left codec TX-disabled + DAC-muted. Flag re-init so
                         // the next streaming write restores the active state.
                         if speaker_ready {
@@ -779,8 +797,10 @@ pub(crate) fn spawn_capture_thread(
                     // the DAC even while pre-roll holds new ring data. `tail` was already
                     // advanced when this run was staged, so the residue is not re-derived from
                     // the ring; the buffer alone owns it.
-                    if stager.has_residue() {
-                        stager.push(&mut driver, speaker_ready, &mut tx_write_stats);
+                    if stager.has_residue()
+                        && stager.push(&mut driver, speaker_ready, &mut tx_write_stats)
+                    {
+                        last_tx_accept = Some(std::time::Instant::now());
                     }
                     let residue_pending = stager.has_residue();
 
@@ -1012,7 +1032,9 @@ pub(crate) fn spawn_capture_thread(
                         // the last committed run, and 200 ms comfortably exceeds the ≤120 ms DMA
                         // + ≤20 ms staged residue playout, so the banked tail plays before mute.
                         last_pcm_write = Some(std::time::Instant::now());
-                        stager.push(&mut driver, speaker_ready, &mut tx_write_stats);
+                        if stager.push(&mut driver, speaker_ready, &mut tx_write_stats) {
+                            last_tx_accept = Some(std::time::Instant::now());
+                        }
                         staged_this_run = true;
                     }
 
@@ -1239,6 +1261,7 @@ pub(crate) fn spawn_capture_thread(
                 let frames = frames.min(320); // cap to dma_buf capacity
 
                 let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+                let playing = speaker_playing(last_tx_accept.map(|t| t.elapsed()));
 
                 // Write both slots into the capture ring, unless a HIL test has
                 // quiesced capture and owns the ring. The flag is checked under the
@@ -1257,13 +1280,11 @@ pub(crate) fn spawn_capture_thread(
                         let ridx = RingIndex::new(RING_CAPACITY_SAMPLES);
 
                         // The right slot is the raw microphone, the level channel.
-                        // `dac_active` stays true through starvation and the mute
-                        // tail, the conservative side for the room meter.
                         for i in 0..frames {
                             let base = i * 8;
                             let frame = &dma_buf[base..base + 8];
                             let (left, right) = slot_pair(frame);
-                            ring.commit(&ridx, left, Some(right), dac_active);
+                            ring.commit(&ridx, left, Some(right), playing);
                         }
 
                         ring.anchor_sample = ring.write_head.saturating_sub(1);

@@ -1608,9 +1608,9 @@ fn rtd_send_blocking(
 #[cfg(target_os = "espidf")]
 const POD_STATUS_IDLE_RUN_MS: u64 = 3_500;
 
-/// How long `PodStatusIdle` waits for the playback path to fall idle before it
-/// connects: an earlier test may have left the DAC unmuted with a backlog and no
-/// end-of-audio mark, and every block would then carry the playing flag.
+/// How long `PodStatusIdle` waits for the inbound ring to empty before it connects: an
+/// earlier test may have left it full, and a full ring takes about two seconds to play
+/// out.
 #[cfg(target_os = "espidf")]
 const POD_STATUS_IDLE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -1624,14 +1624,20 @@ const POD_STATUS_IDLE_STACK_BYTES: usize = 16_384;
 
 /// Pod status frame presence-and-cadence self-test.
 ///
-/// Brings the playback path to rest (end-of-audio mark, inbound ring empty), then
-/// connects over TLS-PSK to the HIL-host status listener, sends the audio `Hello`, and
+/// Waits for the inbound ring to be empty, issuing no end-of-audio mark, then connects
+/// over TLS-PSK to the HIL-host status listener, sends the audio `Hello`, and
 /// drives `pod_streamer::run::idle_status_step` — the streamer loop's own idle status
 /// step — against the live `CAPTURE_RING` once per idle tick for
 /// `POD_STATUS_IDLE_RUN_MS`. Capture is not quiesced: the frames carry the room as the
 /// production streamer would send it. The host decodes the frames and owns every
 /// assertion; this handler reports how many frames the step skipped and how long it
 /// ran.
+///
+/// One of the host's gates is that no block after the first frame's history carries the
+/// playing flag. The state that gate needs: a feed through the production sink since the
+/// last boot, with no stream reset after it — in the suite this test runs after both
+/// level-flag tests. Without that state a pass proves nothing about the flag: with no
+/// feed since boot it was never set.
 ///
 /// The counters come from a `PodStats` of the test's own, with this pod's sources, so
 /// the self-test's frames are not counted as the pod's. Requires prior `WifiAssociate`,
@@ -1669,7 +1675,7 @@ fn run_pod_status_idle_inner() -> (Status, Payload) {
         Ok(v) => v,
         Err(fail) => return fail,
     };
-    if !crate::level_tests::bring_playback_to_rest(POD_STATUS_IDLE_SETTLE) {
+    if !crate::level_tests::await_inbound_empty(POD_STATUS_IDLE_SETTLE) {
         return test_report_fail_fmt(format_args!(
             "FAIL src=pod-status reason=playback-not-idle waited_ms={}",
             POD_STATUS_IDLE_SETTLE.as_millis()

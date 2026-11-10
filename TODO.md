@@ -1149,11 +1149,24 @@ second covers the wake phrase. So the record does not say whether the XVF3800's
 speech-energy output stays low for speech over noise it has adapted to, or the gate's
 threshold or release is the limit.
 
+Also seen, the other way round: the gate opening with nobody addressing the pod.
+pod-fbe2f8, 2026-11-10, no noise source, the room in use and not controlled. In the 2.6
+minutes between the pod connecting and the first wake line the gate opened 13 times. One
+opening was already in progress as the pod connected and one carried the wake line; the
+host scored the other 12 segments and discarded them. The raw-mic room median on the
+`pod_status` lines over that time was about −79 dBFS (−72.5 to −81.5 on 27 of 31 lines,
+−59 to −62 on four). `gauges.gate_energy` on the lines with the gate open read from
+2 × 10³ to 1.8 × 10⁷. Not known: what sound opened each, and whether any was speech not
+meant for the pod. Each opening is a segment streamed over Wi-Fi and scored by the host.
+
 Needs a design: what the gate's input does under steady noise, and what should open a
 segment then. Done = the gate's input is sampled across a line spoken over steady
 noise, the mechanism is identified from it, and a wake line at −17 dBFS over −20 dBFS
 pink noise that has played for 15 s opens a segment, with a HIL or bench check that
-states how often. See `TODO(gate-misses-speech-over-steady-noise)` where the gate's
+states how often. The same design accounts for openings with nobody addressing the pod:
+they are the same gate on the same input, so it also samples the gate's input in a quiet
+room in ordinary use, and states the rate of such openings it accepts and the rate its
+check measured. See `TODO(gate-misses-speech-over-steady-noise)` where the gate's
 input is taken from the speech-energy reading, in `TelemetryCore::poll_tick`
 (`firmware/crates/pod-streamer/src/telemetry.rs`).
 

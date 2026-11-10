@@ -374,9 +374,10 @@ impl Router {
     /// count as audible clipping caused by positive gain. `level` is the answered
     /// utterance's measured level, whose `ambient` the automatic term read —
     /// partial or carried readings included, as they are — present for every
-    /// reply to a measured utterance (null for an announcement, an offline clip,
-    /// or an utterance nothing was measured for — `auto` is then `no_level`
-    /// unless automatic gain is off or overridden).
+    /// reply to a live utterance (null for an announcement or an offline clip —
+    /// `auto` is then `no_level` unless automatic gain is off or overridden).
+    /// `auto` is also `no_level` when an admitted `level` has `ambient` null;
+    /// `level.room` then says why.
     fn apply_gain(
         &self,
         pod: &PodId,
@@ -1245,6 +1246,12 @@ mod tests {
                 carried: false,
             }),
             source: LevelSource::RawMic,
+            room: speech_pipeline::RoomSurvey {
+                held: 300,
+                playing: 120,
+                addressed: 4,
+                dead: 0,
+            },
         };
         let mut measured = pcm_cmd("p", 1, &[100, -100]);
         measured.level = Some(level);
@@ -1276,6 +1283,7 @@ mod tests {
                 "speech_dbfs": -36.0,
                 "ambient": {"dbfs": -58.0, "blocks": 40, "age_ms": 2_000, "carried": false},
                 "source": "raw_mic",
+                "room": {"held": 300, "playing": 120, "addressed": 4, "dead": 0},
             })
         );
         assert_eq!(lines[1]["auto"], "overridden");

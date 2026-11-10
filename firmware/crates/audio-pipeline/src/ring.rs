@@ -84,7 +84,8 @@ impl<B: core::ops::DerefMut<Target = [i16]>> CaptureRing<B> {
     ///
     /// `sample` goes to `samples` and `aux`, when given and the ring has a second
     /// channel, to `aux`. The level sample is `aux` when given, else `sample`;
-    /// `playing` is whether the speaker output is active as the frame is captured.
+    /// `playing` is the pod's playing flag as the frame is captured: audio was handed to
+    /// the speaker output within the pod's hold (see [`crate::wire::LevelBlock::playing`]).
     /// The anchor is the caller's to refresh, once per chunk.
     pub fn commit(&mut self, ridx: &RingIndex, sample: i16, aux: Option<i16>, playing: bool) {
         let slot = ridx.slot(self.write_head);

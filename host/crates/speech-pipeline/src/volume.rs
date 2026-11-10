@@ -567,7 +567,7 @@ pub fn resolve_shared(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AmbientReading;
+    use crate::types::{AmbientReading, RoomSurvey};
 
     fn pod(id: &str) -> PodId {
         PodId(id.to_string())
@@ -607,6 +607,7 @@ mod tests {
                 carried: false,
             }),
             source,
+            room: RoomSurvey::default(),
         }
     }
 
@@ -838,6 +839,7 @@ mod tests {
             speech_dbfs: Some(-20.0),
             ambient: None,
             source: LevelSource::RawMic,
+            room: RoomSurvey::default(),
         };
         let r = b.resolve(&pod("p"), None, Some(&speech_only));
         assert_eq!((r.auto_db, r.auto), (0.0, AutoStatus::NoLevel));

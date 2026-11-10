@@ -444,6 +444,38 @@ pub(crate) fn should_rearm_preroll(
     saw_nonempty && dac_active && !preroll_pending
 }
 
+/// How long the capture ring's playing flag holds after the TX DMA last accepted inbound
+/// audio, in milliseconds.
+///
+/// The flag on a level block means audio was handed to the speaker output during the
+/// block or within this hold before it; it says nothing about the DAC's mute state. What
+/// was handed over still plays for the DMA ring's depth after it (at most 120 ms, plus a
+/// capture pass), so the hold is at least that depth plus 20 ms — enforced against the
+/// DMA geometry below — and matches the playout the end-of-audio mute delay allows. A
+/// receiver that needs blocks free of the pod's output applies its own tail after the
+/// last flagged block.
+pub(crate) const SPEAKER_PLAYING_HOLD_MS: u64 = 200;
+
+/// The playing-flag hold outlasts what the TX DMA ring can hold, with 20 ms to spare: a
+/// change to the descriptor geometry that outgrows the hold fails the build.
+#[cfg(target_os = "espidf")]
+const _: () = assert!(
+    SPEAKER_PLAYING_HOLD_MS
+        >= (I2S_DMA_DESC_NUM as u64 * I2S_DMA_FRAME_NUM as u64 * 1000) / I2S_SAMPLE_RATE_HZ as u64
+            + 20
+);
+
+/// Is the speaker output playing, for the capture ring's playing flag?
+///
+/// `since_accept` is the time since the TX DMA last accepted inbound audio (or a tone
+/// test last returned), `None` when that has never happened. True while that age is under
+/// [`SPEAKER_PLAYING_HOLD_MS`]. A pure function of the age, so the flag cannot outlive
+/// the audio: with nothing handed to the output it clears within the hold, however the
+/// stream ended and whether or not it ended at all.
+pub(crate) fn speaker_playing(since_accept: Option<std::time::Duration>) -> bool {
+    since_accept.is_some_and(|age| age.as_millis() < u128::from(SPEAKER_PLAYING_HOLD_MS))
+}
+
 /// Process-lifetime producer half of the inbound-PCM streaming ring.
 ///
 /// Populated in `main()` before the capture thread is spawned, mirroring
@@ -1186,9 +1218,27 @@ mod tests {
     // ── I2S-wedge threshold ───────────────────────────────────────────────
 
     use super::{
-        CAPTURE_PERIODIC_LINE_CHUNK_BYTES, TX_WEDGE_WARN_US, is_tx_wedged, rx_deficit_frames,
-        should_rearm_preroll,
+        CAPTURE_PERIODIC_LINE_CHUNK_BYTES, SPEAKER_PLAYING_HOLD_MS, TX_WEDGE_WARN_US, is_tx_wedged,
+        rx_deficit_frames, should_rearm_preroll, speaker_playing,
     };
+    use std::time::Duration;
+
+    // ── Playing flag ──────────────────────────────────────────────────────
+
+    #[test]
+    fn speaker_playing_is_false_before_any_acceptance() {
+        assert!(!speaker_playing(None));
+    }
+
+    /// Inside the hold the flag is up; from the hold on it is down, however long after.
+    #[test]
+    fn speaker_playing_holds_for_200ms_after_the_last_acceptance() {
+        assert_eq!(SPEAKER_PLAYING_HOLD_MS, 200);
+        assert!(speaker_playing(Some(Duration::ZERO)));
+        assert!(speaker_playing(Some(Duration::from_millis(199))));
+        assert!(!speaker_playing(Some(Duration::from_millis(200))));
+        assert!(!speaker_playing(Some(Duration::from_secs(3_600))));
+    }
 
     /// Below/at threshold is not a wedge (strict `>`), even with data pending and speaker up.
     #[test]

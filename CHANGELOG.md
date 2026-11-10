@@ -362,6 +362,26 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   into ends one to two seconds after its deadline, on the pod's clock, with
   `listen_expired`. A window asked for before a new connection has reported
   its position opens when it does. `listen_opened` gains `at_sample`.
+- **Automatic volume now reads the room on the ESP pod.** The "playing" mark
+  on the pod's room-level blocks followed the DAC's mute state, which is only
+  released by an end-of-audio mark. A stream that ended without one left
+  every block marked from then on, so automatic volume had no room reading
+  and every reply logged `auto: "no_level"`. The mark now follows audio
+  reaching the speaker and clears 200 ms after it stops. The voice host also
+  sets aside its own playback from the room by its own record, writes a
+  `playing_flag_disputed` line (shown loud on the console) when the pod's
+  mark and that record disagree, and every `level` object — on
+  `wake_detected`, `reply_gain`, the utterance line and what the brain
+  receives — now carries `room`: how many readings were on hand and how many
+  were set aside because the pod was speaking, someone was addressing it, or
+  the microphone was dead. A new hardware self-test,
+  `LevelBlocksFlagStreamReset`, guards the mark across a reconnect with audio
+  still queued. Flash the pod with the host update. Now that the room is
+  actually read, a `[volume.auto] ambient_ref_dbfs` set well above the room's
+  typical level turns replies down, as far as the swing floor or the
+  `[volume] min_db` floor, whichever is reached first: set it to a typical
+  room level, as the migration note under **Changed** describes, before
+  judging this fix by ear.
 - **After the wake word, the robot no longer holds its head up while ignoring
   what you say.** Sometimes the head stayed in its listening pose for a long
   time after a wake while every repeat of the command was dropped — when the

@@ -418,6 +418,24 @@ mod tests {
         assert!(!run.blocks[1].playing(), "the flag does not leak forward");
     }
 
+    /// The meter keeps no state about playing beyond the block: a stretch committed
+    /// playing, then any length committed not playing, leaves every whole block after the
+    /// change unflagged.
+    #[test]
+    fn nothing_latches_the_flag_past_the_block_it_ends_in() {
+        let mut h = LevelHistory::new();
+        let playing_until = 2 * N + N / 2;
+        push_square(&mut h, 0, playing_until, 100, true);
+        push_square(&mut h, playing_until, 40 * N - playing_until, 100, false);
+        let run = h.run_from(0);
+        assert_eq!(run.blocks.len(), 40);
+        assert!(run.blocks[..3].iter().all(|b| b.playing()));
+        assert!(
+            run.blocks[3..].iter().all(|b| !b.playing()),
+            "the first whole block after the change and every one after it are unflagged"
+        );
+    }
+
     #[test]
     fn blocks_close_on_multiples_of_the_block_size() {
         let mut h = LevelHistory::new();

@@ -555,6 +555,12 @@ pub fn run_drain_loop(
 
 /// What a pass says about whether the speaker output is active: `Some(true)` when it
 /// put audio out, `Some(false)` when nothing was banked, `None` when it says nothing.
+///
+/// No hold follows the last output: the flag clears with up to one output period still
+/// playing, and, read by the capture thread when it commits a period, may clear on the
+/// captured blocks up to one capture period before the last hand-over ended (up to the
+/// capture ring's four periods when that thread has fallen behind). The receiver's tail
+/// after the last flagged block covers both.
 fn playing_after(outcome: PassOutcome) -> Option<bool> {
     match outcome {
         PassOutcome::Played(_) | PassOutcome::Boundary(_) => Some(true),
