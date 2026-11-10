@@ -1901,6 +1901,8 @@ impl ListenerState {
         // A prior unconsumed arm is superseded by this fresh wake — it fired with
         // no command answered in between. A grant waiting on that arm, standing
         // or spent, goes with it: the repeated wake word starts the turn over.
+        // TODO(second-wake-discards-command): a wake inside continuous speech
+        // throws away the command spoken before it.
         self.expire_unconsumed_arm(pod, wake_end_sample, ArmExpiryCause::FreshWake, events);
         let level = Some(self.wake_level(wake_end_sample, host_rx));
         let arm = WakeArm {

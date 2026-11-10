@@ -1923,6 +1923,9 @@ async fn handle_stt_done(
                     turn: id,
                 });
             }
+            // TODO(multipart-turn-deaf-to-barge): listener events wait here until
+            // the brain's last part arrives, so speech during a multi-part turn
+            // cannot cut it.
             let end = wiring.brain.handle(utterance, sink).await;
             end_turn(barge, scripter, listen, &pod, id, end).await;
         }

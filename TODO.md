@@ -1276,3 +1276,159 @@ of its events are still true once the cursors are torn is not a mechanical chang
 a test that fails a model mid-utterance, at the model call, and finds the closing line.
 See `TODO(inference-error-drops-frame-events)` above the wake model's call in
 `handle_audio` in `host/crates/speech-pipeline/src/listener/runtime.rs`.
+
+## `listen-linger-brain-settable`
+
+How long a `<listen/>` window stays open is `[brenn] presence_linger_ms` (default 8000),
+read from config at startup; the brain cannot change it. `parse_island` in
+`host/crates/speech-pipeline/src/brenn_brain.rs` matches `listen` by name and discards
+its attributes unread, so a `<listen ms="20000"/>` today opens the configured window
+with no trace that the attribute was ignored. The brain's marker help does not state
+the window's length either.
+
+The owner wants both: a standing setting the brain can change (as `<volume hold=…/>`
+changes the held volume) and a per-listen override on the marker. Needs a design: the
+attribute names, the bounds and what an out-of-bounds or unreadable value does (refuse
+and report, as `<volume/>` does, not silently ignore), whether the standing value is per
+pod, how it interacts with `volume-state-lost-on-restart`'s question of what survives a
+daemon restart, and what happens to the head's linger, which the same key sets today
+(`BrennConfig::listen_window_samples`). The help text should state the window length
+the brain will get, and the brain should see the current standing value on each turn
+as it sees `volume`. Done = a standing change and a per-listen override each open a
+window of the asked length, an out-of-bounds value is refused and reported, and tests
+pin all three. See `TODO(listen-linger-brain-settable)` at the `listen` arm of
+`parse_island`.
+
+## `utterance-followup-metadata`
+
+The utterance body sent to the brain (`utterance_body` in
+`host/crates/speech-pipeline/src/brenn_brain.rs`: type, id, pod, room, speaker, text,
+`interrupted`, `volume`, `level`) carries no timing and no provenance. The brain cannot
+tell a follow-up spoken into a `<listen/>` window from a fresh wake-word command, nor
+how long the person was silent between the end of its reply and the start of their
+speech. The host knows both: `listen_opened` / `listen_heard` record the window, and the
+listener dates the window and speech onset on the pod's capture clock.
+
+Add to the body: how the turn was opened (wake word, listen window, barge-in, or
+whatever else the listener can tell apart), the reply it follows when there is one,
+and the gap in ms from the end of that reply's playback to the speech onset, on the pod
+clock. Needs a design for the field names and for what is stated when a value is not
+known (null, never a guessed 0). Done = a follow-up and a fresh wake each reach the
+brain labelled as such, the follow-up with its gap, with tests on both bodies. See
+`TODO(utterance-followup-metadata)` at `utterance_body`.
+
+## `listen-expiry-notify-brain`
+
+A `<listen/>` window that ends with nobody speaking is logged as `listen_expired` and
+nothing else: the brain that asked for the window is never told it closed, so it cannot
+tell an unanswered question from one whose answer is still on its way. Send the brain a
+notify-only message when a window it asked for expires unanswered (as
+`interruption_body` does for a barge-in that carried no command), naming the reply it
+followed. Needs a design for the message shape and for which endings count — the
+`ListenExpired` doc lists the ones that end silently today (a window an utterance's mint
+closed, a declined candidate's `ListenRestored`). Done = an unanswered window reaches
+the brain as one message, an answered one does not, with tests on both. See
+`TODO(listen-expiry-notify-brain)` at `ListenerEvent::ListenExpired` in
+`host/crates/speech-pipeline/src/listener/event.rs`.
+
+## `brain-unprompted-speech`
+
+The brain can speak only in answer to a turn: a message on the response channel with no
+turn pending is dropped whole (`BrennBrain::deliver`, `DeliverOutcome::NoTurnPending`,
+logged as `brenn_delivery_dropped`). The owner wants the brain able to speak first — a
+reminder, an announcement — as an optional capability that can be withheld, for example
+by which channels the brain's remote is granted on the bus.
+
+Needs a design: which channel carries unprompted speech (a separate one is what lets an
+ACL grant or withhold it without touching replies), which pod or room it addresses,
+what happens when it arrives during a turn, during playback or while the pod is offline,
+whether it may carry `<listen/>`, and what is logged. Note the four replayed messages
+every restart drops today (`brenn_subscribed` `replay_count` 4): an unprompted channel
+must not replay stale speech on reconnect. The channel and grants live in brenn-ops'
+brenn config. Done = with the capability granted, an unsolicited message is spoken on
+the addressed pod; with it withheld, it is refused and logged; replayed messages are not
+spoken; tests on each. See `TODO(brain-unprompted-speech)` in `BrennBrain::deliver`.
+
+## `second-wake-discards-command`
+
+A wake that fires while a held wake's command is still being spoken expires the first
+arm (`arm_expired` `cause: "fresh_wake"`) and discards everything said before it: the
+listener treats a repeated wake phrase as the speaker starting over. A command that
+mentions the wake phrase loses its first part. Sighting (pod-fbe2f8, 2026-11-10, framelog
+`pod-fbe2f8_20261110T202413_799Z_1.framelog`): twice, a wake (0.997, then 0.974) was
+followed by about 5 s of continuous speech and a second wake (0.947, then 0.994) with no
+pause between. The first take produced no turn at all (`wake_command_absent`, the second
+wake at the end of the speech); the second reached the brain as only the text after the
+second wake, "have the text Hey Jarvis or similar in them." The discarded audio was not
+transcribed, so that the second wake was the phrase spoken inside the command is
+inferred from the surviving text, not confirmed. The design that introduced the
+transition (brenn-ops `docs/adr/2026/07/13-pod--continuous-listener-roadmap/design-delta-1.md`)
+records no reason for discarding the speech.
+
+What the owner wants: a second wake inside an utterance continues it, the whole span
+goes to STT, and the brain is told that the wake fired mid-utterance and roughly where
+(a time offset or a fraction of the utterance; a position in the text if one can be
+derived honestly). The general direction, from the owner: be less opinionated — give the
+brain the confidence signals and the irregular events of a turn, and let it decide what
+to make of them, rather than deciding in the listener. Needs a design: what still counts
+as starting over (a second wake after the first command has ended, if anything), how a
+speaker who restarts a stumbled command is represented, and the field that carries the
+mid-utterance wake. Done = a command with the wake phrase inside it reaches STT and the
+brain whole, carrying the second wake's position, with a test that replays such a span.
+See `TODO(second-wake-discards-command)` at the fresh-wake arm expiry in
+`host/crates/speech-pipeline/src/listener/runtime.rs`.
+
+## `multipart-turn-deaf-to-barge`
+
+Speech during a multi-part brain reply (a part ending in `<continued/>`, then a later
+part) cannot interrupt it. Two causes, one fix:
+
+- The pipeline awaits the whole turn inline (`wiring.brain.handle(utterance,
+  sink).await` in `host/crates/speech-surface/src/pipeline.rs`), so listener events are
+  not acted on until the brain's last part arrives. `BrennBrain::handle`'s doc already
+  says so: "a barge-in over one of them is not processed until it returns". Every event
+  logged in that span is stamped when the backlog drains, not when it happened.
+- Even when acted on, only speech over audible playback counts as a barge-in. In the gap
+  between two parts nothing is playing, there is no listen window, and without the wake
+  word the speech is dropped.
+
+Sighting (pod-fbe2f8, 2026-11-10, `[barge] mode = "speech"`). In the room, as the
+owner reported it: part 1 of a two-part reply finished; they waited for silence, then
+spoke several times to interrupt; nothing happened; they had stopped speaking when part
+2 started playing. The log agrees: part 1 ended at 22.19, the pod opened a segment for
+their speech at 24.43 and streamed it live, and the three bursts of speech in it (about
+24.4 to 29.6 on the pod's sample clock) were not logged until part 2's `speak_rx` at
+29.125, all in that millisecond:
+
+```
+…522191 playback_finished   utterance 2 (part 1)
+…524434 segment_opened      segment 100            <- speech begins, streamed live
+…529125 endpointer onset         sample 48705984   <- ~24.4 s on the pod clock
+…529125 endpointer soft_endpoint sample 48730048
+…529125 endpointer continuation  sample 48744384
+…529125 speak_rx            utterance 2 (part 2)   <- the wait releases
+…529125 endpointer soft_endpoint sample 48760256
+…529125 endpointer continuation  sample 48772544
+…529705 endpointer soft_endpoint sample 48788928   <- live again; speech ends ~29.6
+…530322 playback_started    utterance 2 (part 2)
+```
+
+No barge-in, no utterance and no refusal line followed: the speech vanished. The same
+session's single-part reply was cut 0.3 s after speech began (`barge_in` `cause:
+"speech"`), so the failure is specific to multi-part turns.
+
+Not established: whether the listener itself scores late during the wait or scores on
+time with its events read late; the timestamps cannot say.
+
+What the owner wants: during a multi-part turn the listener stays live, and speech at
+any point of the turn — over a part or in the gap between parts — is a barge-in, under
+the configured `[barge]` mode: the remaining parts are cancelled, the speech becomes the
+next utterance, and the brain is told its turn was interrupted and where. Needs a
+design: how the turn is awaited without parking the event loop while keeping what the
+turn ledger relies on (`handle`'s return as proof no further command is coming), what a
+part arriving after the cut does (dropped and logged, not spoken), and what the
+interruption body says for a cut that landed between parts. Done = a test that delivers
+part 1, feeds speech in the gap before part 2, and finds a barge-in at the speech's time,
+part 2 not played, and the speech carried as the next utterance; and event timestamps in
+that span match when the event happened. See `TODO(multipart-turn-deaf-to-barge)` at the
+inline `brain.handle` await in `host/crates/speech-surface/src/pipeline.rs`.

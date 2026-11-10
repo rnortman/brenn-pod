@@ -167,6 +167,9 @@ pub fn wake_body(pod: &PodId) -> String {
 /// `volume` is the pod's volume state when the turn is sent: the peer's only view
 /// of it, so a hold lost to a restart or a value clamped into the operator's
 /// bounds shows on the next turn.
+// TODO(utterance-followup-metadata): the body does not say whether the turn
+// came through a listen window or a wake, nor how long the person was silent
+// after the reply before speaking.
 pub fn utterance_body(u: &Utterance, text: &str, volume: &VolumeState) -> String {
     render(&UtteranceWire {
         kind: "utterance",
@@ -390,6 +393,8 @@ fn parse_island(raw: &str) -> Tag {
     match name {
         "reply" => parse_reply(attrs, raw),
         "continued" => Tag::Continued,
+        // TODO(listen-linger-brain-settable): attributes on `<listen/>` are
+        // dropped here unread; the window length is config-only.
         "listen" => Tag::Listen,
         "pose" => parse_cue(attrs, raw, false),
         "motion" => parse_cue(attrs, raw, true),
@@ -871,6 +876,8 @@ impl BrennBrain {
         let Some(turn) = slot.as_ref() else {
             // Nothing asked for this. Dropped whole: no turn owns it, so it earns no
             // per-marker events either.
+            // TODO(brain-unprompted-speech): the peer cannot speak first; an
+            // unsolicited message is dropped here.
             return DeliverOutcome::NoTurnPending;
         };
         let utterance = turn.utterance;

@@ -557,6 +557,8 @@ pub enum ListenerEvent {
     /// candidate becomes a turn instead, its window is simply over: the reply
     /// beginning is that turn's, `brain_dispatched` is the record, and no line
     /// ends a window the turn already answered.
+    // TODO(listen-expiry-notify-brain): this reaches the JSONL log only; the
+    // brain that asked for the window is never told it closed unanswered.
     ListenExpired { pod: PodId, epoch: u64 },
     /// This pod's report of when it was playing and this host's record of when
     /// it sent the pod audio disagree by more than either's known error. It does
