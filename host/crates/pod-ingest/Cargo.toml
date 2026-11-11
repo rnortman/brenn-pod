@@ -14,6 +14,7 @@ audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = 
 heapless = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+stamped-log = { path = "../../../firmware/crates/stamped-log" }
 thiserror = "2"
 
 [dev-dependencies]

@@ -17,21 +17,23 @@
 //!          meta           JSON, meta_len bytes
 //! records: host_rx_us u64 LE | len u16 LE | payload (len bytes, exact wire frame)
 //! ```
+//!
+//! The framing is `stamped-log`'s; a record's stamp is the host receive time.
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use audio_pipeline::wire::MAX_FRAME_BYTES;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use stamped_log::RECORD_HEADER_BYTES;
+use stamped_log::{HeaderError, Item, RecordError, Records};
 
 use crate::clock::HostMicros;
 
 const MAGIC: &[u8; 4] = b"RSFL";
 const FORMAT_VERSION: u16 = 1;
-
-/// Bytes of a fixed per-record header: `host_rx_us` (8) + `len` (2).
-const RECORD_HEADER_BYTES: usize = 10;
 
 /// Self-describing header metadata, serialized as JSON so additive fields do
 /// not force a format-version bump. Unknown fields are ignored on read.
@@ -183,9 +185,8 @@ impl FrameLogWriter {
 /// yields records, a terminal `TornTail` on a mid-record EOF, or a terminal
 /// error on a corrupt length field.
 pub struct FrameLogReader {
-    reader: BufReader<File>,
+    records: Records<BufReader<File>>,
     meta: LogMeta,
-    done: bool,
 }
 
 impl FrameLogReader {
@@ -195,30 +196,20 @@ impl FrameLogReader {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
-        let mut magic = [0u8; 4];
-        reader.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            return Err(FrameLogError::BadMagic);
+        let header = stamped_log::read_header(&mut reader, MAGIC).map_err(|e| match e {
+            HeaderError::BadMagic => FrameLogError::BadMagic,
+            HeaderError::Io(e) => FrameLogError::Io(e),
+        })?;
+        if header.version != FORMAT_VERSION {
+            return Err(FrameLogError::UnsupportedVersion {
+                got: header.version,
+            });
         }
-
-        let mut version = [0u8; 2];
-        reader.read_exact(&mut version)?;
-        let version = u16::from_le_bytes(version);
-        if version != FORMAT_VERSION {
-            return Err(FrameLogError::UnsupportedVersion { got: version });
-        }
-
-        let mut meta_len = [0u8; 2];
-        reader.read_exact(&mut meta_len)?;
-        let meta_len = u16::from_le_bytes(meta_len) as usize;
-        let mut meta_bytes = vec![0u8; meta_len];
-        reader.read_exact(&mut meta_bytes)?;
-        let meta = serde_json::from_slice(&meta_bytes).map_err(FrameLogError::BadMeta)?;
+        let meta = serde_json::from_slice(&header.meta).map_err(FrameLogError::BadMeta)?;
 
         Ok(FrameLogReader {
-            reader,
+            records: Records::new(reader, header.encoded_len(), MAX_FRAME_BYTES),
             meta,
-            done: false,
         })
     }
 
@@ -232,99 +223,26 @@ impl Iterator for FrameLogReader {
     type Item = Result<LogItem, FrameLogError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        let mut header = [0u8; RECORD_HEADER_BYTES];
-        match read_full(&mut self.reader, &mut header) {
-            Ok(ReadFull::Eof) => {
-                self.done = true;
-                return None;
-            }
-            Ok(ReadFull::Partial) => {
-                self.done = true;
-                return Some(Ok(LogItem::TornTail));
-            }
-            Ok(ReadFull::Ok) => {}
-            Err(e) => {
-                self.done = true;
-                return Some(Err(FrameLogError::Io(e)));
-            }
-        }
-
-        let host_rx = HostMicros(u64::from_le_bytes(header[0..8].try_into().unwrap()));
-        let len = u16::from_le_bytes(header[8..10].try_into().unwrap()) as usize;
-        if len == 0 || len > MAX_FRAME_BYTES {
-            self.done = true;
-            return Some(Err(FrameLogError::CorruptLength { len }));
-        }
-
-        let mut payload = vec![0u8; len];
-        match read_full(&mut self.reader, &mut payload) {
-            Ok(ReadFull::Ok) => Some(Ok(LogItem::Record { host_rx, payload })),
-            Ok(ReadFull::Eof) | Ok(ReadFull::Partial) => {
-                self.done = true;
-                Some(Ok(LogItem::TornTail))
-            }
-            Err(e) => {
-                self.done = true;
-                Some(Err(FrameLogError::Io(e)))
-            }
-        }
+        Some(match self.records.next()? {
+            Ok(Item::Record { stamp, payload }) => Ok(LogItem::Record {
+                host_rx: HostMicros(stamp),
+                payload,
+            }),
+            Ok(Item::TornTail) => Ok(LogItem::TornTail),
+            Err(RecordError::CorruptLength { len }) => Err(FrameLogError::CorruptLength { len }),
+            Err(RecordError::Io(e)) => Err(FrameLogError::Io(e)),
+        })
     }
-}
-
-/// Outcome of a fill-the-buffer read.
-enum ReadFull {
-    /// The whole buffer was filled.
-    Ok,
-    /// EOF before any byte of the buffer (a clean record boundary).
-    Eof,
-    /// EOF after some but not all bytes (a torn record).
-    Partial,
-}
-
-fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<ReadFull> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match r.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Ok(if filled == 0 {
-                    ReadFull::Eof
-                } else {
-                    ReadFull::Partial
-                });
-            }
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(ReadFull::Ok)
 }
 
 fn write_header(w: &mut impl Write, meta: &LogMeta) -> io::Result<u64> {
     let json =
         serde_json::to_vec(meta).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if json.len() > u16::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame-log header metadata exceeds 64 KiB",
-        ));
-    }
-    w.write_all(MAGIC)?;
-    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
-    w.write_all(&(json.len() as u16).to_le_bytes())?;
-    w.write_all(&json)?;
-    Ok((MAGIC.len() + 2 + 2 + json.len()) as u64)
+    stamped_log::write_header(w, MAGIC, FORMAT_VERSION, &json)
 }
 
 fn write_record(w: &mut impl Write, host_rx: HostMicros, payload: &[u8]) -> io::Result<u64> {
-    w.write_all(&host_rx.0.to_le_bytes())?;
-    w.write_all(&(payload.len() as u16).to_le_bytes())?;
-    w.write_all(payload)?;
-    Ok((RECORD_HEADER_BYTES + payload.len()) as u64)
+    stamped_log::write_record(w, host_rx.0, payload)
 }
 
 fn file_name_string(path: &Path) -> String {
@@ -694,6 +612,42 @@ mod tests {
             Some(Err(FrameLogError::CorruptLength { len: 0 }))
         ));
         assert!(reader.next().is_none());
+    }
+
+    /// The exact bytes of a small log, spelled out rather than derived from the
+    /// writer, so a change to the framing or the header shows up here.
+    #[test]
+    fn golden_bytes_of_a_two_record_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("golden.framelog");
+        let m = LogMeta {
+            build_id: "golden".to_string(),
+            created_epoch_us: HostMicros(1_700_000_000_000_000),
+            conn_seq: 7,
+            rolled_from: None,
+        };
+        let mut w = FrameLogWriter::create(&path, m).unwrap();
+        w.append(HostMicros(0x0102_0304_0506_0708), &[0xAA, 0xBB, 0xCC])
+            .unwrap();
+        w.append(HostMicros(42), &[0x01]).unwrap();
+        w.finish().unwrap();
+
+        let json: &[u8] =
+            b"{\"build_id\":\"golden\",\"created_epoch_us\":1700000000000000,\"conn_seq\":7}";
+        assert_eq!(json.len(), 70);
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"RSFL");
+        expected.extend_from_slice(&[0x01, 0x00]);
+        expected.extend_from_slice(&[70, 0x00]);
+        expected.extend_from_slice(json);
+        expected.extend_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        expected.extend_from_slice(&[0x03, 0x00]);
+        expected.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        expected.extend_from_slice(&[42, 0, 0, 0, 0, 0, 0, 0]);
+        expected.extend_from_slice(&[0x01, 0x00]);
+        expected.extend_from_slice(&[0x01]);
+
+        assert_eq!(fs::read(&path).unwrap(), expected);
     }
 
     #[test]

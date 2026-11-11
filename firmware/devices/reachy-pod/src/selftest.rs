@@ -31,8 +31,10 @@ use xvf3800_ctrl::{
     VERSION_LABEL, VERSION_READ_LEN, control_read, decode_f32x4,
 };
 
+use alsa_pcm::{CardInfo, PcmError};
+
 use crate::alsa_capture::{
-    CAPTURE_PARAMS, CaptureStream, CardInfo, PERIOD_FRAMES, PcmError, append_channels, open_capture,
+    CAPTURE_PARAMS, CaptureStream, PERIOD_FRAMES, append_channels, open_capture,
 };
 use crate::beam::beam_energy_speech;
 use crate::chip::{self, Routing};

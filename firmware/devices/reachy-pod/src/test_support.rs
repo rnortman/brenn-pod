@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use xvf3800_ctrl::{ControlTransport, STATUS_DONE, encode_f32x2};
 
-use crate::alsa_capture::PcmError;
 use crate::fixed_beams::BROADSIDE;
 use crate::run::PeriodSource;
 use crate::selftest::Outcome;
+use alsa_pcm::PcmError;
 
 /// A transport that answers reads from a script.
 ///

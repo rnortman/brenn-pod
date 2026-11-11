@@ -56,6 +56,8 @@ impl fmt::Display for DeviceId {
 
 /// The two ids, in the order the factory software searches them: the updated
 /// firmware first, the module's own id second.
+// TODO(xvf-control-on-usb-audio-image): the Flex on Seeed's six-channel USB audio
+// image (2886:0022) is not here, so its captures carry no chip version or routing.
 pub const DEVICE_IDS: [DeviceId; 2] = [
     DeviceId {
         vendor: 0x38fb,

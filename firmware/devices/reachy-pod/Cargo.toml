@@ -39,6 +39,9 @@ psk-link = { path = "../../crates/psk-link" }
 # USB vendor control transfers (libusb-1.0). The audio interfaces stay with the
 # kernel's snd_usb_audio; only EP0 is ours.
 rusb = "0.9"
+# The Linux pod's ALSA layer: finding the card, opening with exact parameters, the
+# recovery budget and the capture clock, shared with pod-capture.
+alsa-pcm = { path = "../../crates/alsa-pcm" }
 # The board's audio, through ALSA's own library (libasound2). Direct `hw:` access:
 # this application is the card's only user, so there is no sound server in the path.
 alsa = "0.12"

@@ -1,0 +1,38 @@
+[package]
+name = "pod-capture"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The Linux pod's recorder: one ALSA capture device, every channel, to a local
+# capture record. Needs no configuration file, no network, no key and no playback
+# device, and links libasound and no other system library.
+#
+# Not in default-members: `alsa-pcm` links libasound2, so a plain `cargo build`
+# stays free of system dependencies; `make check-host`'s `--workspace` clippy and
+# tests cover it.
+
+[dependencies]
+# The ALSA layer shared with reachy-pod: the capture stream read as bytes, the
+# recovery budget and the clock pair.
+alsa-pcm = { path = "../../crates/alsa-pcm" }
+# The open stream's sample format and direction, as alsa-pcm takes them.
+alsa = "0.12"
+# The commit this binary was built from, stated in every record it writes.
+build-id = { path = "../../crates/build-id" }
+# The record format, written here and read by its own reader tool.
+capture-record = { path = "../../crates/capture-record" }
+# The event-line envelope every Linux-pod binary narrates itself in.
+pod-jsonl = { path = "../../crates/pod-jsonl" }
+# The kernel's random source for the record id.
+getrandom = "0.4"
+# fstatvfs for the free-space floor, the errno values a recovery is mapped by
+# and sigaction for the stop signals.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# The waveform guards the hardware tests judge each channel by.
+audio-pipeline = { path = "../../crates/audio-pipeline", features = ["std"] }
+serde_json = "1"
+tempfile = "3"

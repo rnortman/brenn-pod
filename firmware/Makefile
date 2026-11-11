@@ -10,8 +10,8 @@
 # default-member or not):
 #   libssl-dev         — psk-link links openssl (the audio link's TLS-PSK parameters).
 #   libusb-1.0-0-dev   — reachy-pod links libusb (the XVF3800 USB control transport).
-#   libasound2-dev     — reachy-pod links libasound (the board's ALSA capture and
-#                        playback ends).
+#   libasound2-dev     — alsa-pcm, and through it reachy-pod and pod-capture, links
+#                        libasound (the Linux pod's ALSA capture and playback ends).
 # The device lanes (check-device, build-firmware, flash) additionally need espup.
 # The reachy lanes (reachy-pod and the deploy targets below) need
 # podman, an aarch64 binfmt_misc registration on a non-arm64 workstation, and
@@ -70,6 +70,7 @@ check-host: check-host-arch
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
+	$(MAKE) check-build-id-declared
 # This lane runs only the awk-parser fixture self-test, NOT `check-realign` against a
 # freshly-built device ELF. That is deliberate: pre-commit stays fast and toolchain-optional
 # (the host lane needs no espup). The real-ELF audit runs manually before flash via
@@ -101,6 +102,34 @@ check-host: check-host-arch
 # Lint for this whole directory, which had none. Skips visibly where shellcheck is absent.
 	tools/check-shell.sh
 
+# build-id's declared commit (BRENN_POD_BUILD_COMMIT), from both sides of the line git
+# draws. Each run has a target directory of its own, so the stamp of the main build is
+# not disturbed.
+#   1. Declared as this checkout's HEAD inside the checkout: git vouches, source `git`.
+#   2. Declared as forty zeros inside the checkout: the build must fail, because a
+#      declared commit cannot override a checkout.
+#   3. Declared with git's view hidden (no repository is found from the crate's
+#      directory under the ceiling): source `declared`. This is a fetched revision.
+#   4. Nothing declared, with GIT_DIR exported and GIT_WORK_TREE not, as git runs a
+#      hook from a linked worktree: git still vouches, source `git`.
+.PHONY: check-build-id-declared
+check-build-id-declared:
+	@set -e; \
+	head=$$(git rev-parse HEAD); \
+	BRENN_POD_BUILD_COMMIT=$$head BUILD_ID_EXPECT_SOURCE=git \
+	    cargo test -q -p build-id --target-dir target/build-id-declared-git; \
+	if out=$$(BRENN_POD_BUILD_COMMIT=0000000000000000000000000000000000000000 \
+	    cargo build -q -p build-id --target-dir target/build-id-declared-mismatch 2>&1); then \
+	    echo "check-build-id-declared: a declared commit overrode the checkout" >&2; exit 1; \
+	fi; \
+	echo "$$out" | grep -q "A declared commit cannot override a checkout" || { \
+	    echo "check-build-id-declared: the mismatched build failed for another reason:" >&2; \
+	    echo "$$out" >&2; exit 1; }; \
+	GIT_CEILING_DIRECTORIES=$(CURDIR) BRENN_POD_BUILD_COMMIT=$$head BUILD_ID_EXPECT_SOURCE=declared \
+	    cargo test -q -p build-id --target-dir target/build-id-declared-hidden; \
+	GIT_DIR=$$(git rev-parse --absolute-git-dir) BUILD_ID_EXPECT_SOURCE=git \
+	    cargo test -q -p build-id --target-dir target/build-id-declared-git-dir
+
 # Host-architecture workspace (host/) — stable toolchain, no espup.
 # Standalone workspace beside firmware/; check and check-host both depend on this
 # so the default inner loop and the no-espup lane each cover host/. Delegates to
@@ -115,6 +144,16 @@ check-host-arch:
 .PHONY: hil-test
 hil-test:
 	cargo run -p hil-host --release
+
+# Capture HIL — pod-capture records the reSpeaker Flex XVF3800 (USB-audio image,
+# 2886:0022) on this machine: ten seconds of every channel, then a one-second pause
+# that must come back as an overrun gap with a clock estimate. Silent: nothing is
+# played. Needs the Flex attached and its capture device free; a desktop sound
+# server may be holding it (docs/runbooks/capture-record.md).
+# NEVER invoked by check/check-host/pre-commit/CI.
+.PHONY: capture-hil
+capture-hil:
+	cargo test -p pod-capture --test flex_hil -- --ignored --nocapture --test-threads=1
 
 # Build-time guard against the xtensa frame-realign / stack-arg miscompile
 # (TODO(xtensa-realign-stack-args)). The device toolchain is the stock esp channel, which

@@ -41,10 +41,9 @@ use pod_streamer::telemetry::{
 };
 use xvf3800_ctrl::{ControlTransport, USB_RETRY};
 
-use crate::alsa_capture::{
-    CaptureStream, PcmError, append_channel, enumerate_cards, monotonic_us, new_ring, open_capture,
-    select_card,
-};
+use alsa_pcm::{PcmError, enumerate_cards, monotonic_us};
+
+use crate::alsa_capture::{CaptureStream, append_channel, new_ring, open_capture, select_card};
 use crate::chip::{self, Routing, StateLineCadence};
 use crate::cli::{EXIT_FAILED, EXIT_OK};
 use crate::config::{Config, ConfigError, RECHECK_INTERVAL};

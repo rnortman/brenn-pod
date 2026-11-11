@@ -1,11 +1,14 @@
 [workspace]
 members = [
+    "devices/pod-capture",
     "devices/reachy-pod",
     "devices/respeaker-pod",
+    "crates/alsa-pcm",
     "crates/audio-pipeline",
     "crates/brenn-bridge",
     "crates/device-protocol",
     "crates/build-id",
+    "crates/capture-record",
     "crates/hil-host",
     "crates/pod-jsonl",
     "crates/pod-secrets",
@@ -13,6 +16,7 @@ members = [
     "crates/pod-transport",
     "crates/podctl",
     "crates/psk-link",
+    "crates/stamped-log",
     "crates/truncfmt",
     "crates/wifi-diag",
     "crates/wifi-reconnect",
@@ -28,11 +32,13 @@ members = [
 # reason (openssl, which needs libssl-dev); `make check-host` covers it via --workspace.
 # reachy-pod is out for the same reason too (rusb → libusb-1.0); it is a Linux binary
 # built for the Pi in a container, and its host-triple unit tests run under --workspace.
+# alsa-pcm is out because `alsa` links libasound2; its tests run under --workspace.
+# pod-capture is out for the same reason, through alsa-pcm.
 # brenn-bridge is out for the same reason again (native-tls → openssl); its own tests run
 # under --workspace, and its only consumer lives in host/, which is a separate workspace
-# covered by its own lane. pod-jsonl and pod-secrets are in: they are small, pure-Rust,
-# and everything else here can depend on them freely.
-default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
+# covered by its own lane. pod-jsonl, pod-secrets, stamped-log and capture-record are in:
+# they are small, pure-Rust, and everything else here can depend on them freely.
+default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/capture-record", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/stamped-log", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
 resolver = "2"
 
 [workspace.package]

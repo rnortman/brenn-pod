@@ -9,6 +9,21 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
+- **The Linux pod can record a capture device to a local file that says where
+  it lost audio.** The new `pod-capture` program records every channel of one
+  ALSA capture device, at the rate and sample format asked for and never
+  resampled, until it is stopped. Each block carries its position and a reading
+  of both the monotonic and wall clocks; overruns, suspends and a destination
+  that falls behind are recorded as gaps where they happened, and the file ends
+  saying why it stopped. `capture-record summary` describes a recording and
+  `capture-record export-wav` turns it into a WAV with gaps as silence plus a
+  map of them. `pod-capture` needs only libasound: no configuration, network or
+  key. Format: `docs/reference/capture-record.md`; procedure and the reSpeaker
+  Flex hardware tests (`make -C firmware capture-hil`):
+  `docs/runbooks/capture-record.md`.
+- A build outside a git checkout can state its commit in
+  `BRENN_POD_BUILD_COMMIT`; inside a checkout git decides, and a declared
+  commit that disagrees fails the build.
 - **Every pod reports its health and its room once a second, whether or not
   anyone is speaking.** The pod sends a small status frame over the
   connection it already holds: its capture position, 100 ms room-level blocks

@@ -266,6 +266,8 @@ impl TelemetryCore {
             };
             let transition = self.vad.update(&MaxBeamEnergy(max_energy));
             match transition {
+                // TODO(gated-stream-continuous-mode): the gate's opening is the only
+                // thing that opens a segment; no pod can be told to stream without it.
                 VadTransition::Opened => self.note_vad_opened(ctx, max_energy),
                 VadTransition::Closed => self.note_vad_closed(ctx),
                 VadTransition::Unchanged => {}

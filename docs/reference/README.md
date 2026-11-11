@@ -20,6 +20,10 @@ confirm against the device and fix the doc.
 - [`audio-and-channels.md`](audio-and-channels.md) — I2S vs USB firmware modes,
   the confirmed 6-channel map, sample rates/formats, codec (TLV320AIC3104) and
   HP-out routing, what stock 2-ch I2S firmware exposes.
+- [`capture-record.md`](capture-record.md) — the Linux pod's local capture
+  record: the container, header keys, block and event records, positions and
+  clocks, lateness, tail verdicts, `pod-capture`'s event lines and the
+  `capture-record` tool's summary and WAV export.
 - [`firmware-toolchain.md`](firmware-toolchain.md) — Rust-on-ESP-IDF target
   (ESP32-S3 / XIAO), toolchain (`espup` / `cargo-espflash` / `xtask`), formatBCE
   port relevance, repo/workspace expectations.

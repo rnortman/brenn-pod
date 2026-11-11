@@ -1,0 +1,24 @@
+[package]
+name = "alsa-pcm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The Linux pod's ALSA layer: finding a card by name, opening a PCM with exact
+# parameters, the recovery budget, the capture clock, and a capture stream read
+# as bytes. Shared by reachy-pod (the voice stream) and pod-capture (the
+# recorder). Links libasound and nothing else native, so a binary built on it
+# inherits no other system library.
+#
+# Not in default-members: `alsa` links libasound2, so a plain `cargo build`
+# stays free of system dependencies; `make check-host`'s `--workspace` clippy
+# and tests cover it.
+
+[dependencies]
+alsa = "0.12"
+# CLOCK_MONOTONIC and CLOCK_REALTIME, and the errno values a transfer fails with.
+libc = "0.2"
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

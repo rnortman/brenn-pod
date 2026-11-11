@@ -32,10 +32,9 @@ use audio_pipeline::playback::{
 };
 use audio_pipeline::stats::PodStats;
 
-use crate::alsa_capture::{
-    CAPTURE_PARAMS, CardInfo, PcmError, PcmParams, RecoveryBudget, Retry, enumerate_cards,
-    open_pcm, select_card,
-};
+use alsa_pcm::{CardInfo, PcmError, PcmParams, RecoveryBudget, Retry, enumerate_cards, open_pcm};
+
+use crate::alsa_capture::{CAPTURE_PARAMS, select_card};
 use crate::config::CHANNELS;
 
 /// The parameters the board's playback stream is opened with — the same ones its
