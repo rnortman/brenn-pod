@@ -149,7 +149,7 @@ hil-test:
 # 2886:0022) on this machine: ten seconds of every channel, then a one-second pause
 # that must come back as an overrun gap with a clock estimate. Silent: nothing is
 # played. Needs the Flex attached and its capture device free; a desktop sound
-# server may be holding it (docs/runbooks/capture-record.md).
+# server may be holding it (docs/runbooks/pod-capture.md).
 # NEVER invoked by check/check-host/pre-commit/CI.
 .PHONY: capture-hil
 capture-hil:

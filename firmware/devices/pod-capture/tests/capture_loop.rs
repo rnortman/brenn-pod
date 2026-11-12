@@ -1,6 +1,9 @@
 //! The capture loop through its seams: a scripted source, a stepped clock and an
-//! in-memory destination that can block, refuse writes and run out of space.
-//! Every record is read back with `capture-record`'s own reader.
+//! in-memory destination that can block, refuse or tear writes and run out of
+//! space. Every log is read back with `frame-log`'s walker and summary, and
+//! every summary is held to what a continuous capture writes: no audio unsent
+//! or resent between segments, no break inside one, and no tail but `ended`,
+//! `unterminated` or `torn`.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -9,13 +12,17 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use alsa_pcm::{ClockPair, PcmError, Period, Read, Recovery, Wait};
-use capture_record::{
-    BuildSource, Clocks, Device, DeviceControl, EndReason, GapCause, Granted, Header, Item,
-    RecordReader, SampleFormat, StartPair, Summary, Truncate, Verdict, WriterBuild, WriterInfo,
-    summarize,
+use audio_pipeline::wide::{LossCause, StreamEndReason};
+use audio_pipeline::wire::{ChannelSource, EndReason};
+use frame_log::{
+    BuildSource, Cause, Device, DeviceControl, Step as LogStep, Summary, WriterBuild, WriterInfo,
+    summarize, walk,
 };
 use pod_capture::lines::Lines;
-use pod_capture::{CaptureSource, Clock, Destination, Outcome, STALL_TIMEOUTS, run};
+use pod_capture::{
+    CaptureSource, Clock, Destination, Granted, Outcome, Recording, STALL_TIMEOUTS, SampleFormat,
+    Truncate, run,
+};
 use serde_json::Value;
 
 const RATE: u32 = 1000;
@@ -197,6 +204,8 @@ struct DestState {
     writes: AtomicU32,
     /// Write calls still to refuse; `u32::MAX` refuses every one.
     refuse: AtomicU32,
+    /// A refused write first lands half its bytes.
+    tear: AtomicBool,
     free: AtomicU64,
     /// Every sync fails while this is set.
     sync_fails: AtomicBool,
@@ -258,6 +267,13 @@ impl Write for MemDest {
             if refuse != u32::MAX {
                 self.0.refuse.store(refuse - 1, Ordering::SeqCst);
             }
+            if self.0.tear.load(Ordering::SeqCst) {
+                self.0
+                    .data
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buf[..buf.len() / 2]);
+            }
             return Err(io::Error::other("scripted: no space left on device"));
         }
         self.0.data.lock().unwrap().extend_from_slice(buf);
@@ -296,9 +312,10 @@ impl Destination for MemDest {
     }
 }
 
-fn header(channels: u32, format: SampleFormat) -> Header {
-    Header {
+fn recording(channels: u32, format: SampleFormat, period_frames: u32) -> Recording {
+    Recording {
         record_id: RECORD_ID.to_owned(),
+        pod_id: "bench".to_owned(),
         writer: WriterInfo {
             program: "pod-capture".to_owned(),
             build: WriterBuild {
@@ -319,15 +336,10 @@ fn header(channels: u32, format: SampleFormat) -> Header {
             rate_hz: RATE,
             channels,
             sample_format: format,
-            period_frames: PERIOD,
-            buffer_frames: PERIOD * 16,
+            period_frames,
+            buffer_frames: period_frames * 16,
         },
         layout: (0..channels).map(|c| format!("ch{c}")).collect(),
-        clocks: Clocks::v1(),
-        started: StartPair {
-            mono_us: 0,
-            wall_us: 0,
-        },
         device_control: DeviceControl { performed: false },
     }
 }
@@ -362,37 +374,53 @@ impl Ran {
     }
 
     fn summary(&self) -> Summary {
-        summarize(self.file().path()).unwrap()
+        summary_of(&self.record)
     }
 
-    /// Every item, then the tail's verdict.
-    fn items(&self) -> (Vec<Item>, Verdict) {
+    /// Every step the walker yields, then the tail's verdict.
+    fn steps(&self) -> (Vec<LogStep>, &'static str) {
         let f = self.file();
-        let mut r = RecordReader::open(f.path()).unwrap();
-        let items: Vec<Item> = r.by_ref().map(|i| i.unwrap()).collect();
-        (items, r.tail().unwrap().verdict.clone())
+        let mut w = walk(f.path()).unwrap();
+        let steps: Vec<LogStep> = w.by_ref().map(|s| s.unwrap()).collect();
+        (steps, w.tail().unwrap().verdict.name())
     }
 
-    /// Every block's bytes are the frames its position names, and the blocks and
-    /// measured gaps together cover the delivered stream.
+    /// Every audio frame's bytes are the frames its index names.
     fn assert_blocks_are_the_delivered_frames(&self) {
-        let (items, _) = self.items();
-        for item in &items {
-            if let Item::Block {
-                first_frame,
-                frames,
-                pcm,
-                ..
-            } = item
-            {
+        let (steps, _) = self.steps();
+        for step in &steps {
+            if let LogStep::Audio(a) = step {
                 assert_eq!(
-                    *pcm,
-                    expected_bytes(*first_frame, *frames, self.frame_bytes),
-                    "block at {first_frame}"
+                    a.pcm,
+                    expected_bytes(a.first_frame, a.frames, self.frame_bytes),
+                    "audio at {}",
+                    a.first_frame
                 );
             }
         }
     }
+}
+
+/// The summary of `bytes`, held to what this recorder writes.
+fn summary_of(bytes: &[u8]) -> Summary {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(bytes).unwrap();
+    let s = summarize(f.path()).unwrap();
+    assert!(
+        matches!(s.tail.verdict, "ended" | "unterminated" | "torn"),
+        "{:?}",
+        s.tail
+    );
+    assert_eq!(s.hello.channel_source, ChannelSource::Described);
+    assert_eq!(s.hello.pod_id.as_str(), "bench");
+    for seg in &s.segments {
+        assert_eq!((seg.not_sent_frames, seg.resent_frames), (0, 0), "{seg:?}");
+        assert!(seg.count_check.is_none_or(|c| c == "match"), "{seg:?}");
+    }
+    for d in &s.discontinuities {
+        assert_eq!(d.kind, "loss", "only a Loss frame marks a loss: {d:?}");
+    }
+    s
 }
 
 fn run_script(
@@ -402,7 +430,11 @@ fn run_script(
     dest: MemDest,
     clock: StepClock,
 ) -> Ran {
-    let frame_bytes = channels as usize * format.bytes_per_sample();
+    run_recording(recording(channels, format, PERIOD), steps, dest, clock)
+}
+
+fn run_recording(rec: Recording, steps: Vec<Step>, dest: MemDest, clock: StepClock) -> Ran {
+    let frame_bytes = rec.granted.frame_bytes();
     let stop = Arc::new(AtomicBool::new(false));
     let mut script = Script::new(steps, frame_bytes, stop.clone());
     let mut lines = Lines::new(Vec::new());
@@ -411,8 +443,8 @@ fn run_script(
         &mut script,
         clock,
         dest.clone(),
-        header(channels, format),
-        "/records/test.bpcr",
+        rec,
+        "/records/test.framelog",
         &stop,
         &mut lines,
         BOUND,
@@ -443,15 +475,27 @@ fn run_steps(steps: Vec<Step>) -> Ran {
     )
 }
 
-fn gaps(s: &Summary) -> Vec<(GapCause, u64, Option<u64>)> {
-    s.gaps
+/// Every loss: its cause, where and how long.
+fn gaps(s: &Summary) -> Vec<(LossCause, u64, Option<u64>)> {
+    s.discontinuities
         .iter()
-        .map(|g| (g.cause, g.at_frame, g.frames))
+        .map(|d| match d.cause {
+            Some(Cause::Loss(c)) => (c, d.at_frame, d.frames),
+            other => panic!("a loss with cause {other:?}"),
+        })
         .collect()
 }
 
-fn end_reason(s: &Summary) -> Option<EndReason> {
+fn end_reason(s: &Summary) -> Option<StreamEndReason> {
     s.end.as_ref().map(|e| e.reason)
+}
+
+/// Each segment's base, frames and end.
+fn segments(s: &Summary) -> Vec<(u64, u64, Option<EndReason>)> {
+    s.segments
+        .iter()
+        .map(|g| (g.base_frame, g.frames, g.end))
+        .collect()
 }
 
 fn every_frame_and_a_clean_stop(channels: u32, format: SampleFormat) {
@@ -470,7 +514,7 @@ fn every_frame_and_a_clean_stop(channels: u32, format: SampleFormat) {
     assert_eq!(started["record_id"], RECORD_ID);
     assert_eq!(stopped["record_id"], RECORD_ID);
     assert_eq!(started["frame"], 0);
-    assert_eq!(started["path"], "/records/test.bpcr");
+    assert_eq!(started["path"], "/records/test.framelog");
     assert_eq!(started["granted"]["channels"], channels);
     assert_eq!(started["device"]["usb_id"], "2886:0022");
     assert_eq!(started["build"]["source"], "git");
@@ -478,13 +522,38 @@ fn every_frame_and_a_clean_stop(channels: u32, format: SampleFormat) {
     assert_eq!(stopped["gaps"], 0);
 
     let s = ran.summary();
-    assert_eq!(s.record_id, RECORD_ID);
-    assert_eq!(s.header["started"]["mono_us"], started["mono_us"]);
+    assert_eq!(s.record_id.as_deref(), Some(RECORD_ID));
+    assert_eq!(s.header["build_id"], started["build"]["commit"]);
+    assert_eq!(s.header["created_epoch_us"], started["wall_us"]);
+    assert_eq!(s.header["capture"]["device"], started["device"]);
+    assert_eq!(s.header["capture"]["granted"]["period_frames"], PERIOD);
+    assert_eq!(s.hello.sample_rate_hz, RATE);
+    assert_eq!(u32::from(s.hello.channels), channels);
+    assert_eq!(s.hello.codec, format.wire().1);
+    assert_eq!(s.hello.bits_per_sample, format.wire().0);
+    let capture = s.capture.as_ref().unwrap();
+    assert_eq!(
+        capture.channel_names,
+        started["layout"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(capture.period_frames, PERIOD);
+    assert_eq!(capture.started.mono_us, started["mono_us"]);
+    assert_eq!(capture.started.wall_us, started["wall_us"]);
     assert_eq!(s.frames_delivered, u64::from(50 * PERIOD));
     assert_eq!(s.frames_recorded, u64::from(50 * PERIOD));
-    assert_eq!(s.blocks, 50);
-    assert!(s.gaps.is_empty());
-    assert_eq!(end_reason(&s), Some(EndReason::Stopped));
+    assert_eq!(
+        segments(&s),
+        [(0, u64::from(50 * PERIOD), Some(EndReason::StreamEnd))]
+    );
+    assert_eq!(s.blocks, Some(50));
+    assert!(s.discontinuities.is_empty());
+    assert_eq!(s.wall_steps.as_deref(), Some(&[][..]));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::Stopped));
     assert_eq!(s.end.as_ref().unwrap().at_frame, u64::from(50 * PERIOD));
     assert_eq!(s.tail.verdict, "ended");
     ran.assert_blocks_are_the_delivered_frames();
@@ -509,8 +578,17 @@ fn an_overrun_is_an_unmeasured_gap_at_its_position() {
     let ran = run_steps(steps);
     assert_eq!(ran.outcome, Outcome::Stopped);
     let s = ran.summary();
-    assert_eq!(gaps(&s), [(GapCause::Overrun, 100, None)]);
-    assert!(s.gaps[0].detail.contains("errno"));
+    assert_eq!(gaps(&s), [(LossCause::Overrun, 100, None)]);
+    assert!(s.discontinuities[0].detail.contains("errno"));
+    // The segment closes at the loss and the next opens where it happened:
+    // the index does not advance over audio nothing counted.
+    assert_eq!(
+        segments(&s),
+        [
+            (0, 100, Some(EndReason::SourceLoss)),
+            (100, 100, Some(EndReason::StreamEnd))
+        ]
+    );
     assert_eq!(s.frames_delivered, 200);
     let gap = ran.line("capture_gap");
     assert_eq!(gap["cause"], "overrun");
@@ -532,8 +610,8 @@ fn each_errno_maps_to_its_cause() {
     assert_eq!(
         gaps(&s),
         [
-            (GapCause::Suspend, 20, None),
-            (GapCause::TransferError, 40, None)
+            (LossCause::Suspend, 20, None),
+            (LossCause::TransferError, 40, None)
         ]
     );
 }
@@ -550,7 +628,7 @@ fn a_recovery_from_wait_is_a_gap_like_one_from_read() {
         )
     };
     let from_wait = via(Step::WaitRecovered(libc::EPIPE));
-    assert_eq!(from_wait.0, [(GapCause::Overrun, 60, None)]);
+    assert_eq!(from_wait.0, [(LossCause::Overrun, 60, None)]);
     assert_eq!(from_wait, via(Step::ReadRecovered(libc::EPIPE)));
 }
 
@@ -565,10 +643,11 @@ fn a_short_read_is_a_short_block_and_no_gap() {
         .collect();
     let ran = run_steps(steps);
     let s = ran.summary();
-    assert!(s.gaps.is_empty());
-    assert_eq!(s.short_blocks.len(), 1);
-    assert_eq!(s.short_blocks[0].first_frame, 40);
-    assert_eq!(s.short_blocks[0].frames, 7);
+    assert!(s.discontinuities.is_empty());
+    let short = s.short_blocks.as_ref().unwrap();
+    assert_eq!(short.len(), 1);
+    assert_eq!(short[0].first_frame, 40);
+    assert_eq!(short[0].frames, 7);
     assert_eq!(s.frames_delivered, 87);
     ran.assert_blocks_are_the_delivered_frames();
 }
@@ -601,21 +680,28 @@ fn a_blocked_destination_drops_blocks_into_one_exact_backlog_gap() {
     let ran = run_script(6, SampleFormat::S16Le, steps, dest, StepClock::new());
     assert_eq!(ran.outcome, Outcome::Stopped);
     let s = ran.summary();
-    assert_eq!(gaps(&s), [(GapCause::WriterBacklog, 2020, Some(49 * 20))]);
-    let gap = &s.gaps[0];
+    assert_eq!(gaps(&s), [(LossCause::WriterBacklog, 2020, Some(49 * 20))]);
+    let gap = &s.discontinuities[0];
     let dropped = gap.frames.unwrap();
     assert_eq!(s.frames_delivered, 155 * u64::from(PERIOD));
     assert_eq!(s.frames_recorded + dropped, s.frames_delivered);
-    let (items, verdict) = ran.items();
-    assert_eq!(verdict, Verdict::Ended);
-    let after = items
+    // A measured loss is a jump of the index inside the one segment.
+    assert_eq!(gap.segment_id, Some(0));
+    assert_eq!(s.segments.len(), 1);
+    let (steps, verdict) = ran.steps();
+    assert_eq!(verdict, "ended");
+    let after = steps
         .iter()
-        .skip_while(|i| !matches!(i, Item::Gap { .. }))
+        .skip_while(|i| !matches!(i, LogStep::Loss { .. }))
         .find_map(|i| match i {
-            Item::Block { first_frame, .. } => Some(*first_frame),
+            LogStep::Audio(a) => Some((a.first_frame, a.jump)),
             _ => None,
         })
         .unwrap();
+    let after = match after {
+        (first_frame, None) => first_frame,
+        (_, jump) => panic!("the Loss frame accounts for the jump: {jump:?}"),
+    };
     assert_eq!(after, gap.at_frame + dropped);
     let line = ran.line("capture_gap");
     assert_eq!(line["cause"], "writer_backlog");
@@ -642,12 +728,18 @@ fn an_overrun_behind_a_full_queue_stays_in_order_between_backlog_gaps() {
     assert_eq!(
         gaps(&s),
         [
-            (GapCause::WriterBacklog, 2020, Some(49 * 20)),
-            (GapCause::Overrun, 3000, None),
-            (GapCause::WriterBacklog, 3000, Some(50 * 20)),
+            (LossCause::WriterBacklog, 2020, Some(49 * 20)),
+            (LossCause::Overrun, 3000, None),
+            (LossCause::WriterBacklog, 3000, Some(50 * 20)),
         ]
     );
-    assert_eq!(end_reason(&s), Some(EndReason::Stopped));
+    // The overrun closes the one segment; the backlog after it has none open.
+    assert_eq!(
+        segments(&s),
+        [(0, 101 * u64::from(PERIOD), Some(EndReason::SourceLoss))]
+    );
+    assert_eq!(s.discontinuities[2].segment_id, None);
+    assert_eq!(end_reason(&s), Some(StreamEndReason::Stopped));
     assert_eq!(s.end.as_ref().unwrap().at_frame, 200 * u64::from(PERIOD));
     assert_eq!(s.tail.verdict, "ended");
     assert_eq!(ran.line("capture_stopped")["gaps"], 3);
@@ -681,7 +773,7 @@ fn twenty_timeouts_in_a_row_end_the_stream() {
     );
     assert_eq!(failed["at_frame"], 60);
     let s = ran.summary();
-    assert_eq!(end_reason(&s), Some(EndReason::StreamDied));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::StreamDied));
     assert_eq!(s.frames_delivered, 60);
     assert_eq!(s.tail.verdict, "ended");
 }
@@ -696,7 +788,7 @@ fn a_delivered_period_restarts_the_timeout_count() {
         .collect();
     let ran = run_steps(steps);
     assert_eq!(ran.outcome, Outcome::Stopped);
-    assert_eq!(end_reason(&ran.summary()), Some(EndReason::Stopped));
+    assert_eq!(end_reason(&ran.summary()), Some(StreamEndReason::Stopped));
 }
 
 #[test]
@@ -724,20 +816,22 @@ fn a_stream_that_dies_ends_the_record_with_stream_died() {
             .contains("recovery failed")
     );
     let s = ran.summary();
-    assert_eq!(end_reason(&s), Some(EndReason::StreamDied));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::StreamDied));
     assert_eq!(s.frames_delivered, 80);
     assert_eq!(s.tail.verdict, "ended");
     assert!(ran.script.stopped);
 }
 
 #[test]
-fn a_refused_write_ends_the_record_at_the_last_whole_block() {
+fn a_refused_write_ends_the_log_at_the_last_whole_block() {
     let dest = MemDest::new();
     let refuse = dest.clone();
     let steps = periods(5)
         .chain([act(move || {
-            // The header and five blocks: the refusal meets the next block.
+            // The header and five blocks: the refusal meets the next block,
+            // which lands half its bytes before failing.
             refuse.until_writes(6);
+            refuse.0.tear.store(true, Ordering::SeqCst);
             refuse.0.refuse.store(1, Ordering::SeqCst);
         })])
         .chain(periods(5))
@@ -748,16 +842,17 @@ fn a_refused_write_ends_the_record_at_the_last_whole_block() {
     assert_eq!(failed["reason"], "write_failed");
     let detail = failed["detail"].as_str().unwrap();
     assert!(detail.contains("no space left"), "{detail}");
-    assert!(detail.contains("ends with end/write_failed"), "{detail}");
+    assert!(detail.contains("ends with End{write_failed}"), "{detail}");
     let s = ran.summary();
-    assert_eq!(s.blocks, 5);
-    assert_eq!(end_reason(&s), Some(EndReason::WriteFailed));
+    assert_eq!(s.blocks, Some(5));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::WriteFailed));
     assert_eq!(s.end.as_ref().unwrap().at_frame, 100);
+    assert_eq!(segments(&s), [(0, 100, Some(EndReason::StreamEnd))]);
     assert_eq!(s.tail.verdict, "ended");
 }
 
 #[test]
-fn a_refused_end_too_leaves_the_record_unterminated() {
+fn a_refused_end_too_leaves_the_log_unterminated() {
     let dest = MemDest::new();
     let refuse = dest.clone();
     let steps = periods(5)
@@ -771,16 +866,12 @@ fn a_refused_end_too_leaves_the_record_unterminated() {
     assert_eq!(ran.outcome, Outcome::Failed);
     let failed = ran.line("capture_failed");
     assert_eq!(failed["reason"], "write_failed");
-    assert!(
-        failed["detail"]
-            .as_str()
-            .unwrap()
-            .contains("has no end record")
-    );
+    assert!(failed["detail"].as_str().unwrap().contains("has no end"));
     let s = ran.summary();
-    assert_eq!(s.blocks, 5);
+    assert_eq!(s.blocks, Some(5));
     assert_eq!(s.end, None);
     assert_eq!(s.tail.verdict, "unterminated");
+    assert_eq!(s.tail.open_segment, Some(0));
 }
 
 #[test]
@@ -798,7 +889,7 @@ fn a_destination_under_the_floor_ends_with_destination_full() {
     let failed = ran.line("capture_failed");
     assert_eq!(failed["reason"], "destination_full");
     let s = ran.summary();
-    assert_eq!(end_reason(&s), Some(EndReason::DestinationFull));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::DestinationFull));
     assert!(s.end.as_ref().unwrap().detail.contains("under the floor"));
     assert_eq!(s.tail.verdict, "ended");
 }
@@ -849,10 +940,11 @@ fn a_wall_clock_step_is_a_step_and_not_a_gap() {
         .collect();
     let ran = run_script(6, SampleFormat::S16Le, steps, MemDest::new(), clock);
     let s = ran.summary();
-    assert!(s.gaps.is_empty());
-    assert_eq!(s.wall_steps.len(), 1);
-    assert_eq!(s.wall_steps[0].at_frame, 100);
-    assert_eq!(s.wall_steps[0].step_us, 3_000_000);
+    assert!(s.discontinuities.is_empty());
+    let steps = s.wall_steps.as_ref().unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].at_frame, 100);
+    assert_eq!(steps[0].step_us, 3_000_000);
 }
 
 #[test]
@@ -880,15 +972,16 @@ fn a_late_block_carries_its_backlog_and_each_late_run_is_announced_once() {
         .collect();
     assert_eq!(late_lines, [(40, 20), (140, 40)]);
     let s = ran.summary();
-    assert_eq!(s.late.len(), 2);
-    assert_eq!(s.late[0].blocks, 3);
-    assert_eq!(s.late[0].max_backlog_frames, 3 * PERIOD);
-    assert!(s.gaps.is_empty());
-    let (items, _) = ran.items();
-    let backlogs: Vec<u32> = items
+    let late = s.late.as_ref().unwrap();
+    assert_eq!(late.len(), 2);
+    assert_eq!(late[0].blocks, 3);
+    assert_eq!(late[0].max_backlog_frames, 3 * PERIOD);
+    assert!(s.discontinuities.is_empty());
+    let (steps, _) = ran.steps();
+    let backlogs: Vec<u32> = steps
         .iter()
         .filter_map(|i| match i {
-            Item::Block { backlog_frames, .. } => Some(*backlog_frames),
+            LogStep::Read { backlog_frames, .. } => Some(*backlog_frames),
             _ => None,
         })
         .collect();
@@ -911,15 +1004,13 @@ fn a_copy_taken_mid_run_reads_back_without_error() {
     run_script(6, SampleFormat::S16Le, steps, dest, StepClock::new());
     let copy = copy.lock().unwrap().clone();
     for cut in [copy.len(), copy.len() - 1, copy.len() - 7] {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(&copy[..cut]).unwrap();
-        let s = summarize(f.path()).unwrap();
+        let s = summary_of(&copy[..cut]);
         assert!(
             matches!(s.tail.verdict, "unterminated" | "torn"),
             "cut at {cut}: {}",
             s.tail.verdict
         );
-        assert!(s.blocks > 0);
+        assert!(s.blocks.unwrap() > 0);
         assert_eq!(s.end, None);
     }
 }
@@ -960,8 +1051,8 @@ fn a_failed_sync_after_the_end_is_a_write_failure_and_says_the_end_is_there() {
     assert_eq!(failed["reason"], "write_failed");
     let detail = failed["detail"].as_str().unwrap();
     assert!(detail.contains("sync failed"), "{detail}");
-    assert!(detail.contains("holds its end record"), "{detail}");
-    assert_eq!(end_reason(&ran.summary()), Some(EndReason::Stopped));
+    assert!(detail.contains("holds its end"), "{detail}");
+    assert_eq!(end_reason(&ran.summary()), Some(StreamEndReason::Stopped));
 }
 
 #[test]
@@ -998,10 +1089,10 @@ fn a_read_that_delivers_nothing_is_no_block_and_no_period() {
     assert_eq!(ran.outcome, Outcome::Failed);
     assert_eq!(ran.line("capture_failed")["reason"], "stream_died");
     let s = ran.summary();
-    assert_eq!(s.blocks, 2);
-    assert!(s.short_blocks.is_empty());
+    assert_eq!(s.blocks, Some(2));
+    assert_eq!(s.short_blocks.as_deref(), Some(&[][..]));
     assert_eq!(s.frames_delivered, 40);
-    assert_eq!(end_reason(&s), Some(EndReason::StreamDied));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::StreamDied));
 }
 
 #[test]
@@ -1020,14 +1111,14 @@ fn a_free_space_reading_that_fails_is_a_failed_write() {
     assert_eq!(failed["reason"], "write_failed");
     let detail = failed["detail"].as_str().unwrap();
     assert!(detail.contains("free space"), "{detail}");
-    assert!(detail.contains("ends with end/write_failed"), "{detail}");
+    assert!(detail.contains("ends with End{write_failed}"), "{detail}");
     let s = ran.summary();
-    assert_eq!(end_reason(&s), Some(EndReason::WriteFailed));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::WriteFailed));
     assert_eq!(s.tail.verdict, "ended");
 }
 
 #[test]
-fn a_destination_that_falls_under_the_floor_mid_capture_ends_where_the_record_does() {
+fn a_destination_that_falls_under_the_floor_mid_capture_ends_where_the_log_does() {
     let dest = MemDest::new();
     let low = dest.clone();
     let steps = periods(5)
@@ -1047,15 +1138,15 @@ fn a_destination_that_falls_under_the_floor_mid_capture_ends_where_the_record_do
     // The capture had read one more period when it found the writer gone.
     assert_eq!(failed["at_frame"], 6 * PERIOD);
     let s = ran.summary();
-    assert_eq!(end_reason(&s), Some(EndReason::DestinationFull));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::DestinationFull));
     assert_eq!(s.end.as_ref().unwrap().at_frame, 5 * u64::from(PERIOD));
     assert_eq!(s.frames_delivered, 5 * u64::from(PERIOD));
-    assert_eq!(s.blocks, 5);
+    assert_eq!(s.blocks, Some(5));
     assert_eq!(s.tail.verdict, "ended");
 }
 
 #[test]
-fn a_stop_held_in_the_final_sync_is_write_stalled_with_the_end_in_the_record() {
+fn a_stop_held_in_the_final_sync_is_write_stalled_with_the_end_in_the_log() {
     let dest = MemDest::new();
     dest.0.sync_held.store(true, Ordering::SeqCst);
     let ran = run_script(
@@ -1070,9 +1161,9 @@ fn a_stop_held_in_the_final_sync_is_write_stalled_with_the_end_in_the_record() {
     let failed = ran.line("capture_failed");
     assert_eq!(failed["reason"], "write_stalled");
     let detail = failed["detail"].as_str().unwrap();
-    assert!(!detail.contains("no end record"), "{detail}");
+    assert!(!detail.contains("no end"), "{detail}");
     let s = ran.summary();
-    assert_eq!(end_reason(&s), Some(EndReason::Stopped));
+    assert_eq!(end_reason(&s), Some(StreamEndReason::Stopped));
     assert_eq!(s.tail.verdict, "ended");
 }
 
@@ -1100,7 +1191,7 @@ fn a_gap_between_late_blocks_starts_a_new_late_run() {
     let ran = run_steps(steps);
     assert_eq!(late_lines(&ran), [20, 40]);
     let s = ran.summary();
-    let runs: Vec<u64> = s.late.iter().map(|r| r.first_frame).collect();
+    let runs: Vec<u64> = s.late.unwrap().iter().map(|r| r.first_frame).collect();
     assert_eq!(runs, [20, 40]);
 }
 
@@ -1124,8 +1215,64 @@ fn a_late_block_the_queue_drops_announces_no_late_run() {
     let ran = run_script(6, SampleFormat::S16Le, steps, dest, StepClock::new());
     assert_eq!(ran.outcome, Outcome::Stopped);
     let s = ran.summary();
-    assert_eq!(gaps(&s), [(GapCause::WriterBacklog, 2020, Some(20))]);
+    assert_eq!(gaps(&s), [(LossCause::WriterBacklog, 2020, Some(20))]);
     assert_eq!(late_lines(&ran), [2040]);
-    let runs: Vec<u64> = s.late.iter().map(|r| r.first_frame).collect();
+    let runs: Vec<u64> = s.late.unwrap().iter().map(|r| r.first_frame).collect();
     assert_eq!(runs, [2040]);
+}
+
+#[test]
+fn a_block_is_late_against_the_granted_period_not_the_one_asked_for() {
+    // 1 kHz asks for a 20-frame period; the device granted 25. A backlog of
+    // 20 is not a period behind, one of 25 is.
+    let read = |backlog| Step::Period {
+        frames: 25,
+        backlog,
+    };
+    let steps = vec![read(0), read(20), read(25), read(0)];
+    let ran = run_recording(
+        recording(6, SampleFormat::S16Le, 25),
+        steps,
+        MemDest::new(),
+        StepClock::new(),
+    );
+    assert_eq!(ran.outcome, Outcome::Stopped);
+    assert_eq!(late_lines(&ran), [50]);
+    assert_eq!(ran.line("capture_started")["granted"]["period_frames"], 25);
+    let s = ran.summary();
+    assert_eq!(s.capture.as_ref().unwrap().period_frames, 25);
+    let late = s.late.unwrap();
+    assert_eq!(late.len(), 1);
+    assert_eq!((late[0].first_frame, late[0].blocks), (50, 1));
+    assert_eq!(late[0].max_backlog_frames, 25);
+    assert_eq!(s.short_blocks.as_deref(), Some(&[][..]));
+}
+
+#[test]
+fn an_audio_frame_s_time_is_its_first_frame_s_capture_time() {
+    // The clock reads 1 ms apart: the start pair, then one per read. A
+    // 20-frame read at 1 kHz with 40 frames behind it began 60 ms before
+    // the read returned.
+    let steps = vec![Step::Period {
+        frames: 20,
+        backlog: 40,
+    }];
+    let ran = run_steps(steps);
+    let (steps, _) = ran.steps();
+    let read_mono = steps
+        .iter()
+        .find_map(|s| match s {
+            LogStep::Read { mono_us, .. } => Some(*mono_us),
+            _ => None,
+        })
+        .unwrap();
+    let audio_ts = steps
+        .iter()
+        .find_map(|s| match s {
+            LogStep::Audio(a) => Some(a.device_ts_us),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(audio_ts, read_mono - 60_000);
+    assert_eq!(ran.summary().segments[0].base_frame, 0);
 }

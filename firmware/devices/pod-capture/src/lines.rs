@@ -4,8 +4,12 @@
 
 use std::io::Write;
 
-use capture_record::{Device, Gap, GapCause, Granted, WriterBuild};
+use audio_pipeline::wide::LossCause;
+use frame_log::{Device, WriterBuild};
 use serde::Serialize;
+
+use crate::framer::Gap;
+use crate::granted::Granted;
 
 /// Writes event lines. A stdout the caller has closed does not stop the capture:
 /// the first failed write is noted on stderr, and later lines are not attempted.
@@ -64,12 +68,12 @@ pub struct CaptureStarted<'a> {
 }
 
 /// `capture_gap`: audio is missing at `at_frame`, and the same fact is in the
-/// record. An unmeasured gap is announced when it happens; a `writer_backlog`
+/// log. An unmeasured gap is announced when it happens; a `writer_backlog`
 /// gap when it is queued, which is when its length is final.
 #[derive(Debug, Serialize)]
 pub struct CaptureGap<'a> {
     pub record_id: &'a str,
-    pub cause: GapCause,
+    pub cause: LossCause,
     pub at_frame: u64,
     /// `null` when the hole was not measured.
     pub frames: Option<u64>,
@@ -79,7 +83,7 @@ pub struct CaptureGap<'a> {
 }
 
 impl<'a> CaptureGap<'a> {
-    /// The line for a gap the record holds, stamped `mono_us` as its event is.
+    /// The line for a gap the log holds, stamped `mono_us` as its event is.
     pub fn of(record_id: &'a str, mono_us: u64, gap: &'a Gap) -> Self {
         CaptureGap {
             record_id,
@@ -94,8 +98,8 @@ impl<'a> CaptureGap<'a> {
 }
 
 /// `capture_late`: the reader fell a period or more behind here. Nothing was
-/// lost. One line at the start of each run of late blocks the record holds,
-/// emitted once the run's first block is queued for the record; a gap ends a run.
+/// lost. One line at the start of each run of late blocks the log holds,
+/// emitted once the run's first block is queued for the log; a gap ends a run.
 #[derive(Debug, Serialize)]
 pub struct CaptureLate<'a> {
     pub record_id: &'a str,
@@ -105,7 +109,7 @@ pub struct CaptureLate<'a> {
     pub wall_us: u64,
 }
 
-/// `capture_stopped`: the record ends with `end`/`stopped`, is synced and
+/// `capture_stopped`: the log ends with `End{stopped}`, is synced and
 /// closed, and holds every delivered frame outside its gaps. Exit status 0
 /// follows.
 #[derive(Debug, Serialize)]
@@ -113,7 +117,7 @@ pub struct CaptureStopped<'a> {
     pub record_id: &'a str,
     /// The final delivered-frame position.
     pub frames: u64,
-    /// Gap records in the record.
+    /// Gaps in the log.
     pub gaps: u64,
     pub mono_us: u64,
     pub wall_us: u64,
@@ -123,12 +127,12 @@ pub struct CaptureStopped<'a> {
 /// 1 follows.
 #[derive(Debug, Serialize)]
 pub struct CaptureFailed<'a> {
-    /// `null` before a record exists.
+    /// `null` before a log exists.
     pub record_id: Option<&'a str>,
     pub reason: FailReason,
     pub detail: &'a str,
     /// The delivered-frame position the capture had reached; `null` before a
-    /// record exists.
+    /// log exists.
     pub at_frame: Option<u64>,
     pub mono_us: u64,
     pub wall_us: u64,
@@ -154,18 +158,18 @@ pub enum FailReason {
     /// The destination could not be created or its header written.
     Destination,
     /// The stream failed past recovery, would not start, or delivered nothing
-    /// for too long. The record ends with `end`/`stream_died` where the writer
+    /// for too long. The log ends with `End{stream_died}` where the writer
     /// could still write it.
     StreamDied,
-    /// Free space fell under the floor; the record ends with
-    /// `end`/`destination_full`.
+    /// Free space fell under the floor; the log ends with
+    /// `End{destination_full}`.
     DestinationFull,
-    /// A write to the destination failed; `detail` says whether the record
-    /// ends with `end`/`write_failed`.
+    /// A write to the destination failed; `detail` says whether the log
+    /// ends with `End{write_failed}`.
     WriteFailed,
     /// The writer had not reported within the bound after the stream stopped.
-    /// It may have been held writing a record or syncing after its end record,
-    /// so whether the record ends is for its reader to say.
+    /// It may have been held writing or syncing after the end, so whether the
+    /// log ends is for its reader to say.
     WriteStalled,
 }
 

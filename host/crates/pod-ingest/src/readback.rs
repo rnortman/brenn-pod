@@ -10,8 +10,8 @@
 use audio_pipeline::wire::decode_frame;
 use serde::Serialize;
 
-use crate::framelog::{FrameLogError, FrameLogReader, LogItem};
 use crate::session::{FormatConstraint, ResumeLedger, SessionEvent, SessionFsm};
+use frame_log::{FrameLogError, FrameLogReader, LogItem};
 
 /// Why a log's replay stopped before clean EOF. The samples spliced so far
 /// are kept; the remainder of the requested range stays whatever the caller
@@ -181,12 +181,10 @@ fn splice_event(
 mod tests {
     use super::*;
     use crate::clock::HostMicros;
-    use crate::framelog::FrameLogWriter;
     use crate::session::Codec;
     use crate::test_fixtures::{audio, framed, meta, seg_end, seg_start, write_log};
-    use audio_pipeline::wire::{
-        AUDIO_PROTOCOL_VERSION, ChannelSource, Hello, MAX_FRAME_BYTES, StreamFrame,
-    };
+    use audio_pipeline::wire::{AUDIO_PROTOCOL_VERSION, ChannelSource, Hello, StreamFrame};
+    use frame_log::FrameLogWriter;
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::path::Path;
@@ -352,10 +350,11 @@ mod tests {
         let path = dir.path().join("a.framelog");
         write_log(&path, &[hello(), seg_start(1, 0), audio(1, 0, 320)]);
 
-        // Append a raw record header claiming an out-of-range length.
+        // Append a raw record header claiming a zero length, the one length
+        // the format cannot hold.
         let mut extra = Vec::new();
         extra.extend_from_slice(&99u64.to_le_bytes());
-        extra.extend_from_slice(&((MAX_FRAME_BYTES + 1) as u16).to_le_bytes());
+        extra.extend_from_slice(&0u16.to_le_bytes());
         OpenOptions::new()
             .append(true)
             .open(&path)

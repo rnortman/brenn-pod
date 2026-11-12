@@ -945,6 +945,7 @@ mod tests {
                 created_epoch_us: HostMicros(1_700_000_000_000_000),
                 conn_seq: 1,
                 rolled_from: rolled.then(|| "prev.framelog".to_string()),
+                capture: None,
             },
         )
         .expect("create framelog");

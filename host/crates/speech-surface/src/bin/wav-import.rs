@@ -112,6 +112,7 @@ fn import(cli: &Cli) -> Result<usize> {
         created_epoch_us: HostMicros(cli.base_epoch_us),
         conn_seq: cli.conn_seq,
         rolled_from: None,
+        capture: None,
     };
     let writer = FrameLogWriter::create(&cli.output, meta)
         .with_context(|| format!("create frame log {}", cli.output.display()))?;

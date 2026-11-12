@@ -17,6 +17,9 @@ std = []
 # feature so its `#[cfg(test)]` `drain_*` tests share one `audio_frame` definition
 # without dragging it into the production build (partial-write-fix design §2.3a).
 test-support = ["std"]
+# The frame-log frame type (`wide` module): audio of any length up to a frame-log
+# record, and the capture extension. Host-side only; the device crates do not enable it.
+wide = ["std", "serde/alloc"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive"] }
@@ -30,6 +33,7 @@ log = { workspace = true }
 
 [dev-dependencies]
 postcard = { version = "1", features = ["alloc"] }
+serde_json = "1"
 # Host-only: the stream_send host-socket integration test backs its `wait_writable`
 # closure with `poll(POLLOUT)` against a real localhost socket (mirroring the device
 # `poll_writable`).  A `[dev-dependencies]`, so it never reaches the device build

@@ -7,8 +7,8 @@ members = [
     "crates/audio-pipeline",
     "crates/brenn-bridge",
     "crates/device-protocol",
+    "crates/frame-log",
     "crates/build-id",
-    "crates/capture-record",
     "crates/hil-host",
     "crates/pod-jsonl",
     "crates/pod-secrets",
@@ -16,7 +16,6 @@ members = [
     "crates/pod-transport",
     "crates/podctl",
     "crates/psk-link",
-    "crates/stamped-log",
     "crates/truncfmt",
     "crates/wifi-diag",
     "crates/wifi-reconnect",
@@ -36,9 +35,9 @@ members = [
 # pod-capture is out for the same reason, through alsa-pcm.
 # brenn-bridge is out for the same reason again (native-tls → openssl); its own tests run
 # under --workspace, and its only consumer lives in host/, which is a separate workspace
-# covered by its own lane. pod-jsonl, pod-secrets, stamped-log and capture-record are in:
+# covered by its own lane. pod-jsonl, pod-secrets and frame-log are in:
 # they are small, pure-Rust, and everything else here can depend on them freely.
-default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/capture-record", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/stamped-log", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
+default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/frame-log", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl"]
 resolver = "2"
 
 [workspace.package]

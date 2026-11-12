@@ -1,8 +1,10 @@
 # Runbook: recording a capture device with `pod-capture`
 
 Record every channel of one ALSA capture device on a Linux workstation to a
-capture record, stop it, and read it back. The format is
-[`docs/reference/capture-record.md`](../reference/capture-record.md).
+frame log, stop it, and read it back. The format is
+[`docs/reference/frame-log.md`](../reference/frame-log.md); the program's
+command line and event lines are
+[`docs/reference/pod-capture.md`](../reference/pod-capture.md).
 
 ## Prerequisites
 
@@ -26,18 +28,18 @@ capture record, stop it, and read it back. The format is
 
 ```sh
 cd firmware
-cargo build --release -p pod-capture -p capture-record
+cargo build --release -p pod-capture -p frame-log
 ```
 
 The binaries are `target/release/pod-capture` and
-`target/release/capture-record`.
+`target/release/frame-log`.
 
 ## Record
 
 ```sh
 target/release/pod-capture --card "Flex XVF3800 L16K6Ch" --rate 16000 --format s16_le \
     --layout conference_beam,asr_beam,raw_mic_0,raw_mic_1,raw_mic_2,raw_mic_3 \
-    --out flex.bpcr
+    --pod-id flex --out flex.framelog
 ```
 
 - `--card` is matched case-insensitively against each card's name and long name
@@ -46,30 +48,32 @@ target/release/pod-capture --card "Flex XVF3800 L16K6Ch" --rate 16000 --format s
 - `--rate`, `--format` and the channel count (one per `--layout` name) are
   demanded exactly. A device that will not grant them is refused with `params`
   and what it advertises; nothing is resampled or converted.
+- `--pod-id` names the stream's source in the log's hello: 1 to 32 bytes.
 - `--out` must not exist.
 
 One JSON line per event goes to stdout; `capture_started` says the stream runs
-and names the record. The capture runs until it is stopped, the destination
+and names the capture. The capture runs until it is stopped, the destination
 runs low (it stops with five seconds of capture plus 1 MiB still free), or it
 fails.
 
 ## Stop
 
 `Ctrl-C` (`SIGINT`) or `SIGTERM`. The capture stops the stream at once, writes
-the end record, syncs and closes the file, prints `capture_stopped` and exits 0.
+the log's end, syncs and closes the file, prints `capture_stopped` and exits 0.
 Any other ending is one `capture_failed` line and exit 1; its `reason` and
-`detail` say what happened and whether the record has its end record.
+`detail` say what happened and whether the log has its end.
 
 ## Read it back
 
 ```sh
-target/release/capture-record summary flex.bpcr
-target/release/capture-record export-wav flex.bpcr flex.wav
+target/release/frame-log summary flex.framelog
+target/release/frame-log export-wav flex.framelog flex.wav
 ```
 
-The summary's `gaps` lists every place audio is missing, `[]` when there is
-none; `tail.verdict` is `ended` for a capture that stopped cleanly. The export's
-map says which WAV frames are audio and which are silence standing for a gap.
+The summary's `discontinuities` lists every place audio is missing, `[]` when
+there is none; `tail.verdict` is `ended` for a capture that stopped cleanly.
+The export's map says which WAV frames are audio and which are silence standing
+for a hole. The same tool reads the voice host's frame logs.
 
 ## Hardware test
 
@@ -80,9 +84,10 @@ make -C firmware capture-hil
 ```
 
 Two tests, silent (nothing is played), about 21 seconds: ten seconds of every
-channel with no gap and every channel live by the repository's waveform guards;
-and a capture paused for one second (`SIGSTOP`, `SIGCONT`) that must come back
-as an `overrun` gap whose clock estimate is between 0.9 s and 1.2 s. Each prints
+channel in one segment with no discontinuity and every channel live by the
+repository's waveform guards; and a capture paused for one second (`SIGSTOP`,
+`SIGCONT`) that must come back as an `overrun` `capture_gap` line and an
+`overrun` loss in the log whose clock estimates sum to between 0.9 s and 1.2 s. Each prints
 its event lines, the summary, and every channel's statistics. A capture that
 fails to start fails the test with its `capture_failed` line printed whole. The
 waveform guards were calibrated on the ESP pod's I2S image; a channel of the USB

@@ -796,7 +796,8 @@ impl SessionFsm {
     /// Validate a `Hello`'s format fields against the constraint. The channel
     /// layout is either the constraint's mono count with a mono beam source, or
     /// two channels declared as [`ChannelSource::StereoBeamRawMic`]; any other
-    /// pairing (including the unlabelled `Stereo`) is rejected.
+    /// pairing (including the unlabelled `Stereo`, and a capture's `Described`) is
+    /// rejected.
     fn format_ok(&self, hello: &audio_pipeline::wire::Hello) -> bool {
         let c = &self.constraint;
         let layout_ok = match hello.channel_source {
@@ -804,7 +805,7 @@ impl SessionFsm {
             | ChannelSource::ConferenceBeam
             | ChannelSource::CommunicationBeam => hello.channels == c.channels,
             ChannelSource::StereoBeamRawMic => hello.channels == 2,
-            ChannelSource::Stereo => false,
+            ChannelSource::Stereo | ChannelSource::Described => false,
         };
         hello.sample_rate_hz == c.sample_rate_hz
             && hello.bits_per_sample == c.bits_per_sample
@@ -1299,6 +1300,8 @@ mod tests {
             (2, ChannelSource::CommunicationBeam),
             (2, ChannelSource::ConferenceBeam),
             (3, ChannelSource::StereoBeamRawMic),
+            (1, ChannelSource::Described),
+            (2, ChannelSource::Described),
         ] {
             let mut fsm = SessionFsm::new(SPINE, new_ledger());
             let ev = fsm.feed(hello_with(channels, source), hx(1));

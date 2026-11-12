@@ -290,6 +290,7 @@ pub fn generate_fixture() -> Vec<u8> {
         created_epoch_us: HostMicros(FIXTURE_EPOCH_US),
         conn_seq: 1,
         rolled_from: None,
+        capture: None,
     };
     let mut w = FrameLogWriter::create(&path, meta).expect("create fixture log");
     for (offset, frame) in fixture_frames() {

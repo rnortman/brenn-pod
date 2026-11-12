@@ -9,18 +9,23 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Added
 
-- **The Linux pod can record a capture device to a local file that says where
+- **The Linux pod can record a capture device to a frame log that says where
   it lost audio.** The new `pod-capture` program records every channel of one
   ALSA capture device, at the rate and sample format asked for and never
-  resampled, until it is stopped. Each block carries its position and a reading
-  of both the monotonic and wall clocks; overruns, suspends and a destination
-  that falls behind are recorded as gaps where they happened, and the file ends
-  saying why it stopped. `capture-record summary` describes a recording and
-  `capture-record export-wav` turns it into a WAV with gaps as silence plus a
-  map of them. `pod-capture` needs only libasound: no configuration, network or
-  key. Format: `docs/reference/capture-record.md`; procedure and the reSpeaker
-  Flex hardware tests (`make -C firmware capture-hil`):
-  `docs/runbooks/capture-record.md`.
+  resampled, until it is stopped, into a frame log: the same format the voice
+  host records a pod's connection into. Each block carries its position and a
+  reading of both the monotonic and wall clocks; overruns, suspends and a
+  destination that falls behind are recorded as losses at their positions, and
+  the log ends saying why it stopped. `frame-log summary` describes a capture's
+  log or the voice host's, and `frame-log export-wav` turns either into a WAV
+  with holes as silence plus a map of them. `pod-capture` needs only
+  libasound: no configuration, network or key. The capture's additions to the
+  frame format (a 32-bit sample format, described channels, a capture frame
+  the pods never send) leave the audio protocol version at 4, so no pod needs
+  reflashing. Format:
+  `docs/reference/frame-log.md`; the program: `docs/reference/pod-capture.md`;
+  procedure and the reSpeaker Flex hardware tests
+  (`make -C firmware capture-hil`): `docs/runbooks/pod-capture.md`.
 - A build outside a git checkout can state its commit in
   `BRENN_POD_BUILD_COMMIT`; inside a checkout git decides, and a declared
   commit that disagrees fails the build.

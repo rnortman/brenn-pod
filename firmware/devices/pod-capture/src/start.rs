@@ -1,14 +1,17 @@
 //! Start-up: from the command line to a running capture, in the one order that
-//! never leaves a half-made record behind a refusal it could have made first.
+//! never leaves a half-made log behind a refusal it could have made first.
 //!
 //! 1. Parse the arguments (exit 2 with usage on stderr if not understood).
 //! 2. Refuse if `--out` exists.
-//! 3. Enumerate the cards and select exactly one.
-//! 4. Open its first PCM for capture at exactly the demanded parameters.
-//! 5. Read back what was granted and the card's USB id.
-//! 6. Create the destination with `create_new`.
-//! 7. Hand over to [`run`](crate::run), which triggers the stream, takes the
-//!    start pair, writes the header and emits `capture_started`.
+//! 3. Refuse a layout the stream cannot state: more than 255 channels, a frame
+//!    no audio frame holds, or names too long for a `Describe` frame.
+//! 4. Enumerate the cards and select exactly one.
+//! 5. Open its first PCM for capture at exactly the demanded parameters.
+//! 6. Read back what was granted and the card's USB id.
+//! 7. Create the destination with `create_new`.
+//! 8. Hand over to [`run`](crate::run), which triggers the stream, takes the
+//!    start pair, writes the header, hello and `Describe` and emits
+//!    `capture_started`.
 //!
 //! Each refusal before the capture runs is one `capture_failed` line and exit 1.
 
@@ -21,13 +24,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use alsa::Direction;
 use alsa::pcm::Format;
 use alsa_pcm::{ByteCapture, CardInfo, PcmError, PcmParams, SelectError};
-use capture_record::{
-    BuildSource, Clocks, Device, DeviceControl, Granted, Header, SampleFormat, StartPair,
-    WriterBuild, WriterInfo,
-};
+use audio_pipeline::wide::{CaptureFrame, MAX_WIDE_FRAME_BYTES, WideFrame, encode_wide};
+use frame_log::{BuildSource, Device, DeviceControl, WriterBuild, WriterInfo};
 
-use crate::capture::{STOP_BOUND, failed, period_frames, run};
+use crate::capture::{Recording, STOP_BOUND, failed, period_frames, run};
 use crate::cli::{self, Args};
+use crate::granted::{Granted, SampleFormat};
 use crate::lines::{CardLine, FailReason, Lines, note};
 use crate::seams::SystemClock;
 
@@ -69,7 +71,7 @@ pub fn main_with<W: Write>(args: &[OsString], out: W) -> u8 {
     }
 }
 
-/// Why start-up refused, before any record exists.
+/// Why start-up refused, before any log exists.
 struct Refusal {
     reason: FailReason,
     detail: String,
@@ -97,6 +99,19 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
         ));
     }
 
+    let channels = layout_channels(&args.layout)?;
+    let frame_bytes = args.layout.len() * args.format.bytes_per_sample();
+    let period = period_frames(args.rate_hz, frame_bytes).ok_or_else(|| {
+        Refusal::new(
+            FailReason::Params,
+            format!(
+                "one frame of {channels} channels of {} is {frame_bytes} bytes, more than one \
+                 audio frame holds",
+                args.format.name()
+            ),
+        )
+    })?;
+
     let cards = alsa_pcm::enumerate_cards()
         .map_err(|e| Refusal::new(FailReason::Open, PcmError::Enumerate(e).to_string()))?;
     let card = alsa_pcm::select_one(&cards, &args.card).map_err(|e| {
@@ -111,19 +126,6 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
         }
     })?;
 
-    let channels = u32::try_from(args.layout.len())
-        .map_err(|_| Refusal::new(FailReason::Params, "--layout names too many channels"))?;
-    let frame_bytes = args.layout.len() * args.format.bytes_per_sample();
-    let period = period_frames(args.rate_hz, frame_bytes).ok_or_else(|| {
-        Refusal::new(
-            FailReason::Params,
-            format!(
-                "one frame of {channels} channels of {} is {frame_bytes} bytes, more than one \
-                 block holds",
-                args.format.name()
-            ),
-        )
-    })?;
     let wanted = PcmParams {
         rate_hz: args.rate_hz,
         channels,
@@ -150,8 +152,9 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
     let mut source =
         ByteCapture::new(&pcm).map_err(|e| Refusal::new(FailReason::Params, e.to_string()))?;
 
-    let header = Header {
+    let rec = Recording {
         record_id: record_id(),
+        pod_id: args.pod_id.clone(),
         writer: WriterInfo {
             program: "pod-capture".to_owned(),
             build: writer_build(),
@@ -171,12 +174,6 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
         },
         granted,
         layout: args.layout.clone(),
-        clocks: Clocks::v1(),
-        // `run` overwrites this with the pair taken directly after the trigger.
-        started: StartPair {
-            mono_us: 0,
-            wall_us: 0,
-        },
         device_control: DeviceControl { performed: false },
     };
 
@@ -198,7 +195,7 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
         &mut source,
         SystemClock,
         dest,
-        header,
+        rec,
         &out,
         &STOP,
         lines,
@@ -207,8 +204,42 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
     Ok(outcome.exit_code())
 }
 
+/// The channel count of `layout`, refused when a hello cannot state it or the
+/// names do not fit one `Describe` frame.
+fn layout_channels(layout: &[String]) -> Result<u32, Refusal> {
+    if layout.len() > usize::from(u8::MAX) {
+        return Err(Refusal::new(
+            FailReason::Params,
+            format!(
+                "--layout names {} channels; a hello states at most {}",
+                layout.len(),
+                u8::MAX
+            ),
+        ));
+    }
+    // The largest values the other fields can take, so a layout that fits
+    // here fits whatever the device grants and whenever the stream starts.
+    let describe = WideFrame::Capture(CaptureFrame::Describe {
+        schema: u8::MAX,
+        channel_names: layout.to_vec(),
+        period_frames: u32::MAX,
+        mono_us: u64::MAX,
+    });
+    let mut buf = vec![0; MAX_WIDE_FRAME_BYTES + 2];
+    encode_wide(&describe, &mut buf).map_err(|e| {
+        Refusal::new(
+            FailReason::Params,
+            format!(
+                "--layout's names do not fit one Describe frame of {MAX_WIDE_FRAME_BYTES} \
+                 bytes ({e:?})"
+            ),
+        )
+    })?;
+    Ok(layout.len() as u32)
+}
+
 /// What the device granted, refused unless it is what was demanded and a period
-/// fits in one block.
+/// fits in one audio frame.
 fn granted(pcm: &alsa::PCM, hw: &str, wanted: &PcmParams) -> Result<Granted, Refusal> {
     let g = alsa_pcm::granted(pcm).map_err(|e| {
         Refusal::new(
@@ -245,7 +276,7 @@ fn granted(pcm: &alsa::PCM, hw: &str, wanted: &PcmParams) -> Result<Granted, Ref
     };
     if g.period_frames == 0 || g.period_frames as usize > granted.max_block_frames() {
         return Err(refused(format!(
-            "a period of {} frames, which one block cannot hold",
+            "a period of {} frames, which one audio frame cannot hold",
             g.period_frames
         )));
     }
@@ -267,7 +298,7 @@ fn card_line(c: &CardInfo) -> CardLine {
     }
 }
 
-/// This binary's build id as the record states it.
+/// This binary's build id as the log's header states it.
 fn writer_build() -> WriterBuild {
     let id = build_id::build_id();
     match build_id::source() {
@@ -322,6 +353,28 @@ fn install_stop_handler() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(n: usize, len: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{i:0len$}")).collect()
+    }
+
+    #[test]
+    fn a_layout_is_at_most_255_channels() {
+        assert_eq!(layout_channels(&names(255, 3)).ok(), Some(255));
+        let refused = layout_channels(&names(256, 3)).expect_err("refused");
+        assert_eq!(refused.reason, FailReason::Params);
+        assert!(refused.detail.contains("256"), "{}", refused.detail);
+    }
+
+    #[test]
+    fn a_layout_whose_names_overflow_a_describe_frame_is_refused() {
+        // 255 names of 256 bytes is 65280 bytes of names, plus their length
+        // prefixes and the other fields: past the limit.
+        let refused = layout_channels(&names(255, 256)).expect_err("refused");
+        assert_eq!(refused.reason, FailReason::Params);
+        assert!(refused.detail.contains("Describe"), "{}", refused.detail);
+        assert_eq!(layout_channels(&names(255, 250)).ok(), Some(255));
+    }
 
     #[test]
     fn a_record_id_is_32_lowercase_hex_digits_and_not_repeated() {

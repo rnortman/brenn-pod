@@ -310,6 +310,8 @@ fn end_info_from_close(close: &SegmentClose, gap_count: u32, resumed: bool) -> S
                 EndReason::VadRelease => SegmentEndCause::VadRelease,
                 EndReason::Overrun => SegmentEndCause::Overrun,
                 EndReason::InternalError => SegmentEndCause::InternalError,
+                EndReason::SourceLoss => SegmentEndCause::SourceLoss,
+                EndReason::StreamEnd => SegmentEndCause::StreamEnd,
             },
             resumed,
             gap_count,
@@ -337,6 +339,8 @@ mod tests {
             (EndReason::VadRelease, SegmentEndCause::VadRelease),
             (EndReason::Overrun, SegmentEndCause::Overrun),
             (EndReason::InternalError, SegmentEndCause::InternalError),
+            (EndReason::SourceLoss, SegmentEndCause::SourceLoss),
+            (EndReason::StreamEnd, SegmentEndCause::StreamEnd),
         ] {
             let close = SegmentClose::Completed {
                 end_reason: reason,

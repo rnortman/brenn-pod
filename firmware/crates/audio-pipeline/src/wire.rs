@@ -19,16 +19,31 @@
 //!
 //! **Version:** the device requires the host's `Hello::version` to equal
 //! `AUDIO_PROTOCOL_VERSION`; the host reads any uplink from `AUDIO_PROTOCOL_MIN_READABLE`
-//! to `AUDIO_PROTOCOL_VERSION`.  Anything else is a fatal protocol error.  The version guards schema changes;
-//! it is not bumped when the server begins sending `Audio` frames back on the
-//! previously silent server→device direction, because the wire schema is unchanged.
+//! to `AUDIO_PROTOCOL_VERSION`.  Anything else is a fatal protocol error.  What the
+//! version covers, and when it is bumped, is on [`AUDIO_PROTOCOL_VERSION`].
+//!
+//! **Capture extension:** frame tag 64 ([`STREAM_FRAME_TAG_CAPTURE`]) is not part of the
+//! connection schema.  It carries a capture stream's own frames, encoded and decoded by
+//! the `wide` module; no connection peer sends it, and [`decode_frame`] and
+//! [`decode_inbound`] refuse it as an unknown tag.
 
 use heapless::{String as HString, Vec as HVec};
 use serde::{Deserialize, Serialize};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Wire protocol version embedded in `Hello`.  Increment on breaking schema changes.
+/// Wire protocol version embedded in `Hello`: the version of the **connection schema**,
+/// the frames and field values the two peers of a device–host connection may send each
+/// other.  It is bumped when either peer starts sending something the other end of an
+/// existing deployment cannot decode; the device's exact-match check and the host's
+/// range check guard it.
+///
+/// Frame tags 0 to 63 belong to the connection schema.  Tag 64 is the capture
+/// extension, versioned by its own `CAPTURE_SCHEMA_VERSION` together with the enum
+/// values only a capture stream uses (`Codec::S32Le`, `ChannelSource::Described`,
+/// `EndReason::SourceLoss`, `EndReason::StreamEnd`).  The day a connection peer sends
+/// one of those values, or a tag-64 frame, to the other peer, that is a
+/// connection-schema change and bumps this version.
 ///
 /// v2: `Hello` gained an explicit `codec: Codec` field so the PCM encoding is a
 /// negotiated part of the handshake rather than an implicit S16_LE convention.
@@ -44,8 +59,10 @@ pub const AUDIO_PROTOCOL_VERSION: u8 = 4;
 /// requires an exact match on the host's `Hello`.
 pub const AUDIO_PROTOCOL_MIN_READABLE: u8 = 3;
 
-/// Maximum postcard payload size (bytes), excluding the 2-byte length prefix.
-/// A received frame length field exceeding this is a protocol violation.
+/// Maximum postcard payload size (bytes) of a frame on a device–host connection,
+/// excluding the 2-byte length prefix, and the size of the ESP pod's frame buffers.
+/// A received frame length field exceeding this is a protocol violation on the
+/// connection.  It is not a limit of the frame-log format.
 pub const MAX_FRAME_BYTES: usize = 4096;
 
 /// PCM samples per `AudioFrame`, per channel.  20 ms @ 16 kHz.
@@ -109,14 +126,14 @@ pub struct Hello {
     pub sample_rate_hz: u32,
     /// Bits per sample, e.g. 16 (S16_LE).
     pub bits_per_sample: u8,
-    /// Number of PCM channels in `AudioFrame::pcm` (1 = mono, 2 = stereo).
+    /// Number of interleaved PCM channels in `AudioFrame::pcm`.
     pub channels: u8,
     /// PCM sample encoding in `AudioFrame::pcm`.  Negotiated explicitly rather than
     /// assumed: today `S16Le` is the only supported value, but carrying it on the
     /// handshake lets a receiver reject an unsupported codec instead of misinterpreting
     /// the bytes.
     pub codec: Codec,
-    /// Which XVF3800 output is captured.
+    /// What the channels carry, in interleave order.
     pub channel_source: ChannelSource,
 }
 
@@ -129,12 +146,14 @@ pub struct Hello {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum Codec {
-    /// Signed 16-bit little-endian PCM.  The only currently supported encoding.
+    /// Signed 16-bit little-endian PCM.  The only encoding a connection carries.
     /// Discriminant 0x00 — **do not reorder or rename** (golden-byte pinned).
     S16Le,
+    /// Signed 32-bit little-endian PCM.  Capture extension only.  Discriminant 0x01.
+    S32Le,
 }
 
-/// Which XVF3800 beam output is captured and sent.
+/// What a stream's channels carry, in interleave order.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelSource {
@@ -155,6 +174,10 @@ pub enum ChannelSource {
     /// (`AUDIO_MGR_OP_L = (8,0)`), right is amplified raw microphone 0
     /// (`AUDIO_MGR_OP_R = (3,0)`). Discriminant 0x04.
     StereoBeamRawMic,
+    /// The channels are named, one name per channel in interleave order, by the
+    /// capture `Describe` frame that follows the hello.  Capture extension only.
+    /// Discriminant 0x05.
+    Described,
 }
 
 /// Begins an utterance segment.
@@ -162,8 +185,25 @@ pub enum ChannelSource {
 pub struct SegmentStart {
     /// Monotonically increasing per-boot segment counter.
     pub segment_id: u32,
-    /// Absolute sample index (since capture start) of this segment's first sample.
-    /// Includes pre-roll samples.
+    /// Absolute sample index of this segment's first sample. Includes pre-roll
+    /// samples.
+    ///
+    /// The sample index counts samples per channel delivered by the capture
+    /// source since the stream's start. A sample has one index for the life of
+    /// the stream and no two samples share one. Inside a segment the index never
+    /// goes backwards.
+    ///
+    /// - Audio the source delivered and the stream does not carry shows as a
+    ///   forward jump of exactly its length. Inside a segment the jump is a
+    ///   measured loss. Between two segments it is audio not sent: the gate was
+    ///   closed, or the producer lost it and says so in a frame (the earlier
+    ///   segment's `Overrun` end, or a capture `Loss` frame).
+    /// - Audio the source never delivered is an unmeasured loss: the index does
+    ///   not advance, because nothing counted the samples.
+    /// - A segment may begin before the previous one ended: when a gate reopens
+    ///   within the pre-roll length, the new base lies inside the previous
+    ///   segment, and the samples sent again carry the indices and values they
+    ///   had. A producer with no pre-roll never does this.
     pub base_sample_index: u64,
     /// Device monotonic µs at the moment `base_sample_index` was captured.
     /// Clock-mapping anchor: telemetry timestamps resolve to sample offsets via
@@ -275,6 +315,12 @@ pub enum EndReason {
     /// Appended last: postcard encodes enum tags positionally, so new variants go
     /// at the end and existing tags never move.
     InternalError,
+    /// The capture source lost audio of unknown length here; the sample index does not
+    /// advance across the loss.  Capture extension only.
+    SourceLoss,
+    /// The producer ended its stream while the segment was open; why is in the
+    /// stream's capture `End` frame.  Capture extension only.
+    StreamEnd,
 }
 
 /// Body of [`StreamFrame::EndOfAudio`] — the server's explicit end-of-audio marker.
@@ -519,6 +565,9 @@ const STREAM_FRAME_TAG_SEGMENT_END: u32 = 4;
 const STREAM_FRAME_TAG_END_OF_AUDIO: u32 = 5;
 const STREAM_FRAME_TAG_FLUSH_PLAYBACK: u32 = 6;
 const STREAM_FRAME_TAG_STATUS: u32 = 7;
+/// The capture extension's one frame.  Not a connection tag: every connection tag is
+/// below 64.
+pub const STREAM_FRAME_TAG_CAPTURE: u32 = 64;
 
 /// Outcome of a borrowing inbound decode: classifies the frame and, for `Audio`,
 /// borrows the PCM directly out of the caller's buffer (no owned `AudioFrame`, no
@@ -794,12 +843,13 @@ fn take_u64(buf: &[u8]) -> Result<(u64, &[u8]), DecodeError> {
     postcard::take_from_bytes::<u64>(buf).map_err(|_| DecodeError::PostcardError)
 }
 
-/// Errors returned by `encode_frame`.
+/// Errors returned by `encode_frame` and the `wide` module's `encode_wide`.
 #[derive(Debug, PartialEq)]
 pub enum EncodeError {
     /// Output buffer is smaller than 2 bytes.
     BufferTooSmall,
-    /// Postcard payload would exceed `MAX_FRAME_BYTES`.
+    /// Postcard payload would exceed the codec's limit: `MAX_FRAME_BYTES`, or
+    /// `MAX_WIDE_FRAME_BYTES` for a wide frame.
     PayloadTooLarge,
     /// Postcard serialization failed (typically a capacity overflow in a heapless container).
     PostcardError,
@@ -813,7 +863,8 @@ pub enum EncodeError {
 pub enum DecodeError {
     /// Input buffer is shorter than the declared length.
     Truncated,
-    /// Length prefix exceeds `MAX_FRAME_BYTES`.
+    /// Length prefix exceeds the codec's limit: `MAX_FRAME_BYTES`, or
+    /// `MAX_WIDE_FRAME_BYTES` for a wide frame.
     OversizeFrame { len: usize },
     /// An `Audio` frame's declared PCM run exceeds `MAX_AUDIO_PAYLOAD`.
     /// Only the borrowing `decode_inbound` path returns this — the owned `decode_frame`
@@ -1180,6 +1231,111 @@ mod tests {
         assert_eq!(tag(EndReason::VadRelease), 0);
         assert_eq!(tag(EndReason::Overrun), 1);
         assert_eq!(tag(EndReason::InternalError), 2);
+        assert_eq!(tag(EndReason::SourceLoss), 3);
+        assert_eq!(tag(EndReason::StreamEnd), 4);
+    }
+
+    /// The capture extension's appended `Codec` and `ChannelSource` values take the next
+    /// positional index; the old values keep their bytes.
+    #[test]
+    fn appended_hello_enum_values_take_next_index() {
+        let hello_tail = |codec: Codec, channel_source: ChannelSource| {
+            let bytes = frame_bytes(&StreamFrame::Hello(Hello {
+                version: AUDIO_PROTOCOL_VERSION,
+                pod_id: HString::try_from("p").unwrap(),
+                sample_rate_hz: 16_000,
+                bits_per_sample: 16,
+                channels: 1,
+                codec,
+                channel_source,
+            }));
+            [bytes[bytes.len() - 2], bytes[bytes.len() - 1]]
+        };
+        assert_eq!(hello_tail(Codec::S16Le, ChannelSource::AsrBeam), [0, 0]);
+        assert_eq!(hello_tail(Codec::S32Le, ChannelSource::AsrBeam), [1, 0]);
+        assert_eq!(
+            hello_tail(Codec::S16Le, ChannelSource::StereoBeamRawMic),
+            [0, 4]
+        );
+        assert_eq!(hello_tail(Codec::S16Le, ChannelSource::Described), [0, 5]);
+    }
+
+    /// The tag a connection frame encodes with; exhaustive, so a new `StreamFrame`
+    /// variant does not compile here until it has a tag.
+    fn connection_tag(frame: &StreamFrame) -> u32 {
+        match frame {
+            StreamFrame::Hello(_) => STREAM_FRAME_TAG_HELLO,
+            StreamFrame::SegmentStart(_) => STREAM_FRAME_TAG_SEGMENT_START,
+            StreamFrame::Audio(_) => STREAM_FRAME_TAG_AUDIO,
+            StreamFrame::Telemetry(_) => STREAM_FRAME_TAG_TELEMETRY,
+            StreamFrame::SegmentEnd(_) => STREAM_FRAME_TAG_SEGMENT_END,
+            StreamFrame::EndOfAudio(_) => STREAM_FRAME_TAG_END_OF_AUDIO,
+            StreamFrame::FlushPlayback(_) => STREAM_FRAME_TAG_FLUSH_PLAYBACK,
+            StreamFrame::Status(_) => STREAM_FRAME_TAG_STATUS,
+        }
+    }
+
+    #[test]
+    fn every_connection_tag_is_below_the_capture_tag() {
+        let frames = [
+            StreamFrame::Hello(Hello {
+                version: AUDIO_PROTOCOL_VERSION,
+                pod_id: HString::try_from("p").unwrap(),
+                sample_rate_hz: 16_000,
+                bits_per_sample: 16,
+                channels: 1,
+                codec: Codec::S16Le,
+                channel_source: ChannelSource::AsrBeam,
+            }),
+            StreamFrame::SegmentStart(SegmentStart {
+                segment_id: 0,
+                base_sample_index: 0,
+                base_device_ts_us: 0,
+                preroll_samples: 0,
+            }),
+            StreamFrame::Audio(AudioFrame {
+                segment_id: 0,
+                first_sample_index: 0,
+                device_ts_us: 0,
+                pcm: HVec::new(),
+            }),
+            StreamFrame::Telemetry(Telemetry {
+                device_ts_us: 0,
+                kind: TelemetryKind::SpEnergy { values: [0.0; 4] },
+            }),
+            StreamFrame::SegmentEnd(SegmentEnd {
+                segment_id: 0,
+                device_ts_us: 0,
+                frames_sent: 0,
+                samples_sent: 0,
+                reason: EndReason::VadRelease,
+            }),
+            StreamFrame::EndOfAudio(EndOfAudio {}),
+            StreamFrame::FlushPlayback(FlushPlayback {}),
+            StreamFrame::Status(Status {
+                device_ts_us: 0,
+                capture_head: 0,
+                capture_head_ts_us: 0,
+                levels: LevelRun::default(),
+                counters: PodCounters::default(),
+                gauges: PodGauges::default(),
+                segment_reach: 0,
+            }),
+        ];
+        for frame in &frames {
+            let tag = connection_tag(frame);
+            assert!(tag < STREAM_FRAME_TAG_CAPTURE, "{frame:?} has tag {tag}");
+            assert_eq!(u32::from(frame_bytes(frame)[2]), tag);
+        }
+    }
+
+    /// Neither connection decoder accepts the capture extension's tag.
+    #[test]
+    fn connection_decoders_refuse_the_capture_tag() {
+        // Tag 64, then a `Read` body (nested tag 1 and three zero fields).
+        let buf = [0x05, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00];
+        assert_eq!(decode_frame(&buf), Err(DecodeError::PostcardError));
+        assert_eq!(decode_inbound(&buf), Err(DecodeError::PostcardError));
     }
 
     // ── EndOfAudio / FlushPlayback (v3 control frames) ─────────────────────────
@@ -1623,11 +1779,11 @@ mod tests {
         let ci = bad_codec.len() - 2;
         bad_codec[ci] = 0x05; // no such Codec discriminant
         let bad_codec = reframe(&bad_codec);
-        // Bad channel_source tag — the last body byte; only 0x00..=0x04 are valid, both
+        // Bad channel_source tag — the last body byte; only 0x00..=0x05 are valid, both
         // paths deserialize the full body so both reject an out-of-range discriminant.
         let mut bad_channel_source = payload.clone();
         let si = bad_channel_source.len() - 1;
-        bad_channel_source[si] = 0x05; // no such ChannelSource discriminant
+        bad_channel_source[si] = 0x7F; // no such ChannelSource discriminant
         let bad_channel_source = reframe(&bad_channel_source);
         // Oversize pod_id — declared String<32> length 40 exceeds capacity, both reject.
         let mut oversize = vec![STREAM_FRAME_TAG_HELLO as u8, AUDIO_PROTOCOL_VERSION, 0x28];

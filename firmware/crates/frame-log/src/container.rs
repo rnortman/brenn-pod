@@ -5,9 +5,10 @@
 //! records: stamp u64 LE | len u16 LE | payload (len bytes, 1..=65535)
 //! ```
 //!
-//! The crate gives no meaning to the magic, the version, the metadata, a stamp
-//! or a payload: each format built on it checks its own version, parses its own
-//! metadata and says what its stamps count. What it does own is the framing and
+//! This module gives no meaning to the magic, the version, the metadata, a
+//! stamp or a payload: the format built on it checks its own version, parses
+//! its own metadata and says what its stamps count. What it does own is the
+//! framing and
 //! the reading of a file that ends early: a reader can tell a clean end on a
 //! record boundary from a record cut short, and a length that cannot be right
 //! from either.

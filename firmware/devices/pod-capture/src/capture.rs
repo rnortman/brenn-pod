@@ -8,16 +8,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use alsa_pcm::{ClockPair, Read, Recovery, Wait};
-use capture_record::{
-    End, EndReason, Event, Gap, GapCause, Granted, Header, MAX_BLOCK_PCM_BYTES, RecordWriter,
-    StartPair,
+use audio_pipeline::wide::{LossCause, MAX_WIDE_PCM_BYTES, StreamEndReason};
+use frame_log::{
+    CaptureGranted, CaptureMeta, Clocks, Device, DeviceControl, HostMicros, LogMeta, WriterInfo,
 };
 
+use crate::framer::{Block, End, Event, Framer, Gap, prelude};
+use crate::granted::Granted;
 use crate::lines::{
     CaptureFailed, CaptureGap, CaptureLate, CaptureStarted, CaptureStopped, CardLine, FailReason,
     Lines, note,
 };
 use crate::seams::{CaptureSource, Clock, Destination};
+use crate::writer::FrameWriter;
 
 /// How long one wait for a period lasts before the stop flag is looked at again.
 pub const WAIT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -27,7 +30,7 @@ pub const WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// the count.
 pub const STALL_TIMEOUTS: u32 = 20;
 
-/// From the moment the stream stops, how long the hand-over of the last records
+/// From the moment the stream stops, how long the hand-over of the last items
 /// and the writer's drain, sync and close may take together.
 pub const STOP_BOUND: Duration = Duration::from_secs(5);
 
@@ -48,16 +51,17 @@ const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(1);
 const HAND_OVER_POLL: Duration = Duration::from_millis(2);
 
 const BACKLOG_DETAIL: &str = "the destination was not taking blocks fast enough; the device \
-    delivered these frames and they were dropped before reaching the record";
+    delivered these frames and they were dropped before reaching the log";
 
 /// The period demanded of a device at `rate_hz`: a 20 ms slice, or the largest
-/// whole number of frames that fits in one block where that is smaller. `None`
-/// when no frame fits in a block, or the rate gives a period of no frames.
+/// whole number of frames that fits in one audio frame where that is smaller.
+/// `None` when no frame fits in an audio frame, or the rate gives a period of
+/// no frames.
 pub fn period_frames(rate_hz: u32, frame_bytes: usize) -> Option<u32> {
     if frame_bytes == 0 {
         return None;
     }
-    let fits = u32::try_from(MAX_BLOCK_PCM_BYTES / frame_bytes).unwrap_or(u32::MAX);
+    let fits = u32::try_from(MAX_WIDE_PCM_BYTES / frame_bytes).unwrap_or(u32::MAX);
     let period = (rate_hz / 50).min(fits);
     (period > 0).then_some(period)
 }
@@ -68,9 +72,9 @@ pub fn queue_capacity(granted: &Granted) -> usize {
     usize::try_from(periods).unwrap_or(usize::MAX).max(1)
 }
 
-/// Free bytes under which the writer ends the record with `destination_full`:
+/// Free bytes under which the writer ends the log with `destination_full`:
 /// five seconds of capture at the granted parameters plus 1 MiB, so the end
-/// record still fits.
+/// still fits.
 pub fn free_space_floor(granted: &Granted) -> u64 {
     let per_second = u64::from(granted.rate_hz).saturating_mul(granted.frame_bytes() as u64);
     FLOOR_SECONDS
@@ -81,7 +85,7 @@ pub fn free_space_floor(granted: &Granted) -> u64 {
 /// How a capture ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// Told to stop; the record ends with `end`/`stopped`, synced and closed.
+    /// Told to stop; the log ends with `End{stopped}`, synced and closed.
     Stopped,
     /// Anything else. One `capture_failed` line says what.
     Failed,
@@ -96,19 +100,59 @@ impl Outcome {
     }
 }
 
+/// What a capture records and how it names it: everything its header, hello
+/// and `Describe` state but the start pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recording {
+    /// 32 lowercase hex digits.
+    pub record_id: String,
+    /// The hello's `pod_id`: 1 to 32 bytes.
+    pub pod_id: String,
+    pub writer: WriterInfo,
+    pub device: Device,
+    pub granted: Granted,
+    /// One name per channel, in interleave order.
+    pub layout: Vec<String>,
+    pub device_control: DeviceControl,
+}
+
+impl Recording {
+    /// The header metadata, with the start pair's wall reading as its
+    /// creation time.
+    fn meta(&self, start_wall_us: u64) -> LogMeta {
+        LogMeta {
+            build_id: self.writer.build.commit.clone(),
+            created_epoch_us: HostMicros(start_wall_us),
+            conn_seq: 0,
+            rolled_from: None,
+            capture: Some(CaptureMeta {
+                record_id: self.record_id.clone(),
+                writer: self.writer.clone(),
+                device: self.device.clone(),
+                granted: CaptureGranted {
+                    period_frames: self.granted.period_frames,
+                    buffer_frames: self.granted.buffer_frames,
+                },
+                clocks: Clocks::v1(),
+                device_control: self.device_control.clone(),
+            }),
+        }
+    }
+}
+
 /// Record the stream from `source` into `dest` until `stop` is set, the stream
 /// dies or stalls, or the destination fails or runs low.
 ///
-/// The stream is triggered here and the start pair taken directly after;
-/// `header.started` is overwritten with it before the header is written. Every
-/// outcome is one terminal line on `lines`: `capture_stopped`, or
+/// The stream is triggered here and the start pair taken directly after; the
+/// header, the hello and the `Describe` carrying it are written in one write.
+/// Every outcome is one terminal line on `lines`: `capture_stopped`, or
 /// `capture_failed`. `stop_bound` is [`STOP_BOUND`] outside tests.
 #[allow(clippy::too_many_arguments)]
 pub fn run<S, C, D, W>(
     source: &mut S,
     clock: C,
     dest: D,
-    mut header: Header,
+    rec: Recording,
     path: &str,
     stop: &AtomicBool,
     lines: &mut Lines<W>,
@@ -120,8 +164,8 @@ where
     D: Destination,
     W: Write,
 {
-    let record_id = header.record_id.clone();
-    // Until the header is written no record exists, so the lines below name none
+    let record_id = rec.record_id.clone();
+    // Until the header is written no log exists, so the lines below name none
     // and no position in one: a file at `path` holds no header carrying
     // `record_id`.
     if let Err(e) = source.start() {
@@ -138,25 +182,35 @@ where
         return Outcome::Failed;
     }
     let start = clock.pair();
-    header.started = StartPair {
-        mono_us: start.mono_us,
-        wall_us: start.wall_us,
-    };
-    let w = match RecordWriter::new(dest, &header) {
+    let opened = prelude(
+        &rec.pod_id,
+        &rec.granted,
+        &rec.layout,
+        start.mono_us,
+        start.wall_us,
+    )
+    .map_err(|e| (FailReason::Params, e))
+    .and_then(|prelude| {
+        FrameWriter::new(
+            dest,
+            &rec.meta(start.wall_us),
+            &prelude,
+            Framer::new(&rec.granted),
+        )
+        .map_err(|e| {
+            (
+                FailReason::Destination,
+                format!("writing the log's header failed: {e}"),
+            )
+        })
+    });
+    let w = match opened {
         Ok(w) => w,
-        Err(e) => {
+        Err((reason, detail)) => {
             if let Err(e) = source.stop() {
                 note(format_args!("{e}"));
             }
-            failed(
-                lines,
-                None,
-                FailReason::Destination,
-                &format!("writing the record's header failed: {e}"),
-                None,
-                clock.pair(),
-                None,
-            );
+            failed(lines, None, reason, &detail, None, clock.pair(), None);
             return Outcome::Failed;
         }
     };
@@ -165,25 +219,23 @@ where
         &CaptureStarted {
             record_id: &record_id,
             path,
-            device: &header.device,
-            granted: &header.granted,
-            layout: &header.layout,
-            build: &header.writer.build,
+            device: &rec.device,
+            granted: &rec.granted,
+            layout: &rec.layout,
+            build: &rec.writer.build,
             frame: 0,
             mono_us: start.mono_us,
             wall_us: start.wall_us,
         },
     );
 
-    let granted = &header.granted;
+    let granted = &rec.granted;
     let (tx, rx) = mpsc::sync_channel(queue_capacity(granted));
     let (done_tx, done_rx) = mpsc::channel();
     let writer = Writer {
         w,
         clock: clock.clone(),
         floor: free_space_floor(granted),
-        frame_bytes: granted.frame_bytes(),
-        position: 0,
     };
     thread::Builder::new()
         .name("pod-capture-writer".to_owned())
@@ -254,8 +306,8 @@ where
     }
     let deadline = stopped_at + stop_bound;
     let end = match &ending {
-        Ending::Stopped => Some((EndReason::Stopped, "told to stop".to_owned())),
-        Ending::StreamDied(detail) => Some((EndReason::StreamDied, detail.clone())),
+        Ending::Stopped => Some((StreamEndReason::Stopped, "told to stop".to_owned())),
+        Ending::StreamDied(detail) => Some((StreamEndReason::StreamDied, detail.clone())),
         Ending::WriterEnded => None,
     };
     if let Some((reason, detail)) = end {
@@ -304,11 +356,11 @@ where
         (Ok(WriterEnd::Finished), Ending::StreamDied(detail)) => (FailReason::StreamDied, detail),
         (Ok(WriterEnd::Finished), Ending::WriterEnded) => (
             FailReason::WriteFailed,
-            "the writer finished before it was handed an end record".to_owned(),
+            "the writer finished before it was handed an end".to_owned(),
         ),
         (Ok(WriterEnd::DestinationFull { detail }), _) => (
             FailReason::DestinationFull,
-            format!("{detail}; the record ends with end/destination_full"),
+            format!("{detail}; the log ends with End{{destination_full}}"),
         ),
         (
             Ok(WriterEnd::WriteFailed {
@@ -319,31 +371,30 @@ where
         ) => (
             FailReason::WriteFailed,
             if end_written {
-                format!("{detail}; the record ends with end/write_failed")
+                format!("{detail}; the log ends with End{{write_failed}}")
             } else {
-                format!("{detail}; the record has no end record")
+                format!("{detail}; the log has no end")
             },
         ),
         (Ok(WriterEnd::SyncFailed { detail }), _) => (
             FailReason::WriteFailed,
             format!(
-                "{detail}; the record holds its end record, which may not have reached the \
-                 storage device"
+                "{detail}; the log holds its end, which may not have reached the storage \
+                 device"
             ),
         ),
         (Err(RecvTimeoutError::Timeout), _) => (
             FailReason::WriteStalled,
             format!(
                 "the writer had not reported {} ms after the stream stopped; it may be \
-                 held on a write or on the sync after its end record, so whether the \
-                 record ends is for its reader to say",
+                 held on a write or on the sync after its end, so whether the log ends \
+                 is for its reader to say",
                 stop_bound.as_millis()
             ),
         ),
         (Err(RecvTimeoutError::Disconnected), _) => (
             FailReason::WriteFailed,
-            "the writer thread ended without reporting; the record may have no end record"
-                .to_owned(),
+            "the writer thread ended without reporting; the log may have no end".to_owned(),
         ),
     };
     failed(
@@ -388,23 +439,14 @@ pub(crate) fn failed<W: Write>(
 enum Ending {
     Stopped,
     StreamDied(String),
-    /// The writer ended the record itself (floor or failed write).
+    /// The writer ended the log itself (floor or failed write).
     WriterEnded,
 }
 
 /// What the loop hands the writer.
 enum Item {
-    Block {
-        mono_us: u64,
-        wall_us: u64,
-        first_frame: u64,
-        backlog_frames: u32,
-        pcm: Vec<u8>,
-    },
-    Event {
-        mono_us: u64,
-        event: Event,
-    },
+    Block(Block),
+    Event { mono_us: u64, event: Event },
 }
 
 /// The capture loop's state between turns.
@@ -422,7 +464,7 @@ struct Capture<'a, C, W: Write> {
     gaps: u64,
     /// Consecutive timed-out waits.
     timeouts: u32,
-    /// Inside a run of late blocks queued for the record, as the reader counts
+    /// Inside a run of late blocks queued for the log, as the reader counts
     /// them: a non-late block or any gap ends it, a dropped block included.
     late: bool,
     period_frames: u32,
@@ -441,16 +483,16 @@ impl<C: Clock, W: Write> Capture<'_, C, W> {
         let late = backlog_frames >= self.period_frames;
         self.queue_pending();
         if self.pending.is_empty() && !self.writer_gone {
-            let block = Item::Block {
+            let block = Item::Block(Block {
                 mono_us: pair.mono_us,
                 wall_us: pair.wall_us,
                 first_frame,
                 backlog_frames,
                 pcm,
-            };
+            });
             match self.tx.try_send(block) {
                 Ok(()) => {
-                    // A late run starts at a block the record holds.
+                    // A late run starts at a block the log holds.
                     if late && !self.late {
                         self.lines.emit(
                             "capture_late",
@@ -483,7 +525,7 @@ impl<C: Clock, W: Write> Capture<'_, C, W> {
         if let Some(Item::Event {
             event:
                 Event::Gap(Gap {
-                    cause: GapCause::WriterBacklog,
+                    cause: LossCause::WriterBacklog,
                     frames: Some(n),
                     ..
                 }),
@@ -497,7 +539,7 @@ impl<C: Clock, W: Write> Capture<'_, C, W> {
         self.pending.push_back(Item::Event {
             mono_us: pair.mono_us,
             event: Event::Gap(Gap {
-                cause: GapCause::WriterBacklog,
+                cause: LossCause::WriterBacklog,
                 at_frame: first_frame,
                 frames: Some(frames),
                 wall_us: pair.wall_us,
@@ -511,9 +553,9 @@ impl<C: Clock, W: Write> Capture<'_, C, W> {
     fn recovered(&mut self, r: Recovery) {
         let pair = self.clock.pair();
         let cause = match r.errno {
-            libc::EPIPE => GapCause::Overrun,
-            libc::ESTRPIPE => GapCause::Suspend,
-            _ => GapCause::TransferError,
+            libc::EPIPE => LossCause::Overrun,
+            libc::ESTRPIPE => LossCause::Suspend,
+            _ => LossCause::TransferError,
         };
         self.late = false;
         self.gaps += 1;
@@ -544,7 +586,7 @@ impl<C: Clock, W: Write> Capture<'_, C, W> {
                 Item::Event {
                     mono_us,
                     event: Event::Gap(g),
-                } if g.cause == GapCause::WriterBacklog => Some((*mono_us, g.clone())),
+                } if g.cause == LossCause::WriterBacklog => Some((*mono_us, g.clone())),
                 _ => None,
             };
             match self.tx.try_send(item) {
@@ -570,29 +612,24 @@ impl<C: Clock, W: Write> Capture<'_, C, W> {
 
 /// How the writer stopped, when it stopped on its own account or on `end`.
 enum WriterEnd {
-    /// `end` was written and the record synced.
+    /// The end was written and the log synced.
     Finished,
-    /// Free space fell under the floor; `end`/`destination_full` was written.
+    /// Free space fell under the floor; `End{destination_full}` was written.
     DestinationFull { detail: String },
-    /// A write, a sync or a free-space reading failed. The record was cut back
-    /// to its last whole record and one attempt made to append
-    /// `end`/`write_failed`.
+    /// A write, a sync or a free-space reading failed. The log was cut back to
+    /// its last whole item and one attempt made to append `End{write_failed}`.
     WriteFailed { detail: String, end_written: bool },
-    /// The `end` the capture handed over was written, and syncing the record
-    /// then failed.
+    /// The end the capture handed over was written, and syncing the log then
+    /// failed.
     SyncFailed { detail: String },
 }
 
-/// The writer thread: writes each item through the record writer and does
+/// The writer thread: writes each item through the frame writer and does
 /// nothing else.
 struct Writer<C, D: Destination> {
-    w: RecordWriter<D>,
+    w: FrameWriter<D>,
     clock: C,
     floor: u64,
-    frame_bytes: usize,
-    /// The delivered-frame position the record has reached, counted as its
-    /// reader counts it.
-    position: u64,
 }
 
 impl<C: Clock, D: Destination> Writer<C, D> {
@@ -619,40 +656,23 @@ impl<C: Clock, D: Destination> Writer<C, D> {
                 Err(RecvTimeoutError::Disconnected) => return None,
             };
             match item {
-                Item::Block {
-                    mono_us,
-                    wall_us,
-                    first_frame,
-                    backlog_frames,
-                    pcm,
-                } => {
-                    if let Err(e) =
-                        self.w
-                            .block(mono_us, wall_us, first_frame, backlog_frames, &pcm)
-                    {
+                Item::Block(block) => {
+                    if let Err(e) = self.w.block(block) {
                         return Some(self.fail(format!("writing a block failed: {e}")));
                     }
-                    self.position = first_frame + (pcm.len() / self.frame_bytes) as u64;
                 }
                 Item::Event { mono_us, event } => {
-                    if let Err(e) = self.w.event(mono_us, &event) {
+                    let is_end = matches!(event, Event::End(_));
+                    if let Err(e) = self.w.event(mono_us, event) {
                         return Some(self.fail(format!("writing an event failed: {e}")));
                     }
-                    match event {
-                        Event::Gap(Gap {
-                            at_frame,
-                            frames: Some(n),
-                            ..
-                        }) => self.position = at_frame + n,
-                        Event::Gap(_) => {}
-                        Event::End(_) => {
-                            return Some(match self.w.get_ref().sync() {
-                                Ok(()) => WriterEnd::Finished,
-                                Err(e) => WriterEnd::SyncFailed {
-                                    detail: format!("syncing the record failed: {e}"),
-                                },
-                            });
-                        }
+                    if is_end {
+                        return Some(match self.w.get_ref().sync() {
+                            Ok(()) => WriterEnd::Finished,
+                            Err(e) => WriterEnd::SyncFailed {
+                                detail: format!("syncing the log failed: {e}"),
+                            },
+                        });
                     }
                 }
             }
@@ -666,45 +686,45 @@ impl<C: Clock, D: Destination> Writer<C, D> {
         );
         let pair = self.clock.pair();
         let end = Event::End(End {
-            reason: EndReason::DestinationFull,
-            at_frame: self.position,
+            reason: StreamEndReason::DestinationFull,
+            at_frame: self.w.position(),
             wall_us: pair.wall_us,
             detail: detail.clone(),
         });
-        if let Err(e) = self.w.event(pair.mono_us, &end) {
+        if let Err(e) = self.w.event(pair.mono_us, end) {
             return self.fail(format!("writing the destination_full end failed: {e}"));
         }
         if let Err(e) = self.w.get_ref().sync() {
             note(format_args!(
-                "syncing the record after destination_full failed: {e}"
+                "syncing the log after destination_full failed: {e}"
             ));
         }
         WriterEnd::DestinationFull { detail }
     }
 
-    /// Cut the record back to its last whole record and make one attempt to
-    /// end it with `write_failed`.
+    /// Cut the log back to its last whole item and make one attempt to end it
+    /// with `write_failed`.
     fn fail(&mut self, detail: String) -> WriterEnd {
-        let end_written = match self.w.truncate_to_last_record() {
+        let end_written = match self.w.truncate_to_last_item() {
             Err(e) => {
                 note(format_args!(
-                    "cutting the record back after a failed write failed: {e}"
+                    "cutting the log back after a failed write failed: {e}"
                 ));
                 false
             }
             Ok(()) => {
                 let pair = self.clock.pair();
                 let end = Event::End(End {
-                    reason: EndReason::WriteFailed,
-                    at_frame: self.position,
+                    reason: StreamEndReason::WriteFailed,
+                    at_frame: self.w.position(),
                     wall_us: pair.wall_us,
                     detail: detail.clone(),
                 });
-                match self.w.event(pair.mono_us, &end) {
+                match self.w.event(pair.mono_us, end) {
                     Ok(()) => {
                         if let Err(e) = self.w.get_ref().sync() {
                             note(format_args!(
-                                "syncing the record after write_failed failed: {e}"
+                                "syncing the log after write_failed failed: {e}"
                             ));
                         }
                         true
@@ -726,7 +746,7 @@ impl<C: Clock, D: Destination> Writer<C, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capture_record::SampleFormat;
+    use crate::granted::SampleFormat;
 
     fn granted(rate_hz: u32, channels: u32, period_frames: u32) -> Granted {
         Granted {
@@ -748,14 +768,16 @@ mod tests {
     #[test]
     fn the_period_is_the_largest_that_fits_where_twenty_milliseconds_does_not() {
         // 192 kHz of 32 channels of s32_le: 3840 frames of 128 bytes is 491520
-        // bytes; 511 frames is the most that fit in 65514.
+        // bytes; 511 frames is the most that fit in 65504.
         assert_eq!(period_frames(192_000, 128), Some(511));
-        assert_eq!(period_frames(16_000, MAX_BLOCK_PCM_BYTES), Some(1));
+        assert_eq!(period_frames(16_000, MAX_WIDE_PCM_BYTES), Some(1));
+        assert_eq!(period_frames(16_000, 2), Some(320));
+        assert_eq!(period_frames(4_000_000, 2), Some(32_752));
     }
 
     #[test]
     fn no_period_where_no_frame_fits_or_the_rate_gives_none() {
-        assert_eq!(period_frames(16_000, MAX_BLOCK_PCM_BYTES + 1), None);
+        assert_eq!(period_frames(16_000, MAX_WIDE_PCM_BYTES + 1), None);
         assert_eq!(period_frames(49, 2), None);
         assert_eq!(period_frames(16_000, 0), None);
     }

@@ -1,6 +1,7 @@
 //! Clock newtypes. Two distinct time domains that must never be mixed:
 //! `DeviceMicros` (the pod's clock, for intra-segment sample math only) and
-//! `HostMicros` (microseconds since the UNIX epoch on the host). Cross-domain
+//! `HostMicros` (microseconds since the UNIX epoch on the host; `frame-log`'s
+//! record stamp, re-exported here). Cross-domain
 //! arithmetic does not compile — each type exposes only same-domain deltas.
 //!
 //! [`ClockOffsetEstimate`] is the one sanctioned crossing, and it is a type
@@ -8,19 +9,15 @@
 //! casual mixing still does not compile, and the estimate's fuzziness is
 //! documented where it is produced instead of at each consumer.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
+
+pub use frame_log::HostMicros;
 
 /// Device-clock microseconds. Meaningful only relative to other `DeviceMicros`
 /// from the same connection; used for intra-segment sample-offset math, never
 /// for host-side latency measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DeviceMicros(pub u64);
-
-/// Host-clock microseconds since the UNIX epoch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct HostMicros(pub u64);
 
 impl DeviceMicros {
     /// Microseconds elapsed from `earlier` to `self`, or `None` if `earlier`
@@ -122,26 +119,6 @@ impl ClockOffsetEstimate {
     }
 }
 
-impl HostMicros {
-    /// Current host time as microseconds since the UNIX epoch. A pre-epoch
-    /// clock yields `0` (`unwrap_or_default`), matching the host-side epoch
-    /// convention used elsewhere in the codebase.
-    pub fn now() -> HostMicros {
-        HostMicros(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64,
-        )
-    }
-
-    /// Microseconds elapsed from `earlier` to `self`, or `None` if `earlier`
-    /// is later — e.g. an NTP step moved the clock backward between stamps.
-    pub fn checked_delta(self, earlier: HostMicros) -> Option<u64> {
-        self.0.checked_sub(earlier.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,29 +142,8 @@ mod tests {
     }
 
     #[test]
-    fn host_delta_positive() {
-        assert_eq!(
-            HostMicros(2_000_000).checked_delta(HostMicros(1_999_000)),
-            Some(1_000)
-        );
-    }
-
-    #[test]
-    fn host_delta_negative_is_none() {
-        // NTP step backward between two stamps.
-        assert_eq!(HostMicros(10).checked_delta(HostMicros(11)), None);
-    }
-
-    #[test]
     fn ordering() {
-        assert!(HostMicros(1) < HostMicros(2));
         assert!(DeviceMicros(9) > DeviceMicros(8));
-    }
-
-    #[test]
-    fn now_is_after_epoch() {
-        // Any real host clock is well past the epoch.
-        assert!(HostMicros::now() > HostMicros(0));
     }
 
     #[test]

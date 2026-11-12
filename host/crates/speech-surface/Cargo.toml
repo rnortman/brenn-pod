@@ -78,6 +78,10 @@ psk-link = { path = "../../../firmware/crates/psk-link", features = [
     "client-transport",
     "test-util",
 ] }
+# The frame log's reader, held in agreement with `SessionFsm` on the committed
+# fixtures; `wide` builds a capture's frames to show the voice host refuses one.
+frame-log = { path = "../../../firmware/crates/frame-log" }
+audio-pipeline = { path = "../../../firmware/crates/audio-pipeline", features = ["std", "wide"] }
 # SIGTERM (via `process`) for the replay round-trip test's graceful-shutdown
 # assertion. Feature-unified with the normal-dep `rustix` (`fs`) in test builds.
 rustix = { version = "1", features = ["process"] }

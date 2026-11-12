@@ -141,6 +141,7 @@ impl Recorder {
                     created_epoch_us: HostMicros::now(),
                     conn_seq,
                     rolled_from: None,
+                    capture: None,
                 };
                 // Track the path as open *before* it exists on disk, so a
                 // concurrent prune pass can never see the new file untracked
@@ -312,6 +313,7 @@ impl Recorder {
             created_epoch_us: now,
             conn_seq,
             rolled_from: None, // `roll_to` sets this from the prior path.
+            capture: None,
         };
         // Track the new rolled log as open *before* `roll_to` creates it on disk,
         // mirroring the create/rename ordering: a new file is never on disk

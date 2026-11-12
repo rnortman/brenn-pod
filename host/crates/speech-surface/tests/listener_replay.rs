@@ -247,6 +247,7 @@ fn write_two_segment_framelog(
         created_epoch_us: HostMicros(0),
         conn_seq: 1,
         rolled_from: None,
+        capture: None,
     };
     let mut writer = FrameLogWriter::create(&out, meta).expect("create frame log");
     let mut buf = [0u8; MAX_FRAME_BYTES + 2];

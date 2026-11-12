@@ -20,7 +20,7 @@ use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::framelog::{FrameLogError, FrameLogReader};
+use frame_log::{FrameLogError, FrameLogReader};
 
 /// A segment inside a frame log, addressed by the log's store-root-relative
 /// file name and the per-connection segment id.
@@ -101,7 +101,7 @@ fn is_single_normal_component(log: &str) -> bool {
 mod tests {
     use super::*;
     use crate::clock::HostMicros;
-    use crate::framelog::{FrameLogWriter, LogItem, LogMeta};
+    use frame_log::{FrameLogWriter, LogItem, LogMeta};
     use std::fs;
 
     fn meta() -> LogMeta {
@@ -110,6 +110,7 @@ mod tests {
             created_epoch_us: HostMicros(1_700_000_000_000_000),
             conn_seq: 1,
             rolled_from: None,
+            capture: None,
         }
     }
 

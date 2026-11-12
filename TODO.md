@@ -1433,37 +1433,24 @@ part 2 not played, and the speech carried as the next utterance; and event times
 that span match when the event happened. See `TODO(multipart-turn-deaf-to-barge)` at the
 inline `brain.handle` await in `host/crates/speech-surface/src/pipeline.rs`.
 
-## `record-reader-reads-frame-logs`
-
-brenn-pod has two on-disk audio formats: the voice host's frame log (raw
-wire frames with host receive times,
-`host/crates/pod-ingest/src/framelog.rs`) and the capture record the Linux
-pod writes locally. The record reader tool summarises and exports capture
-records only; a frame log can be replayed through the voice host's decode
-and nothing else reads it.
-
-Done = the record reader tool, given a frame log, prints the same
-machine-readable summary it prints for a capture record (channels, rate,
-sample count, each segment and the gaps between segments, whether the tail
-is torn) and exports its audio to WAV. See
-`TODO(record-reader-reads-frame-logs)` where the reader tool identifies its
-input's format.
-
 ## `gated-stream-continuous-mode`
 
 Both pods send audio to the voice host only while the chip's speech-energy
 gate is open, and nothing switches that: the gate is the only thing that
 opens a segment (`TelemetryCore::poll_tick` in
-`firmware/crates/pod-streamer/src/telemetry.rs`). The Linux pod can record
-every channel continuously to a local record, which is a separate mode with
-a separate output; the stream itself has no continuous mode on either pod,
-and nothing switches a running pod between the two.
+`firmware/crates/pod-streamer/src/telemetry.rs`). `pod-capture` records
+every channel continuously to a frame log, as a separate program; the voice
+stream itself has no continuous mode on either pod, and nothing switches a
+running pod between the two.
 
 The work: a running pod can be told to stream continuously instead of by
 the gate, and told to go back, for uses outside data collection (a
 host-side detector that should hear what precedes a gate opening, for one).
-It touches the wire both pods share with the voice host, so it is a
-protocol change and needs the ESP pod on the bench.
+A continuous stream needs no new frame: it is one long segment, which the
+frame log and its reader tool already hold. Telling a running pod to switch
+does: the command travels on the connection both pods share with the voice
+host, which is a connection-schema change, and that part needs the ESP pod
+on the bench.
 
 Done = a running pod told to switch to continuous delivers every captured
 sample to the voice host with the gate shut, and told to switch back sends
@@ -1476,11 +1463,11 @@ segment.
 The USB control plane (`firmware/devices/reachy-pod/src/usb_ctrl.rs`)
 recognises only the ids `38fb:1001` and `2886:001a`. A reSpeaker Flex on
 Seeed's six-channel USB audio image enumerates as `2886:0022`, so a capture
-record made from it carries no chip firmware version and no routing, and
+made from it carries no chip firmware version and no routing, and
 whether that image answers the control commands the pod uses has not been
 tried on hardware.
 
-The control plane is libusb (`rusb`), and the capture-to-record mode links
+The control plane is libusb (`rusb`), and `pod-capture` links
 libasound and no other system library so that it can be built hermetically
 elsewhere. This work keeps that link free of libusb: where the USB read
 runs, and how what it read is stored beside the capture it describes, is
@@ -1488,7 +1475,7 @@ this work's design.
 
 Done = for a `2886:0022` device, the chip's firmware version and output
 routing are read over USB by brenn-pod and recorded where a reader of that
-device's capture record finds them, with the capture mode's link still
+device's capture finds them, with the capture mode's link still
 libasound only; a hardware test asserts both values and has been run; and
 any control command the image refuses is documented under
 `docs/reference/`. See `TODO(xvf-control-on-usb-audio-image)` at the control

@@ -138,6 +138,11 @@ pub enum SegmentEndCause {
     InternalError,
     /// The host-side length cap fired before the device's real `SegmentEnd`.
     HostCapped,
+    /// The producer closed the segment because its capture source lost audio of
+    /// unknown length.
+    SourceLoss,
+    /// The producer ended its stream while the segment was open.
+    StreamEnd,
 }
 
 /// One telemetry reading attached to a segment: the DoA-azimuth or speech-energy

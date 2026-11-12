@@ -1,9 +1,8 @@
-//! The frame-log record format: an append-only log of raw wire frames plus
-//! their host receive timestamps. The wire bytes *are* the record, so replay
-//! feeds a log straight back through the same decode + FSM path that live
-//! ingest uses.
+//! The frame log: an append-only log of framed wire frames, each with a stamp.
+//! The wire bytes *are* the record, so replay feeds a log straight back
+//! through the same decode path that live ingest uses.
 //!
-//! The format is policy-free: *when* to roll or prune is the embedder's call
+//! [`FrameLogWriter`] is the voice host's file writer. It is policy-free: *when* to roll or prune is the embedder's call
 //! (rolls are legal only between segments, which needs session state this
 //! writer must not know). Buffered writes are flushed by the embedder at
 //! segment close and on roll/finish; there is no fsync — a frame log is a
@@ -15,42 +14,24 @@
 //!          format_version u16 LE  (= 1)
 //!          meta_len       u16 LE
 //!          meta           JSON, meta_len bytes
-//! records: host_rx_us u64 LE | len u16 LE | payload (len bytes, exact wire frame)
+//! records: stamp u64 LE | len u16 LE | payload (len bytes, 1..=65535: one framed wire frame)
 //! ```
 //!
-//! The framing is `stamped-log`'s; a record's stamp is the host receive time.
+//! The framing is [`crate::container`]'s. A record's stamp is a [`HostMicros`]:
+//! the voice host's receive time, or the wall reading of a capture's clock pair.
+//! [`write_header`] and [`write_record`] are the format's encoder, for a writer
+//! with its own destination and flush policy.
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use audio_pipeline::wire::MAX_FRAME_BYTES;
-use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use stamped_log::RECORD_HEADER_BYTES;
-use stamped_log::{HeaderError, Item, RecordError, Records};
-
-use crate::clock::HostMicros;
+use crate::HostMicros;
+use crate::container::{self, HeaderError, Item, MAX_PAYLOAD, RecordError, Records};
+use crate::header::{CaptureMetaInvalid, LogMeta};
 
 const MAGIC: &[u8; 4] = b"RSFL";
 const FORMAT_VERSION: u16 = 1;
-
-/// Self-describing header metadata, serialized as JSON so additive fields do
-/// not force a format-version bump. Unknown fields are ignored on read.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogMeta {
-    /// Build identity of the writing process.
-    pub build_id: String,
-    /// Host wall-clock (microseconds since UNIX epoch) at log creation. The
-    /// `HostMicros` newtype serializes transparently, so the JSON key stays a
-    /// bare integer named `created_epoch_us`.
-    pub created_epoch_us: HostMicros,
-    /// Per-process connection sequence number.
-    pub conn_seq: u64,
-    /// Name of the prior log this one rolled from, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rolled_from: Option<String>,
-}
 
 /// One item yielded while reading a frame log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +57,9 @@ pub enum FrameLogError {
     UnsupportedVersion { got: u16 },
     #[error("corrupt frame-log header metadata: {0}")]
     BadMeta(#[source] serde_json::Error),
+    #[error("frame-log header: {0}")]
+    BadCapture(#[source] CaptureMetaInvalid),
+    /// A record length of zero: the bytes from here on cannot be framed.
     #[error("corrupt frame-log record: length {len} out of range")]
     CorruptLength { len: usize },
 }
@@ -110,15 +94,10 @@ impl FrameLogWriter {
         })
     }
 
-    /// Append one frame's exact wire bytes with its host receive time. The
-    /// payload must be a single wire frame (`1..=MAX_FRAME_BYTES`).
+    /// Append one framed wire frame's exact bytes with its host receive time.
+    /// A payload outside `1..=65535` bytes is `InvalidInput` and nothing is
+    /// written.
     pub fn append(&mut self, host_rx: HostMicros, payload: &[u8]) -> io::Result<()> {
-        if payload.is_empty() || payload.len() > MAX_FRAME_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "frame-log payload length out of range",
-            ));
-        }
         self.bytes += write_record(&mut self.writer, host_rx, payload)?;
         Ok(())
     }
@@ -183,20 +162,24 @@ impl FrameLogWriter {
 
 /// Streaming reader over a frame log. Validates the header at `open`; iterating
 /// yields records, a terminal `TornTail` on a mid-record EOF, or a terminal
-/// error on a corrupt length field.
+/// error on a zero length field.
 pub struct FrameLogReader {
     records: Records<BufReader<File>>,
-    meta: LogMeta,
+    /// Boxed: a capture's description makes `LogMeta` large, and readers are
+    /// held in enums beside unit variants.
+    meta: Box<LogMeta>,
+    raw_meta: Vec<u8>,
 }
 
 impl FrameLogReader {
-    /// Open and validate a frame log's header. Bad magic or an unknown format
-    /// version is a hard error here.
+    /// Open and validate a frame log's header. Bad magic, an unknown format
+    /// version, or metadata that does not parse or whose `capture` breaks the
+    /// format's rules is a hard error here.
     pub fn open(path: &Path) -> Result<Self, FrameLogError> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
-        let header = stamped_log::read_header(&mut reader, MAGIC).map_err(|e| match e {
+        let header = container::read_header(&mut reader, MAGIC).map_err(|e| match e {
             HeaderError::BadMagic => FrameLogError::BadMagic,
             HeaderError::Io(e) => FrameLogError::Io(e),
         })?;
@@ -205,17 +188,33 @@ impl FrameLogReader {
                 got: header.version,
             });
         }
-        let meta = serde_json::from_slice(&header.meta).map_err(FrameLogError::BadMeta)?;
+        let meta: LogMeta = serde_json::from_slice(&header.meta).map_err(FrameLogError::BadMeta)?;
+        if let Some(capture) = &meta.capture {
+            capture.validate().map_err(FrameLogError::BadCapture)?;
+        }
 
         Ok(FrameLogReader {
-            records: Records::new(reader, header.encoded_len(), MAX_FRAME_BYTES),
-            meta,
+            records: Records::new(reader, header.encoded_len(), MAX_PAYLOAD),
+            meta: Box::new(meta),
+            raw_meta: header.meta,
         })
     }
 
     /// The header metadata.
     pub fn meta(&self) -> &LogMeta {
         &self.meta
+    }
+
+    /// The header metadata's JSON as written, unknown keys included.
+    pub fn raw_meta(&self) -> &[u8] {
+        &self.raw_meta
+    }
+
+    /// The byte offset of the next unread record. After a torn tail or a
+    /// corrupt length it is where that record starts, so the file up to here
+    /// is whole records.
+    pub fn offset(&self) -> u64 {
+        self.records.offset()
     }
 }
 
@@ -235,14 +234,24 @@ impl Iterator for FrameLogReader {
     }
 }
 
-fn write_header(w: &mut impl Write, meta: &LogMeta) -> io::Result<u64> {
+/// Write a frame log's header in one `write_all`. Returns the bytes written.
+/// A `capture` that breaks the format's rules, or metadata over 65535 bytes,
+/// is `InvalidData` and nothing is written.
+pub fn write_header(w: &mut impl Write, meta: &LogMeta) -> io::Result<u64> {
+    if let Some(capture) = &meta.capture {
+        capture
+            .validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    }
     let json =
         serde_json::to_vec(meta).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    stamped_log::write_header(w, MAGIC, FORMAT_VERSION, &json)
+    container::write_header(w, MAGIC, FORMAT_VERSION, &json)
 }
 
-fn write_record(w: &mut impl Write, host_rx: HostMicros, payload: &[u8]) -> io::Result<u64> {
-    stamped_log::write_record(w, host_rx.0, payload)
+/// Write one record in one `write_all`. Returns the bytes written. A payload
+/// outside `1..=65535` bytes is `InvalidInput` and nothing is written.
+pub fn write_record(w: &mut impl Write, stamp: HostMicros, payload: &[u8]) -> io::Result<u64> {
+    container::write_record(w, stamp.0, payload)
 }
 
 fn file_name_string(path: &Path) -> String {
@@ -254,6 +263,8 @@ fn file_name_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::RECORD_HEADER_BYTES;
+    use crate::header::tests::capture;
     use std::fs::OpenOptions;
 
     fn meta(conn_seq: u64) -> LogMeta {
@@ -262,6 +273,7 @@ mod tests {
             created_epoch_us: HostMicros(1_700_000_000_000_000),
             conn_seq,
             rolled_from: None,
+            capture: None,
         }
     }
 
@@ -310,10 +322,21 @@ mod tests {
             w.append(HostMicros(1), &[]).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
-        let oversize = vec![0u8; MAX_FRAME_BYTES + 1];
+        let oversize = vec![0u8; MAX_PAYLOAD + 1];
         assert_eq!(
             w.append(HostMicros(1), &oversize).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
+        );
+        w.append(HostMicros(2), &vec![7u8; MAX_PAYLOAD]).unwrap();
+        w.finish().unwrap();
+
+        let items = records(&path);
+        assert_eq!(
+            items,
+            vec![LogItem::Record {
+                host_rx: HostMicros(2),
+                payload: vec![7u8; MAX_PAYLOAD],
+            }]
         );
     }
 
@@ -345,40 +368,6 @@ mod tests {
             FrameLogReader::open(&path),
             Err(FrameLogError::UnsupportedVersion { got: 99 })
         ));
-    }
-
-    #[test]
-    fn oversize_len_stops_iteration_as_corrupt() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.framelog");
-        let mut w = FrameLogWriter::create(&path, meta(1)).unwrap();
-        w.append(HostMicros(10), &[1, 2, 3]).unwrap();
-        w.finish().unwrap();
-
-        // Append a raw record header claiming an out-of-range length.
-        let mut extra = Vec::new();
-        extra.extend_from_slice(&99u64.to_le_bytes());
-        extra.extend_from_slice(&((MAX_FRAME_BYTES + 1) as u16).to_le_bytes());
-        OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(&extra)
-            .unwrap();
-
-        let mut reader = FrameLogReader::open(&path).unwrap();
-        assert_eq!(
-            reader.next().unwrap().unwrap(),
-            LogItem::Record {
-                host_rx: HostMicros(10),
-                payload: vec![1, 2, 3],
-            }
-        );
-        assert!(matches!(
-            reader.next(),
-            Some(Err(FrameLogError::CorruptLength { len })) if len == MAX_FRAME_BYTES + 1
-        ));
-        assert!(reader.next().is_none());
     }
 
     #[test]
@@ -554,6 +543,7 @@ mod tests {
             created_epoch_us: HostMicros(100),
             conn_seq: 0,
             rolled_from: None,
+            capture: None,
         };
         let w = FrameLogWriter::create(&path, m).unwrap();
         assert_eq!(w.age(HostMicros(250)), 150);
@@ -625,6 +615,7 @@ mod tests {
             created_epoch_us: HostMicros(1_700_000_000_000_000),
             conn_seq: 7,
             rolled_from: None,
+            capture: None,
         };
         let mut w = FrameLogWriter::create(&path, m).unwrap();
         w.append(HostMicros(0x0102_0304_0506_0708), &[0xAA, 0xBB, 0xCC])
@@ -659,5 +650,97 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    /// A log's header bytes with the given metadata, laid through the
+    /// container so a test can place metadata the writer would refuse.
+    fn raw_log(json: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        container::write_header(&mut bytes, MAGIC, FORMAT_VERSION, json).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_capture_header_round_trips_with_its_raw_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.framelog");
+        let mut m = meta(0);
+        m.capture = Some(capture());
+        let mut file = Vec::new();
+        let header_len = write_header(&mut file, &m).unwrap();
+        write_record(&mut file, HostMicros(5), &[1, 2]).unwrap();
+        fs::write(&path, &file).unwrap();
+
+        let mut reader = FrameLogReader::open(&path).unwrap();
+        assert_eq!(reader.meta(), &m);
+        assert_eq!(reader.raw_meta(), serde_json::to_vec(&m).unwrap());
+        assert_eq!(reader.offset(), header_len);
+        assert!(matches!(reader.next(), Some(Ok(LogItem::Record { .. }))));
+        assert_eq!(reader.offset(), file.len() as u64);
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn a_header_without_capture_has_no_capture_key() {
+        let json = serde_json::to_string(&meta(3)).unwrap();
+        assert_eq!(
+            json,
+            "{\"build_id\":\"test-build\",\"created_epoch_us\":1700000000000000,\"conn_seq\":3}"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored_and_kept_in_the_raw_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u.framelog");
+        let mut m = serde_json::to_value(meta(0)).unwrap();
+        m["later_key"] = serde_json::json!({"x": 1});
+        let mut c = serde_json::to_value(capture()).unwrap();
+        c["later_key"] = serde_json::json!(true);
+        m["capture"] = c;
+        let json = serde_json::to_vec(&m).unwrap();
+        fs::write(&path, raw_log(&json)).unwrap();
+
+        let reader = FrameLogReader::open(&path).unwrap();
+        assert_eq!(reader.meta().capture, Some(capture()));
+        assert_eq!(reader.raw_meta(), json);
+    }
+
+    #[test]
+    fn an_invalid_capture_is_refused_on_write_and_on_read() {
+        let mut m = meta(0);
+        let mut c = capture();
+        c.granted.period_frames = 0;
+        m.capture = Some(c);
+
+        let mut file = Vec::new();
+        let err = write_header(&mut file, &m).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(file.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.framelog");
+        fs::write(&path, raw_log(&serde_json::to_vec(&m).unwrap())).unwrap();
+        assert!(matches!(
+            FrameLogReader::open(&path),
+            Err(FrameLogError::BadCapture(e)) if e.0.contains("period_frames")
+        ));
+    }
+
+    #[test]
+    fn offset_after_a_torn_tail_is_the_last_whole_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.framelog");
+        let mut file = Vec::new();
+        write_header(&mut file, &meta(1)).unwrap();
+        write_record(&mut file, HostMicros(1), &[1, 2, 3]).unwrap();
+        let whole = file.len() as u64;
+        file.extend_from_slice(&[0xAA; RECORD_HEADER_BYTES + 1]);
+        fs::write(&path, &file).unwrap();
+
+        let mut reader = FrameLogReader::open(&path).unwrap();
+        assert!(matches!(reader.next(), Some(Ok(LogItem::Record { .. }))));
+        assert_eq!(reader.next().unwrap().unwrap(), LogItem::TornTail);
+        assert_eq!(reader.offset(), whole);
     }
 }

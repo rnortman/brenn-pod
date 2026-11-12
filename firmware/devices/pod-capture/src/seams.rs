@@ -2,18 +2,17 @@
 //! production implementation.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use alsa_pcm::{ByteCapture, ClockPair, PcmError, Read, Wait};
-use capture_record::Truncate;
 
 /// Where captured frames come from.
 ///
 /// Not reachy-pod's `run::PeriodSource`, which returns `i16` samples and retries
 /// past a recovery: this one returns bytes and hands every recovery to its
-/// caller, which is what puts the loss in the record.
+/// caller, which is what puts the loss in the log.
 pub trait CaptureSource {
     /// Trigger the stream.
     fn start(&mut self) -> Result<(), PcmError>;
@@ -45,7 +44,7 @@ impl CaptureSource for ByteCapture<'_> {
 }
 
 /// The capturing machine's clocks, read as a pair. Cloned into the writer
-/// thread, which stamps the end records it writes itself.
+/// thread, which stamps the ends it writes itself.
 pub trait Clock: Clone + Send + 'static {
     fn pair(&self) -> ClockPair;
 }
@@ -60,7 +59,21 @@ impl Clock for SystemClock {
     }
 }
 
-/// Where the record goes: written, cut back after a failed write, asked for its
+/// A destination a capture's log can be cut back on.
+pub trait Truncate {
+    /// Cut the destination to `len` bytes and leave the next write at `len`.
+    fn truncate(&mut self, len: u64) -> io::Result<()>;
+}
+
+impl Truncate for File {
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.set_len(len)?;
+        self.seek(SeekFrom::Start(len))?;
+        Ok(())
+    }
+}
+
+/// Where the log goes: written, cut back after a failed write, asked for its
 /// free space, and synced at the end.
 pub trait Destination: Write + Truncate + Send + 'static {
     /// Bytes still free to an unprivileged writer on the destination's file

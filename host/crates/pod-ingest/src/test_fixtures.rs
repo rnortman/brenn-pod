@@ -17,7 +17,7 @@ use audio_pipeline::wire::{
 use heapless::Vec as HVec;
 
 use crate::clock::HostMicros;
-use crate::framelog::{FrameLogWriter, LogMeta};
+use frame_log::{FrameLogWriter, LogMeta};
 
 /// Encode `frame` exactly as it would appear on the wire and in a frame log
 /// (`[u16 len][postcard]`), so replay through `decode_frame` is byte-faithful.
@@ -115,6 +115,7 @@ pub fn meta(base_epoch_us: u64) -> LogMeta {
         created_epoch_us: HostMicros(base_epoch_us),
         conn_seq: 1,
         rolled_from: None,
+        capture: None,
     }
 }
 

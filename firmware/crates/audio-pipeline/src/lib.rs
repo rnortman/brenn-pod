@@ -46,4 +46,7 @@ pub mod stream_send;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod vad;
+// `wide`-only: it allocates, and the device builds do not need it.
+#[cfg(feature = "wide")]
+pub mod wide;
 pub mod wire;

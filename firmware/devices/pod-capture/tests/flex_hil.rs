@@ -18,7 +18,8 @@ use std::thread;
 use std::time::Duration;
 
 use audio_pipeline::ring::{BEAM_GUARDS, LivenessGuards, RAW_MIC_GUARDS, WaveformStats};
-use capture_record::{GapCause, Item, RecordReader, Summary, summarize};
+use audio_pipeline::wide::{LossCause, StreamEndReason};
+use frame_log::{Cause, Step, Summary, summarize, walk};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pod-capture");
 const CARD: &str = "Flex XVF3800 L16K6Ch";
@@ -43,7 +44,13 @@ struct Running {
 fn start(out: &Path) -> Running {
     let mut child = Command::new(BIN)
         .args(["--card", CARD, "--rate", "16000", "--format", "s16_le"])
-        .args(["--layout", &LAYOUT.join(","), "--out"])
+        .args([
+            "--layout",
+            &LAYOUT.join(","),
+            "--pod-id",
+            "flex-hil",
+            "--out",
+        ])
         .arg(out)
         .stdout(Stdio::piped())
         .spawn()
@@ -101,26 +108,26 @@ fn assert_started_on_the_flex(started: &serde_json::Value) {
 }
 
 fn summary_of(path: &Path) -> Summary {
-    let s = summarize(path).expect("the record reads back");
+    let s = summarize(path).expect("the log reads back");
     println!("{}", serde_json::to_string_pretty(&s).unwrap());
     s
 }
 
-/// Each channel's samples, split into the contiguous stretches between gaps.
+/// Each channel's samples, split into the contiguous stretches between losses.
 fn stretches(path: &Path) -> Vec<[Vec<i16>; CHANNELS]> {
     let mut out: Vec<[Vec<i16>; CHANNELS]> = vec![Default::default()];
-    for item in RecordReader::open(path).expect("the record opens") {
-        match item.expect("the record reads") {
-            Item::Block { pcm, .. } => {
+    for step in walk(path).expect("the log opens") {
+        match step.expect("the log reads") {
+            Step::Audio(a) => {
                 let current = out.last_mut().unwrap();
-                for frame in pcm.chunks_exact(2 * CHANNELS) {
+                for frame in a.pcm.chunks_exact(2 * CHANNELS) {
                     for (ch, sample) in frame.chunks_exact(2).enumerate() {
                         current[ch].push(i16::from_le_bytes([sample[0], sample[1]]));
                     }
                 }
             }
-            Item::Gap { .. } => out.push(Default::default()),
-            Item::End { .. } => {}
+            Step::Loss { .. } => out.push(Default::default()),
+            _ => {}
         }
     }
     out.retain(|s| !s[0].is_empty());
@@ -157,14 +164,30 @@ fn assert_channels_live(path: &Path) {
 }
 
 fn late_blocks(s: &Summary) -> u64 {
-    s.late.iter().map(|r| r.blocks).sum()
+    s.late.iter().flatten().map(|r| r.blocks).sum()
+}
+
+fn late_runs(s: &Summary) -> usize {
+    s.late.as_ref().map_or(0, Vec::len)
+}
+
+/// No segment of a continuous capture lies apart from the position.
+fn assert_segments_continuous(s: &Summary) {
+    for seg in &s.segments {
+        assert_eq!(
+            (seg.not_sent_frames, seg.resent_frames),
+            (0, 0),
+            "segments: {:#?}",
+            s.segments
+        );
+    }
 }
 
 #[test]
 #[ignore = "needs the reSpeaker Flex attached and free; run by `make -C firmware capture-hil`"]
-fn ten_seconds_of_the_flex_record_every_channel_with_no_gap() {
+fn ten_seconds_of_the_flex_record_every_channel_with_no_loss() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("flex.bpcr");
+    let path = dir.path().join("flex.framelog");
     let r = start(&path);
     assert_started_on_the_flex(&r.started);
     thread::sleep(Duration::from_secs(10));
@@ -173,15 +196,24 @@ fn ten_seconds_of_the_flex_record_every_channel_with_no_gap() {
     assert_eq!(lines.last().unwrap()["event"], "capture_stopped");
 
     let s = summary_of(&path);
-    println!("late blocks: {} in {} runs", late_blocks(&s), s.late.len());
+    println!("late blocks: {} in {} runs", late_blocks(&s), late_runs(&s));
     assert_eq!(s.tail.verdict, "ended");
     assert_eq!(
         s.end.as_ref().map(|e| e.reason),
-        Some(capture_record::EndReason::Stopped)
+        Some(StreamEndReason::Stopped)
     );
-    assert!(s.gaps.is_empty(), "gaps: {:#?}", s.gaps);
-    assert!(s.wall_steps.is_empty(), "wall steps: {:#?}", s.wall_steps);
-    assert_eq!(s.header["layout"], serde_json::json!(LAYOUT));
+    assert!(
+        s.discontinuities.is_empty(),
+        "discontinuities: {:#?}",
+        s.discontinuities
+    );
+    assert_eq!(s.segments.len(), 1, "segments: {:#?}", s.segments);
+    assert_segments_continuous(&s);
+    assert_eq!(s.wall_steps.as_deref(), Some(&[][..]), "wall steps");
+    assert_eq!(
+        s.capture.as_ref().map(|c| c.channel_names.clone()),
+        Some(LAYOUT.map(str::to_owned).to_vec())
+    );
     assert!(s.duration_frames_s >= 9.0, "{}", s.duration_frames_s);
     let clock = s.duration_clock_s.expect("blocks were recorded");
     assert!(
@@ -194,9 +226,9 @@ fn ten_seconds_of_the_flex_record_every_channel_with_no_gap() {
 
 #[test]
 #[ignore = "needs the reSpeaker Flex attached and free; run by `make -C firmware capture-hil`"]
-fn a_one_second_pause_is_an_overrun_gap_with_a_clock_estimate() {
+fn a_one_second_pause_is_an_overrun_loss_with_a_clock_estimate() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("flex-overrun.bpcr");
+    let path = dir.path().join("flex-overrun.framelog");
     let r = start(&path);
     assert_started_on_the_flex(&r.started);
     thread::sleep(Duration::from_secs(5));
@@ -214,15 +246,28 @@ fn a_one_second_pause_is_an_overrun_gap_with_a_clock_estimate() {
     );
 
     let s = summary_of(&path);
-    println!("late blocks: {} in {} runs", late_blocks(&s), s.late.len());
+    println!("late blocks: {} in {} runs", late_blocks(&s), late_runs(&s));
     assert_eq!(s.tail.verdict, "ended");
+    assert_segments_continuous(&s);
     let overruns: Vec<_> = s
-        .gaps
+        .discontinuities
         .iter()
-        .filter(|g| g.cause == GapCause::Overrun && g.frames.is_none())
+        .filter(|d| {
+            d.kind == "loss"
+                && d.cause == Some(Cause::Loss(LossCause::Overrun))
+                && d.frames.is_none()
+        })
         .collect();
-    assert!(!overruns.is_empty(), "gaps: {:#?}", s.gaps);
-    let estimated: i64 = s.gaps.iter().filter_map(|g| g.clock_estimate_frames).sum();
+    assert!(
+        !overruns.is_empty(),
+        "discontinuities: {:#?}",
+        s.discontinuities
+    );
+    let estimated: i64 = s
+        .discontinuities
+        .iter()
+        .filter_map(|d| d.clock_estimate_frames)
+        .sum();
     let seconds = estimated as f64 / f64::from(RATE);
     println!("clock estimates sum to {estimated} frames, {seconds:.4} s, for a 1 s pause");
     assert!(
