@@ -129,6 +129,10 @@ architecture-arc-and-deferred-paths.md:88-92]
 
 ## 5. Codec / headphone-out routing [confirmed + documented]
 
+<!-- TODO(usb-image-output-silenced-by-esp32-firmware): the "plug in, audio
+plays" bullet below has been seen to hold only while the XIAO ESP32-S3 module
+runs no firmware that configures the XVF3800. -->
+
 - Codec: **TI TLV320AIC3104**, I2C address `0x18`. The XVF3800 sends analog
   audio to it over I2S; the codec's analog outs drive both the 3.5 mm headphone
   jack and the TPA3139D2 speaker amp **in hardware-parallel** — not a software

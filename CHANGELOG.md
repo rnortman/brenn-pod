@@ -443,6 +443,11 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   asks for actually happens.
 - **First HIL attempt after a cold boot could fail (AC9).** The host now retries Identify,
   and a re-send write error no longer aborts the whole wait.
+- The audio reference now warns that the reSpeaker Flex's USB audio image
+  can play nothing, while accepting every frame without error, when the
+  board's XIAO ESP32-S3 module runs firmware that configures the XVF3800.
+  Erasing the module's firmware restored playback. Which firmware does this is
+  not yet known; a tracker entry follows it up.
 
 ## [0.1.0] - 2026-07-23
 

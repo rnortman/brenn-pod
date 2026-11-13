@@ -1504,3 +1504,25 @@ declared and no `git` on `PATH`, starts no program and stamps the declared
 commit with source `declared`, and a build inside a checkout behaves as it
 does today. See `TODO(build-id-declared-build-runs-git)` in
 `firmware/crates/build-id/build.rs`, where `main` consults git.
+
+## `usb-image-output-silenced-by-esp32-firmware`
+
+`docs/reference/audio-and-channels.md`, section 5, says the stock USB firmware
+plays out of the 3.5 mm jack with nothing to set up: "plug in, audio plays".
+That has been seen to hold only while the board's XIAO ESP32-S3 module leaves
+the XVF3800 alone. On a reSpeaker Flex on Seeed's six-channel USB audio image
+whose module ran firmware that configures the XVF3800 at boot, the USB
+playback endpoint took every frame written to it, the writer saw no error,
+and the board played nothing. With the module's firmware erased, the same
+board plays.
+
+The module is soldered to the board and masters the I2C bus that reaches both
+the XVF3800 and the codec (`docs/reference/hardware-reference.md`, section
+1), so a board is back in that state whenever such firmware is flashed to it.
+Which firmware was on the module, and what it set on the chip or the codec,
+was not recorded when this was seen, so the section is not corrected here.
+
+Done = section 5 says which firmware on the module does this and what it
+sets, and that the USB image's output depends on the module leaving the chip
+alone. See `TODO(usb-image-output-silenced-by-esp32-firmware)` at the head of
+that section.
