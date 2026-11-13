@@ -19,6 +19,10 @@ use decide::DECLARED_VAR;
 fn main() {
     println!("cargo:rerun-if-env-changed={DECLARED_VAR}");
 
+    // TODO(build-id-declared-build-runs-git): both git calls below run even when the
+    // commit is declared, so a builder that lets no build action run a host program
+    // cannot use the declared commit.
+
     // Re-run whenever HEAD or the current branch's ref moves, so the stamp tracks HEAD.
     // TODO(build-id-dirty-flag-stale): these triggers cover a moving ref only, so the
     // dirty flag below is not re-evaluated when tracked files change under an unmoved

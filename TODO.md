@@ -1480,3 +1480,27 @@ libasound only; a hardware test asserts both values and has been run; and
 any control command the image refuses is documented under
 `docs/reference/`. See `TODO(xvf-control-on-usb-audio-image)` at the control
 plane's device table.
+
+## `build-id-declared-build-runs-git`
+
+`build-id`'s build script runs git on every build, including one that
+declares its commit in `BRENN_POD_BUILD_COMMIT`: `git rev-parse
+--git-common-dir` for the rerun triggers, and `git rev-parse --show-prefix`
+to learn whether a checkout vouches. A build of a fetched revision has no
+checkout around it, so neither answer can change the stamp, and the script
+reaches for the host's git anyway. A builder that lets no build action run a
+host program, such as a hermetic Bazel build that pins `pod-capture` by
+revision, cannot use the documented variable; it switches the script off and
+sets `HIL_BUILD_COMMIT`, `HIL_BUILD_DIRTY` and `HIL_BUILD_SOURCE` itself,
+which copies this crate's private contract between its script and its
+library into another repository.
+
+Needs a design decision: how a builder says there is no checkout to consult,
+without weakening the rule that inside a checkout git always vouches and a
+declared commit cannot override it.
+
+Done = a build of this crate from a fetched revision, with the commit
+declared and no `git` on `PATH`, starts no program and stamps the declared
+commit with source `declared`, and a build inside a checkout behaves as it
+does today. See `TODO(build-id-declared-build-runs-git)` in
+`firmware/crates/build-id/build.rs`, where `main` consults git.
