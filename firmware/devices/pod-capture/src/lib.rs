@@ -13,6 +13,7 @@
 //! can be asserted without a sound card or a disk.
 
 mod capture;
+pub mod chip_state;
 pub mod cli;
 mod framer;
 mod granted;

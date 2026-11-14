@@ -13,10 +13,11 @@
 
 use std::fmt;
 
-use xvf3800_ctrl::{ControlTransport, RetryPolicy, STATUS_DONE, control_read, control_write};
+use xvf3800_ctrl::state::{RegisterRead, read_one};
+use xvf3800_ctrl::{ControlTransport, RetryPolicy, STATUS_DONE, control_write};
 
 /// One register's payload under `policy`, or the one-line reading that says why
-/// there is none.
+/// there is none. A declined transfer reads as a failed one.
 ///
 /// # Errors
 /// The transport failing, or a final status that is not [`STATUS_DONE`].
@@ -31,12 +32,14 @@ pub(crate) fn read_register<T: ControlTransport>(
 where
     T::Error: fmt::Display,
 {
-    match control_read(transport, policy, resid, cmd, payload) {
-        Ok((STATUS_DONE, _)) => Ok(()),
-        Ok((status, attempts)) => Err(format!(
+    match read_one(transport, policy, resid, cmd, payload) {
+        RegisterRead::Done => Ok(()),
+        RegisterRead::Status { status, attempts } => Err(format!(
             "{label} read returned status 0x{status:02x} after {attempts} transaction(s)"
         )),
-        Err(e) => Err(format!("{label} read failed: {e}")),
+        RegisterRead::Declined(e) | RegisterRead::Failed(e) => {
+            Err(format!("{label} read failed: {e}"))
+        }
     }
 }
 

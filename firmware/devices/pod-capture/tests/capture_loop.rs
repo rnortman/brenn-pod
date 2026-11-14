@@ -15,8 +15,9 @@ use alsa_pcm::{ClockPair, PcmError, Period, Read, Recovery, Wait};
 use audio_pipeline::wide::{LossCause, StreamEndReason};
 use audio_pipeline::wire::{ChannelSource, EndReason};
 use frame_log::{
-    BuildSource, Cause, Device, DeviceControl, Step as LogStep, Summary, WriterBuild, WriterInfo,
-    summarize, walk,
+    BuildSource, Cause, Device, DeviceControl, DeviceState, NotAttemptedWhy, RegisterEntry,
+    RegisterReading, RegisterRefusal, Step as LogStep, Summary, UnavailableWhy, UsbLocation,
+    WriterBuild, WriterInfo, summarize, walk,
 };
 use pod_capture::lines::Lines;
 use pod_capture::{
@@ -331,6 +332,13 @@ fn recording(channels: u32, format: SampleFormat, period_frames: u32) -> Recordi
             card_long_name: "Seeed Studio reSpeaker Flex at usb-1".to_owned(),
             pcm: "hw:2,0".to_owned(),
             usb_id: Some("2886:0022".to_owned()),
+            usb: Some(UsbLocation {
+                port: "3-2.2".to_owned(),
+                bus: 3,
+                address: 28,
+                serial: Some("EXAMPLE-SERIAL".to_owned()),
+                bcd_device: "0100".to_owned(),
+            }),
         },
         granted: Granted {
             rate_hz: RATE,
@@ -341,6 +349,61 @@ fn recording(channels: u32, format: SampleFormat, period_frames: u32) -> Recordi
         },
         layout: (0..channels).map(|c| format!("ch{c}")).collect(),
         device_control: DeviceControl { performed: false },
+        device_state: read_state(),
+    }
+}
+
+/// A `read` state with one register read and one refused of each kind.
+fn read_state() -> DeviceState {
+    let entry = |resid, cmd, reading| RegisterEntry {
+        resid,
+        cmd,
+        reading,
+    };
+    DeviceState::Read {
+        kind: "xvf3800".to_owned(),
+        begun_mono_us: 10,
+        ended_mono_us: 50,
+        wall_us: 1_794_000_000_000_010,
+        registers: [
+            (
+                "version",
+                entry(
+                    48,
+                    0,
+                    RegisterReading::Read {
+                        bytes: "020102".to_owned(),
+                        value: serde_json::json!([2, 1, 2]),
+                    },
+                ),
+            ),
+            (
+                "bld_repo_hash",
+                entry(
+                    48,
+                    3,
+                    RegisterReading::Refused {
+                        refused: RegisterRefusal::Status {
+                            status: 3,
+                            attempts: 1,
+                        },
+                    },
+                ),
+            ),
+            (
+                "aec_asroutgain",
+                entry(
+                    33,
+                    36,
+                    RegisterReading::Refused {
+                        refused: RegisterRefusal::Declined,
+                    },
+                ),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, e)| (name.to_owned(), e))
+        .collect(),
     }
 }
 
@@ -1275,4 +1338,75 @@ fn an_audio_frame_s_time_is_its_first_frame_s_capture_time() {
         .unwrap();
     assert_eq!(audio_ts, read_mono - 60_000);
     assert_eq!(ran.summary().segments[0].base_frame, 0);
+}
+
+#[test]
+fn the_header_and_capture_started_carry_the_same_device_state_for_each_outcome() {
+    let unavailable = |why, kind: Option<&str>, begun: Option<u64>| DeviceState::Unavailable {
+        why,
+        detail: "scripted".to_owned(),
+        kind: kind.map(str::to_owned),
+        begun_mono_us: begun,
+        wall_us: begun.map(|t| t + 1),
+    };
+    let states = [
+        (read_state(), "read", true),
+        (
+            DeviceState::NotAttempted {
+                why: NotAttemptedWhy::NotUsb,
+                detail: "card 2's device is not on USB".to_owned(),
+            },
+            "not_attempted",
+            false,
+        ),
+        (
+            DeviceState::NotAttempted {
+                why: NotAttemptedWhy::UnknownUsbId,
+                detail: "046d:0825 at port 1-4".to_owned(),
+            },
+            "not_attempted",
+            true,
+        ),
+        (
+            unavailable(UnavailableWhy::Sysfs, None, None),
+            "unavailable",
+            false,
+        ),
+        (
+            unavailable(UnavailableWhy::Open, Some("xvf3800"), None),
+            "unavailable",
+            true,
+        ),
+        (
+            unavailable(UnavailableWhy::Transfer, Some("xvf3800"), Some(10)),
+            "unavailable",
+            true,
+        ),
+        (
+            unavailable(UnavailableWhy::DeviceChanged, Some("xvf3800"), Some(10)),
+            "unavailable",
+            true,
+        ),
+    ];
+    for (state, outcome, on_usb) in states {
+        let mut rec = recording(6, SampleFormat::S16Le, PERIOD);
+        if !on_usb {
+            rec.device.usb = None;
+        }
+        rec.device_state = state.clone();
+        let ran = run_recording(rec, periods(3).collect(), MemDest::new(), StepClock::new());
+        assert_eq!(ran.outcome, Outcome::Stopped);
+        let started = ran.line("capture_started");
+        assert_eq!(started["device_state"]["outcome"], outcome);
+        assert_eq!(
+            started["device_state"],
+            serde_json::to_value(&state).unwrap()
+        );
+        assert_eq!(started["device"]["usb"].is_null(), !on_usb);
+
+        let s = ran.summary();
+        assert_eq!(s.header["capture"]["device_state"], started["device_state"]);
+        assert_eq!(s.header["capture"]["device"], started["device"]);
+        assert_eq!(s.header["capture"]["device_control"]["performed"], false);
+    }
 }

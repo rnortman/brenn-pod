@@ -109,9 +109,14 @@ check-host: check-host-arch
 #   2. Declared as forty zeros inside the checkout: the build must fail, because a
 #      declared commit cannot override a checkout.
 #   3. Declared with git's view hidden (no repository is found from the crate's
-#      directory under the ceiling): source `declared`. This is a fetched revision.
+#      directory under the ceiling): source `declared`. This is the path on which git
+#      is asked, inside a checkout, and cannot answer.
 #   4. Nothing declared, with GIT_DIR exported and GIT_WORK_TREE not, as git runs a
 #      hook from a linked worktree: git still vouches, source `git`.
+#   5. A fetched revision as it really is: the tracked files of this directory copied
+#      into a temporary directory with no `.git`, declared, with a `git` first on PATH
+#      that records being started and fails. Source `declared`, and no record: a
+#      declared build with no checkout around it starts no program.
 .PHONY: check-build-id-declared
 check-build-id-declared:
 	@set -e; \
@@ -128,7 +133,20 @@ check-build-id-declared:
 	GIT_CEILING_DIRECTORIES=$(CURDIR) BRENN_POD_BUILD_COMMIT=$$head BUILD_ID_EXPECT_SOURCE=declared \
 	    cargo test -q -p build-id --target-dir target/build-id-declared-hidden; \
 	GIT_DIR=$$(git rev-parse --absolute-git-dir) BUILD_ID_EXPECT_SOURCE=git \
-	    cargo test -q -p build-id --target-dir target/build-id-declared-git-dir
+	    cargo test -q -p build-id --target-dir target/build-id-declared-git-dir; \
+	fetched=$$(mktemp -d); \
+	trap 'rm -rf -- "$${fetched:?}"' EXIT; \
+	mkdir -p "$$fetched/firmware" "$$fetched/bin"; \
+	git ls-files -z | xargs -0 cp --parents -t "$$fetched/firmware"; \
+	printf '#!/bin/sh\ntouch "%s/git-was-started"\nexit 1\n' "$$fetched" > "$$fetched/bin/git"; \
+	chmod +x "$$fetched/bin/git"; \
+	( cd "$$fetched/firmware" && PATH="$$fetched/bin:$$PATH" \
+	    BRENN_POD_BUILD_COMMIT=$$head BUILD_ID_EXPECT_SOURCE=declared \
+	    cargo test -q -p build-id --target-dir $(CURDIR)/target/build-id-declared-fetched ); \
+	if [ -e "$$fetched/git-was-started" ]; then \
+	    echo "check-build-id-declared: a declared build with no checkout around it started git" >&2; \
+	    exit 1; \
+	fi
 
 # Host-architecture workspace (host/) — stable toolchain, no espup.
 # Standalone workspace beside firmware/; check and check-host both depend on this
@@ -154,6 +172,16 @@ hil-test:
 .PHONY: capture-hil
 capture-hil:
 	cargo test -p pod-capture --test flex_hil -- --ignored --nocapture --test-threads=1
+
+# Chip HIL — the reSpeaker Flex's XVF3800 (USB-audio image, 2886:0022) read over
+# USB control transfers, found through its sound card as pod-capture finds it.
+# Read-only and silent: nothing is written to the chip and nothing is played. Needs
+# the Flex attached and its USB node openable by this account (the udev rule,
+# docs/runbooks/pod-capture.md).
+# NEVER invoked by check/check-host/pre-commit/CI.
+.PHONY: chip-hil
+chip-hil:
+	cargo test -p pod-capture --test flex_chip_hil -- --ignored --nocapture --test-threads=1
 
 # Build-time guard against the xtensa frame-realign / stack-arg miscompile
 # (TODO(xtensa-realign-stack-args)). The device toolchain is the stock esp channel, which

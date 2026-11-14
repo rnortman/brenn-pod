@@ -264,7 +264,7 @@ fn file_name_string(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::container::RECORD_HEADER_BYTES;
-    use crate::header::tests::capture;
+    use crate::header::tests::{capture, read_state};
     use std::fs::OpenOptions;
 
     fn meta(conn_seq: u64) -> LogMeta {
@@ -665,7 +665,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.framelog");
         let mut m = meta(0);
-        m.capture = Some(capture());
+        let mut c = capture();
+        c.device_state = Some(read_state());
+        m.capture = Some(c);
         let mut file = Vec::new();
         let header_len = write_header(&mut file, &m).unwrap();
         write_record(&mut file, HostMicros(5), &[1, 2]).unwrap();

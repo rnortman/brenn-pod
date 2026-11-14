@@ -47,13 +47,31 @@ JSON. Unknown keys are ignored on read.
                "card_name": "reSpeaker Flex XVF3800 L16K6Ch",
                "card_long_name": "Seeed Studio reSpeaker Flex XVF3800 L16K6Ch at usb-…",
                "pcm": "hw:2,0",
-               "usb_id": "2886:0022"},
+               "usb_id": "2886:0022",
+               "usb": {"port": "3-2.2", "bus": 3, "address": 28,
+                       "serial": "EXAMPLE-SERIAL", "bcd_device": "0100"}},
     "granted": {"period_frames": 320, "buffer_frames": 5120},
     "clocks": {"mono": "CLOCK_MONOTONIC", "wall": "CLOCK_REALTIME", "unit": "us"},
-    "device_control": {"performed": false}
+    "device_control": {"performed": false},
+    "device_state": {
+      "outcome": "read",
+      "kind": "xvf3800",
+      "begun_mono_us": 81234500000, "ended_mono_us": 81234541000,
+      "wall_us": 1794000000000000,
+      "registers": {
+        "version":        {"resid": 48, "cmd": 0,  "bytes": "…", "value": […]},
+        "bld_msg":        {"resid": 48, "cmd": 1,  "bytes": "…", "value": "…"},
+        "bld_repo_hash":  {"resid": 48, "cmd": 3,
+                           "refused": {"how": "status", "status": 3, "attempts": 1}},
+        "aec_asroutgain": {"resid": 33, "cmd": 36, "refused": {"how": "declined"}},
+        "…": "…"
+      }
+    }
   }
 }
 ```
+
+(The values are placeholders, not readings of any device.)
 
 - `build_id`, `created_epoch_us`, `conn_seq` and the optional `rolled_from` are
   every log's. A capture's `build_id` is the commit, its `created_epoch_us` the
@@ -68,14 +86,59 @@ JSON. Unknown keys are ignored on read.
     `BRENN_POD_BUILD_COMMIT`. `dirty` is `null` when the source is `declared`.
   - `device.usb_id`: the kernel's `/proc/asound/card<N>/usbid`, or `null` for a
     card with no USB id.
+  - `device.usb`: the USB device behind the card, resolved through sysfs:
+    `port` (the sysfs device name, such as `3-2.2`), `bus`, `address`,
+    `serial` (`null` for a device that reports none) and `bcd_device` (four hex
+    digits). `null` for a card whose device is not on USB, or whose USB device
+    could not be read; absent in a log written before the key existed. Two
+    boards of one id on one machine differ in `port` and `serial`.
+    Whether `device_state` is read, and its `kind`, follow from that USB
+    device's own `idVendor` and `idProduct` in sysfs, not from `usb_id`, which
+    is the ALSA driver's id for the card and which its `quirk_alias` option can
+    remap. The two are not compared.
   - `granted`: read back from the open stream, not echoed from the request.
     The rate, channel count and sample format are in the hello.
-  - `device_control.performed: false`: the writer sent the device no control
-    command.
+  - `device_control.performed: false`: the writer wrote nothing to the device.
+  - `device_state`: what the writer read of the device's own state, below.
 
   A `capture` block that breaks these rules (a malformed id or commit, a zero
-  period, a buffer smaller than the period, other clocks) is refused on write
-  and on read.
+  period, a buffer smaller than the period, other clocks, a register's `bytes`
+  that is not lowercase hex of even length, a `read` state with no registers,
+  an `ended_mono_us` under its `begun_mono_us`) is refused on write and on
+  read.
+
+### `device_state`
+
+Four statements, by the key's absence and its `outcome`:
+
+| In the header | Means |
+|---|---|
+| no `device_state` key | The writer reads no device state, as every log written before the key existed. Nothing tried to read. |
+| `{"outcome": "not_attempted", "why": "not_usb" \| "unknown_usb_id", "detail": "…"}` | The writer reads device state, and this device is not one it knows how to read. Nothing was sent to it. |
+| `{"outcome": "unavailable", "why": "sysfs" \| "open" \| "transfer" \| "device_changed", "detail": "…", …}` | The writer tried and could not reach the device's state. `detail` carries the system's own words and, for `transfer`, the register the read failed at. `kind` is present once the device is known to be one the writer reads (every `why` but `sysfs`); `begun_mono_us` and `wall_us` once a transfer was begun. No register value is recorded. |
+| `{"outcome": "read", "kind": "…", "begun_mono_us": …, "ended_mono_us": …, "wall_us": …, "registers": {…}}` | Every register the writer reads for that `kind` was asked, and each is either read or refused. |
+
+- `kind` names the reader (`xvf3800`), not a USB id.
+- `begun_mono_us` and `ended_mono_us` are `CLOCK_MONOTONIC` readings directly
+  before the first transfer and directly after the last, on the clock of the
+  capture's own `mono_us` values; `wall_us` is the wall reading paired with the
+  first. The capture's start pair is in its `Describe` frame, so the state was
+  read `start mono_us - ended_mono_us` before frame 0. The reading always
+  precedes the start, and is taken once.
+- `registers` maps a register's name to its entry, `resid` and `cmd` beside
+  either `bytes` and `value` or `refused`:
+  - `bytes`: the payload as read, lowercase hex, without the status byte. This
+    is the reading.
+  - `value`: the same payload decoded by the register's kind: an array of
+    numbers, a string (ASCII up to the first NUL), an integer, or a number. A
+    float that is not finite is `null`; `bytes` still holds it.
+  - `refused`: `{"how": "status", "status": <byte>, "attempts": <n>}` when the
+    device answered with a status other than done after the retry budget, or
+    `{"how": "declined"}` when it stalled the transfer.
+
+  The reader of this format knows no register names; which registers an
+  `xvf3800` reading holds, and why, is in `xvf3800-control-protocol.md`,
+  section 8.
 
 ## The version rule
 

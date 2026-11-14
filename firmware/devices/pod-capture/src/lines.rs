@@ -5,7 +5,7 @@
 use std::io::Write;
 
 use audio_pipeline::wide::LossCause;
-use frame_log::{Device, WriterBuild};
+use frame_log::{Device, DeviceState, WriterBuild};
 use serde::Serialize;
 
 use crate::framer::Gap;
@@ -61,6 +61,8 @@ pub struct CaptureStarted<'a> {
     pub granted: &'a Granted,
     pub layout: &'a [String],
     pub build: &'a WriterBuild,
+    /// The same statement of the device's state as the log's header.
+    pub device_state: &'a DeviceState,
     /// Always 0: the position the pair anchors.
     pub frame: u64,
     pub mono_us: u64,

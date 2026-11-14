@@ -5,7 +5,8 @@
 //! tree in one `make hil-test` invocation, the two stamps match on a clean rebuild.
 //!
 //! A build with no checkout of this repository around it (a fetched revision)
-//! takes its commit from `BRENN_POD_BUILD_COMMIT` instead; [`source`] says which.
+//! takes its commit from `BRENN_POD_BUILD_COMMIT` instead, and starts no program
+//! to do so; [`source`] says which.
 //! Inside a checkout of this repository git always vouches, and a declared commit
 //! that disagrees with it fails the build.
 //!
@@ -145,8 +146,9 @@ mod tests {
 
     mod decision {
         use std::ffi::OsStr;
+        use std::path::Path;
 
-        use crate::decide::{OWN_PREFIX, Stamp, decide, parse_declared};
+        use crate::decide::{OWN_PREFIX, Stamp, checkout_top, decide, parse_declared};
 
         const HEAD: &str = "13a513d6b38a14194ecb2e1853a7a55d9e7f7dab";
         const OTHER: &str = "0000000000000000000000000000000000000000";
@@ -161,6 +163,51 @@ mod tests {
 
         fn git_not_asked() -> (String, bool) {
             panic!("git's commit was asked for where git does not vouch")
+        }
+
+        fn prefix_not_asked() -> Result<String, String> {
+            panic!("git's prefix was asked for where no checkout can be")
+        }
+
+        #[test]
+        fn the_checkout_top_is_three_components_above_the_crate() {
+            assert_eq!(
+                checkout_top(Path::new("/src/pod/firmware/crates/build-id")),
+                Some(Path::new("/src/pod"))
+            );
+            assert_eq!(
+                checkout_top(Path::new("firmware/crates/build-id")),
+                Some(Path::new(""))
+            );
+            for elsewhere in [
+                "/src/pod/vendor/build-id",
+                "/src/pod/crates/build-id",
+                "/src/pod/firmware/crates/build-id-0.1.0",
+                "/registry/build-id",
+                "crates/build-id",
+                "/",
+            ] {
+                assert_eq!(checkout_top(Path::new(elsewhere)), None, "{elsewhere}");
+            }
+        }
+
+        #[test]
+        fn with_no_checkout_around_the_crate_git_is_not_asked() {
+            assert_eq!(
+                decide(
+                    false,
+                    prefix_not_asked,
+                    Some(HEAD.to_owned()),
+                    git_not_asked
+                ),
+                Ok(stamp(HEAD, false, "declared"))
+            );
+            let err = decide(false, prefix_not_asked, None, git_not_asked).unwrap_err();
+            assert!(
+                err.contains("no checkout of this repository")
+                    && err.contains("Declare the commit in BRENN_POD_BUILD_COMMIT"),
+                "{err}"
+            );
         }
 
         fn stamp(commit: &str, dirty: bool, source: &'static str) -> Stamp {
@@ -195,18 +242,18 @@ mod tests {
         #[test]
         fn at_its_own_place_git_vouches_with_its_dirty_flag() {
             assert_eq!(
-                decide(own(), None, git_at_head),
+                decide(true, own, None, git_at_head),
                 Ok(stamp(HEAD, true, "git"))
             );
             assert_eq!(
-                decide(own(), Some(HEAD.to_owned()), git_at_head),
+                decide(true, own, Some(HEAD.to_owned()), git_at_head),
                 Ok(stamp(HEAD, true, "git"))
             );
         }
 
         #[test]
         fn a_declaration_that_disagrees_with_the_checkout_fails() {
-            let err = decide(own(), Some(OTHER.to_owned()), git_at_head).unwrap_err();
+            let err = decide(true, own, Some(OTHER.to_owned()), git_at_head).unwrap_err();
             assert!(
                 err.contains("A declared commit cannot override a checkout"),
                 "{err}"
@@ -216,28 +263,28 @@ mod tests {
 
         #[test]
         fn inside_another_repository_git_does_not_vouch() {
-            let vendored = || Ok("vendor/build-id/".to_owned());
-            let err = decide(vendored(), None, git_not_asked).unwrap_err();
+            let vendored = || Ok::<_, String>("vendor/build-id/".to_owned());
+            let err = decide(true, vendored, None, git_not_asked).unwrap_err();
             assert!(err.contains("not at `firmware/crates/build-id/`"), "{err}");
             assert!(err.contains("`vendor/build-id/`"), "{err}");
             assert_eq!(
-                decide(vendored(), Some(OTHER.to_owned()), git_not_asked),
+                decide(true, vendored, Some(OTHER.to_owned()), git_not_asked),
                 Ok(stamp(OTHER, false, "declared"))
             );
             // The top of a work tree is another place too.
-            assert!(decide(Ok(String::new()), None, git_not_asked).is_err());
+            assert!(decide(true, || Ok(String::new()), None, git_not_asked).is_err());
         }
 
         #[test]
         fn where_git_cannot_answer_only_a_declaration_stamps() {
-            let none = || Err("no repository".to_owned());
-            let err = decide(none(), None, git_not_asked).unwrap_err();
+            let none = || Err::<String, _>("no repository".to_owned());
+            let err = decide(true, none, None, git_not_asked).unwrap_err();
             assert!(
                 err.contains("no repository") && err.contains("declare the commit"),
                 "{err}"
             );
             assert_eq!(
-                decide(none(), Some(HEAD.to_owned()), git_not_asked),
+                decide(true, none, Some(HEAD.to_owned()), git_not_asked),
                 Ok(stamp(HEAD, false, "declared"))
             );
         }

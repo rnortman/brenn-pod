@@ -5,8 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 # Provides the compiled-in build identity (git commit + dirty flag) to both the
-# host harness and the device firmware. build.rs runs unconditionally every build
-# (no rerun-if-changed) to satisfy the fresh-stamp invariant.
+# host harness and the device firmware.
 
 [dependencies]
 device-protocol = { path = "../device-protocol" }

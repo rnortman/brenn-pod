@@ -23,6 +23,13 @@ command line and event lines are
   sound settings), and set it back afterwards.
   `cat /proc/asound/card<N>/pcm0c/sub0/status` reads `closed` when nothing
   holds the capture stream.
+- For the chip's state in the record, access to the board's USB node,
+  `/dev/bus/usb/<bus>/<address>` (`ls -l` on it; `lsusb` gives the bus and
+  address). The XVF3800 udev rule (`firmware/udev/99-respeaker-xvf3800.rules`,
+  installed as `firmware/docs/setup.md` describes) grants it for every `2886`
+  board. Without it the capture still records, and its header says
+  `device_state: {"outcome": "unavailable", "why": "open", …}` with the node's
+  path and "Permission denied".
 
 ## Build
 
@@ -75,6 +82,13 @@ there is none; `tail.verdict` is `ended` for a capture that stopped cleanly.
 The export's map says which WAV frames are audio and which are silence standing
 for a hole. The same tool reads the voice host's frame logs.
 
+The summary's `header.capture.device_state` is what the recorder read of the
+device's chip before the stream started, and `header.capture.device.usb` names
+the USB device it read it from (port, bus, address, serial number); the same
+two are on the `capture_started` line. `outcome` is `read` with every
+register's `bytes` and `value`, or says why nothing was read
+(`docs/reference/frame-log.md`, `device_state`).
+
 ## Hardware test
 
 With the Flex attached and its capture device free:
@@ -93,3 +107,23 @@ fails to start fails the test with its `capture_failed` line printed whole. The
 waveform guards were calibrated on the ESP pod's I2S image; a channel of the USB
 image that fails one is a reading for the owner to review, not a threshold to
 move.
+
+The chip's state, with the Flex attached, its USB node openable (the udev rule
+above) and its capture device free:
+
+```sh
+make -C firmware chip-hil
+```
+
+Four tests, silent and read-only (nothing is written to the chip), a few
+seconds: the chip answers a version read; its firmware identity and its
+routing and reference-path registers are the expected ones, each reading
+printed beside its expectation and that expectation's source; and a two-second
+capture's `capture_started` and header carry the same reading as one taken
+directly, from the board sysfs names. **The command exits non-zero today**, on
+`the_chip_is_the_expected_firmware` and `the_chip_routing_is_the_expected_routing`
+and on those two only: ten registers have no expectation the maintainer has
+confirmed. The tracker entry `flex-usb-image-chip-readings-unconfirmed` says
+which, why, and what ends it. A failure of any other test, a failure naming any
+other register, or a reading that differs from the entry's is a new reading
+for the owner to review.

@@ -34,7 +34,13 @@ getrandom = "0.4"
 # and sigaction for the stop signals.
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+# A register's decoded value in the header and on `capture_started`.
+serde_json = "1"
+# The XVF3800's state read at start: the protocol's read driver and register
+# table, over the read-only USB transport, which links no USB library and has
+# no host-to-device transfer.
+xvf3800-ctrl = { path = "../../crates/xvf3800-ctrl" }
+xvf3800-usb = { path = "../../crates/xvf3800-usb" }
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3"

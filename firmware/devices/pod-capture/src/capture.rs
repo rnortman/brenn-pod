@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use alsa_pcm::{ClockPair, Read, Recovery, Wait};
 use audio_pipeline::wide::{LossCause, MAX_WIDE_PCM_BYTES, StreamEndReason};
 use frame_log::{
-    CaptureGranted, CaptureMeta, Clocks, Device, DeviceControl, HostMicros, LogMeta, WriterInfo,
+    CaptureGranted, CaptureMeta, Clocks, Device, DeviceControl, DeviceState, HostMicros, LogMeta,
+    WriterInfo,
 };
 
 use crate::framer::{Block, End, Event, Framer, Gap, prelude};
@@ -114,6 +115,8 @@ pub struct Recording {
     /// One name per channel, in interleave order.
     pub layout: Vec<String>,
     pub device_control: DeviceControl,
+    /// What was read of the device's state before the stream started.
+    pub device_state: DeviceState,
 }
 
 impl Recording {
@@ -135,6 +138,7 @@ impl Recording {
                 },
                 clocks: Clocks::v1(),
                 device_control: self.device_control.clone(),
+                device_state: Some(self.device_state.clone()),
             }),
         }
     }
@@ -223,6 +227,7 @@ where
             granted: &rec.granted,
             layout: &rec.layout,
             build: &rec.writer.build,
+            device_state: &rec.device_state,
             frame: 0,
             mono_us: start.mono_us,
             wall_us: start.wall_us,

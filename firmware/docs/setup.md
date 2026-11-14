@@ -241,6 +241,9 @@ the `plugdev` group (see "Device-access group" above; check with `id -Gn`).
 - PID `0x0022` — app mode (USB-audio firmware)
 - PID `0x801c` — Safe/DFU mode (used by `dfu-util` to flash XMOS firmware)
 
+The same rule is what lets `pod-capture` open the USB node of a `2886` board to read
+its chip's state at the start of a capture (`docs/runbooks/pod-capture.md`).
+
 ---
 
 ## Recovery (brick prevention)

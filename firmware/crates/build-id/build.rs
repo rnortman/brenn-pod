@@ -2,14 +2,21 @@
 //
 // Stamps the current git commit + dirty flag into the binary, or, where git cannot
 // place this crate in a checkout of its own repository, the commit the builder
-// declares in BRENN_POD_BUILD_COMMIT. To keep the stamp from
-// going stale, we emit `cargo:rerun-if-changed` for the git ref files that move when
-// HEAD advances (see `emit_git_ref_rerun_triggers`). Without these, cargo would re-run
-// the script only when files in this crate's own directory change — so HEAD could
-// advance, downstream sources recompile, yet the cached commit stamp be silently reused,
-// flashing a fresh binary tagged with a stale commit.
+// declares in BRENN_POD_BUILD_COMMIT.
+//
+// A build with no checkout of this repository around the crate starts no program:
+// the crate's directory does not end in `firmware/crates/build-id`, or the directory
+// above those has no `.git` entry, and the declared commit is stamped without asking
+// git. Only where a checkout can be around the crate is git run.
+//
+// To keep the stamp from going stale, we emit `cargo:rerun-if-changed` for the git
+// ref files that move when HEAD advances (see `emit_git_ref_rerun_triggers`). Without
+// these, cargo would re-run the script only when files in this crate's own directory
+// change — so HEAD could advance, downstream sources recompile, yet the cached commit
+// stamp be silently reused, flashing a fresh binary tagged with a stale commit.
 
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 mod decide;
@@ -19,20 +26,29 @@ use decide::DECLARED_VAR;
 fn main() {
     println!("cargo:rerun-if-env-changed={DECLARED_VAR}");
 
-    // TODO(build-id-declared-build-runs-git): both git calls below run even when the
-    // commit is declared, so a builder that lets no build action run a host program
-    // cannot use the declared commit.
+    let manifest_dir = manifest_dir();
+    let checkout_git = decide::checkout_top(Path::new(&manifest_dir)).map(|top| top.join(".git"));
+    let in_checkout = checkout_git
+        .as_deref()
+        .is_some_and(|git| fs::symlink_metadata(git).is_ok());
 
-    // Re-run whenever HEAD or the current branch's ref moves, so the stamp tracks HEAD.
-    // TODO(build-id-dirty-flag-stale): these triggers cover a moving ref only, so the
-    // dirty flag below is not re-evaluated when tracked files change under an unmoved
-    // ref; a build then carries the flag of this script's last run in its target dir.
-    // In a linked worktree they watch the main checkout's `HEAD` and branch, not the
-    // worktree's, so the commit below can be stale there too.
-    emit_git_ref_rerun_triggers();
+    if in_checkout {
+        // Re-run whenever HEAD or the current branch's ref moves, so the stamp tracks HEAD.
+        // TODO(build-id-dirty-flag-stale): these triggers cover a moving ref only, so the
+        // dirty flag below is not re-evaluated when tracked files change under an unmoved
+        // ref; a build then carries the flag of this script's last run in its target dir.
+        // In a linked worktree they watch the main checkout's `HEAD` and branch, not the
+        // worktree's, so the commit below can be stale there too.
+        emit_git_ref_rerun_triggers();
+    } else if let Some(git) = &checkout_git {
+        // Re-run if a checkout appears where this one would be.
+        println!("cargo:rerun-if-changed={}", git.display());
+    }
 
     let stamp = decide::parse_declared(std::env::var_os(DECLARED_VAR).as_deref())
-        .and_then(|declared| decide::decide(git_prefix(), declared, git_commit_and_dirty))
+        .and_then(|declared| {
+            decide::decide(in_checkout, git_prefix, declared, git_commit_and_dirty)
+        })
         .unwrap_or_else(|why| panic!("{why}"));
 
     println!("cargo:rustc-env=HIL_BUILD_COMMIT={}", stamp.commit);

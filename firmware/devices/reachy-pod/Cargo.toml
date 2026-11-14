@@ -21,6 +21,9 @@ license.workspace = true
 # The transport-independent XVF3800 control protocol: resids, commands, status
 # semantics and the shared retry driver. This crate supplies the USB transport.
 xvf3800-ctrl = { path = "../../crates/xvf3800-ctrl" }
+# The protocol's USB setup-packet framing, shared with the recorder's reader.
+# Only the framing is used here; the transfers are moved by `rusb`.
+xvf3800-usb = { path = "../../crates/xvf3800-usb" }
 # Telemetry plausibility predicates, shared with the ESP pod's HIL self-tests.
 device-protocol = { path = "../../crates/device-protocol" }
 # The commit and dirty flag of the tree this binary was compiled from, stamped in

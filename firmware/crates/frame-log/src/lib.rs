@@ -25,7 +25,8 @@ mod walk;
 pub use export::{Basis, ExportError, ExportMap, Hole, Resent, Run, WAV_HEADER_BYTES, export_wav};
 pub use header::{
     BuildSource, CaptureGranted, CaptureMeta, CaptureMetaInvalid, Clocks, Device, DeviceControl,
-    LogMeta, WriterBuild, WriterInfo,
+    DeviceState, LogMeta, NotAttemptedWhy, RegisterEntry, RegisterReading, RegisterRefusal,
+    UnavailableWhy, UsbLocation, WriterBuild, WriterInfo,
 };
 pub use log::{FrameLogError, FrameLogReader, FrameLogWriter, LogItem, write_header, write_record};
 pub use stamp::HostMicros;

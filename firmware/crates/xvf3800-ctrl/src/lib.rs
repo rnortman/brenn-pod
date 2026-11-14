@@ -10,11 +10,15 @@
 //! Transports implement [`ControlTransport`] (one attempt, returning the device's
 //! status byte) and the shared drivers [`control_read`] / [`control_write`] apply
 //! the retry policy on top. That keeps WAIT/RETRY handling — the part where the
-//! two platforms must not diverge — in one place.
+//! two platforms must not diverge — in one place. A transport that must never
+//! write implements [`ControlRead`] alone, which [`control_read`] accepts and
+//! [`control_write`] does not.
 //!
 //! `no_std` and dependency-free; every item here is host-testable.
 
 #![cfg_attr(not(test), no_std)]
+
+pub mod state;
 
 /// XVF3800 I2C control address (7-bit). Assumed to be exposed on the stock
 /// l16k2ch firmware image; not separately confirmed for other firmware images.
@@ -46,6 +50,20 @@ pub const BLD_MSG_CMD: u8 = 1;
 
 /// `BLD_MSG` payload length in bytes: 50 characters, NUL-padded by the firmware.
 pub const BLD_MSG_READ_LEN: usize = 50;
+
+/// `BLD_REPO_HASH` command ID on [`APPLICATION_SERVICER_RESID`] — the git hash of
+/// the source the firmware was built from, `char × 40`.
+pub const BLD_REPO_HASH_CMD: u8 = 3;
+
+/// `BLD_REPO_HASH` payload length in bytes.
+pub const BLD_REPO_HASH_READ_LEN: usize = 40;
+
+/// `BLD_MODIFIED` command ID on [`APPLICATION_SERVICER_RESID`] — whether that
+/// source was modified from the release, `char × 6`.
+pub const BLD_MODIFIED_CMD: u8 = 4;
+
+/// `BLD_MODIFIED` payload length in bytes.
+pub const BLD_MODIFIED_READ_LEN: usize = 6;
 
 /// `REBOOT` command ID on [`APPLICATION_SERVICER_RESID`] — write-only, `uint8 × 1`.
 /// Any value reboots the chip and returns every parameter to its build default.
@@ -98,8 +116,9 @@ pub const PP_ECHOONOFF_CMD: u8 = 23;
 /// trade-off.
 pub const PP_DTSENSITIVE_CMD: u8 = 31;
 
-/// Payload length of every single-value `int32` or `float` AEC and PP register named
-/// here: four bytes either way (five on the wire with the status byte).
+/// Payload length of every single-value `int32` or `float` AEC, PP and audio
+/// manager register named here: four bytes either way (five on the wire with the
+/// status byte).
 /// [`AEC_FIXEDBEAMSGATING_CMD`], a single `uint8`, is the exception.
 pub const SCALAR_READ_LEN: usize = 4;
 
@@ -156,6 +175,54 @@ pub const AUDIO_MGR_OP_R_CMD: u8 = 19;
 /// here interprets them, because no reading of them from this firmware has been
 /// reviewed yet.
 pub const AUDIO_MGR_OP_READ_LEN: usize = 2;
+
+/// `AUDIO_MGR_MIC_GAIN` command ID (`float × 1`) — the gain on the microphone
+/// signals ahead of the processing stage.
+pub const AUDIO_MGR_MIC_GAIN_CMD: u8 = 0;
+
+/// `AUDIO_MGR_REF_GAIN` command ID (`float × 1`) — the gain on the far-end
+/// reference ahead of the processing stage.
+pub const AUDIO_MGR_REF_GAIN_CMD: u8 = 1;
+
+/// `AUDIO_MGR_SELECTED_CHANNELS` command ID (`uint8 × 2`) — which channels the
+/// "user chosen channels" output category carries.
+pub const AUDIO_MGR_SELECTED_CHANNELS_CMD: u8 = 12;
+
+/// `AUDIO_MGR_OP_PACKED` command ID (`uint8 × 2`, left then right) — whether each
+/// output side is packed.
+pub const AUDIO_MGR_OP_PACKED_CMD: u8 = 13;
+
+/// `AUDIO_MGR_OP_UPSAMPLE` command ID (`uint8 × 2`, left then right) — whether each
+/// output side is upsampled.
+pub const AUDIO_MGR_OP_UPSAMPLE_CMD: u8 = 14;
+
+/// Payload length of the two-value `uint8` audio manager registers
+/// ([`AUDIO_MGR_SELECTED_CHANNELS_CMD`], [`AUDIO_MGR_OP_PACKED_CMD`],
+/// [`AUDIO_MGR_OP_UPSAMPLE_CMD`]): one byte per value.
+pub const AUDIO_MGR_PAIR_READ_LEN: usize = 2;
+
+/// `AUDIO_MGR_OP_ALL` command ID (`uint8 × 12`) — (category, source) for all
+/// three slots of the left output, then all three of the right.
+pub const AUDIO_MGR_OP_ALL_CMD: u8 = 23;
+
+/// `AUDIO_MGR_OP_ALL` payload length in bytes: six (category, source) pairs.
+pub const AUDIO_MGR_OP_ALL_READ_LEN: usize = 12;
+
+/// `AUDIO_MGR_FAR_END_DSP_ENABLE` command ID (`uint8 × 1`) — whether the far-end
+/// DSP runs.
+pub const AUDIO_MGR_FAR_END_DSP_ENABLE_CMD: u8 = 25;
+
+/// `AUDIO_MGR_SYS_DELAY` command ID (`int32 × 1`) — the delay, in samples, applied
+/// to the reference ahead of the processing stage.
+pub const AUDIO_MGR_SYS_DELAY_CMD: u8 = 26;
+
+/// `I2S_DAC_DSP_ENABLE` command ID on [`AUDIO_MGR_RESID`] (`uint8 × 1`) — whether
+/// the pipeline takes the I2S signal as its input even on a USB audio image.
+pub const I2S_DAC_DSP_ENABLE_CMD: u8 = 27;
+
+/// Payload length of the one-value `uint8` audio manager flags
+/// ([`AUDIO_MGR_FAR_END_DSP_ENABLE_CMD`], [`I2S_DAC_DSP_ENABLE_CMD`]).
+pub const AUDIO_MGR_FLAG_READ_LEN: usize = 1;
 
 /// GPO servicer resource ID. The general-purpose-output lines (amp enable, mute LED)
 /// are read/written through this resid.
@@ -230,6 +297,43 @@ pub const AUDIO_MGR_OP_L_LABEL: &str = "AUDIO_MGR_OP_L (resid 35 cmd 15)";
 
 /// [`AUDIO_MGR_OP_R_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
 pub const AUDIO_MGR_OP_R_LABEL: &str = "AUDIO_MGR_OP_R (resid 35 cmd 19)";
+
+/// [`BLD_REPO_HASH_CMD`] on [`APPLICATION_SERVICER_RESID`], as a reader names it.
+pub const BLD_REPO_HASH_LABEL: &str = "BLD_REPO_HASH (resid 48 cmd 3)";
+
+/// [`BLD_MODIFIED_CMD`] on [`APPLICATION_SERVICER_RESID`], as a reader names it.
+pub const BLD_MODIFIED_LABEL: &str = "BLD_MODIFIED (resid 48 cmd 4)";
+
+/// [`AEC_ASROUTGAIN_CMD`] on [`AEC_RESID`], as a reader names it.
+pub const AEC_ASROUTGAIN_LABEL: &str = "AEC_ASROUTGAIN (resid 33 cmd 36)";
+
+/// [`AUDIO_MGR_MIC_GAIN_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_MIC_GAIN_LABEL: &str = "AUDIO_MGR_MIC_GAIN (resid 35 cmd 0)";
+
+/// [`AUDIO_MGR_REF_GAIN_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_REF_GAIN_LABEL: &str = "AUDIO_MGR_REF_GAIN (resid 35 cmd 1)";
+
+/// [`AUDIO_MGR_SELECTED_CHANNELS_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_SELECTED_CHANNELS_LABEL: &str = "AUDIO_MGR_SELECTED_CHANNELS (resid 35 cmd 12)";
+
+/// [`AUDIO_MGR_OP_PACKED_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_PACKED_LABEL: &str = "AUDIO_MGR_OP_PACKED (resid 35 cmd 13)";
+
+/// [`AUDIO_MGR_OP_UPSAMPLE_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_UPSAMPLE_LABEL: &str = "AUDIO_MGR_OP_UPSAMPLE (resid 35 cmd 14)";
+
+/// [`AUDIO_MGR_OP_ALL_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_ALL_LABEL: &str = "AUDIO_MGR_OP_ALL (resid 35 cmd 23)";
+
+/// [`AUDIO_MGR_FAR_END_DSP_ENABLE_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_FAR_END_DSP_ENABLE_LABEL: &str =
+    "AUDIO_MGR_FAR_END_DSP_ENABLE (resid 35 cmd 25)";
+
+/// [`AUDIO_MGR_SYS_DELAY_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_SYS_DELAY_LABEL: &str = "AUDIO_MGR_SYS_DELAY (resid 35 cmd 26)";
+
+/// [`I2S_DAC_DSP_ENABLE_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const I2S_DAC_DSP_ENABLE_LABEL: &str = "I2S_DAC_DSP_ENABLE (resid 35 cmd 27)";
 
 // ── Status semantics ─────────────────────────────────────────────────────────
 
@@ -327,6 +431,64 @@ pub trait ControlTransport {
 
     /// Sleep `ms` milliseconds between retries.
     fn delay_ms(&mut self, ms: u32);
+
+    /// Whether `err` is the device declining the request, as against a transfer
+    /// that did not complete. A transport that cannot tell the two apart reports
+    /// every error as a failed transfer.
+    fn refused(_err: &Self::Error) -> bool {
+        false
+    }
+}
+
+/// A transport that can only read: the half of [`ControlTransport`] that
+/// [`control_read`] drives, with nothing that sends a payload to the device.
+///
+/// Every [`ControlTransport`] is a `ControlRead` through the blanket
+/// implementation below, with the same error type. A type that implements
+/// `ControlRead` and not `ControlTransport` cannot be handed to
+/// [`control_write`].
+pub trait ControlRead {
+    /// Transport-level failure (bus fault, NAK, timeout, no device, refusal).
+    type Error;
+
+    /// Issue one control READ and return the status byte. The contract is
+    /// [`ControlTransport::control_read_once`]'s.
+    fn control_read_once(
+        &mut self,
+        resid: u8,
+        cmd: u8,
+        payload: &mut [u8],
+        attempt: u32,
+    ) -> Result<u8, Self::Error>;
+
+    /// Sleep `ms` milliseconds between retries.
+    fn delay_ms(&mut self, ms: u32);
+
+    /// Whether `err` is the device declining the request (on USB, a stalled
+    /// control transfer) rather than a transfer that did not complete.
+    fn refused(err: &Self::Error) -> bool;
+}
+
+impl<T: ControlTransport> ControlRead for T {
+    type Error = <T as ControlTransport>::Error;
+
+    fn control_read_once(
+        &mut self,
+        resid: u8,
+        cmd: u8,
+        payload: &mut [u8],
+        attempt: u32,
+    ) -> Result<u8, Self::Error> {
+        <T as ControlTransport>::control_read_once(self, resid, cmd, payload, attempt)
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        <T as ControlTransport>::delay_ms(self, ms);
+    }
+
+    fn refused(err: &Self::Error) -> bool {
+        <T as ControlTransport>::refused(err)
+    }
 }
 
 /// Perform an XVF3800 control READ, retrying transient statuses per `policy`.
@@ -337,7 +499,7 @@ pub trait ControlTransport {
 ///   fatal status or an exhausted retry budget, and `attempts > 1` distinguishes
 ///   the two. `payload` holds the last response's bytes either way.
 /// - `Err(_)` — the transport failed; `payload` contents are unspecified.
-pub fn control_read<T: ControlTransport>(
+pub fn control_read<T: ControlRead>(
     transport: &mut T,
     policy: RetryPolicy,
     resid: u8,
@@ -347,9 +509,9 @@ pub fn control_read<T: ControlTransport>(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        let status = transport.control_read_once(resid, cmd, payload, attempt)?;
+        let status = ControlRead::control_read_once(transport, resid, cmd, payload, attempt)?;
         if should_retry(status) && attempt <= policy.max_retries {
-            transport.delay_ms(policy.delay_ms);
+            ControlRead::delay_ms(transport, policy.delay_ms);
             continue;
         }
         return Ok((status, attempt));
@@ -371,7 +533,7 @@ pub fn control_write<T: ControlTransport>(
         attempt += 1;
         let status = transport.control_write_once(resid, cmd, payload, attempt)?;
         if should_retry(status) && attempt <= policy.max_retries {
-            transport.delay_ms(policy.delay_ms);
+            ControlTransport::delay_ms(transport, policy.delay_ms);
             continue;
         }
         return Ok((status, attempt));
@@ -549,6 +711,78 @@ mod tests {
                 AUDIO_MGR_OP_R_LABEL,
                 AUDIO_MGR_RESID,
                 AUDIO_MGR_OP_R_CMD,
+            ),
+            (
+                "BLD_REPO_HASH",
+                BLD_REPO_HASH_LABEL,
+                APPLICATION_SERVICER_RESID,
+                BLD_REPO_HASH_CMD,
+            ),
+            (
+                "BLD_MODIFIED",
+                BLD_MODIFIED_LABEL,
+                APPLICATION_SERVICER_RESID,
+                BLD_MODIFIED_CMD,
+            ),
+            (
+                "AEC_ASROUTGAIN",
+                AEC_ASROUTGAIN_LABEL,
+                AEC_RESID,
+                AEC_ASROUTGAIN_CMD,
+            ),
+            (
+                "AUDIO_MGR_MIC_GAIN",
+                AUDIO_MGR_MIC_GAIN_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_MIC_GAIN_CMD,
+            ),
+            (
+                "AUDIO_MGR_REF_GAIN",
+                AUDIO_MGR_REF_GAIN_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_REF_GAIN_CMD,
+            ),
+            (
+                "AUDIO_MGR_SELECTED_CHANNELS",
+                AUDIO_MGR_SELECTED_CHANNELS_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_SELECTED_CHANNELS_CMD,
+            ),
+            (
+                "AUDIO_MGR_OP_PACKED",
+                AUDIO_MGR_OP_PACKED_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_OP_PACKED_CMD,
+            ),
+            (
+                "AUDIO_MGR_OP_UPSAMPLE",
+                AUDIO_MGR_OP_UPSAMPLE_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_OP_UPSAMPLE_CMD,
+            ),
+            (
+                "AUDIO_MGR_OP_ALL",
+                AUDIO_MGR_OP_ALL_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_OP_ALL_CMD,
+            ),
+            (
+                "AUDIO_MGR_FAR_END_DSP_ENABLE",
+                AUDIO_MGR_FAR_END_DSP_ENABLE_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_FAR_END_DSP_ENABLE_CMD,
+            ),
+            (
+                "AUDIO_MGR_SYS_DELAY",
+                AUDIO_MGR_SYS_DELAY_LABEL,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_SYS_DELAY_CMD,
+            ),
+            (
+                "I2S_DAC_DSP_ENABLE",
+                I2S_DAC_DSP_ENABLE_LABEL,
+                AUDIO_MGR_RESID,
+                I2S_DAC_DSP_ENABLE_CMD,
             ),
         ] {
             // The whole spelling, not only the address: the name is what a reader
@@ -950,6 +1184,100 @@ mod tests {
             Err(FakeError)
         );
         assert_eq!(t.calls.len(), 1);
+    }
+
+    /// A function bounded on `ControlTransport` reads through the blanket
+    /// `ControlRead`: the same transport method is called, the same error type
+    /// comes back, and a transport that does not say otherwise refuses nothing.
+    #[test]
+    fn a_control_transport_reads_as_a_control_read_with_its_own_error() {
+        fn through_transport<T: ControlTransport>(t: &mut T) -> Result<(u8, u32), T::Error> {
+            let mut payload = [0u8; VERSION_READ_LEN];
+            control_read(
+                t,
+                USB_RETRY,
+                APPLICATION_SERVICER_RESID,
+                VERSION_CMD,
+                &mut payload,
+            )
+        }
+        let mut t = Scripted::new(&[STATUS_RETRY, STATUS_DONE]);
+        let got: Result<(u8, u32), FakeError> = through_transport(&mut t);
+        assert_eq!(got, Ok((STATUS_DONE, 2)));
+        assert!(t.calls.iter().all(|c| c.read));
+        assert_eq!(t.delays, vec![10]);
+
+        let mut t = Scripted::new(&[STATUS_DONE]).failing_at(0);
+        assert_eq!(through_transport(&mut t), Err(FakeError));
+        assert!(!<Scripted as ControlRead>::refused(&FakeError));
+    }
+
+    /// A transport that implements only `ControlRead`, and says which of its
+    /// errors are refusals.
+    struct ReadOnly {
+        statuses: Vec<u8>,
+        delays: Vec<u32>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ReadOnlyError {
+        Stalled,
+    }
+
+    impl ControlRead for ReadOnly {
+        type Error = ReadOnlyError;
+
+        fn control_read_once(
+            &mut self,
+            _resid: u8,
+            _cmd: u8,
+            payload: &mut [u8],
+            _attempt: u32,
+        ) -> Result<u8, Self::Error> {
+            if self.statuses.is_empty() {
+                return Err(ReadOnlyError::Stalled);
+            }
+            payload.fill(7);
+            Ok(self.statuses.remove(0))
+        }
+
+        fn delay_ms(&mut self, ms: u32) {
+            self.delays.push(ms);
+        }
+
+        fn refused(err: &Self::Error) -> bool {
+            matches!(err, ReadOnlyError::Stalled)
+        }
+    }
+
+    #[test]
+    fn a_read_only_transport_drives_the_read_retry_loop() {
+        let mut t = ReadOnly {
+            statuses: vec![STATUS_WAIT, STATUS_DONE],
+            delays: Vec::new(),
+        };
+        let mut payload = [0u8; 2];
+        assert_eq!(
+            control_read(
+                &mut t,
+                USB_RETRY,
+                AUDIO_MGR_RESID,
+                AUDIO_MGR_OP_L_CMD,
+                &mut payload
+            ),
+            Ok((STATUS_DONE, 2))
+        );
+        assert_eq!(payload, [7, 7]);
+        assert_eq!(t.delays, vec![10]);
+        let err = control_read(
+            &mut t,
+            USB_RETRY,
+            AUDIO_MGR_RESID,
+            AUDIO_MGR_OP_L_CMD,
+            &mut payload,
+        )
+        .expect_err("script exhausted");
+        assert!(ReadOnly::refused(&err));
     }
 
     #[test]

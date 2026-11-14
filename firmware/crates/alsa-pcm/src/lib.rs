@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use alsa::PCM;
 use alsa::pcm::{Access, Format, HwParams};
@@ -203,6 +203,31 @@ pub fn usb_id(card_index: i32, proc_asound: &Path) -> io::Result<Option<String>>
     let path = proc_asound.join(format!("card{card_index}")).join("usbid");
     match std::fs::read_to_string(&path) {
         Ok(text) => Ok(Some(text.trim_end_matches('\n').to_string())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The sysfs directory of the USB device behind a card: the canonical target of
+/// `<sys_root>/class/sound/card<N>/device`, which for a USB card is one of the
+/// device's interfaces, then that interface's parent. `None` when the parent is
+/// not a USB device (it has no `busnum`), which is how a card on another bus reads.
+/// A card with no such link is an error. `sys_root` is `/sys` outside tests.
+///
+/// The card is resolved to its own device through the kernel's links, so two
+/// boards with one USB id resolve to two directories.
+pub fn usb_device_dir(card_index: i32, sys_root: &Path) -> io::Result<Option<PathBuf>> {
+    let link = sys_root
+        .join("class/sound")
+        .join(format!("card{card_index}"))
+        .join("device");
+    let target = std::fs::canonicalize(&link)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", link.display())))?;
+    let Some(parent) = target.parent() else {
+        return Ok(None);
+    };
+    match std::fs::metadata(parent.join("busnum")) {
+        Ok(_) => Ok(Some(parent.to_path_buf())),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -557,6 +582,59 @@ mod tests {
         );
         assert_eq!(usb_id(0, dir.path()).expect("read"), None, "no usbid file");
         assert_eq!(usb_id(7, dir.path()).expect("read"), None, "no card dir");
+    }
+
+    /// A sysfs tree as the kernel lays one out: the device tree under `devices/`,
+    /// and `class/sound/card<N>` linking into it.
+    fn sound_card(sys: &Path, index: i32, device: &str) {
+        let card = sys.join("class/sound").join(format!("card{index}"));
+        std::fs::create_dir_all(&card).expect("card dir");
+        std::os::unix::fs::symlink(sys.join(device), card.join("device")).expect("device link");
+    }
+
+    #[test]
+    fn a_usb_card_resolves_to_the_device_behind_its_interface() {
+        let sys = tempfile::tempdir().expect("tempdir");
+        let usb = "devices/host/0000:c4:00.0/usb3/3-2/3-2.2";
+        std::fs::create_dir_all(sys.path().join(usb).join("3-2.2:1.0")).expect("interface");
+        std::fs::write(sys.path().join(usb).join("busnum"), "3\n").expect("busnum");
+        sound_card(sys.path(), 2, &format!("{usb}/3-2.2:1.0"));
+        let dir = usb_device_dir(2, sys.path()).expect("resolve");
+        let want = std::fs::canonicalize(sys.path().join(usb)).expect("canonical");
+        assert_eq!(dir, Some(want));
+    }
+
+    #[test]
+    fn two_cards_of_one_id_resolve_to_their_own_devices() {
+        let sys = tempfile::tempdir().expect("tempdir");
+        for (index, port) in [(1, "3-2.2"), (3, "3-2.3")] {
+            let usb = format!("devices/usb3/3-2/{port}");
+            std::fs::create_dir_all(sys.path().join(&usb).join(format!("{port}:1.0")))
+                .expect("interface");
+            std::fs::write(sys.path().join(&usb).join("busnum"), "3\n").expect("busnum");
+            sound_card(sys.path(), index, &format!("{usb}/{port}:1.0"));
+        }
+        let one = usb_device_dir(1, sys.path()).expect("one").expect("usb");
+        let three = usb_device_dir(3, sys.path()).expect("three").expect("usb");
+        assert!(one.ends_with("3-2.2"), "{}", one.display());
+        assert!(three.ends_with("3-2.3"), "{}", three.display());
+    }
+
+    #[test]
+    fn a_card_on_another_bus_is_not_on_usb() {
+        let sys = tempfile::tempdir().expect("tempdir");
+        let hda = "devices/host/0000:c2:00.1";
+        std::fs::create_dir_all(sys.path().join(hda)).expect("hda");
+        sound_card(sys.path(), 0, hda);
+        assert_eq!(usb_device_dir(0, sys.path()).expect("resolve"), None);
+    }
+
+    #[test]
+    fn a_missing_card_is_an_error_naming_the_link() {
+        let sys = tempfile::tempdir().expect("tempdir");
+        let err = usb_device_dir(7, sys.path()).expect_err("no card");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("card7/device"), "{err}");
     }
 
     #[test]

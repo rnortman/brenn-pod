@@ -26,9 +26,26 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   `docs/reference/frame-log.md`; the program: `docs/reference/pod-capture.md`;
   procedure and the reSpeaker Flex hardware tests
   (`make -C firmware capture-hil`): `docs/runbooks/pod-capture.md`.
+- **A capture says what the chip behind it was set to.** `pod-capture` reads
+  the XVF3800's firmware identity and its output routing and reference-path
+  registers over USB once before the stream starts, for the three USB ids the
+  control protocol knows, and records them in the log's header
+  (`capture.device_state`, printed by `frame-log summary`) and on
+  `capture_started`, beside the USB device behind the card (`device.usb`: port,
+  bus, address, serial number). It never writes to the chip, and still links
+  libasound and no other system library: the read is the kernel's usbfs
+  control ioctl. A device it does not read, or cannot reach (no udev rule, a
+  failed transfer, a board changed under the read), is stated as such and the
+  capture goes on. A failing transfer is retried, so the read can delay the
+  stream's start by up to about half a minute. The register list and one
+  board's readings: `docs/reference/xvf3800-control-protocol.md`, section 8.
+  The new hardware test, `make -C firmware chip-hil`, has two identity tests
+  that fail until the readings of the reSpeaker Flex's six-channel USB image
+  are confirmed (`flex-usb-image-chip-readings-unconfirmed`).
 - A build outside a git checkout can state its commit in
-  `BRENN_POD_BUILD_COMMIT`; inside a checkout git decides, and a declared
-  commit that disagrees fails the build.
+  `BRENN_POD_BUILD_COMMIT`, and with no checkout around it starts no program;
+  inside a checkout git decides, and a declared commit that disagrees fails the
+  build.
 - **Every pod reports its health and its room once a second, whether or not
   anyone is speaking.** The pod sends a small status frame over the
   connection it already holds: its capture position, 100 ms room-level blocks

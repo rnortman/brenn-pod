@@ -230,3 +230,62 @@ Also unverified but minor: whether the Flex `v1.0.0` blob is built from XMOS
 sw_xvf3800 2.x or 3.x, which affects the NaN-on-silence semantics of cmd 11
 (research-multi-beam.md:284-293). Empirically the spike *did* observe
 NaN-on-silence, so the 3.x semantics appear to hold. [confirmed for our blob]
+
+## 8. The six-channel USB audio image (`2886:0022`): the state `pod-capture` reads
+
+`pod-capture` reads seventeen registers from the chip of the device it records,
+once, before the stream starts, over the §3 framing and the kernel's usbfs
+control ioctl (`firmware/crates/xvf3800-usb`); the register table is
+`STATE_REGISTERS` in `firmware/crates/xvf3800-ctrl/src/state.rs`. Every one is a
+read: `bmRequestType` `0xC0`, `bRequest` 0, `wValue` `0x80 | cmd`, `wIndex`
+resid, `wLength` the payload length plus the status byte. Nothing is written.
+The same table is read for `38fb:1001` and `2886:001a`; only `2886:0022` has
+been read on hardware. [confirmed for `2886:0022`]
+
+### 8.1 One board's readings, 2026-11-13
+
+What one reSpeaker Flex on this image (`2886:0022`, `bcdDevice` 0100) held on
+2026-11-13, read by `make -C firmware chip-hil`. These are that board's
+readings on that day, not the image's defaults: none has been confirmed as the
+image's own value, and the guide cited is XMOS's XVF3800 User Guide v3.2.1
+(`firmware/vendor/xvf3800/docs/`), which describes XMOS's development kit and
+not Seeed's image. Every read answered status `0x00` on its first attempt;
+**the image refused none of the seventeen.**
+
+| Register | resid, cmd | `wValue`, `wLength` | Payload read | Against the guide |
+|---|---|---|---|---|
+| `version` | 48, 0 | `0x0080`, 4 | `01 00 00` (1.0.0) | no document states it |
+| `bld_msg` | 48, 1 | `0x0081`, 51 | `"ua-io16-6ch-lin"`, NUL-padded | no document states it |
+| `bld_repo_hash` | 48, 3 | `0x0083`, 41 | `"4b339d00721937451ee487759c04e2acb3215793"` | no document states it |
+| `bld_modified` | 48, 4 | `0x0084`, 7 | `"FALSE"` | no document states it |
+| `audio_mgr_op_l` | 35, 15 | `0x008f`, 3 | `08 00` (8, 0) | agrees (p. 23; Table 10.4, p. 81) |
+| `audio_mgr_op_r` | 35, 19 | `0x0093`, 3 | `07 03` (7, 3) | no single default: an amplified microphone (p. 21, prose) or (0, 0) (Table 3.2, p. 21; p. 23; Table 10.4, p. 81); the reading is neither |
+| `audio_mgr_op_all` | 35, 23 | `0x0097`, 13 | `08 00 01 00 01 02 07 03 01 01 01 03` | no default stated (Table 10.4, p. 82) |
+| `audio_mgr_op_packed` | 35, 13 | `0x008d`, 3 | `00 00` | agrees (Table 10.4, p. 81) |
+| `audio_mgr_op_upsample` | 35, 14 | `0x008e`, 3 | `00 00` | no default stated for a 16 kHz interface (Table 10.4, p. 81) |
+| `audio_mgr_selected_channels` | 35, 12 | `0x008c`, 3 | `03 03` | agrees (Table 10.4, p. 81) |
+| `aec_asroutonoff` | 33, 35 | `0x00a3`, 5 | `01 00 00 00` (1) | differs: 0 (Table 10.1, p. 75) |
+| `aec_asroutgain` | 33, 36 | `0x00a4`, 5 | `00 00 80 3f` (1.0) | agrees (Table 10.1, p. 75) |
+| `audio_mgr_mic_gain` | 35, 0 | `0x0080`, 5 | `00 00 20 41` (10.0) | agrees (Table 10.4, p. 80) |
+| `audio_mgr_ref_gain` | 35, 1 | `0x0081`, 5 | `33 33 f3 3f` (1.9) | differs: 1.5 (Table 10.4, p. 80) |
+| `audio_mgr_sys_delay` | 35, 26 | `0x009a`, 5 | `0c 00 00 00` (12) | differs: -32 (Table 10.4, p. 82) |
+| `audio_mgr_far_end_dsp_enable` | 35, 25 | `0x0099`, 2 | `00` | agrees (Table 10.4, p. 82) |
+| `i2s_dac_dsp_enable` | 35, 27 | `0x009b`, 2 | `00` | agrees (Table 10.4, p. 82) |
+
+Seven agree with the guide, three differ from it, and seven have no single
+stated value: the four identity registers, which no document states, and the
+three the guide gives no single default for. The ten that do not agree are
+tracked as `flex-usb-image-chip-readings-unconfirmed`, and the chip hardware
+test fails on them until each has a confirmed source.
+
+### 8.2 Not known
+
+- **Which register governs which of the six capture channels.** The image's
+  processed channels may be the left and right output multiplexers or may not;
+  the record names readings by register and claims no mapping from register to
+  capture channel.
+- **Whether a reading is the image's value or a saved configuration.** A value
+  saved to the chip's flash comes back after a power cycle exactly as the
+  image's own would.
+- **Changes during a capture.** The reading is taken once, before the stream
+  starts; a write to the chip by another program during a capture is not seen.

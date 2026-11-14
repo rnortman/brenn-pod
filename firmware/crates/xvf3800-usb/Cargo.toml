@@ -1,0 +1,21 @@
+[package]
+name = "xvf3800-usb"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The XVF3800 control protocol on USB, for Linux hosts: the setup-packet framing
+# both directions share, and a transport that can only read, built on the
+# kernel's usbfs control ioctl and the device's sysfs attributes. Links no USB
+# library and no other system library, so a program built on it inherits none.
+
+[dependencies]
+# The protocol above the wire: command ids, status semantics, the retry driver
+# and the read-only transport seam this crate's reader implements.
+xvf3800-ctrl = { path = "../xvf3800-ctrl" }
+# The usbfs control ioctl and the errno a stalled transfer fails with.
+libc = "0.2"
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

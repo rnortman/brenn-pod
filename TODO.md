@@ -1460,50 +1460,31 @@ segment.
 
 ## `xvf-control-on-usb-audio-image`
 
-The USB control plane (`firmware/devices/reachy-pod/src/usb_ctrl.rs`)
-recognises only the ids `38fb:1001` and `2886:001a`. A reSpeaker Flex on
-Seeed's six-channel USB audio image enumerates as `2886:0022`, so a capture
-made from it carries no chip firmware version and no routing, and
-whether that image answers the control commands the pod uses has not been
-tried on hardware.
+A reSpeaker Flex on Seeed's six-channel USB audio image (`2886:0022`) has
+its chip's firmware identity and its output routing and reference-path
+registers read over USB and recorded with its captures. Nothing writes to
+the chip on that image. The image's six capture channels carry no copy of
+what the device plays, so nothing ties a frame played through the device to
+a frame captured from it more closely than the clocks do. Every control
+read the recorder makes, and what one board answered, is in
+`docs/reference/xvf3800-control-protocol.md`, section 8; the image refused
+none of them.
 
-The control plane is libusb (`rusb`), and `pod-capture` links
-libasound and no other system library so that it can be built hermetically
-elsewhere. This work keeps that link free of libusb: where the USB read
-runs, and how what it read is stored beside the capture it describes, is
-this work's design.
+The work: find out whether the XVF3800 on this image can be told, by a
+control write, to route its playback reference into a capture channel, and
+if it can, do it under a command that says so. A routing write changes what
+every later capture's channels mean until the board is power-cycled, so a
+capture made after one must show the routing in force in its own record,
+and nothing may write a routing as a side effect of reading.
 
-Done = for a `2886:0022` device, the chip's firmware version and output
-routing are read over USB by brenn-pod and recorded where a reader of that
-device's capture finds them, with the capture mode's link still
-libasound only; a hardware test asserts both values and has been run; and
-any control command the image refuses is documented under
-`docs/reference/`. See `TODO(xvf-control-on-usb-audio-image)` at the control
-plane's device table.
-
-## `build-id-declared-build-runs-git`
-
-`build-id`'s build script runs git on every build, including one that
-declares its commit in `BRENN_POD_BUILD_COMMIT`: `git rev-parse
---git-common-dir` for the rerun triggers, and `git rev-parse --show-prefix`
-to learn whether a checkout vouches. A build of a fetched revision has no
-checkout around it, so neither answer can change the stamp, and the script
-reaches for the host's git anyway. A builder that lets no build action run a
-host program, such as a hermetic Bazel build that pins `pod-capture` by
-revision, cannot use the documented variable; it switches the script off and
-sets `HIL_BUILD_COMMIT`, `HIL_BUILD_DIRTY` and `HIL_BUILD_SOURCE` itself,
-which copies this crate's private contract between its script and its
-library into another repository.
-
-Needs a design decision: how a builder says there is no checkout to consult,
-without weakening the rule that inside a checkout git always vouches and a
-declared commit cannot override it.
-
-Done = a build of this crate from a fetched revision, with the commit
-declared and no `git` on `PATH`, starts no program and stamps the declared
-commit with source `declared`, and a build inside a checkout behaves as it
-does today. See `TODO(build-id-declared-build-runs-git)` in
-`firmware/crates/build-id/build.rs`, where `main` consults git.
+Done = a hardware test writes the routing, captures while the device plays,
+and finds the played signal in the stated capture channel, with the
+capture's record showing the routing that was in force; or
+`docs/reference/` documents that the image refuses it, with what was sent
+and what came back. Such a test plays sound and needs the maintainer's
+agreement on when. See `TODO(xvf-control-on-usb-audio-image)` at
+`ChipReader` in `firmware/crates/xvf3800-usb/src/lib.rs`, the transport
+that cannot write.
 
 ## `usb-image-output-silenced-by-esp32-firmware`
 
@@ -1526,3 +1507,144 @@ Done = section 5 says which firmware on the module does this and what it
 sets, and that the USB image's output depends on the module leaving the chip
 alone. See `TODO(usb-image-output-silenced-by-esp32-firmware)` at the head of
 that section.
+
+## `pod-capture-reachy-pod-one-capture-path`
+
+brenn-pod has two programs that capture from an XVF3800 over ALSA.
+`reachy-pod` captures, controls the chip over USB and streams to the voice
+host by the speech gate, and is built for a Reachy's board. `pod-capture`
+records every channel of a capture device continuously to a frame log, and
+is what a Flex on any Linux machine uses. They share the capture crate and
+the frame log but are started, configured and tested separately, and a
+recording from a Reachy's board through `pod-capture`, with that board's
+chip state in its record, has never been made on hardware: the chip-state
+read through `pod-capture` has been run on hardware for `2886:0022` only.
+The two programs share the control protocol and its USB framing but move
+the bytes by different code, `reachy-pod` with `rusb` on the host's libusb
+and `pod-capture` through `xvf3800-usb`, which has no USB library and can
+only read.
+
+The work: one capture path that serves a Flex on any Linux machine and a
+Reachy alike. Whether that is one program, or `reachy-pod run` handing its
+capture to the recorder's code, is this work's design; what it may not leave
+is capture logic or chip-reading logic that exists twice. `reachy-pod` moves
+its control transfers to the shared crate, which gains a host-to-device
+transfer where the recorder cannot reach it (the recorder stays unable to
+write to a chip), and `rusb` and libusb leave the workspace, the Makefile's
+prerequisites, the builder container and CI. That changes how a robot's pod
+reboots its chip and writes its routing, and `make reachy-deploy` puts
+whatever the tree builds on a robot.
+
+Done = a continuous capture from a Reachy's board and one from a Flex are
+made by the same capture and recording code, each carrying its chip's
+firmware version and routing read the same way; a hardware test on each
+board asserts it and has been run; the reference documents describe one
+path; `reachy-pod` links no libusb, and `make -C firmware reachy-selftest`
+has passed on a Reachy with the new transport before any deploy of it. See
+`TODO(pod-capture-reachy-pod-one-capture-path)` in
+`firmware/devices/pod-capture/src/start.rs`, where the capture's device and
+its chip reading are recorded, and at `UsbControl` in
+`firmware/devices/reachy-pod/src/usb_ctrl.rs`.
+
+## `flex-usb-image-chip-readings-unconfirmed`
+
+The chip hardware test (`firmware/devices/pod-capture/tests/flex_chip_hil.rs`,
+run by `make -C firmware chip-hil`) holds one expectation for each of the
+seventeen XVF3800 registers `pod-capture` records. For ten of them it holds
+none that the maintainer has confirmed, so `the_chip_is_the_expected_firmware`
+and `the_chip_routing_is_the_expected_routing` fail, naming those ten. The
+other seven readings agree with XMOS's XVF3800 User Guide v3.2.1
+(`firmware/vendor/xvf3800/docs/`) and are asserted.
+
+The readings below were taken on 2026-11-13, read-only, from one reSpeaker
+Flex on Seeed's six-channel USB audio image (`2886:0022`, `bcdDevice` 0100).
+They are what that board held on that day. The test prints the serial number
+of the board it reads; the serial of the board read on that day is not
+recorded in the tree. Whether they are the image's own values has not been
+established: the guide describes XMOS's development kit and not Seeed's
+image, and no document in the tree states what the image sets.
+
+No document states a value (the firmware's identity):
+
+- `version`: `01 00 00`, 1.0.0
+- `bld_msg`: `"ua-io16-6ch-lin"`
+- `bld_repo_hash`: `"4b339d00721937451ee487759c04e2acb3215793"`
+- `bld_modified`: `"FALSE"`
+
+The reading differs from the guide's default, which the test asserts:
+
+- `aec_asroutonoff`: read 1; the guide says 0 (Table 10.1, p. 75)
+- `audio_mgr_ref_gain`: read `33 33 f3 3f`, 1.9; the guide says 1.5 (Table
+  10.4, p. 80)
+- `audio_mgr_sys_delay`: read 12; the guide says -32 (Table 10.4, p. 82)
+
+The guide states no single default:
+
+- `audio_mgr_op_r`: read (7, 3). The guide states two defaults, an amplified
+  microphone (p. 21, prose) and (0, 0) (Table 3.2, p. 21; p. 23; Table 10.4,
+  p. 81); the reading is neither.
+- `audio_mgr_op_all`: read `08 00 01 00 01 02 07 03 01 01 01 03`, that is
+  left (8, 0), (1, 0), (1, 2) and right (7, 3), (1, 1), (1, 3). The guide
+  states no default for this register (Table 10.4, p. 82).
+- `audio_mgr_op_upsample`: read (0, 0). The guide states no default for a
+  16 kHz interface (Table 10.4, p. 81).
+
+What bears on a value. A reading that comes back the same after the board
+has been unplugged and replugged is one the chip loads at boot, and not one
+left by a write since it was last powered, provided the board's XIAO ESP32
+module carries no firmware that configures the chip; the board returns as a
+new sound card when replugged, and a desktop sound server may take it
+(`docs/runbooks/pod-capture.md`). That does not make it the image's own
+value. The vendor's control table for this board lists a command that saves
+the current configuration to the chip's flash and one that clears it
+(`SAVE_CONFIGURATION` and `CLEAR_CONFIGURATION`,
+`firmware/vendor/xvf3800/docs/reSpeaker_Flex/python_control/xvf_host.py`).
+Whether this image honours them has not been established, and nothing
+records whether a configuration was ever saved on this board; a saved value
+would come back after a replug exactly as the image's own would. A statement
+of the image's values tells the two apart: the vendor's release notes for
+the image, if the maintainer has them, may state some. Clearing the saved
+configuration would also tell them apart, but it writes to the chip's flash
+and erases the state these readings describe. It is the maintainer's
+decision alone and is not a step of this entry.
+
+Done = each of the ten is either asserted in the test with "confirmed by the
+maintainer, <date>" as its source, the guide's citation kept beside the three
+readings that contradict it, or shown not to be the image's value, with the
+explanation in `docs/reference/xvf3800-control-protocol.md` and the test
+asserting the value that is; and `make -C firmware chip-hil` passes on the
+Flex. See `TODO(flex-usb-image-chip-readings-unconfirmed)` at the two
+expectation tables in the test.
+
+## `correctness-chip-read-worst-case-exceeds-brenn-lab-start-timeout`
+
+`pod-capture` reads the chip state of an XVF3800 before it emits
+`capture_started`, and nothing bounds that read as a whole. Each of the
+seventeen registers is read under `USB_RETRY`: a chip that answers WAIT or
+RETRY throughout costs 101 transfers 10 ms apart, about two seconds per
+register at the roughly 9 ms a transfer took on the bench Flex, so about half
+a minute for the seventeen, and more on a chip slow to answer each transfer.
+`SIGINT` and `SIGTERM` set the stop flag during the read, but nothing looks
+at it until the read is over and `capture_started` has been written. A
+caller that bounds the recorder's start (brenn-lab gives it ten seconds
+before it kills the recorder) loses the capture and the record of why. No
+hardware has shown a WAIT or RETRY answer to these reads: on the bench Flex
+all seventeen completed on the first attempt in 152 ms.
+
+The design question is what the record says when the read is cut short. A
+register the deadline cut off is not one the device declined, and the record
+keeps those apart: either a new `unavailable` reason for a read that ran out
+of time, or a per-register outcome beside `refused`, with the frame-log
+reference and `validate` following. The same answer covers a stop signal
+seen between registers. Then the budget: one total deadline for the read,
+a smaller per-register retry budget than `USB_RETRY`, or both, stated in
+`docs/reference/pod-capture.md` so a caller can size its start timeout
+against it.
+
+Done = the read has a stated total bound of a few seconds at most, a stop
+signal during it ends the read promptly, the record states either outcome in
+the shape the design chose, unit tests in `pod-capture`'s `chip_state` drive
+both with a stand-in chip that answers retry throughout, and
+`docs/reference/pod-capture.md` gives the bound. See
+`TODO(correctness-chip-read-worst-case-exceeds-brenn-lab-start-timeout)` in
+`firmware/devices/pod-capture/src/chip_state.rs`.

@@ -8,8 +8,11 @@
 //! 4. Enumerate the cards and select exactly one.
 //! 5. Open its first PCM for capture at exactly the demanded parameters.
 //! 6. Read back what was granted and the card's USB id.
-//! 7. Create the destination with `create_new`.
-//! 8. Hand over to [`run`](crate::run), which triggers the stream, takes the
+//! 7. Read the state of the card's device, with the PCM held open
+//!    ([`chip_state`](crate::chip_state)); every outcome is recorded and none
+//!    refuses the capture.
+//! 8. Create the destination with `create_new`.
+//! 9. Hand over to [`run`](crate::run), which triggers the stream, takes the
 //!    start pair, writes the header, hello and `Describe` and emits
 //!    `capture_started`.
 //!
@@ -25,9 +28,10 @@ use alsa::Direction;
 use alsa::pcm::Format;
 use alsa_pcm::{ByteCapture, CardInfo, PcmError, PcmParams, SelectError};
 use audio_pipeline::wide::{CaptureFrame, MAX_WIDE_FRAME_BYTES, WideFrame, encode_wide};
-use frame_log::{BuildSource, Device, DeviceControl, WriterBuild, WriterInfo};
+use frame_log::{BuildSource, Device, DeviceControl, DeviceState, WriterBuild, WriterInfo};
 
 use crate::capture::{Recording, STOP_BOUND, failed, period_frames, run};
+use crate::chip_state::{self, DeviceReading};
 use crate::cli::{self, Args};
 use crate::granted::{Granted, SampleFormat};
 use crate::lines::{CardLine, FailReason, Lines, note};
@@ -38,6 +42,9 @@ pub const BUFFER_PERIODS: u32 = 16;
 
 /// Where the kernel publishes each card's USB id.
 const PROC_ASOUND: &str = "/proc/asound";
+
+/// Where the kernel publishes each card's device.
+const SYS: &str = "/sys";
 
 /// Set by `SIGINT` and `SIGTERM`; the capture loop reads it every turn.
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -149,6 +156,21 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
             format!("reading card {}'s USB id failed: {e}", card.index),
         )
     })?;
+    // TODO(pod-capture-reachy-pod-one-capture-path): the capture's device and its
+    // chip reading are recorded here, by this program only; reachy-pod captures and
+    // reads the same chip by its own code and records neither.
+    let DeviceReading { usb, state } = chip_state::read_device(
+        card.index,
+        Path::new(SYS),
+        |device| xvf3800_usb::open_reader(device, Path::new(xvf3800_usb::DEV_BUS_USB)),
+        &SystemClock,
+    );
+    if let DeviceState::Unavailable { detail, .. } = &state {
+        note(format_args!(
+            "the device's state could not be read: {detail}; the capture goes on and its \
+             record says so"
+        ));
+    }
     let mut source =
         ByteCapture::new(&pcm).map_err(|e| Refusal::new(FailReason::Params, e.to_string()))?;
 
@@ -171,10 +193,12 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
             card_long_name: card.long_name.clone(),
             pcm: hw,
             usb_id,
+            usb,
         },
         granted,
         layout: args.layout.clone(),
         device_control: DeviceControl { performed: false },
+        device_state: state,
     };
 
     let dest = File::create_new(&args.out).map_err(|e| {

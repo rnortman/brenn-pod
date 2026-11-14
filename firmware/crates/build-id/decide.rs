@@ -3,6 +3,7 @@
 // case. Included by both through a module path, so the two cannot drift apart.
 
 use std::ffi::OsStr;
+use std::path::{Component, Path};
 
 /// The variable a builder sets to declare the commit of a build that has no
 /// checkout of this repository around it.
@@ -11,6 +12,22 @@ pub const DECLARED_VAR: &str = "BRENN_POD_BUILD_COMMIT";
 /// Where this crate sits in a checkout of its own repository, as
 /// `git rev-parse --show-prefix` prints it from the crate's directory.
 pub const OWN_PREFIX: &str = "firmware/crates/build-id/";
+
+/// The top of the checkout of this repository the crate would sit in, from the
+/// crate's own directory: the directory above `firmware/crates/build-id`, or
+/// `None` when the crate's directory does not end in those three components and
+/// so no checkout of this repository can be around it. Reads nothing.
+pub fn checkout_top(manifest_dir: &Path) -> Option<&Path> {
+    let mut dir = manifest_dir;
+    for expected in OWN_PREFIX.trim_end_matches('/').rsplit('/') {
+        match dir.components().next_back() {
+            Some(Component::Normal(name)) if name == expected => {}
+            _ => return None,
+        }
+        dir = dir.parent()?;
+    }
+    Some(dir)
+}
 
 /// What build.rs stamps into the crate.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,19 +56,31 @@ pub fn parse_declared(value: Option<&OsStr>) -> Result<Option<String>, String> {
     Ok(Some(value.to_ascii_lowercase()))
 }
 
-/// The stamp, from git's answer to `--show-prefix` (`Err` says why git could not
-/// answer), the declared commit, and `git_commit_and_dirty`, which is called only
-/// when git vouches. `Err` is the message the build fails with.
+/// The stamp, from whether a checkout of this repository can be around the crate
+/// (`checkout_top` found a `.git` entry where the checkout's would be), git's
+/// answer to `--show-prefix` (`Err` says why git could not answer), the declared
+/// commit, and `git_commit_and_dirty`. `Err` is the message the build fails with.
 ///
-/// Git vouches only when this crate sits at its own place in a checkout of this
-/// repository. A crate vendored inside some other repository would otherwise be
-/// stamped with that repository's commit.
+/// With no checkout possible, git is not asked anything: neither closure is
+/// called. Otherwise git vouches only when this crate sits at its own place in a
+/// checkout of this repository; a crate vendored inside some other repository
+/// would otherwise be stamped with that repository's commit.
 pub fn decide(
-    prefix: Result<String, String>,
+    in_checkout: bool,
+    prefix: impl FnOnce() -> Result<String, String>,
     declared: Option<String>,
     git_commit_and_dirty: impl FnOnce() -> (String, bool),
 ) -> Result<Stamp, String> {
-    let refusal = match prefix {
+    if !in_checkout {
+        return match declared {
+            Some(declared) => Ok(declared_stamp(declared)),
+            None => Err(format!(
+                "build-id: no checkout of this repository is around this crate, so \
+                 nothing can vouch for its commit. Declare the commit in {DECLARED_VAR}."
+            )),
+        };
+    }
+    let refusal = match prefix() {
         Ok(prefix) if prefix == OWN_PREFIX => {
             let (commit, dirty) = git_commit_and_dirty();
             if let Some(declared) = &declared
@@ -72,13 +101,7 @@ pub fn decide(
         refusal => refusal,
     };
     match (declared, refusal) {
-        // The dirty flag is not asserted for a declared commit: nothing here can
-        // see the tree it was built from.
-        (Some(declared), _) => Ok(Stamp {
-            commit: declared,
-            dirty: false,
-            source: "declared",
-        }),
+        (Some(declared), _) => Ok(declared_stamp(declared)),
         // Fail rather than stamp a sentinel ("unknown"): a silent sentinel would let
         // the build-ID gate pass falsely when git is unavailable (e.g. Docker, CI
         // without git installed), defeating the core HIL invariant.
@@ -91,5 +114,15 @@ pub fn decide(
             "build-id: {why}. Build from a checkout of this repository with git on \
              PATH, or declare the commit in {DECLARED_VAR}."
         )),
+    }
+}
+
+/// A declared commit's stamp. The dirty flag is not asserted: nothing here can
+/// see the tree it was built from.
+fn declared_stamp(commit: String) -> Stamp {
+    Stamp {
+        commit,
+        dirty: false,
+        source: "declared",
     }
 }
