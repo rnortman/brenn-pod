@@ -1648,3 +1648,40 @@ both with a stand-in chip that answers retry throughout, and
 `docs/reference/pod-capture.md` gives the bound. See
 `TODO(correctness-chip-read-worst-case-exceeds-brenn-lab-start-timeout)` in
 `firmware/devices/pod-capture/src/chip_state.rs`.
+
+## `usb-image-capture-channel-register-map-unknown`
+
+A capture from a Flex on the six-channel USB image (`2886:0022`) records the
+chip's output routing registers by name, and nothing establishes which
+register governs which of the six capture channels
+(`docs/reference/xvf3800-control-protocol.md`, section 8.2), so a reader of a
+capture cannot say from its record what each channel carries.
+
+The work: establish the mapping and state it in that reference, by a vendor
+statement of the image's channel layout or by a hardware test that changes
+one routing register and finds the change in one capture channel, which is a
+chip write and falls under `xvf-control-on-usb-audio-image`'s rules for one.
+
+Done = the reference states for each of the six channels which register and
+slot decides it and how that was established, or states why it cannot be
+established on this image. See
+`TODO(usb-image-capture-channel-register-map-unknown)` in
+`firmware/devices/pod-capture/src/start.rs`.
+
+## `frame-log-writes-no-synthetic-capture-log`
+
+No shipped program writes a capture frame log from given samples. `frame-log`
+reads; `pod-capture` records from a sound card only; the crate's tests build
+capture logs with helpers that are not public. A program that depends on the
+reader therefore cannot hold a synthetic capture log to test against, and
+tests its use of `export-wav` on a device or not at all.
+
+The work: a way to write a capture-shaped frame log, with a stated layout,
+rate and sample format, from a WAV and a list of losses, through the crate's
+own writer, as a `frame-log` subcommand or a small program beside it.
+
+Done = a capture log written that way from a synthetic WAV is read back by
+`frame-log summary` and `export-wav` with the same samples and the stated
+losses, and the reference document describes the command. See
+`TODO(frame-log-writes-no-synthetic-capture-log)` in
+`firmware/crates/frame-log/src/main.rs`.

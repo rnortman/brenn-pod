@@ -159,6 +159,9 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
     // TODO(pod-capture-reachy-pod-one-capture-path): the capture's device and its
     // chip reading are recorded here, by this program only; reachy-pod captures and
     // reads the same chip by its own code and records neither.
+    // TODO(usb-image-capture-channel-register-map-unknown): the routing registers
+    // are recorded by name; which of them decides each of the six capture
+    // channels on the USB image is not established.
     let DeviceReading { usb, state } = chip_state::read_device(
         card.index,
         Path::new(SYS),

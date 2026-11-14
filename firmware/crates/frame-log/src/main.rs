@@ -30,6 +30,8 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[OsString]) -> u8 {
+    // TODO(frame-log-writes-no-synthetic-capture-log): every subcommand reads a
+    // log; none writes a capture log from given samples.
     let result = match args {
         [cmd, log] if cmd == "summary" => frame_log::summarize(Path::new(log))
             .map_err(|e| e.to_string())
