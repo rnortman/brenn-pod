@@ -7,25 +7,17 @@
 //! created; the second writes it.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::Path;
 
 use audio_pipeline::wire::Hello;
 use serde::Serialize;
 
+use crate::new_file::{NewFileError, write_new};
 use crate::summary::{SummaryError, TailSummary, first_hello};
 use crate::unmeasured::Unmeasured;
 use crate::walk::{AudioStep, JumpKind, Step, walk};
-
-/// Bytes of the WAV header this writes: `RIFF`, a 40-byte
-/// `WAVE_FORMAT_EXTENSIBLE` `fmt ` chunk, and the `data` chunk's header.
-pub const WAV_HEADER_BYTES: u64 = 68;
-
-/// The PCM sub-format GUID, `00000001-0000-0010-8000-00aa00389b71`.
-const KSDATAFORMAT_SUBTYPE_PCM: [u8; 16] = [
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
-];
+use crate::wav::{self, WAV_HEADER_BYTES};
 
 /// Where each stretch of the WAV file came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -152,6 +144,19 @@ impl std::error::Error for ExportError {
             ExportError::Output(e) => Some(e),
             ExportError::Incomplete { error, .. } => Some(error.as_ref()),
             _ => None,
+        }
+    }
+}
+
+impl NewFileError for ExportError {
+    fn output(e: io::Error) -> Self {
+        ExportError::Output(e)
+    }
+
+    fn incomplete(error: Self, remove: io::Error) -> Self {
+        ExportError::Incomplete {
+            error: Box::new(error),
+            remove,
         }
     }
 }
@@ -395,60 +400,6 @@ fn plan(path: &Path) -> Result<Plan, ExportError> {
     })
 }
 
-fn wav_header(plan: &Plan, byte_rate: u32, data_bytes: u32) -> Vec<u8> {
-    let bits = plan.hello.bits_per_sample as u16;
-    let mut h = Vec::with_capacity(WAV_HEADER_BYTES as usize);
-    h.extend_from_slice(b"RIFF");
-    h.extend_from_slice(&(data_bytes + (WAV_HEADER_BYTES as u32 - 8)).to_le_bytes());
-    h.extend_from_slice(b"WAVE");
-    h.extend_from_slice(b"fmt ");
-    h.extend_from_slice(&40u32.to_le_bytes());
-    h.extend_from_slice(&0xfffeu16.to_le_bytes());
-    h.extend_from_slice(&u16::from(plan.hello.channels).to_le_bytes());
-    h.extend_from_slice(&plan.hello.sample_rate_hz.to_le_bytes());
-    h.extend_from_slice(&byte_rate.to_le_bytes());
-    h.extend_from_slice(&(plan.frame_bytes() as u16).to_le_bytes());
-    h.extend_from_slice(&bits.to_le_bytes());
-    h.extend_from_slice(&22u16.to_le_bytes());
-    h.extend_from_slice(&bits.to_le_bytes());
-    // Channel mask 0: no speaker positions are claimed.
-    h.extend_from_slice(&0u32.to_le_bytes());
-    h.extend_from_slice(&KSDATAFORMAT_SUBTYPE_PCM);
-    h.extend_from_slice(b"data");
-    h.extend_from_slice(&data_bytes.to_le_bytes());
-    debug_assert_eq!(h.len() as u64, WAV_HEADER_BYTES);
-    h
-}
-
-/// Create `out`, which must not exist, fill it with `fill`, flush and sync it.
-/// When anything after the create fails, `out` is removed, so no failed export
-/// leaves a file whose header states more data than it holds.
-fn write_new<T>(
-    out: &Path,
-    fill: impl FnOnce(&mut BufWriter<File>) -> Result<T, ExportError>,
-) -> Result<T, ExportError> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(out)
-        .map_err(ExportError::Output)?;
-    let mut w = BufWriter::new(file);
-    let result = fill(&mut w).and_then(|t| {
-        let file = w
-            .into_inner()
-            .map_err(|e| ExportError::Output(e.into_error()))?;
-        file.sync_all().map_err(ExportError::Output)?;
-        Ok(t)
-    });
-    result.map_err(|error| match std::fs::remove_file(out) {
-        Ok(()) => error,
-        Err(remove) => ExportError::Incomplete {
-            error: Box::new(error),
-            remove,
-        },
-    })
-}
-
 /// Export the frame log at `path` to a new WAV file at `out`, which must not
 /// exist. On any error nothing is left at `out`, unless the error is
 /// [`ExportError::Incomplete`].
@@ -463,8 +414,14 @@ pub fn export_wav(path: &Path, out: &Path) -> Result<ExportMap, ExportError> {
         return Err(ExportError::TooLarge { data_bytes });
     }
     write_new(out, |w| {
-        w.write_all(&wav_header(&plan, byte_rate, data_bytes as u32))
-            .map_err(ExportError::Output)?;
+        let header = wav::header(
+            u16::from(plan.hello.channels),
+            plan.hello.sample_rate_hz,
+            u16::from(plan.hello.bits_per_sample),
+            byte_rate,
+            data_bytes as u32,
+        );
+        w.write_all(&header).map_err(ExportError::Output)?;
         fill_wav(w, path, &plan)
     })?;
     Ok(ExportMap {
@@ -522,51 +479,4 @@ fn write_silence(w: &mut dyn Write, mut bytes: u64) -> io::Result<()> {
         bytes -= n as u64;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_fill_that_fails_after_writing_leaves_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out.wav");
-        let result: Result<(), _> = write_new(&out, |w| {
-            w.write_all(b"RIFF and a header promising more").unwrap();
-            Err(ExportError::Changed)
-        });
-        assert!(matches!(result, Err(ExportError::Changed)), "{result:?}");
-        assert!(!out.exists());
-    }
-
-    #[test]
-    fn a_failed_removal_is_incomplete_and_names_both_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out.wav");
-        let result: Result<(), _> = write_new(&out, |_| {
-            std::fs::remove_file(&out).unwrap();
-            Err(ExportError::Changed)
-        });
-        let err = result.unwrap_err();
-        let message = err.to_string();
-        let ExportError::Incomplete { error, remove } = &err else {
-            panic!("expected Incomplete, got {err:?}");
-        };
-        assert!(matches!(**error, ExportError::Changed), "{error:?}");
-        assert_eq!(remove.kind(), io::ErrorKind::NotFound);
-        assert!(
-            message.contains(&ExportError::Changed.to_string()),
-            "{message}"
-        );
-        assert!(message.contains(&remove.to_string()), "{message}");
-    }
-
-    #[test]
-    fn a_fill_that_succeeds_keeps_what_it_wrote() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out.wav");
-        write_new(&out, |w| w.write_all(b"whole").map_err(ExportError::Output)).unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), b"whole");
-    }
 }

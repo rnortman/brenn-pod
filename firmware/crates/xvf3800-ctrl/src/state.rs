@@ -320,6 +320,35 @@ pub struct StateFailure<E> {
     pub register: &'static Register,
     /// The transport's error.
     pub error: E,
+    /// The readings of the registers before `register`.
+    pub completed: Completed,
+}
+
+/// The readings of a prefix of [`STATE_REGISTERS`]: the registers a read
+/// completed before it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Completed {
+    readings: [Reading; STATE_REGISTER_COUNT],
+    count: usize,
+}
+
+impl Completed {
+    /// Each completed register with its reading, in table order.
+    pub fn entries(&self) -> impl Iterator<Item = (&'static Register, &Reading)> {
+        STATE_REGISTERS
+            .iter()
+            .zip(self.readings[..self.count].iter())
+    }
+
+    /// How many registers were completed.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether no register was completed.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 }
 
 /// Read every register of [`STATE_REGISTERS`] in table order under [`USB_RETRY`].
@@ -329,13 +358,18 @@ pub struct StateFailure<E> {
 ///
 /// # Errors
 /// The first transfer that does not complete ends the read: the failure names its
-/// register and carries the transport's error.
+/// register, carries the transport's error and keeps the readings of every
+/// register before it.
+// The failure holds the completed readings by value, as `ChipState` holds all
+// of them: the crate is no_std without an allocator, and the `Ok` variant is as
+// large, so boxing the error would not shrink the result.
+#[allow(clippy::result_large_err)]
 pub fn read_state<T: ControlRead>(transport: &mut T) -> Result<ChipState, StateFailure<T::Error>> {
     let mut readings = [Reading::Refused(Refusal::Declined); STATE_REGISTER_COUNT];
-    for (register, slot) in STATE_REGISTERS.iter().zip(readings.iter_mut()) {
+    for (index, register) in STATE_REGISTERS.iter().enumerate() {
         let mut buf = [0u8; CTRL_BUF_CAPACITY];
         let len = register.len;
-        *slot = match read_one(
+        readings[index] = match read_one(
             transport,
             USB_RETRY,
             register.resid,
@@ -347,7 +381,16 @@ pub fn read_state<T: ControlRead>(transport: &mut T) -> Result<ChipState, StateF
                 Reading::Refused(Refusal::Status { status, attempts })
             }
             RegisterRead::Declined(_) => Reading::Refused(Refusal::Declined),
-            RegisterRead::Failed(error) => return Err(StateFailure { register, error }),
+            RegisterRead::Failed(error) => {
+                return Err(StateFailure {
+                    register,
+                    error,
+                    completed: Completed {
+                        readings,
+                        count: index,
+                    },
+                });
+            }
         };
     }
     Ok(ChipState { readings })
@@ -596,5 +639,56 @@ mod tests {
             index + 1,
             "nothing is asked after the failure"
         );
+    }
+
+    #[test]
+    fn a_failed_read_keeps_the_readings_before_its_register() {
+        let repo_hash = row("bld_repo_hash");
+        let op_r = row("audio_mgr_op_r");
+        let mut t = ByRegister::new(&[
+            ((repo_hash.resid, repo_hash.cmd), Answer::Status(3)),
+            ((op_r.resid, op_r.cmd), Answer::Fail),
+        ]);
+        let failure = read_state(&mut t).expect_err("a failed transfer ends the read");
+        let names: Vec<_> = failure.completed.entries().map(|(r, _)| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                "version",
+                "bld_msg",
+                "bld_repo_hash",
+                "bld_modified",
+                "audio_mgr_op_l"
+            ]
+        );
+        assert_eq!(failure.completed.len(), 5);
+        for (r, reading) in failure.completed.entries() {
+            if r.name == "bld_repo_hash" {
+                assert_eq!(
+                    reading,
+                    &Reading::Refused(Refusal::Status {
+                        status: 3,
+                        attempts: 1
+                    })
+                );
+            } else {
+                assert_eq!(
+                    reading.payload(),
+                    Some(&vec![r.cmd; r.len][..]),
+                    "{}",
+                    r.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_failing_at_its_first_register_keeps_nothing() {
+        let version = row("version");
+        let mut t = ByRegister::new(&[((version.resid, version.cmd), Answer::Fail)]);
+        let failure = read_state(&mut t).expect_err("a failed transfer ends the read");
+        assert_eq!(failure.register.name, "version");
+        assert!(failure.completed.is_empty());
+        assert_eq!(failure.completed.entries().count(), 0);
     }
 }

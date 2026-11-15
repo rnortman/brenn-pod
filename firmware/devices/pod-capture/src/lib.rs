@@ -15,17 +15,14 @@
 mod capture;
 pub mod chip_state;
 pub mod cli;
-mod framer;
-mod granted;
 pub mod lines;
 mod seams;
 mod start;
-mod writer;
 
 pub use capture::{
     FLOOR_EXTRA_BYTES, FLOOR_SECONDS, Outcome, Recording, STALL_TIMEOUTS, STOP_BOUND, WAIT_TIMEOUT,
     free_space_floor, period_frames, queue_capacity, run,
 };
-pub use granted::{Granted, SampleFormat};
-pub use seams::{CaptureSource, Clock, Destination, SystemClock, Truncate};
+pub use frame_log::capture_stream::{Granted, SampleFormat, Truncate};
+pub use seams::{CaptureSource, Clock, Destination, SystemClock};
 pub use start::{BUFFER_PERIODS, main_with};

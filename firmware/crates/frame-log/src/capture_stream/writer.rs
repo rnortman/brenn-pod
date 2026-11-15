@@ -5,11 +5,11 @@
 
 use std::io::{self, Write};
 
+use crate::LogMeta;
 use audio_pipeline::wide::{MAX_WIDE_FRAME_BYTES, encode_wide};
-use frame_log::LogMeta;
 
-use crate::framer::{Block, Event, Framer, Stamped};
-use crate::seams::Truncate;
+use super::Truncate;
+use super::framer::{Block, Event, Framer, Stamped};
 
 /// Writes one capture's frame log, framing each item with a [`Framer`].
 pub struct FrameWriter<D: Write> {
@@ -40,7 +40,7 @@ impl<D: Write> FrameWriter<D> {
     ) -> io::Result<Self> {
         let mut scratch = vec![0; MAX_WIDE_FRAME_BYTES + 2];
         let mut buf = Vec::new();
-        frame_log::write_header(&mut buf, meta)?;
+        crate::write_header(&mut buf, meta)?;
         for (stamp, frame) in prelude {
             append(&mut buf, &mut scratch, *stamp, frame)?;
         }
@@ -125,22 +125,22 @@ impl<D: Write + Truncate> FrameWriter<D> {
 fn append(
     buf: &mut Vec<u8>,
     scratch: &mut [u8],
-    stamp: frame_log::HostMicros,
+    stamp: crate::HostMicros,
     frame: &audio_pipeline::wide::WideFrame,
 ) -> io::Result<()> {
     let n = encode_wide(frame, scratch)
         .map_err(|e| invalid_input(format!("encoding a frame failed: {e:?}")))?;
-    frame_log::write_record(buf, stamp, &scratch[..n])?;
+    crate::write_record(buf, stamp, &scratch[..n])?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::framer::{End, prelude};
-    use crate::granted::{Granted, SampleFormat};
+    use crate::capture_stream::framer::{End, prelude};
+    use crate::capture_stream::granted::{Granted, SampleFormat};
+    use crate::{HostMicros, LogItem};
     use audio_pipeline::wide::StreamEndReason;
-    use frame_log::{HostMicros, LogItem};
 
     fn granted() -> Granted {
         Granted {
@@ -218,7 +218,7 @@ mod tests {
     fn records(bytes: &[u8]) -> usize {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(bytes).unwrap();
-        frame_log::FrameLogReader::open(f.path())
+        crate::FrameLogReader::open(f.path())
             .unwrap()
             .map(|i| match i.unwrap() {
                 LogItem::Record { .. } => 1,

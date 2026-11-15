@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 # The frame log in both directions: the container, its header metadata, the
-# record stamp, and the file writer and reader. The voice host's recorder and
-# pod-capture write it; every reader of either goes through here. Its
+# record stamp, the file writer and reader, and a capture's stream framed as a
+# log. The voice host's recorder and pod-capture write it, and the `frame-log`
+# tool also writes a capture log from a WAV file's samples; every reader of
+# any of them goes through here. Its
 # dependency closure is held to an exact allow-list by tests/dep_graph.rs, so a
 # reader of logs never links a native library or a brenn-pod crate with a
 # build script.

@@ -2,11 +2,12 @@
 //! production implementation.
 
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use alsa_pcm::{ByteCapture, ClockPair, PcmError, Read, Wait};
+use frame_log::capture_stream::Truncate;
 
 /// Where captured frames come from.
 ///
@@ -56,20 +57,6 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn pair(&self) -> ClockPair {
         alsa_pcm::clock_pair()
-    }
-}
-
-/// A destination a capture's log can be cut back on.
-pub trait Truncate {
-    /// Cut the destination to `len` bytes and leave the next write at `len`.
-    fn truncate(&mut self, len: u64) -> io::Result<()>;
-}
-
-impl Truncate for File {
-    fn truncate(&mut self, len: u64) -> io::Result<()> {
-        self.set_len(len)?;
-        self.seek(SeekFrom::Start(len))?;
-        Ok(())
     }
 }
 

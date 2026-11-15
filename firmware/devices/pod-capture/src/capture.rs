@@ -14,14 +14,12 @@ use frame_log::{
     WriterInfo,
 };
 
-use crate::framer::{Block, End, Event, Framer, Gap, prelude};
-use crate::granted::Granted;
 use crate::lines::{
     CaptureFailed, CaptureGap, CaptureLate, CaptureStarted, CaptureStopped, CardLine, FailReason,
     Lines, note,
 };
 use crate::seams::{CaptureSource, Clock, Destination};
-use crate::writer::FrameWriter;
+use frame_log::capture_stream::{Block, End, Event, FrameWriter, Framer, Gap, Granted, prelude};
 
 /// How long one wait for a period lasts before the stop flag is looked at again.
 pub const WAIT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -751,7 +749,7 @@ impl<C: Clock, D: Destination> Writer<C, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::granted::SampleFormat;
+    use frame_log::capture_stream::SampleFormat;
 
     fn granted(rate_hz: u32, channels: u32, period_frames: u32) -> Granted {
         Granted {

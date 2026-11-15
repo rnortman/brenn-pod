@@ -36,9 +36,13 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   libasound and no other system library: the read is the kernel's usbfs
   control ioctl. A device it does not read, or cannot reach (no udev rule, a
   failed transfer, a board changed under the read), is stated as such and the
-  capture goes on. A failing transfer is retried, so the read can delay the
-  stream's start by up to about half a minute. The register list and one
-  board's readings: `docs/reference/xvf3800-control-protocol.md`, section 8.
+  capture goes on. A register the chip answers with a WAIT or RETRY status is
+  asked again, and a failed transfer ends the read. The read is bounded: it
+  adds at most about three seconds to the stream's start, and a stop signal
+  ends it within one transfer. A read cut short either way is recorded as
+  `cut_short`, with the registers read before the cut. The register list and
+  one board's readings: `docs/reference/xvf3800-control-protocol.md`, section
+  8.
   The new hardware test, `make -C firmware chip-hil`, has two identity tests
   that fail until the readings of the reSpeaker Flex's six-channel USB image
   are confirmed (`flex-usb-image-chip-readings-unconfirmed`).
@@ -46,6 +50,15 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   `BRENN_POD_BUILD_COMMIT`, and with no checkout around it starts no program;
   inside a checkout git decides, and a declared commit that disagrees fails the
   build.
+- **`frame-log write-capture` writes a capture log from given samples.** From
+  a PCM WAV file and a JSON spec (the device, its state, the losses and the
+  end), it writes the log a recorder would have written had the device
+  delivered those samples at exactly the nominal rate, through the same
+  framing `pod-capture` records with, so a program that reads capture logs can
+  test against one without a device. The log names its writer as `frame-log`
+  with a commit its caller stated (`writer.build.source: caller`), so it is
+  never mistaken for a recording; a `frame-log` older than this refuses such a
+  log. Format and command: `docs/reference/frame-log.md`, *The tool*.
 - **Every pod reports its health and its room once a second, whether or not
   anyone is speaking.** The pod sends a small status frame over the
   connection it already holds: its capture position, 100 ms room-level blocks

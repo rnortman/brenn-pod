@@ -8,21 +8,169 @@
 //! checked against sysfs at open, and sysfs is read again after the last
 //! transfer, so a board replaced during the read is recorded as changed and
 //! not as read.
+//!
+//! The read is bounded: no transfer begins once [`STATE_READ_BUDGET`] has
+//! passed since the reading taken directly before the first, and none begins
+//! once the stop flag is set. A transfer in flight is not cut; the transport's
+//! own timeout bounds it.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use frame_log::{
-    DeviceState, NotAttemptedWhy, RegisterEntry, RegisterReading, RegisterRefusal, UnavailableWhy,
-    UsbLocation,
+    CutShortWhy, DeviceState, NotAttemptedWhy, RegisterEntry, RegisterReading, RegisterRefusal,
+    UnavailableWhy, UsbLocation,
 };
-use xvf3800_ctrl::state::{ChipState, KIND, Kind, Reading, Refusal, read_state};
+use xvf3800_ctrl::state::{KIND, Kind, Reading, Refusal, Register, read_state};
 use xvf3800_ctrl::{ControlRead, decode_f32, decode_i32};
-use xvf3800_usb::OpenError;
 use xvf3800_usb::sysfs::UsbDevice;
+use xvf3800_usb::{OpenError, ReadError};
 
 use crate::seams::Clock;
+
+/// How long transfers of the state read may keep beginning, on
+/// `CLOCK_MONOTONIC`, from the reading taken directly before the first. With
+/// the transport's one-second timeout on the last transfer begun and one retry
+/// delay, the read ends within 3.01 s of that reading.
+pub const STATE_READ_BUDGET: Duration = Duration::from_secs(2);
+
+/// Whether a reader's error is a transfer the system reports as interrupted by
+/// a signal, as against a transfer that failed for its own reason.
+pub trait Interrupted {
+    fn interrupted(&self) -> bool;
+}
+
+impl Interrupted for ReadError {
+    fn interrupted(&self) -> bool {
+        matches!(self, ReadError::Transfer(e) if e.raw_os_error() == Some(libc::EINTR))
+    }
+}
+
+/// Why the gated reader made no transfer, or why a transfer it forwarded is
+/// not the device's failure.
+#[derive(Debug)]
+enum Cut<E> {
+    /// The budget had passed.
+    Deadline,
+    /// The stop flag was set; `interrupted` holds the error of a transfer the
+    /// stop's signal interrupted in flight.
+    Stopped { interrupted: Option<E> },
+}
+
+/// The gated reader's error: the reader's own, or a cut.
+#[derive(Debug)]
+enum Gated<E> {
+    Reader(E),
+    Cut(Cut<E>),
+}
+
+/// The last transfer forwarded for the register in progress: its attempt
+/// number and the status it answered.
+#[derive(Debug, Clone, Copy)]
+struct Forwarded {
+    register: (u8, u8),
+    attempt: u32,
+    status: u8,
+}
+
+/// The opened reader behind the stop flag and the budget: each transfer is
+/// asked of both before it is forwarded.
+struct Gate<'a, R, C> {
+    reader: R,
+    stop: &'a AtomicBool,
+    clock: &'a C,
+    begun_mono_us: u64,
+    budget_us: u64,
+    last: Option<Forwarded>,
+}
+
+impl<R, C> ControlRead for Gate<'_, R, C>
+where
+    R: ControlRead,
+    R::Error: Interrupted,
+    C: Clock,
+{
+    type Error = Gated<R::Error>;
+
+    fn control_read_once(
+        &mut self,
+        resid: u8,
+        cmd: u8,
+        payload: &mut [u8],
+        attempt: u32,
+    ) -> Result<u8, Self::Error> {
+        if self.last.is_some_and(|f| f.register != (resid, cmd)) {
+            self.last = None;
+        }
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(Gated::Cut(Cut::Stopped { interrupted: None }));
+        }
+        let elapsed = self.clock.pair().mono_us.saturating_sub(self.begun_mono_us);
+        if elapsed >= self.budget_us {
+            return Err(Gated::Cut(Cut::Deadline));
+        }
+        match self.reader.control_read_once(resid, cmd, payload, attempt) {
+            Ok(status) => {
+                self.last = Some(Forwarded {
+                    register: (resid, cmd),
+                    attempt,
+                    status,
+                });
+                Ok(status)
+            }
+            Err(e) if e.interrupted() && self.stop.load(Ordering::SeqCst) => {
+                Err(Gated::Cut(Cut::Stopped {
+                    interrupted: Some(e),
+                }))
+            }
+            Err(e) => Err(Gated::Reader(e)),
+        }
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        self.reader.delay_ms(ms);
+    }
+
+    fn refused(err: &Self::Error) -> bool {
+        match err {
+            Gated::Reader(e) => R::refused(e),
+            Gated::Cut(_) => false,
+        }
+    }
+}
+
+/// The record's `detail` for a read cut at `register`.
+fn cut_detail<E: fmt::Display>(
+    cut: &Cut<E>,
+    register: &Register,
+    last: Option<Forwarded>,
+) -> String {
+    let budget = STATE_READ_BUDGET.as_secs_f64();
+    let reason = match cut {
+        Cut::Deadline => format!("the state read's {budget} s had passed"),
+        Cut::Stopped { interrupted: None } => "the recorder was told to stop".to_owned(),
+        Cut::Stopped {
+            interrupted: Some(e),
+        } => format!("the recorder was told to stop, and the signal interrupted a transfer: {e}"),
+    };
+    let transfers = match last {
+        Some(f) if f.register == (register.resid, register.cmd) => format!(
+            "after {} transfer{} answering status {}",
+            f.attempt,
+            if f.attempt == 1 { "" } else { "s" },
+            f.status
+        ),
+        _ => "with no transfer answered for it".to_owned(),
+    };
+    format!(
+        "{reason}; cut at {} (resid {}, cmd {}) {transfers}",
+        register.name, register.resid, register.cmd
+    )
+}
 
 /// The card's USB device, if sysfs could describe it, and what was read of its
 /// state.
@@ -34,13 +182,21 @@ pub struct DeviceReading {
 
 /// Read the state of the device behind card `card_index`, resolving it under
 /// `sys_root` (`/sys` outside tests) and opening its chip with `open`
-/// ([`xvf3800_usb::open_reader`] outside tests).
+/// ([`xvf3800_usb::open_reader`] outside tests). No transfer begins once `stop`
+/// is set or [`STATE_READ_BUDGET`] has passed; a read cut either way is
+/// `cut_short` with the registers it completed.
 ///
 /// Every outcome is a reading: nothing here refuses the capture.
-pub fn read_device<R, O, C>(card_index: i32, sys_root: &Path, open: O, clock: &C) -> DeviceReading
+pub fn read_device<R, O, C>(
+    card_index: i32,
+    sys_root: &Path,
+    open: O,
+    clock: &C,
+    stop: &AtomicBool,
+) -> DeviceReading
 where
     R: ControlRead,
-    R::Error: std::fmt::Display,
+    R::Error: fmt::Display + Interrupted,
     O: FnOnce(&UsbDevice) -> Result<R, OpenError>,
     C: Clock,
 {
@@ -79,7 +235,7 @@ where
     };
     let kind = Some(KIND);
 
-    let mut reader = match open(&device) {
+    let reader = match open(&device) {
         Ok(reader) => reader,
         Err(e) => {
             let why = match e {
@@ -94,28 +250,56 @@ where
     };
 
     let begun = clock.pair();
-    // TODO(correctness-chip-read-worst-case-exceeds-brenn-lab-start-timeout): no
-    // bound on the whole read and no look at the stop flag between registers; a
-    // chip answering retry to every register holds the start about half a minute.
-    let read = read_state(&mut reader);
+    let mut gate = Gate {
+        reader,
+        stop,
+        clock,
+        begun_mono_us: begun.mono_us,
+        budget_us: u64::try_from(STATE_READ_BUDGET.as_micros()).expect("the budget fits u64"),
+        last: None,
+    };
+    let read = read_state(&mut gate);
     let ended = clock.pair();
     let began = Some((begun.mono_us, begun.wall_us));
-    let chip = match read {
-        Ok(chip) => chip,
+    let state = match read {
+        Ok(chip) => DeviceState::Read {
+            kind: KIND.to_owned(),
+            begun_mono_us: begun.mono_us,
+            ended_mono_us: ended.mono_us,
+            wall_us: begun.wall_us,
+            registers: registers(chip.entries()),
+        },
         Err(failure) => {
             let r = failure.register;
-            return DeviceReading {
-                usb,
-                state: unavailable(
-                    UnavailableWhy::Transfer,
-                    format!(
-                        "reading {} (resid {}, cmd {}) failed: {}",
-                        r.name, r.resid, r.cmd, failure.error
-                    ),
-                    kind,
-                    began,
-                ),
-            };
+            match failure.error {
+                Gated::Reader(error) => {
+                    return DeviceReading {
+                        usb,
+                        state: unavailable(
+                            UnavailableWhy::Transfer,
+                            format!(
+                                "reading {} (resid {}, cmd {}) failed: {error}",
+                                r.name, r.resid, r.cmd
+                            ),
+                            kind,
+                            began,
+                        ),
+                    };
+                }
+                Gated::Cut(cut) => DeviceState::CutShort {
+                    why: match cut {
+                        Cut::Deadline => CutShortWhy::Deadline,
+                        Cut::Stopped { .. } => CutShortWhy::Stopped,
+                    },
+                    at: r.name.to_owned(),
+                    detail: cut_detail(&cut, r, gate.last),
+                    kind: KIND.to_owned(),
+                    begun_mono_us: begun.mono_us,
+                    ended_mono_us: ended.mono_us,
+                    wall_us: begun.wall_us,
+                    registers: registers(failure.completed.entries()),
+                },
+            }
         }
     };
 
@@ -126,16 +310,7 @@ where
         };
     }
 
-    DeviceReading {
-        usb,
-        state: DeviceState::Read {
-            kind: KIND.to_owned(),
-            begun_mono_us: begun.mono_us,
-            ended_mono_us: ended.mono_us,
-            wall_us: begun.wall_us,
-            registers: registers(&chip),
-        },
-    }
+    DeviceReading { usb, state }
 }
 
 /// The USB device behind the card, or `None` for a card not on USB.
@@ -191,8 +366,10 @@ fn unavailable(
 
 /// The record's registers: each payload as lowercase hex beside its decoded
 /// value, or the chip's refusal.
-pub fn registers(chip: &ChipState) -> BTreeMap<String, RegisterEntry> {
-    chip.entries()
+fn registers<'a>(
+    entries: impl Iterator<Item = (&'static Register, &'a Reading)>,
+) -> BTreeMap<String, RegisterEntry> {
+    entries
         .map(|(register, reading)| {
             let reading = match reading {
                 Reading::Payload { buf, len } => {
@@ -256,10 +433,12 @@ pub fn decode(kind: Kind, payload: &[u8]) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     use alsa_pcm::ClockPair;
     use xvf3800_ctrl::state::{STATE_REGISTER_COUNT, STATE_REGISTERS};
@@ -287,6 +466,40 @@ mod tests {
         }
     }
 
+    /// A clock read without advancing it, moved only by whoever holds it: the
+    /// stand-in chip, by each transfer's cost and each retry delay.
+    #[derive(Clone)]
+    struct FakeTime(Arc<AtomicU64>);
+
+    /// Where fake time starts, in microseconds.
+    const T0: u64 = 1_000;
+
+    impl FakeTime {
+        fn new() -> Self {
+            FakeTime(Arc::new(AtomicU64::new(T0)))
+        }
+
+        fn now(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+
+        fn advance(&self, us: u64) {
+            self.0.fetch_add(us, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for FakeTime {
+        fn pair(&self) -> ClockPair {
+            let t = self.now();
+            ClockPair {
+                mono_us: t,
+                wall_us: 1_794_000_000_000_000 + t,
+            }
+        }
+    }
+
+    const BUDGET_US: u64 = 2_000_000;
+
     /// One answer of the stand-in chip.
     #[derive(Clone, Copy)]
     enum Answer {
@@ -295,12 +508,15 @@ mod tests {
         Status(u8),
         Stall,
         Fail,
+        /// A transfer the system reports as interrupted by a signal.
+        Interrupted,
     }
 
     #[derive(Debug)]
     enum FakeError {
         Stall,
         TimedOut,
+        Interrupted,
     }
 
     impl std::fmt::Display for FakeError {
@@ -308,16 +524,27 @@ mod tests {
             match self {
                 FakeError::Stall => write!(f, "stalled"),
                 FakeError::TimedOut => write!(f, "timed out"),
+                FakeError::Interrupted => write!(f, "Interrupted system call"),
             }
         }
     }
 
+    impl Interrupted for FakeError {
+        fn interrupted(&self) -> bool {
+            matches!(self, FakeError::Interrupted)
+        }
+    }
+
     /// A read-only chip answering each register by its row, running `on_read`
-    /// before every transfer.
+    /// before every transfer. With `time`, each transfer advances it by `cost_us`
+    /// and each retry delay by the delay.
     struct Chip {
         answers: [Answer; STATE_REGISTER_COUNT],
         on_read: Box<dyn FnMut()>,
         transfers: Rc<Cell<u32>>,
+        time: Option<(FakeTime, u64)>,
+        /// The fake time at which each transfer began.
+        began: Rc<RefCell<Vec<u64>>>,
     }
 
     impl Chip {
@@ -326,6 +553,15 @@ mod tests {
                 answers,
                 on_read: Box::new(|| {}),
                 transfers: Rc::new(Cell::new(0)),
+                time: None,
+                began: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        fn timed(answers: [Answer; STATE_REGISTER_COUNT], time: &FakeTime, cost_us: u64) -> Self {
+            Chip {
+                time: Some((time.clone(), cost_us)),
+                ..Chip::answering(answers)
             }
         }
     }
@@ -342,6 +578,10 @@ mod tests {
         ) -> Result<u8, FakeError> {
             (self.on_read)();
             self.transfers.set(self.transfers.get() + 1);
+            if let Some((time, cost_us)) = &self.time {
+                self.began.borrow_mut().push(time.now());
+                time.advance(*cost_us);
+            }
             let row = STATE_REGISTERS
                 .iter()
                 .position(|r| r.resid == resid && r.cmd == cmd)
@@ -354,10 +594,15 @@ mod tests {
                 Answer::Status(s) => Ok(s),
                 Answer::Stall => Err(FakeError::Stall),
                 Answer::Fail => Err(FakeError::TimedOut),
+                Answer::Interrupted => Err(FakeError::Interrupted),
             }
         }
 
-        fn delay_ms(&mut self, _: u32) {}
+        fn delay_ms(&mut self, ms: u32) {
+            if let Some((time, _)) = &self.time {
+                time.advance(u64::from(ms) * 1_000);
+            }
+        }
 
         fn refused(err: &FakeError) -> bool {
             matches!(err, FakeError::Stall)
@@ -427,6 +672,7 @@ mod tests {
                 Ok(chip)
             },
             &Ticks::new(),
+            &AtomicBool::new(false),
         );
         assert_eq!(opened.get(), Some((3, 28)));
         assert_eq!(got.usb, Some(flex_location()));
@@ -442,7 +688,11 @@ mod tests {
             panic!("expected read, got {:?}", got.state);
         };
         assert_eq!(kind, "xvf3800");
-        assert_eq!((begun_mono_us, ended_mono_us), (100, 101));
+        assert_eq!(
+            (begun_mono_us, ended_mono_us),
+            (100, 101 + STATE_REGISTER_COUNT as u64),
+            "one clock reading before the read, one at each transfer's gate, one after"
+        );
         assert_eq!(wall_us, 1_794_000_000_000_100);
         assert_eq!(registers.len(), STATE_REGISTER_COUNT);
         assert_eq!(
@@ -471,6 +721,7 @@ mod tests {
             sys.path(),
             |_| Ok(Chip::answering(answers)),
             &Ticks::new(),
+            &AtomicBool::new(false),
         );
         let DeviceState::Read { registers, .. } = got.state else {
             panic!("expected read, got {:?}", got.state);
@@ -504,7 +755,13 @@ mod tests {
         answers[0] = Answer::Status(STATUS_RETRY);
         let chip = Chip::answering(answers);
         let transfers = Rc::clone(&chip.transfers);
-        let got = read_device(2, sys.path(), |_| Ok(chip), &Ticks::new());
+        let got = read_device(
+            2,
+            sys.path(),
+            |_| Ok(chip),
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
         let DeviceState::Read { registers, .. } = got.state else {
             panic!("expected read, got {:?}", got.state);
         };
@@ -530,7 +787,13 @@ mod tests {
         let pci = sys.path().join("devices/host/0000:00:1f.3");
         fs::create_dir_all(&pci).expect("pci");
         link_card(sys.path(), 0, &pci);
-        let got = read_device(0, sys.path(), never_opened, &Ticks::new());
+        let got = read_device(
+            0,
+            sys.path(),
+            never_opened,
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
         assert_eq!(got.usb, None);
         assert_eq!(
             got.state,
@@ -548,7 +811,13 @@ mod tests {
         attrs[2] = ("idVendor", "046d");
         attrs[3] = ("idProduct", "0825");
         usb_card(sys.path(), 1, "1-4", &attrs[..5]);
-        let got = read_device(1, sys.path(), never_opened, &Ticks::new());
+        let got = read_device(
+            1,
+            sys.path(),
+            never_opened,
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
         let usb = got.usb.expect("location");
         assert_eq!((usb.port.as_str(), usb.serial), ("1-4", None));
         let DeviceState::NotAttempted { why, detail } = got.state else {
@@ -567,7 +836,13 @@ mod tests {
             "3-2.2",
             &[FLEX[0], FLEX[2], FLEX[3], FLEX[4]],
         );
-        let got = read_device(2, sys.path(), never_opened, &Ticks::new());
+        let got = read_device(
+            2,
+            sys.path(),
+            never_opened,
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
         assert_eq!(got.usb, None);
         let DeviceState::Unavailable {
             why,
@@ -583,7 +858,13 @@ mod tests {
         assert!(detail.contains("devnum"), "{detail}");
         assert_eq!((kind, begun_mono_us), (None, None));
 
-        let missing = read_device(5, sys.path(), never_opened, &Ticks::new());
+        let missing = read_device(
+            5,
+            sys.path(),
+            never_opened,
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
         assert!(matches!(
             missing.state,
             DeviceState::Unavailable {
@@ -607,6 +888,7 @@ mod tests {
                 })
             },
             &Ticks::new(),
+            &AtomicBool::new(false),
         );
         assert_eq!(got.usb, Some(flex_location()));
         let DeviceState::Unavailable {
@@ -641,6 +923,7 @@ mod tests {
                 })
             },
             &Ticks::new(),
+            &AtomicBool::new(false),
         );
         assert!(matches!(
             got.state,
@@ -660,7 +943,13 @@ mod tests {
         answers[4] = Answer::Fail;
         let chip = Chip::answering(answers);
         let transfers = Rc::clone(&chip.transfers);
-        let got = read_device(2, sys.path(), |_| Ok(chip), &Ticks::new());
+        let got = read_device(
+            2,
+            sys.path(),
+            |_| Ok(chip),
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
         assert_eq!(transfers.get(), 5);
         assert_eq!(
             got.state,
@@ -682,7 +971,13 @@ mod tests {
         chip.on_read = Box::new(move || {
             fs::write(device.join("devnum"), "29\n").expect("re-enumerated");
         });
-        let got = read_device(2, sys.path(), |_| Ok(chip), &Ticks::new());
+        let got = read_device(
+            2,
+            sys.path(),
+            |_| Ok(chip),
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
         assert_eq!(got.usb, Some(flex_location()));
         let DeviceState::Unavailable {
             why,
@@ -706,7 +1001,306 @@ mod tests {
         chip.on_read = Box::new(move || {
             let _ = fs::remove_dir_all(&device);
         });
-        let got = read_device(2, sys.path(), |_| Ok(chip), &Ticks::new());
+        let got = read_device(
+            2,
+            sys.path(),
+            |_| Ok(chip),
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(
+            got.state,
+            DeviceState::Unavailable {
+                why: UnavailableWhy::DeviceChanged,
+                ..
+            }
+        ));
+    }
+
+    /// The fields of a `cut_short` state, or a panic naming what came instead.
+    struct CutShortState {
+        why: CutShortWhy,
+        at: String,
+        detail: String,
+        begun_mono_us: u64,
+        ended_mono_us: u64,
+        registers: BTreeMap<String, RegisterEntry>,
+    }
+
+    fn cut_short(state: DeviceState) -> CutShortState {
+        let DeviceState::CutShort {
+            why,
+            at,
+            detail,
+            kind,
+            begun_mono_us,
+            ended_mono_us,
+            wall_us,
+            registers,
+        } = state
+        else {
+            panic!("expected cut_short, got {state:?}");
+        };
+        assert_eq!(kind, "xvf3800");
+        assert_eq!(wall_us, 1_794_000_000_000_000 + begun_mono_us);
+        assert!(!registers.contains_key(&at), "{at} is in registers");
+        CutShortState {
+            why,
+            at,
+            detail,
+            begun_mono_us,
+            ended_mono_us,
+            registers,
+        }
+    }
+
+    /// The registers' names in table order; every key is a register of the
+    /// table.
+    fn names(registers: &BTreeMap<String, RegisterEntry>) -> Vec<&'static str> {
+        let names: Vec<_> = STATE_REGISTERS
+            .iter()
+            .map(|r| r.name)
+            .filter(|n| registers.contains_key(*n))
+            .collect();
+        assert_eq!(names.len(), registers.len(), "a key outside the table");
+        names
+    }
+
+    fn first(n: usize) -> Vec<&'static str> {
+        STATE_REGISTERS[..n].iter().map(|r| r.name).collect()
+    }
+
+    /// Read card 2, a Flex, from `chip` with `time` as the clock.
+    fn read_timed(chip: Chip, time: &FakeTime, stop: &AtomicBool) -> DeviceReading {
+        let sys = tempfile::tempdir().expect("sys");
+        usb_card(sys.path(), 2, "3-2.2", &FLEX);
+        read_device(2, sys.path(), |_| Ok(chip), time, stop)
+    }
+
+    #[test]
+    fn a_chip_answering_retry_throughout_is_cut_by_the_deadline() {
+        let time = FakeTime::new();
+        let chip = Chip::timed(
+            [Answer::Status(STATUS_RETRY); STATE_REGISTER_COUNT],
+            &time,
+            0,
+        );
+        let began = Rc::clone(&chip.began);
+        let got = cut_short(read_timed(chip, &time, &AtomicBool::new(false)).state);
+        assert_eq!(got.why, CutShortWhy::Deadline);
+        assert_eq!(got.at, "bld_msg");
+        assert_eq!(names(&got.registers), ["version"]);
+        assert_eq!(
+            got.registers["version"].reading,
+            RegisterReading::Refused {
+                refused: RegisterRefusal::Status {
+                    status: STATUS_RETRY,
+                    attempts: USB_RETRY.max_retries + 1
+                }
+            }
+        );
+        let began = began.borrow();
+        assert!(
+            began.iter().all(|&t| t - T0 < BUDGET_US),
+            "a transfer began at or after the budget"
+        );
+        assert_eq!(began.len(), 101 + 100, "version's 101, then bld_msg's 100");
+        assert_eq!(
+            got.detail,
+            format!(
+                "the state read's 2 s had passed; cut at bld_msg (resid 48, cmd 1) after 100 \
+                 transfers answering status {STATUS_RETRY}"
+            )
+        );
+    }
+
+    #[test]
+    fn slow_answers_are_cut_within_one_transfer_of_the_budget() {
+        let time = FakeTime::new();
+        let cost = 400_000;
+        let chip = Chip::timed(all_done(), &time, cost);
+        let transfers = Rc::clone(&chip.transfers);
+        let got = cut_short(read_timed(chip, &time, &AtomicBool::new(false)).state);
+        assert_eq!(got.why, CutShortWhy::Deadline);
+        assert_eq!(names(&got.registers), first(5));
+        assert_eq!(got.at, STATE_REGISTERS[5].name);
+        assert_eq!(transfers.get(), 5);
+        assert_eq!(got.begun_mono_us, T0);
+        assert!(got.ended_mono_us - got.begun_mono_us <= BUDGET_US + cost);
+        assert!(
+            got.detail.ends_with(
+                "cut at audio_mgr_op_r (resid 35, cmd 19) with no transfer answered for it"
+            ),
+            "{}",
+            got.detail
+        );
+    }
+
+    #[test]
+    fn retry_answers_each_taking_the_timeout_end_within_the_stated_bound() {
+        let time = FakeTime::new();
+        let chip = Chip::timed(
+            [Answer::Status(STATUS_RETRY); STATE_REGISTER_COUNT],
+            &time,
+            1_000_000,
+        );
+        let transfers = Rc::clone(&chip.transfers);
+        let got = cut_short(read_timed(chip, &time, &AtomicBool::new(false)).state);
+        assert_eq!(got.why, CutShortWhy::Deadline);
+        assert_eq!(got.at, "version");
+        assert!(got.registers.is_empty());
+        assert_eq!(transfers.get(), 2);
+        assert!(got.ended_mono_us - got.begun_mono_us <= 3_010_000);
+        assert!(time.now() - T0 <= 3_010_000);
+    }
+
+    #[test]
+    fn a_stop_after_some_transfers_keeps_what_was_read_and_asks_no_more() {
+        for k in [1u32, 4, 16] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let time = FakeTime::new();
+            let mut chip = Chip::timed(all_done(), &time, 9_000);
+            let transfers = Rc::clone(&chip.transfers);
+            let seen = Rc::clone(&chip.transfers);
+            let flag = Arc::clone(&stop);
+            chip.on_read = Box::new(move || {
+                if seen.get() + 1 == k {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            });
+            let got = cut_short(read_timed(chip, &time, &stop).state);
+            assert_eq!(got.why, CutShortWhy::Stopped, "k={k}");
+            assert_eq!(names(&got.registers), first(k as usize), "k={k}");
+            assert_eq!(got.at, STATE_REGISTERS[k as usize].name, "k={k}");
+            assert_eq!(transfers.get(), k, "k={k}");
+            assert!(
+                got.detail
+                    .starts_with("the recorder was told to stop; cut at"),
+                "{}",
+                got.detail
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_before_the_read_makes_no_transfer() {
+        let time = FakeTime::new();
+        let chip = Chip::timed(all_done(), &time, 9_000);
+        let transfers = Rc::clone(&chip.transfers);
+        let got = cut_short(read_timed(chip, &time, &AtomicBool::new(true)).state);
+        assert_eq!(got.why, CutShortWhy::Stopped);
+        assert_eq!(got.at, "version");
+        assert!(got.registers.is_empty());
+        assert_eq!(transfers.get(), 0);
+        assert_eq!(got.begun_mono_us, got.ended_mono_us);
+    }
+
+    #[test]
+    fn the_stop_is_reported_when_the_deadline_has_also_passed() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let time = FakeTime::new();
+        let mut chip = Chip::timed(all_done(), &time, BUDGET_US);
+        let flag = Arc::clone(&stop);
+        chip.on_read = Box::new(move || flag.store(true, Ordering::SeqCst));
+        let got = cut_short(read_timed(chip, &time, &stop).state);
+        assert_eq!(got.why, CutShortWhy::Stopped);
+        assert_eq!(names(&got.registers), ["version"]);
+    }
+
+    /// A chip whose register `row` answers `answer`, and whose hook sets the
+    /// stop flag at that register's transfer when `set_stop`.
+    fn failing_at(row: usize, answer: Answer, set_stop: bool) -> (DeviceState, u32) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let time = FakeTime::new();
+        let mut answers = all_done();
+        answers[row] = answer;
+        let mut chip = Chip::timed(answers, &time, 9_000);
+        let transfers = Rc::clone(&chip.transfers);
+        let seen = Rc::clone(&chip.transfers);
+        let flag = Arc::clone(&stop);
+        chip.on_read = Box::new(move || {
+            if set_stop && seen.get() == row as u32 {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+        let state = read_timed(chip, &time, &stop).state;
+        (state, transfers.get())
+    }
+
+    #[test]
+    fn a_transfer_interrupted_by_the_stop_is_a_stop() {
+        let (state, transfers) = failing_at(3, Answer::Interrupted, true);
+        assert_eq!(transfers, 4);
+        let got = cut_short(state);
+        assert_eq!(got.why, CutShortWhy::Stopped);
+        assert_eq!(got.at, "bld_modified");
+        assert_eq!(names(&got.registers), first(3));
+        assert_eq!(
+            got.detail,
+            "the recorder was told to stop, and the signal interrupted a transfer: Interrupted \
+             system call; cut at bld_modified (resid 48, cmd 4) with no transfer answered for it"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_transfer_without_a_stop_or_a_failure_during_one_is_a_transfer_failure() {
+        for (answer, set_stop, words) in [
+            (Answer::Interrupted, false, "Interrupted system call"),
+            (Answer::Fail, true, "timed out"),
+        ] {
+            let (state, _) = failing_at(3, answer, set_stop);
+            let DeviceState::Unavailable { why, detail, .. } = state else {
+                panic!("expected unavailable, got {state:?}");
+            };
+            assert_eq!(why, UnavailableWhy::Transfer);
+            assert_eq!(
+                detail,
+                format!("reading bld_modified (resid 48, cmd 4) failed: {words}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_whose_last_transfer_ends_after_the_budget_is_read() {
+        let time = FakeTime::new();
+        // Seventeen transfers of 120 ms: the last begins at 1.92 s and ends at
+        // 2.04 s.
+        let cost = 120_000;
+        let chip = Chip::timed(all_done(), &time, cost);
+        let got = read_timed(chip, &time, &AtomicBool::new(false));
+        let DeviceState::Read { registers, .. } = got.state else {
+            panic!("expected read, got {:?}", got.state);
+        };
+        assert_eq!(registers.len(), STATE_REGISTER_COUNT);
+        let elapsed = time.now() - T0;
+        assert!(elapsed > BUDGET_US, "{elapsed}");
+        assert!(
+            elapsed - cost < BUDGET_US,
+            "the last transfer began at {}",
+            elapsed - cost
+        );
+    }
+
+    #[test]
+    fn only_a_transfer_failing_with_eintr_is_interrupted() {
+        let eintr = || io::Error::from_raw_os_error(libc::EINTR);
+        assert!(ReadError::Transfer(eintr()).interrupted());
+        assert!(!ReadError::Transfer(io::Error::from_raw_os_error(libc::ETIMEDOUT)).interrupted());
+        assert!(!ReadError::Declined(eintr()).interrupted());
+    }
+
+    #[test]
+    fn a_board_replaced_during_a_cut_read_is_a_changed_device() {
+        let sys = tempfile::tempdir().expect("sys");
+        let device = usb_card(sys.path(), 2, "3-2.2", &FLEX);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut chip = Chip::answering(all_done());
+        let flag = Arc::clone(&stop);
+        chip.on_read = Box::new(move || {
+            fs::write(device.join("devnum"), "29\n").expect("re-enumerated");
+            flag.store(true, Ordering::SeqCst);
+        });
+        let got = read_device(2, sys.path(), |_| Ok(chip), &Ticks::new(), &stop);
         assert!(matches!(
             got.state,
             DeviceState::Unavailable {
@@ -766,7 +1360,13 @@ mod tests {
                 false
             }
         }
-        let got = read_device(2, sys.path(), |_| Ok(Nan), &Ticks::new());
+        let got = read_device(
+            2,
+            sys.path(),
+            |_| Ok(Nan),
+            &Ticks::new(),
+            &AtomicBool::new(false),
+        );
         let DeviceState::Read { registers, .. } = got.state else {
             panic!("expected read, got {:?}", got.state);
         };

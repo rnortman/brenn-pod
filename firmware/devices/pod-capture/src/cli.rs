@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::de::IntoDeserializer;
 
-use crate::granted::SampleFormat;
+use frame_log::capture_stream::SampleFormat;
 
 pub const USAGE: &str = "usage: pod-capture --card <NAME> --rate <HZ> \
     --format <s16_le|s32_le> --layout <a,b,c,...> --pod-id <NAME> --out <PATH>";

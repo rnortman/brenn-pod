@@ -83,7 +83,13 @@ JSON. Unknown keys are ignored on read.
     end_frame}`. The file name is the caller's and is not part of it.
   - `writer.build.source`: `git` when a checkout of this repository vouched for
     the commit, `declared` when the builder declared it through
-    `BRENN_POD_BUILD_COMMIT`. `dirty` is `null` when the source is `declared`.
+    `BRENN_POD_BUILD_COMMIT`, `caller` when nothing in the build vouches for it
+    and the program that ran the writer stated it. Only `frame-log
+    write-capture` writes `caller` (with `writer.program` `frame-log`), so a log
+    it wrote is never mistaken for a recording. `dirty` is `null` unless the
+    source is `git`. A `frame-log` built before `caller` existed refuses a log
+    whose source is `caller`, by the same rule and with the same remedy as for
+    `cut_short` (below).
   - `device.usb_id`: the kernel's `/proc/asound/card<N>/usbid`, or `null` for a
     card with no USB id.
   - `device.usb`: the USB device behind the card, resolved through sysfs:
@@ -101,15 +107,15 @@ JSON. Unknown keys are ignored on read.
   - `device_control.performed: false`: the writer wrote nothing to the device.
   - `device_state`: what the writer read of the device's own state, below.
 
-  A `capture` block that breaks these rules (a malformed id or commit, a zero
-  period, a buffer smaller than the period, other clocks, a register's `bytes`
+  A `capture` block that breaks these rules (a malformed id or commit, a
+  `dirty` flag set for a `declared` or `caller` build, a zero period, a buffer smaller than the period, other clocks, a register's `bytes`
   that is not lowercase hex of even length, a `read` state with no registers,
-  an `ended_mono_us` under its `begun_mono_us`) is refused on write and on
-  read.
+  an `ended_mono_us` under its `begun_mono_us`, a `cut_short` state whose `at`
+  is empty or is a key of its `registers`) is refused on write and on read.
 
 ### `device_state`
 
-Four statements, by the key's absence and its `outcome`:
+Five statements, by the key's absence and its `outcome`:
 
 | In the header | Means |
 |---|---|
@@ -117,10 +123,12 @@ Four statements, by the key's absence and its `outcome`:
 | `{"outcome": "not_attempted", "why": "not_usb" \| "unknown_usb_id", "detail": "…"}` | The writer reads device state, and this device is not one it knows how to read. Nothing was sent to it. |
 | `{"outcome": "unavailable", "why": "sysfs" \| "open" \| "transfer" \| "device_changed", "detail": "…", …}` | The writer tried and could not reach the device's state. `detail` carries the system's own words and, for `transfer`, the register the read failed at. `kind` is present once the device is known to be one the writer reads (every `why` but `sysfs`); `begun_mono_us` and `wall_us` once a transfer was begun. No register value is recorded. |
 | `{"outcome": "read", "kind": "…", "begun_mono_us": …, "ended_mono_us": …, "wall_us": …, "registers": {…}}` | Every register the writer reads for that `kind` was asked, and each is either read or refused. |
+| `{"outcome": "cut_short", "why": "deadline" \| "stopped", "at": "…", "detail": "…", "kind": "…", "begun_mono_us": …, "ended_mono_us": …, "wall_us": …, "registers": {…}}` | The read ended before it asked every register: the writer's time for it ran out (`deadline`) or the writer was told to stop (`stopped`). The device answered for every register in `registers`, each read or refused as in `read`; `registers` holds every register before `at` in the reader's order and may be empty. Nothing is known about `at`, the register the read had reached and did not complete, or about any register of that `kind` absent from the map; in particular the device did not refuse them. `detail` is the writer's prose account of the cut. |
 
 - `kind` names the reader (`xvf3800`), not a USB id.
 - `begun_mono_us` and `ended_mono_us` are `CLOCK_MONOTONIC` readings directly
-  before the first transfer and directly after the last, on the clock of the
+  before the first transfer and directly after the last (for `cut_short`,
+  directly after the read ended), on the clock of the
   capture's own `mono_us` values; `wall_us` is the wall reading paired with the
   first. The capture's start pair is in its `Describe` frame, so the state was
   read `start mono_us - ended_mono_us` before frame 0. The reading always
@@ -139,6 +147,11 @@ Four statements, by the key's absence and its `outcome`:
   The reader of this format knows no register names; which registers an
   `xvf3800` reading holds, and why, is in `xvf3800-control-protocol.md`,
   section 8.
+
+A `frame-log` built before `cut_short` existed refuses a log whose
+`device_state` is `cut_short`, at the header, by the rule for an unknown value
+of a known key. A reader is to be no older than the writer of the logs it
+reads. Every log without a cut read is unchanged.
 
 ## The version rule
 
@@ -288,15 +301,17 @@ A reader stops with one verdict, and everything before it is usable in all four:
 Each verdict carries the byte offset it applies at, a reason, and the id of the
 segment left open, if any. A jump of the index is never corrupt.
 
-## The reader tool
+## The tool
 
 ```sh
 frame-log summary <log>
 frame-log export-wav <log> <out.wav>
+frame-log write-capture <spec.json> <in.wav> <out.framelog>
 ```
 
-Both read a capture's log and a voice host's, at any rate, channel count and
-either sample format.
+`summary` and `export-wav` read a capture's log and a voice host's, at any
+rate, channel count and either sample format. `write-capture` writes a
+capture's log from given samples (below).
 
 `summary` prints one JSON object:
 
@@ -357,3 +372,81 @@ export leaves no output.
 Exit status for both: 0 when the output was produced, whatever the tail; 1 when
 the header is unreadable, the log has no hello, the export is refused or I/O
 failed; 2 for a command line it does not understand.
+
+### `write-capture`
+
+`write-capture` writes the capture log a recorder would have written had its
+device delivered the WAV's samples at exactly the nominal rate, with the losses
+and the end the spec states, through the framing `pod-capture` records with.
+WAV frame `i` is the capture's sample index `i`. It prints one JSON object,
+`{"record_id": …, "frames": <the index after the last frame accounted for>}`.
+
+The WAV gives the rate, the channel count and the sample format. It is read as
+RIFF/WAVE, integer PCM, 16 or 32 bits little-endian, as `WAVE_FORMAT_PCM` or as
+`WAVE_FORMAT_EXTENSIBLE` with the PCM sub-format, so a file `export-wav` wrote
+and an ordinary PCM WAV are both read. Chunks other than `fmt ` and `data` are
+skipped. Refused, with what was found: any other format (float, 8 or 24 bits,
+fewer valid bits than the sample's width), a `data` chunk that is not whole
+frames or runs past the file, a `data` chunk before any `fmt `.
+
+The spec is one JSON object; an unknown key is refused.
+
+| Key | Required | Meaning |
+|---|---|---|
+| `pod_id` | yes | The hello's `pod_id`, 1 to 32 bytes. |
+| `layout` | yes | One name per channel in interleave order, as many as the WAV has channels; each name non-empty and none repeated, as the recorder's `--layout`. |
+| `period_frames` | yes | The block size: positive, at most `buffer_frames`, and no more frames than one audio frame holds. |
+| `buffer_frames` | yes | The header's `granted.buffer_frames`. |
+| `start` | yes | `{"mono_us": …, "wall_us": …}`: the start pair. |
+| `record_id` | yes | 32 lowercase hex digits. |
+| `commit` | yes | 40 hex digits: the commit of the `frame-log` that writes the log, as its caller states it. |
+| `device` | yes | The header's `capture.device`, in the header's own shape. |
+| `device_state` | no | The header's `capture.device_state`, in the header's own shape; absent, the header has none. |
+| `losses` | no | A list in index order; below. |
+| `end` | no | `{"reason": "stopped" \| "destination_full" \| "stream_died" \| "write_failed", "detail": …}`, `detail` optional; absent, the log has no `End` and reads back `unterminated`. |
+
+The header says who wrote it: `capture.writer` is `{"program": "frame-log",
+"build": {"commit": <commit>, "dirty": null, "source": "caller"}}`, and
+`build_id` is the commit. `clocks` are the capture's, `device_control.performed`
+is `false`, `granted.period_frames` is the spec's, `created_epoch_us` is
+`start.wall_us`. The whole header is held to the rules of [Header
+metadata](#header-metadata) before anything is written.
+
+A loss is one of, each with an optional `detail`:
+
+- measured, `{"at_frame": N, "cause": "writer_backlog", "frames": n}`, with
+  `n` positive: WAV frames `N` to `N+n-1` are not written, the log carries
+  `Loss{writer_backlog, n}`, and the next audio is at `N+n` in the same
+  segment;
+- unmeasured, `{"at_frame": N, "cause": "overrun" | "suspend" |
+  "transfer_error", "elapsed_frames": m}`: no WAV frame is skipped, the open
+  segment closes with `source_loss`, the log carries `Loss{cause, null}`, the
+  next audio opens a segment at `N`, and every later stamp is `m` frames' time
+  later.
+
+Any other pairing of cause and shape is refused, as are a loss before the end
+of the one before it, a measured loss reaching past the WAV's last frame, and an
+`at_frame` past the WAV's length. A loss at the WAV's length is allowed.
+
+Audio goes out in blocks of `period_frames`, cut short at a loss and at the
+WAV's end. With `e` the `elapsed_frames` of the unmeasured losses so far, the
+instant after `k` frames is `T(k) = start.mono_us + floor((k + e) × 1 000 000 /
+rate)`. A block of frames `a` to `b-1` is read at `T(b)` with no backlog; a
+measured loss at `N` of `n` is stamped `T(N + n)`; an unmeasured loss at `N` is
+stamped `T(N)` with its own `elapsed_frames` counted; the end is stamped at the
+index after the last frame accounted for. Every wall reading is its `mono_us`
+plus `start.wall_us − start.mono_us`. So no block reads as late, no wall step
+shows, and the clock estimate of an unmeasured hole is its `elapsed_frames` to
+within the rounding of the stamps (exactly, where a frame's duration and the
+hole's are whole microseconds).
+
+It writes every loss a reader distinguishes in a capture, and the end with
+each reason or none. It does not write a `gap`, an `overlap`, a
+`segment_replaced`, a `count_mismatch` or a torn or corrupt tail: no capture
+writer produces those.
+
+The output must not exist. Everything above is refused before it is created; a
+read or write that fails after that removes it, and so does a written log
+whose result cannot be printed. Exit status 0 when the log was
+written, 1 when the spec or the WAV was refused or I/O failed, 2 for a command
+line it does not understand.

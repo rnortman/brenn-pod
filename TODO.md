@@ -1616,39 +1616,6 @@ asserting the value that is; and `make -C firmware chip-hil` passes on the
 Flex. See `TODO(flex-usb-image-chip-readings-unconfirmed)` at the two
 expectation tables in the test.
 
-## `correctness-chip-read-worst-case-exceeds-brenn-lab-start-timeout`
-
-`pod-capture` reads the chip state of an XVF3800 before it emits
-`capture_started`, and nothing bounds that read as a whole. Each of the
-seventeen registers is read under `USB_RETRY`: a chip that answers WAIT or
-RETRY throughout costs 101 transfers 10 ms apart, about two seconds per
-register at the roughly 9 ms a transfer took on the bench Flex, so about half
-a minute for the seventeen, and more on a chip slow to answer each transfer.
-`SIGINT` and `SIGTERM` set the stop flag during the read, but nothing looks
-at it until the read is over and `capture_started` has been written. A
-caller that bounds the recorder's start (brenn-lab gives it ten seconds
-before it kills the recorder) loses the capture and the record of why. No
-hardware has shown a WAIT or RETRY answer to these reads: on the bench Flex
-all seventeen completed on the first attempt in 152 ms.
-
-The design question is what the record says when the read is cut short. A
-register the deadline cut off is not one the device declined, and the record
-keeps those apart: either a new `unavailable` reason for a read that ran out
-of time, or a per-register outcome beside `refused`, with the frame-log
-reference and `validate` following. The same answer covers a stop signal
-seen between registers. Then the budget: one total deadline for the read,
-a smaller per-register retry budget than `USB_RETRY`, or both, stated in
-`docs/reference/pod-capture.md` so a caller can size its start timeout
-against it.
-
-Done = the read has a stated total bound of a few seconds at most, a stop
-signal during it ends the read promptly, the record states either outcome in
-the shape the design chose, unit tests in `pod-capture`'s `chip_state` drive
-both with a stand-in chip that answers retry throughout, and
-`docs/reference/pod-capture.md` gives the bound. See
-`TODO(correctness-chip-read-worst-case-exceeds-brenn-lab-start-timeout)` in
-`firmware/devices/pod-capture/src/chip_state.rs`.
-
 ## `usb-image-capture-channel-register-map-unknown`
 
 A capture from a Flex on the six-channel USB image (`2886:0022`) records the
@@ -1667,21 +1634,3 @@ slot decides it and how that was established, or states why it cannot be
 established on this image. See
 `TODO(usb-image-capture-channel-register-map-unknown)` in
 `firmware/devices/pod-capture/src/start.rs`.
-
-## `frame-log-writes-no-synthetic-capture-log`
-
-No shipped program writes a capture frame log from given samples. `frame-log`
-reads; `pod-capture` records from a sound card only; the crate's tests build
-capture logs with helpers that are not public. A program that depends on the
-reader therefore cannot hold a synthetic capture log to test against, and
-tests its use of `export-wav` on a device or not at all.
-
-The work: a way to write a capture-shaped frame log, with a stated layout,
-rate and sample format, from a WAV and a list of losses, through the crate's
-own writer, as a `frame-log` subcommand or a small program beside it.
-
-Done = a capture log written that way from a synthetic WAV is read back by
-`frame-log summary` and `export-wav` with the same samples and the stated
-losses, and the reference document describes the command. See
-`TODO(frame-log-writes-no-synthetic-capture-log)` in
-`firmware/crates/frame-log/src/main.rs`.

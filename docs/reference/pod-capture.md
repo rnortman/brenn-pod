@@ -59,11 +59,25 @@ log's header (`capture.device_state`, [`frame-log.md`](frame-log.md)) and on
   goes on**: whoever runs the recorder decides what a capture without its
   device's state is worth.
 - A register the chip refuses is recorded as refused, and the read goes on. A
-  chip that answers every read with a retry status holds the start for 101
-  transfers per register, 10 ms apart: about two seconds per register where a
-  transfer takes about 9 ms, as on the bench board, so about half a minute for
-  the seventeen. Nothing bounds the read as a whole, and a stop signal is not
-  acted on until it ends.
+  register the chip answers with a WAIT or RETRY status is asked again, up to
+  101 transfers, 10 ms apart; a transfer that fails ends the read.
+- The read is bounded. No transfer begins once `STATE_READ_BUDGET` (2 s) has
+  passed on `CLOCK_MONOTONIC` since the reading taken directly before the
+  first, and none begins once a stop signal (`SIGINT`, `SIGTERM`) has been
+  received. A transfer in flight is not cut; its one-second timeout bounds it.
+  So the read ends within 3 s plus one retry delay whatever the chip answers,
+  and within one transfer and one retry delay of a stop signal (about 20 ms on
+  the bench board, at most 1.01 s). **For a caller: the state read adds at
+  most 3.01 s to the start.**
+- A read cut by the budget or by a stop is `cut_short`, with `why`
+  (`deadline` or `stopped`), the register it had reached (`at`) and every
+  register before it, each read or refused. One line of prose goes to stderr,
+  and the capture goes on. After a stop, the recorder writes the header and
+  `capture_started`, sees the stop at the loop's first turn and ends the log
+  with `End{stopped}` and `capture_stopped`, exit status 0. A transfer that
+  fails for its own reason during the read is `unavailable` as above, whether
+  or not a stop is pending; one the system reports as interrupted by the stop's
+  signal is the stop.
 
 The reading precedes the stream's start; `ended_mono_us` against the
 `capture_started` line's `mono_us` says by how much. A write to the chip by
@@ -77,7 +91,7 @@ is one sample per channel, so `at_frame` is the log's sample index.
 
 | Event | Fields beyond `record_id` | A reader may conclude |
 |---|---|---|
-| `capture_started` | `path`, `device`, `granted`, `layout`, `build`, `device_state`, `frame: 0`, `mono_us`, `wall_us` | The destination exists with its header, hello and `Describe`, and the stream is running. The pair is the start anchor for this device. `device_state` is the header's statement of the device's state, identical to it. |
+| `capture_started` | `path`, `device`, `granted`, `layout`, `build`, `device_state`, `frame: 0`, `mono_us`, `wall_us` | The destination exists with its header, hello and `Describe`, and the stream is running. The pair is the start anchor for this device. `device_state` is the header's statement of the device's state, identical to it. With `device_state` `cut_short` and `why: stopped`, the recorder had been told to stop before the stream started: the capture holds no audio worth waiting for, and its terminal line follows. |
 | `capture_gap` | `cause`, `at_frame`, `frames` (number or `null`), `mono_us`, `wall_us`, `detail` | Audio is missing at `at_frame`, and the same fact is in the log. A `writer_backlog` gap is announced once its length is final. |
 | `capture_late` | `at_frame`, `backlog_frames`, `mono_us`, `wall_us` | The reader fell a period or more behind here. Nothing was lost. One line per run of late blocks the log holds; a late block dropped into a `writer_backlog` gap gets none, and a gap ends a run. |
 | `capture_stopped` | `frames`, `gaps`, `mono_us`, `wall_us` | The log ends with `End{stopped}`, is synced and closed, and holds every delivered frame outside its gaps. Exit status 0 follows. |

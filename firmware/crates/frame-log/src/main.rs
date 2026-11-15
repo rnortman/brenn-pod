@@ -1,17 +1,21 @@
-//! `frame-log`: read a frame log, a capture's or the voice host's.
+//! `frame-log`: read a frame log, a capture's or the voice host's, and write a
+//! capture log from given samples.
 //!
 //! ```text
 //! frame-log summary <log>
 //! frame-log export-wav <log> <out.wav>
+//! frame-log write-capture <spec.json> <in.wav> <out.framelog>
 //! ```
 //!
-//! Each prints one JSON object on stdout: the summary, or the export map.
-//! Exit status 0 when that output was produced, whatever the log's tail says;
-//! 1 when the header is unreadable, the log has no hello, a read or write
-//! failed, or the export was refused; 2 for a command line this does not
-//! understand. An export whose map cannot be written removes its WAV file,
-//! which is not to be used without the map that says which of its silence is
-//! estimated.
+//! Each prints one JSON object on stdout: the summary, the export map, or the
+//! written log's record id and frames. Exit status 0 when that output was
+//! produced, whatever a read log's tail says; 1 when the header is
+//! unreadable, the log has no hello, a read or write failed, or the export,
+//! the spec or the WAV file was refused; 2 for a command line this does not
+//! understand. A command that wrote a file and cannot print its object
+//! removes the file and exits 1: an export's WAV file is not to be used
+//! without the map that says which of its silence is estimated, and a log is
+//! left behind only by a write that succeeded.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -22,7 +26,7 @@ const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 
-const USAGE: &str = "usage: frame-log summary <log>\n       frame-log export-wav <log> <out.wav>";
+const USAGE: &str = "usage: frame-log summary <log>\n       frame-log export-wav <log> <out.wav>\n       frame-log write-capture <spec.json> <in.wav> <out.framelog>";
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -30,13 +34,22 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &[OsString]) -> u8 {
-    // TODO(frame-log-writes-no-synthetic-capture-log): every subcommand reads a
-    // log; none writes a capture log from given samples.
     let result = match args {
         [cmd, log] if cmd == "summary" => frame_log::summarize(Path::new(log))
             .map_err(|e| e.to_string())
             .and_then(|s| print_json(&s)),
-        [cmd, log, out] if cmd == "export-wav" => export_wav(Path::new(log), Path::new(out)),
+        [cmd, log, out] if cmd == "export-wav" => {
+            let out = Path::new(out);
+            frame_log::export_wav(Path::new(log), out)
+                .map_err(|e| e.to_string())
+                .and_then(|map| print_or_remove(&map, out))
+        }
+        [cmd, spec, wav, out] if cmd == "write-capture" => {
+            let out = Path::new(out);
+            frame_log::write_capture(Path::new(spec), Path::new(wav), out)
+                .map_err(|e| e.to_string())
+                .and_then(|w| print_or_remove(&w, out))
+        }
         _ => {
             eprintln!("{USAGE}");
             return EXIT_USAGE;
@@ -51,14 +64,13 @@ fn run(args: &[OsString]) -> u8 {
     }
 }
 
-/// Export `log` to `out` and print the map; when the map cannot be printed,
+/// Print `value`, the result of writing `out`; when it cannot be printed,
 /// remove `out`.
-fn export_wav(log: &Path, out: &Path) -> Result<(), String> {
-    let map = frame_log::export_wav(log, out).map_err(|e| e.to_string())?;
-    print_json(&map).map_err(|e| match std::fs::remove_file(out) {
+fn print_or_remove(value: &impl serde::Serialize, out: &Path) -> Result<(), String> {
+    print_json(value).map_err(|e| match std::fs::remove_file(out) {
         Ok(()) => format!("{e}; removed {}", out.display()),
         Err(remove) => format!(
-            "{e}; {} could not be removed and must not be used without its map: {remove}",
+            "{e}; {} could not be removed and must not be used: {remove}",
             out.display()
         ),
     })

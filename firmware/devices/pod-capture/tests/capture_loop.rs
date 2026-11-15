@@ -15,9 +15,9 @@ use alsa_pcm::{ClockPair, PcmError, Period, Read, Recovery, Wait};
 use audio_pipeline::wide::{LossCause, StreamEndReason};
 use audio_pipeline::wire::{ChannelSource, EndReason};
 use frame_log::{
-    BuildSource, Cause, Device, DeviceControl, DeviceState, NotAttemptedWhy, RegisterEntry,
-    RegisterReading, RegisterRefusal, Step as LogStep, Summary, UnavailableWhy, UsbLocation,
-    WriterBuild, WriterInfo, summarize, walk,
+    BuildSource, Cause, CutShortWhy, Device, DeviceControl, DeviceState, NotAttemptedWhy,
+    RegisterEntry, RegisterReading, RegisterRefusal, Step as LogStep, Summary, UnavailableWhy,
+    UsbLocation, WriterBuild, WriterInfo, summarize, walk,
 };
 use pod_capture::lines::Lines;
 use pod_capture::{
@@ -407,6 +407,23 @@ fn read_state() -> DeviceState {
     }
 }
 
+/// A `cut_short` state for `why`, holding `read_state()`'s registers.
+fn cut_short_state(why: CutShortWhy) -> DeviceState {
+    let DeviceState::Read { registers, .. } = read_state() else {
+        unreachable!("read_state is read");
+    };
+    DeviceState::CutShort {
+        why,
+        at: "audio_mgr_op_l".to_owned(),
+        detail: "scripted".to_owned(),
+        kind: "xvf3800".to_owned(),
+        begun_mono_us: 10,
+        ended_mono_us: 2_000_020,
+        wall_us: 1_794_000_000_000_010,
+        registers,
+    }
+}
+
 struct Ran {
     outcome: Outcome,
     lines: Vec<Value>,
@@ -497,8 +514,19 @@ fn run_script(
 }
 
 fn run_recording(rec: Recording, steps: Vec<Step>, dest: MemDest, clock: StepClock) -> Ran {
+    run_told_to_stop(rec, steps, dest, clock, false)
+}
+
+/// Run `rec` over `steps`, the stop flag set before the loop when `stopped`.
+fn run_told_to_stop(
+    rec: Recording,
+    steps: Vec<Step>,
+    dest: MemDest,
+    clock: StepClock,
+    stopped: bool,
+) -> Ran {
     let frame_bytes = rec.granted.frame_bytes();
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(stopped));
     let mut script = Script::new(steps, frame_bytes, stop.clone());
     let mut lines = Lines::new(Vec::new());
     let t0 = Instant::now();
@@ -1387,6 +1415,8 @@ fn the_header_and_capture_started_carry_the_same_device_state_for_each_outcome()
             "unavailable",
             true,
         ),
+        (cut_short_state(CutShortWhy::Deadline), "cut_short", true),
+        (cut_short_state(CutShortWhy::Stopped), "cut_short", true),
     ];
     for (state, outcome, on_usb) in states {
         let mut rec = recording(6, SampleFormat::S16Le, PERIOD);
@@ -1409,4 +1439,30 @@ fn the_header_and_capture_started_carry_the_same_device_state_for_each_outcome()
         assert_eq!(s.header["capture"]["device"], started["device"]);
         assert_eq!(s.header["capture"]["device_control"]["performed"], false);
     }
+}
+
+#[test]
+fn a_capture_told_to_stop_before_its_loop_is_an_empty_stopped_log() {
+    let mut rec = recording(6, SampleFormat::S16Le, PERIOD);
+    rec.device_state = cut_short_state(CutShortWhy::Stopped);
+    let ran = run_told_to_stop(
+        rec,
+        periods(3).collect(),
+        MemDest::new(),
+        StepClock::new(),
+        true,
+    );
+    assert_eq!(ran.outcome, Outcome::Stopped);
+    assert_eq!(ran.events(), ["capture_started", "capture_stopped"]);
+    assert_eq!(
+        ran.line("capture_started")["device_state"]["why"],
+        "stopped"
+    );
+    let (steps, tail) = ran.steps();
+    assert_eq!(tail, "ended");
+    assert!(
+        !steps.iter().any(|s| matches!(s, LogStep::Audio(_))),
+        "no audio in {steps:?}"
+    );
+    assert_eq!(end_reason(&ran.summary()), Some(StreamEndReason::Stopped));
 }

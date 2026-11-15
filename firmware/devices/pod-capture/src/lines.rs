@@ -8,8 +8,7 @@ use audio_pipeline::wide::LossCause;
 use frame_log::{Device, DeviceState, WriterBuild};
 use serde::Serialize;
 
-use crate::framer::Gap;
-use crate::granted::Granted;
+use frame_log::capture_stream::{Gap, Granted};
 
 /// Writes event lines. A stdout the caller has closed does not stop the capture:
 /// the first failed write is noted on stderr, and later lines are not attempted.
@@ -62,6 +61,13 @@ pub struct CaptureStarted<'a> {
     pub layout: &'a [String],
     pub build: &'a WriterBuild,
     /// The same statement of the device's state as the log's header.
+    ///
+    /// `cut_short`: the state read ended before it asked every register, at
+    /// the deadline or on a stop. The device answered for every register in
+    /// `registers`; nothing is known about `at` or any register absent from
+    /// the map, and the device did not refuse them. With `why: stopped` the
+    /// recorder had been told to stop before the stream started: the capture
+    /// holds no audio worth waiting for, and its terminal line follows.
     pub device_state: &'a DeviceState,
     /// Always 0: the position the pair anchors.
     pub frame: u64,

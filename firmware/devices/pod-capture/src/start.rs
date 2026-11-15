@@ -33,9 +33,9 @@ use frame_log::{BuildSource, Device, DeviceControl, DeviceState, WriterBuild, Wr
 use crate::capture::{Recording, STOP_BOUND, failed, period_frames, run};
 use crate::chip_state::{self, DeviceReading};
 use crate::cli::{self, Args};
-use crate::granted::{Granted, SampleFormat};
 use crate::lines::{CardLine, FailReason, Lines, note};
 use crate::seams::SystemClock;
+use frame_log::capture_stream::{Granted, SampleFormat};
 
 /// Periods the device's buffer is demanded to hold.
 pub const BUFFER_PERIODS: u32 = 16;
@@ -167,12 +167,18 @@ fn start<W: Write>(args: &Args, lines: &mut Lines<W>) -> Result<u8, Refusal> {
         Path::new(SYS),
         |device| xvf3800_usb::open_reader(device, Path::new(xvf3800_usb::DEV_BUS_USB)),
         &SystemClock,
+        &STOP,
     );
-    if let DeviceState::Unavailable { detail, .. } = &state {
-        note(format_args!(
+    match &state {
+        DeviceState::Unavailable { detail, .. } => note(format_args!(
             "the device's state could not be read: {detail}; the capture goes on and its \
              record says so"
-        ));
+        )),
+        DeviceState::CutShort { detail, .. } => note(format_args!(
+            "the device's state read was cut short: {detail}; the capture goes on and its \
+             record says so"
+        )),
+        DeviceState::NotAttempted { .. } | DeviceState::Read { .. } => {}
     }
     let mut source =
         ByteCapture::new(&pcm).map_err(|e| Refusal::new(FailReason::Params, e.to_string()))?;
@@ -422,6 +428,7 @@ mod tests {
         match b.source {
             BuildSource::Git => assert!(b.dirty.is_some()),
             BuildSource::Declared => assert!(b.dirty.is_none()),
+            BuildSource::Caller => panic!("the recorder's build is never caller-stated"),
         }
     }
 

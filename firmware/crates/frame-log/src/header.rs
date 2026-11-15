@@ -63,8 +63,8 @@ pub struct WriterInfo {
 pub struct WriterBuild {
     /// 40 hex digits.
     pub commit: String,
-    /// Whether the tree had uncommitted changes; `None` when the commit was
-    /// declared by the builder rather than read from git.
+    /// Whether the tree had uncommitted changes; `None` unless the commit was
+    /// read from git.
     pub dirty: Option<bool>,
     pub source: BuildSource,
 }
@@ -73,8 +73,13 @@ pub struct WriterBuild {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildSource {
+    /// The build read it from git.
     Git,
+    /// The builder declared it.
     Declared,
+    /// Nothing in the build vouches for it: the program that ran the writer
+    /// stated it. Only `frame-log write-capture` writes it.
+    Caller,
 }
 
 /// The capture device as the kernel presents it.
@@ -152,6 +157,39 @@ pub enum DeviceState {
         /// By register name; the names are the reader's.
         registers: BTreeMap<String, RegisterEntry>,
     },
+    /// The read was cut before it asked every register the reader knows. The
+    /// device answered for every register in `registers`; nothing is known
+    /// about `at` or about any register of that `kind` absent from the map,
+    /// and in particular the device did not refuse them.
+    CutShort {
+        why: CutShortWhy,
+        /// The register the read had reached and did not complete; never a key
+        /// of `registers`.
+        at: String,
+        /// Prose: the writer's account of the cut.
+        detail: String,
+        /// The reader, e.g. `xvf3800`.
+        kind: String,
+        /// `CLOCK_MONOTONIC` directly before the first transfer was due.
+        begun_mono_us: u64,
+        /// `CLOCK_MONOTONIC` directly after the read ended.
+        ended_mono_us: u64,
+        /// The wall reading paired with `begun_mono_us`.
+        wall_us: u64,
+        /// Every register before `at` in the reader's order, each read or
+        /// refused as in `read`; may be empty.
+        registers: BTreeMap<String, RegisterEntry>,
+    },
+}
+
+/// Why a device's state read was cut short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutShortWhy {
+    /// The writer's time for the read ran out.
+    Deadline,
+    /// The writer was told to stop.
+    Stopped,
 }
 
 /// Why a device's state was not read.
@@ -294,6 +332,9 @@ impl CaptureMeta {
             (BuildSource::Declared, Some(_)) => {
                 return bad("writer.build.dirty is set for a declared build".to_owned());
             }
+            (BuildSource::Caller, Some(_)) => {
+                return bad("writer.build.dirty is set for a caller-stated build".to_owned());
+            }
             _ => {}
         }
         let g = &self.granted;
@@ -313,35 +354,64 @@ impl CaptureMeta {
                 Clocks::v1()
             ));
         }
-        if let Some(DeviceState::Read {
-            begun_mono_us,
-            ended_mono_us,
-            registers,
-            ..
-        }) = &self.device_state
-        {
-            if registers.is_empty() {
-                return bad("device_state is read with no registers".to_owned());
+        match &self.device_state {
+            Some(DeviceState::Read {
+                begun_mono_us,
+                ended_mono_us,
+                registers,
+                ..
+            }) => {
+                if registers.is_empty() {
+                    return bad("device_state is read with no registers".to_owned());
+                }
+                validate_read_span(*begun_mono_us, *ended_mono_us, registers)?;
             }
-            if ended_mono_us < begun_mono_us {
-                return bad(format!(
-                    "device_state.ended_mono_us {ended_mono_us} is under begun_mono_us \
-                     {begun_mono_us}"
-                ));
-            }
-            for (name, entry) in registers {
-                if let RegisterReading::Read { bytes, .. } = &entry.reading
-                    && !is_even_lower_hex(bytes)
-                {
+            Some(DeviceState::CutShort {
+                at,
+                begun_mono_us,
+                ended_mono_us,
+                registers,
+                ..
+            }) => {
+                validate_read_span(*begun_mono_us, *ended_mono_us, registers)?;
+                if at.is_empty() {
+                    return bad("device_state.at is empty".to_owned());
+                }
+                if registers.contains_key(at) {
                     return bad(format!(
-                        "device_state.registers.{name}.bytes {bytes:?} is not lowercase hex \
-                         of even length"
+                        "device_state.at {at:?} is a key of device_state.registers"
                     ));
                 }
             }
+            _ => {}
         }
         Ok(())
     }
+}
+
+/// The rules `read` and `cut_short` share: the read ends no earlier than it
+/// began, and every payload is lowercase hex of even length.
+fn validate_read_span(
+    begun_mono_us: u64,
+    ended_mono_us: u64,
+    registers: &BTreeMap<String, RegisterEntry>,
+) -> Result<(), CaptureMetaInvalid> {
+    if ended_mono_us < begun_mono_us {
+        return Err(CaptureMetaInvalid(format!(
+            "device_state.ended_mono_us {ended_mono_us} is under begun_mono_us {begun_mono_us}"
+        )));
+    }
+    for (name, entry) in registers {
+        if let RegisterReading::Read { bytes, .. } = &entry.reading
+            && !is_even_lower_hex(bytes)
+        {
+            return Err(CaptureMetaInvalid(format!(
+                "device_state.registers.{name}.bytes {bytes:?} is not lowercase hex of even \
+                 length"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_even_lower_hex(s: &str) -> bool {
@@ -592,6 +662,124 @@ pub(crate) mod tests {
         refused(&with(s), "is under begun_mono_us");
     }
 
+    /// A `cut_short` state holding `read_state()`'s registers, cut at
+    /// `audio_mgr_op_l`.
+    pub(crate) fn cut_short_state(why: CutShortWhy) -> DeviceState {
+        let DeviceState::Read { registers, .. } = read_state() else {
+            unreachable!("read_state is read");
+        };
+        DeviceState::CutShort {
+            why,
+            at: "audio_mgr_op_l".to_owned(),
+            detail: "cut at audio_mgr_op_l after 1 transfer".to_owned(),
+            kind: "xvf3800".to_owned(),
+            begun_mono_us: 1_000,
+            ended_mono_us: 2_001_000,
+            wall_us: 1_794_000_000_000_000,
+            registers,
+        }
+    }
+
+    #[test]
+    fn a_cut_short_state_round_trips_in_its_documented_keys() {
+        for (why, text) in [
+            (CutShortWhy::Deadline, "deadline"),
+            (CutShortWhy::Stopped, "stopped"),
+        ] {
+            let mut c = capture();
+            c.device_state = Some(cut_short_state(why));
+            let v = round_trips(&c);
+            assert_eq!(
+                v["device_state"],
+                serde_json::json!({
+                    "outcome": "cut_short", "why": text, "at": "audio_mgr_op_l",
+                    "detail": "cut at audio_mgr_op_l after 1 transfer", "kind": "xvf3800",
+                    "begun_mono_us": 1_000, "ended_mono_us": 2_001_000,
+                    "wall_us": 1_794_000_000_000_000_u64,
+                    "registers": {
+                        "version": {"resid": 48, "cmd": 0, "bytes": "020102", "value": [2, 1, 2]},
+                        "bld_repo_hash": {"resid": 48, "cmd": 3,
+                                          "refused": {"how": "status", "status": 3, "attempts": 1}},
+                        "aec_asroutgain": {"resid": 33, "cmd": 36, "refused": {"how": "declined"}}
+                    }
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_short_state_with_no_registers_validates() {
+        let mut s = cut_short_state(CutShortWhy::Stopped);
+        if let DeviceState::CutShort { registers, at, .. } = &mut s {
+            registers.clear();
+            *at = "version".to_owned();
+        }
+        let mut c = capture();
+        c.device_state = Some(s);
+        round_trips(&c);
+    }
+
+    #[test]
+    fn an_unknown_why_or_outcome_is_refused() {
+        let mut c = capture();
+        c.device_state = Some(cut_short_state(CutShortWhy::Deadline));
+        let v = serde_json::to_value(&c).unwrap();
+
+        let mut bad_why = v.clone();
+        bad_why["device_state"]["why"] = serde_json::json!("bored");
+        assert!(serde_json::from_value::<CaptureMeta>(bad_why).is_err());
+
+        let mut bad_outcome = v;
+        bad_outcome["device_state"]["outcome"] = serde_json::json!("half_read");
+        assert!(serde_json::from_value::<CaptureMeta>(bad_outcome).is_err());
+    }
+
+    #[test]
+    fn each_cut_short_rule_refuses() {
+        let with = |edit: &dyn Fn(&mut DeviceState)| {
+            let mut s = cut_short_state(CutShortWhy::Deadline);
+            edit(&mut s);
+            let mut c = capture();
+            c.device_state = Some(s);
+            c
+        };
+        refused(
+            &with(&|s| {
+                if let DeviceState::CutShort { ended_mono_us, .. } = s {
+                    *ended_mono_us = 999;
+                }
+            }),
+            "is under begun_mono_us",
+        );
+        refused(
+            &with(&|s| {
+                if let DeviceState::CutShort { registers, .. } = s {
+                    registers.get_mut("version").unwrap().reading = RegisterReading::Read {
+                        bytes: "02A102".to_owned(),
+                        value: serde_json::Value::Null,
+                    };
+                }
+            }),
+            "registers.version.bytes",
+        );
+        refused(
+            &with(&|s| {
+                if let DeviceState::CutShort { at, .. } = s {
+                    at.clear();
+                }
+            }),
+            "device_state.at is empty",
+        );
+        refused(
+            &with(&|s| {
+                if let DeviceState::CutShort { at, .. } = s {
+                    *at = "version".to_owned();
+                }
+            }),
+            "is a key of device_state.registers",
+        );
+    }
+
     fn refused(c: &CaptureMeta, needle: &str) {
         let err = c.validate().unwrap_err();
         assert!(err.0.contains(needle), "{err} lacks {needle:?}");
@@ -606,6 +794,20 @@ pub(crate) mod tests {
         c.device.usb_id = None;
         c.device.usb = None;
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn a_caller_stated_build_round_trips_and_an_unknown_source_is_refused() {
+        let mut c = capture();
+        c.writer.build.source = BuildSource::Caller;
+        c.writer.build.dirty = None;
+        c.validate().unwrap();
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["writer"]["build"]["source"], "caller");
+        assert_eq!(serde_json::from_value::<CaptureMeta>(v.clone()).unwrap(), c);
+        let mut unknown = v;
+        unknown["writer"]["build"]["source"] = "vouched".into();
+        assert!(serde_json::from_value::<CaptureMeta>(unknown).is_err());
     }
 
     #[test]
@@ -625,6 +827,10 @@ pub(crate) mod tests {
         let mut c = capture();
         c.writer.build.source = BuildSource::Declared;
         refused(&c, "set for a declared build");
+
+        let mut c = capture();
+        c.writer.build.source = BuildSource::Caller;
+        refused(&c, "set for a caller-stated build");
 
         let mut c = capture();
         c.granted.period_frames = 0;

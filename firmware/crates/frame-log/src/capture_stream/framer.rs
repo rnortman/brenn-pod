@@ -10,15 +10,15 @@
 //! end              SegmentEnd{StreamEnd} if a segment is open; Capture(End)
 //! ```
 
+use crate::HostMicros;
 use audio_pipeline::wide::{
     CAPTURE_SCHEMA_VERSION, CaptureFrame, LossCause, StreamEndReason, WideAudio, WideFrame,
 };
 use audio_pipeline::wire::{
     AUDIO_PROTOCOL_VERSION, ChannelSource, EndReason, Hello, SegmentEnd, SegmentStart,
 };
-use frame_log::HostMicros;
 
-use crate::granted::Granted;
+use super::granted::Granted;
 
 /// The most bytes of a `detail` a `Loss` or `End` frame carries; a longer one
 /// is cut at a character boundary.
@@ -69,7 +69,8 @@ pub struct Block {
 pub type Stamped = (HostMicros, WideFrame);
 
 /// The stream's opening frames: the hello and the `Describe`, both stamped
-/// with the start pair's wall reading.
+/// with the start pair's wall reading. The layout's names must be non-empty
+/// and distinct.
 pub fn prelude(
     pod_id: &str,
     granted: &Granted,
@@ -77,6 +78,14 @@ pub fn prelude(
     start_mono_us: u64,
     start_wall_us: u64,
 ) -> Result<[Stamped; 2], String> {
+    for (i, name) in layout.iter().enumerate() {
+        if name.is_empty() {
+            return Err(format!("layout has an empty name at channel {i}"));
+        }
+        if layout[..i].contains(name) {
+            return Err(format!("layout names {name:?} twice"));
+        }
+    }
     let pod_id = pod_id
         .try_into()
         .map_err(|_| format!("pod id {pod_id:?} is longer than 32 bytes"))?;
@@ -278,7 +287,7 @@ fn cut(mut detail: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::granted::SampleFormat;
+    use crate::capture_stream::granted::SampleFormat;
 
     /// 1 kHz, two channels of s16_le: 4 bytes a frame.
     fn granted() -> Granted {
@@ -368,6 +377,15 @@ mod tests {
         assert!(prelude(&"p".repeat(33), &g, &[], 0, 0).is_err());
         g.channels = 256;
         assert!(prelude("p", &g, &[], 0, 0).is_err());
+    }
+
+    #[test]
+    fn the_prelude_refuses_an_empty_or_repeated_channel_name() {
+        let names = |n: &[&str]| n.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let err = prelude("p", &granted(), &names(&["a", ""]), 0, 0).unwrap_err();
+        assert_eq!(err, "layout has an empty name at channel 1");
+        let err = prelude("p", &granted(), &names(&["a", "a"]), 0, 0).unwrap_err();
+        assert_eq!(err, "layout names \"a\" twice");
     }
 
     #[test]
