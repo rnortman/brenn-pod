@@ -181,9 +181,6 @@ pub fn open_reader(device: &UsbDevice, dev_bus_usb: &Path) -> Result<ChipReader,
     Ok(ChipReader { node })
 }
 
-// TODO(xvf-control-on-usb-audio-image): this transport can only read. A routing
-// write to the chip of a 2886:0022 board needs a transport that can write, and
-// whether one exists beside this reader is decided here.
 /// The read-only XVF3800 control transport over one usbfs node.
 #[derive(Debug)]
 pub struct ChipReader {

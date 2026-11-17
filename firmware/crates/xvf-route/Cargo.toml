@@ -1,0 +1,31 @@
+[package]
+name = "xvf-route"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The one place that writes to the XVF3800 of a reSpeaker Flex on Seeed's
+# six-channel USB audio image (2886:0022): the routing register
+# AUDIO_MGR_OP_ALL, read before, written, read back and restored, and nothing
+# else. A library for the hardware tests and a command for a person.
+#
+# Not in default-members: `alsa-pcm` links libasound2 (the card is found by
+# name, as the recorder finds it); `make check-host`'s `--workspace` clippy and
+# tests cover it. The recorder must never depend on this crate; its dependency
+# test forbids it.
+
+[dependencies]
+# The sound card by name and the USB device behind it.
+alsa-pcm = { path = "../alsa-pcm" }
+# The usbfs control ioctl and the errno a stalled transfer fails with.
+libc = "0.2"
+# The command's one JSON object on stdout.
+serde_json = "1"
+# The protocol: command ids, the transport seam, the read and write drivers.
+xvf3800-ctrl = { path = "../xvf3800-ctrl" }
+# The read-only transport the writer reads through, the setup framing and the
+# device's sysfs attributes.
+xvf3800-usb = { path = "../xvf3800-usb" }
+
+[dev-dependencies]
+tempfile = "3"

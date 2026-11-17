@@ -183,6 +183,73 @@ capture-hil:
 chip-hil:
 	cargo test -p pod-capture --test flex_chip_hil -- --ignored --nocapture --test-threads=1
 
+# Routing HIL — WRITES TO THE CHIP of the reSpeaker Flex (USB-audio image, 2886:0022):
+# its output routing, AUDIO_MGR_OP_ALL, through xvf-route, and nothing else. Every
+# write is volatile, read back and restored; a writing test refuses to start unless
+# the board holds the bench routing, and names the `xvf-route set` command that puts
+# it back. PLAYS SOUND: about ten seconds of band-limited noise at -20 dBFS RMS,
+# in two-second plays, at the mixer's current volume, which nothing here changes.
+# About a minute. Needs the Flex attached, its capture and playback devices free
+# and its USB node openable by this account (docs/runbooks/pod-capture.md).
+# Fails on the_packed_slots_feed_capture_channels_2_to_5 until
+# the tracker entry usb-image-capture-channel-register-map-unknown is closed; when a reference
+# is found, that is the only failure expected of this lane. Built optimised: the
+# analysis correlates every channel over sixteen thousand lags.
+# NEVER invoked by check/check-host/pre-commit/CI.
+.PHONY: route-hil
+route-hil: route-measure-names
+	$(ROUTE_HIL_TEST) --nocapture --test-threads=1 $(addprefix --skip ,$(ROUTE_NAMED_TESTS))
+
+# The routing tests route-measure-hil and route-reread run and route-hil skips, by exact
+# name. libtest runs nothing and exits 0 for a name that matches no test, so
+# route-measure-names fails all three lanes unless each name here is an ignored test of
+# flex_route_hil.
+ROUTE_MEASURE_TESTS := the_routed_reference_holds_still_against_the_microphones \
+	the_other_far_end_taps_are_measured_against_the_reference
+ROUTE_REREAD_TEST := a_kept_measuring_run_reads_again_as_it_was_reported
+ROUTE_NAMED_TESTS := $(ROUTE_MEASURE_TESTS) $(ROUTE_REREAD_TEST)
+ROUTE_HIL_TEST := cargo test --release -p pod-capture --test flex_route_hil -- --ignored --exact
+
+.PHONY: route-measure-names
+route-measure-names:
+	@listed=$$($(ROUTE_HIL_TEST) --list $(ROUTE_NAMED_TESTS) | grep -c ': test$$'); \
+	if [ "$$listed" -ne $(words $(ROUTE_NAMED_TESTS)) ]; then \
+		echo "route-measure-names: $$listed of $(ROUTE_NAMED_TESTS) name an ignored test of flex_route_hil" >&2; \
+		exit 1; \
+	fi
+
+# Routing measurement HIL — WRITES TO THE CHIP of the reSpeaker Flex as route-hil does,
+# and PLAYS SOUND THROUGHOUT: band-limited noise at -20 dBFS RMS in plays of twenty
+# seconds, twenty per routing, at the mixer's current volume, which nothing here
+# changes. Measures the delay of the routed far-end reference, and of every other
+# far-end category that carries the played signal, against the raw microphones while
+# the device plays. About eight minutes per routing: one for (12, 0), up to four more.
+# Each run's log and JSON report go to the cargo target directory's tmp/route-measure/. Needs what
+# route-hil needs. Built optimised for the same reason.
+# Exited non-zero on its last bench run, on
+# the_routed_reference_holds_still_against_the_microphones only: in one window the
+# reference's delay to one microphone was unread while the host's copy's was read, as the
+# tracker entry flex-chip-reference-unread-windows records. A failure of any other test,
+# or on a window more than one frame from the run's median, is a new reading.
+# The measuring tests' capturing half, and the step that places each play from the
+# host's clock, have not run on the board; route-reread ran the analysing half over
+# every kept run and reproduced each report.
+# NEVER invoked by check/check-host/pre-commit/CI.
+.PHONY: route-measure-hil
+route-measure-hil: route-measure-names
+	$(ROUTE_HIL_TEST) --nocapture --test-threads=1 $(ROUTE_MEASURE_TESTS)
+
+# Re-read of a kept routing measurement: RUN names one run's directory under the cargo
+# target directory's tmp/route-measure/. Reads its log through route-measure-hil's
+# analysis, writes reread.json beside its report.json, and fails unless the reading
+# reproduces that report. Touches no device: writes nothing to the chip, opens no card,
+# plays nothing. Built optimised as the other two lanes are.
+# NEVER invoked by check/check-host/pre-commit/CI.
+.PHONY: route-reread
+route-reread: route-measure-names
+	@test -n "$(RUN)" || { echo "route-reread: set RUN to a kept run's directory" >&2; exit 1; }
+	ROUTE_REREAD_RUN="$(abspath $(RUN))" $(ROUTE_HIL_TEST) --nocapture $(ROUTE_REREAD_TEST)
+
 # Build-time guard against the xtensa frame-realign / stack-arg miscompile
 # (TODO(xtensa-realign-stack-args)). The device toolchain is the stock esp channel, which
 # still carries the miscompile; this gate is the primary guard that no realigned Rust

@@ -46,6 +46,23 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
   The new hardware test, `make -C firmware chip-hil`, has two identity tests
   that fail until the readings of the reSpeaker Flex's six-channel USB image
   are confirmed (`flex-usb-image-chip-readings-unconfirmed`).
+- **A capture can now carry the XVF3800 chip's own echo reference.** The
+  reSpeaker Flex's chip keeps a copy of what the device plays (the far-end
+  reference that echo cancellation subtracts). The new `xvf-route` tool shows
+  and sets which signals the Flex's six-channel USB image sends to capture
+  channels 0 and 1, so that reference can be recorded beside the microphones.
+  `xvf-route set` verifies its write by reading it back; it never saves to the
+  chip's flash, clears it or reboots it, and `pod-capture` does not use it.
+  On the bench the chip's reference stayed within one frame of a steady delay
+  to the microphones within each run, where the host's own copy of what it
+  played drifted by tens of frames. Two new hardware tests,
+  `make -C firmware route-hil` and `route-measure-hil`, establish the routing
+  and measure it (`route-reread` re-analyses a kept run offline). Known gaps:
+  what decides channels 2 to 5 is not yet known
+  (`usb-image-capture-channel-register-map-unknown`), and one measurement
+  window could not be read (`flex-chip-reference-unread-windows`); each fails
+  one test. Details: `docs/reference/xvf3800-control-protocol.md`, section 9,
+  and `docs/runbooks/pod-capture.md`.
 - A build outside a git checkout can state its commit in
   `BRENN_POD_BUILD_COMMIT`, and with no checkout around it starts no program;
   inside a checkout git decides, and a declared commit that disagrees fails the

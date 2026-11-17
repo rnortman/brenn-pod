@@ -41,14 +41,19 @@ The spike flashed `respeaker_flex_usb_l16k6ch_v1.0.0.bin` (929,792 bytes, sha256
 confirmed the map empirically by tap/speech RMS testing
 (usb-spike-verdict.md:23-24,57-92, audio-routing-investigation.md:14-31):
 
-| Channel | Signal |
-|---------|--------|
-| 0 | **Conference beam** — processed, post-AEC/beamform, auto-select, AGC |
-| 1 | **ASR beam** — processed, ASR-tuned |
-| 2 | Raw mic 0 |
-| 3 | Raw mic 1 |
-| 4 | Raw mic 2 |
-| 5 | Raw mic 3 |
+| Channel | Signal | Decided by |
+|---------|--------|------------|
+| 0 | **Conference beam** — processed, post-AEC/beamform, auto-select, AGC | `AUDIO_MGR_OP_ALL` slot `L_PK0` (`AUDIO_MGR_OP_L`) (measured) |
+| 1 | **ASR beam** — processed, ASR-tuned | `AUDIO_MGR_OP_ALL` slot `R_PK0` (`AUDIO_MGR_OP_R`) (measured) |
+| 2 | Raw mic 0 | silence written into each `AUDIO_MGR_OP_ALL` slot in turn leaves this channel live (measured); what decides it is not known |
+| 3 | Raw mic 1 | silence written into each `AUDIO_MGR_OP_ALL` slot in turn leaves this channel live (measured); what decides it is not known |
+| 4 | Raw mic 2 | silence written into each `AUDIO_MGR_OP_ALL` slot in turn leaves this channel live (measured); what decides it is not known |
+| 5 | Raw mic 3 | silence written into each `AUDIO_MGR_OP_ALL` slot in turn leaves this channel live (measured); what decides it is not known |
+
+The signals are those of the board's routing as found; a write to `L_PK0` or
+`R_PK0` gives channel 0 or 1 to another source, among them the chip's own echo
+reference. How the map was found, and the routing that puts the reference on a
+capture channel: `docs/reference/xvf3800-control-protocol.md`, section 9.
 
 Empirical confirmation (audio-routing-investigation.md):
 - ch0↔ch1 correlation 0.91 (both beams from same look direction); ch0/ch1 ↔

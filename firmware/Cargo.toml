@@ -21,6 +21,7 @@ members = [
     "crates/wifi-reconnect",
     "crates/xvf3800-ctrl",
     "crates/xvf3800-usb",
+    "crates/xvf-route",
 ]
 # default-members lists only host-buildable crates so no-flag `cargo build`/`cargo test`
 # runs host builds/tests without building the device crate or requiring espup.
@@ -39,6 +40,8 @@ members = [
 # covered by its own lane. pod-jsonl, pod-secrets and frame-log are in:
 # they are small, pure-Rust, and everything else here can depend on them freely.
 # xvf3800-usb is in: it reaches USB through the kernel's ioctl and links no library.
+# xvf-route is out because it finds its card through alsa-pcm; its tests run under
+# --workspace.
 default-members = ["crates/audio-pipeline", "crates/device-protocol", "crates/build-id", "crates/frame-log", "crates/pod-jsonl", "crates/pod-secrets", "crates/pod-streamer", "crates/truncfmt", "crates/wifi-diag", "crates/wifi-reconnect", "crates/xvf3800-ctrl", "crates/xvf3800-usb"]
 resolver = "2"
 

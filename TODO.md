@@ -383,6 +383,30 @@ ASR tuning is the expected pick for a host-side wake-word/STT consumer).
 See `TODO(reachy-beam-mapping)` at `beam_energy_speech` in
 `firmware/devices/reachy-pod/src/beam.rs`.
 
+## `reuse-hil-recorder-harness-copied-again`
+
+`pod-capture`'s three Flex hardware test files each drive the recorder with
+code of their own: `tests/flex_hil.rs` (`start`, `stop`, `signal`),
+`tests/flex_chip_hil.rs` and `tests/flex_route_hil.rs` (`capture_to`) each
+spawn the binary, read its `capture_started` line, stop it with SIGINT and
+wait for it, and the last two hold the same `hex`. A change to the
+recorder's first line or to how it is stopped has to be made three times.
+The third copy was added while the other two files were held unchanged.
+
+The work: one module under `firmware/devices/pod-capture/tests/` holding the
+start, the stop and a reader of a log's channels that reports its losses,
+included by the three files, each keeping its own policy on losses
+(`flex_hil.rs` splits its channels at a loss; `flex_route_hil.rs` refuses a
+log that has any). In `flex_route_hil.rs` both readers of a log, `capture_to`
+and the re-read of a kept run, check the header's
+`device_state.registers.audio_mgr_op_all` against their routing, each with
+its own spelling of that path; the shared reader takes the expected routing,
+checks it, and returns the header's `device_state`. Done = none of the three
+files spawns or signals the recorder itself, and none spells the log
+header's layout. See `TODO(reuse-hil-recorder-harness-copied-again)` at
+`capture_to` and `read_log` in
+`firmware/devices/pod-capture/tests/flex_route_hil.rs`.
+
 ## `rtd-flake-sample`
 
 `StreamRealtimeDuplex`'s pre-roll burst (`burst_drain_ms`, ceiling `RTD_BURST_DRAIN_MAX_MS =
@@ -1458,34 +1482,6 @@ by the gate again, on the Linux pod and on the ESP pod. See
 `TODO(gated-stream-continuous-mode)` where the gate's reading opens a
 segment.
 
-## `xvf-control-on-usb-audio-image`
-
-A reSpeaker Flex on Seeed's six-channel USB audio image (`2886:0022`) has
-its chip's firmware identity and its output routing and reference-path
-registers read over USB and recorded with its captures. Nothing writes to
-the chip on that image. The image's six capture channels carry no copy of
-what the device plays, so nothing ties a frame played through the device to
-a frame captured from it more closely than the clocks do. Every control
-read the recorder makes, and what one board answered, is in
-`docs/reference/xvf3800-control-protocol.md`, section 8; the image refused
-none of them.
-
-The work: find out whether the XVF3800 on this image can be told, by a
-control write, to route its playback reference into a capture channel, and
-if it can, do it under a command that says so. A routing write changes what
-every later capture's channels mean until the board is power-cycled, so a
-capture made after one must show the routing in force in its own record,
-and nothing may write a routing as a side effect of reading.
-
-Done = a hardware test writes the routing, captures while the device plays,
-and finds the played signal in the stated capture channel, with the
-capture's record showing the routing that was in force; or
-`docs/reference/` documents that the image refuses it, with what was sent
-and what came back. Such a test plays sound and needs the maintainer's
-agreement on when. See `TODO(xvf-control-on-usb-audio-image)` at
-`ChipReader` in `firmware/crates/xvf3800-usb/src/lib.rs`, the transport
-that cannot write.
-
 ## `usb-image-output-silenced-by-esp32-firmware`
 
 `docs/reference/audio-and-channels.md`, section 5, says the stock USB firmware
@@ -1533,7 +1529,9 @@ transfer where the recorder cannot reach it (the recorder stays unable to
 write to a chip), and `rusb` and libusb leave the workspace, the Makefile's
 prerequisites, the builder container and CI. That changes how a robot's pod
 reboots its chip and writes its routing, and `make reachy-deploy` puts
-whatever the tree builds on a robot.
+whatever the tree builds on a robot. `xvf-route`, which writes the routing
+of a Flex on its USB audio image, holds a host-to-device usbfs transfer of
+its own until the shared crate has one, and takes the shared one then.
 
 Done = a continuous capture from a Reachy's board and one from a Flex are
 made by the same capture and recording code, each carrying its chip's
@@ -1543,8 +1541,68 @@ path; `reachy-pod` links no libusb, and `make -C firmware reachy-selftest`
 has passed on a Reachy with the new transport before any deploy of it. See
 `TODO(pod-capture-reachy-pod-one-capture-path)` in
 `firmware/devices/pod-capture/src/start.rs`, where the capture's device and
-its chip reading are recorded, and at `UsbControl` in
-`firmware/devices/reachy-pod/src/usb_ctrl.rs`.
+its chip reading are recorded, at `UsbControl` in
+`firmware/devices/reachy-pod/src/usb_ctrl.rs`, and at the host-to-device
+transfer in `firmware/crates/xvf-route/src/usbfs_out.rs`.
+
+## `flex-chip-reference-unread-windows`
+
+The routing measurement test
+`the_routed_reference_holds_still_against_the_microphones`
+(`firmware/devices/pod-capture/tests/flex_route_hil.rs`, run by
+`make -C firmware route-measure-hil`) fails a run in which the routed
+reference's delay to a microphone cannot be read in a window where the host
+copy's delay to the same microphone is read in that window and in the
+windows either side of it. A window cannot be read when its cross-correlation
+peaks below 0.1 within the ±64 lags tracked.
+
+On the bench (reSpeaker Flex on the six-channel USB image, 2026-11-17) the
+test failed on one such window. Four more are in the runs of the other
+far-end taps, whose test asserts only that each run has a control. By run,
+play, window and microphone:
+
+- (12, 0) alone: play 19, window 9, channel 2;
+- (12, 0) beside (4, 0): play 14, window 16, channel 2;
+- (12, 0) beside (10, 1): play 3, window 134, channel 3; play 4, window 109,
+  channel 2; play 6, window 39, channel 3.
+
+Every window that was read, in all eleven runs, is within one frame of its
+run's median. In each of the five windows, two readings were made, and both
+held: the reference's delay to the other microphones was read in that window
+(channels 3, 4 and 5, or 4 and 5 for the two on channel 3); and the host
+copy's delay to the reference channel was read in that window and the
+windows either side, with the host copy's delay to the microphone less its
+delay to the reference within one frame of that difference's median over
+the play. The second reading does not depend on the room, since the reference
+channel is a digital copy of what was played. By either, the reference was
+neither silent nor displaced beyond the tracked lags in those windows, the
+two causes the test's own comment names.
+
+An earlier run of (12, 0) alone had ten unreadable windows, all against
+channel 2 (play 8, windows 89, 90, 125, 126; play 14, windows 80, 81, 85, 86,
+92, 93). Read again from its kept log, the host copy's delay to channel 2
+could not be read in any of the ten either, so none counts against that run.
+
+What is measured about the cause: the first of the five is in a play in
+which the microphones' mean power was 788, against medians over plays of 113
+and 144 in the two earlier runs of (12, 0) alone, in a run whose last ten
+plays lost 1237 windows in all; the
+tap runs' reports hold no microphone power, and in the plays holding their
+four windows the host copy's delay to the same microphone could not be read
+in 5, 18, 33 and 15 windows. In the tap runs the tap beside (12, 0) loses
+the same windows, these four among them. Inferred: the reference's delay is
+read against one template for the whole run and the host copy's against a
+template for each play, and a window whose correlation is near the 0.1 floor
+can fall on either side of it. Not known: why the reference's correlation
+with that one microphone falls below the floor in those windows while the
+host copy's does not.
+
+`docs/reference/xvf3800-control-protocol.md`, section 9.5, gives the figures.
+
+Done = the maintainer has reviewed this reading and the test asserts what the
+maintainer confirms, or the cause is found and the reference states it. See
+`TODO(flex-chip-reference-unread-windows)` at the test's stillness assertion
+in `firmware/devices/pod-capture/tests/flex_route_hil.rs`.
 
 ## `flex-usb-image-chip-readings-unconfirmed`
 
@@ -1619,18 +1677,34 @@ expectation tables in the test.
 ## `usb-image-capture-channel-register-map-unknown`
 
 A capture from a Flex on the six-channel USB image (`2886:0022`) records the
-chip's output routing registers by name, and nothing establishes which
-register governs which of the six capture channels
-(`docs/reference/xvf3800-control-protocol.md`, section 8.2), so a reader of a
-capture cannot say from its record what each channel carries.
+chip's output routing registers by name; what decides four of its six capture
+channels is not established, so a reader of a capture cannot say from its
+record what those channels carry.
 
-The work: establish the mapping and state it in that reference, by a vendor
-statement of the image's channel layout or by a hardware test that changes
-one routing register and finds the change in one capture channel, which is a
-chip write and falls under `xvf-control-on-usb-audio-image`'s rules for one.
+Established by hardware test on that image (2026-11-17, `make -C firmware
+route-hil`, writing `AUDIO_MGR_OP_ALL` through `xvf-route` and capturing with
+`pod-capture`): `AUDIO_MGR_OP_ALL` is the six `PK` registers in the order
+`L_PK0`, `L_PK1`, `L_PK2`, `R_PK0`, `R_PK1`, `R_PK2`; `L_PK0` decides capture
+channel 0 and `R_PK0` decides channel 1, each found by writing silence, (0, 0),
+into the slot and finding exactly that channel all zero.
 
-Done = the reference states for each of the six channels which register and
-slot decides it and how that was established, or states why it cannot be
-established on this image. See
+Measured, and not what was expected: with `AUDIO_MGR_OP_PACKED` reading
+`00 00`, setting any of the other four slots to silence changes no capture
+channel, though the register reads back as written. The test that expected
+those slots to decide channels 2 to 5,
+`the_packed_slots_feed_capture_channels_2_to_5`, fails on that reading and
+names this entry.
+
+Not established: what places channels 2 to 5 on USB, and whether any command
+reroutes them. A vendor statement of the image's layout would say. So might a
+test that turns packing on, which is a write to a register `xvf-route` refuses
+and which changes what every channel carries; whether to make it is the
+maintainer's decision.
+
+Done = the maintainer has reviewed that test's reading and the test asserts
+what the maintainer confirms, and `docs/reference/xvf3800-control-protocol.md`
+states for channels 2 to 5 what decides them and how that was established, or
+why it cannot be established on this image. See
 `TODO(usb-image-capture-channel-register-map-unknown)` in
-`firmware/devices/pod-capture/src/start.rs`.
+`firmware/devices/pod-capture/src/start.rs` and
+`firmware/devices/pod-capture/tests/flex_route_hil.rs`.

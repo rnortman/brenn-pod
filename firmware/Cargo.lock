@@ -1653,6 +1653,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "xvf-route",
  "xvf3800-ctrl",
  "xvf3800-usb",
 ]
@@ -3032,6 +3033,18 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "xvf-route"
+version = "0.1.0"
+dependencies = [
+ "alsa-pcm",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "xvf3800-ctrl",
+ "xvf3800-usb",
 ]
 
 [[package]]

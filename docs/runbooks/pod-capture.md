@@ -127,3 +127,116 @@ confirmed. The tracker entry `flex-usb-image-chip-readings-unconfirmed` says
 which, why, and what ends it. A failure of any other test, a failure naming any
 other register, or a reading that differs from the entry's is a new reading
 for the owner to review.
+
+## Routing the chip's echo reference to a capture channel
+
+`xvf-route` is the one program in the tree that writes to the chip of a Flex
+on the six-channel USB image (`2886:0022`). It writes one register,
+`AUDIO_MGR_OP_ALL`, the chip's output routing, and refuses every other write;
+it never saves to flash or reboots the chip. A write lasts until the board is
+power-cycled or written again, and changes what every later capture's
+channels carry. What each slot decides, and which routing puts the chip's own
+echo reference on a capture channel:
+[`docs/reference/xvf3800-control-protocol.md`](../reference/xvf3800-control-protocol.md),
+section 9.
+
+```sh
+cargo build --release -p xvf-route
+target/release/xvf-route show --card "Flex XVF3800"
+target/release/xvf-route set --card "Flex XVF3800" --op-all 8,0,1,0,1,2,12,0,1,1,1,3
+```
+
+`show` reads only. `set` prints the routing before, writes all twelve bytes,
+reads them back, and exits 1 unless the read-back matches. Both print one JSON
+object on stdout. It needs the board's USB node openable by this account, as
+the chip's state in the record does; nothing else.
+
+The routing above puts the chip's reference, (12, 0), on capture channel 1 in
+place of the ASR beam. Name it so in the capture's `--layout` (for example
+`conference_beam,far_end_reference,raw_mic_0,raw_mic_1,raw_mic_2,raw_mic_3`):
+the layout is the user's statement and is not read from the chip. The
+capture's header and `capture_started` line state the routing it was made
+under (`audio_mgr_op_all`).
+
+**Put the board back** to the routing it was found with, which the hardware
+tests and other tooling assume:
+
+```sh
+target/release/xvf-route set --card "Flex XVF3800" --op-all 8,0,1,0,1,2,7,3,1,1,1,3
+```
+
+A hardware test whose restore fails prints a line beginning
+`ROUTING NOT RESTORED` with this command. A test killed between a write and
+its restore prints nothing; the next writing test refuses to start, and
+`xvf-route show` says what the board holds. If `set` cannot restore it, unplug
+and replug the board.
+
+## Routing hardware tests
+
+These write to the chip and play sound through the Flex at the mixer's
+current volume, which they do not change. Each writing test first requires the
+board to hold the routing above, and refuses to start otherwise, naming the
+`xvf-route set` command that restores it. Every write is read back, and every
+test restores the routing and reads it back before it ends. They need the
+Flex attached, its capture and playback devices free, and its USB node
+openable by this account.
+
+```sh
+make -C firmware route-hil
+```
+
+About a minute; plays about ten seconds of band-limited noise at −20 dBFS
+RMS in two-second plays. Tests that `AUDIO_MGR_OP_ALL` is the six `PK`
+registers in order, that silence written into `L_PK0` and `R_PK0` zeroes
+channels 0 and 1, that silence written into each of the four other slots
+zeroes channels 2 to 5, and that the chip's reference, (12, 0), routed to
+channel 1 carries the played signal; four other far-end categories are routed
+the same way and measured. **The command exits non-zero today**, on
+`the_packed_slots_feed_capture_channels_2_to_5` and on that only: none of the
+four slots zeroes any channel, and the tracker entry
+`usb-image-capture-channel-register-map-unknown` holds that reading for the
+maintainer's review. A failure of any other test is a new reading for the
+owner to review.
+
+```sh
+make -C firmware route-measure-hil
+```
+
+About eight minutes per routing, one for the chip's reference and one for
+each other far-end category that carries the played signal: about forty
+minutes on a board where all four do. Plays throughout, in plays of twenty
+seconds.
+Measures the routed reference's delay to each raw microphone against the
+host's copy of what it played; asserts that the host's copy steps in at least
+one play (otherwise the run has no control and is repeated) and that the
+reference holds still. Each run's log and JSON report go under the cargo
+target directory's `tmp/route-measure/`. **The command exited non-zero on
+its last bench run**, on
+`the_routed_reference_holds_still_against_the_microphones` and on that only:
+in one window the reference's delay to one microphone could not be read while
+the host's copy's could, and the tracker entry
+`flex-chip-reference-unread-windows` holds that reading for the maintainer's
+review. A failure of any other test, or on a window more than one frame from
+the run's median, is a new reading for the owner to review.
+
+The two measuring tests have not been run on the board since their measuring
+function was split into a half that captures and a half that analyses. The
+analysing half was run over every kept run and reproduced each run's report.
+The capturing half, and the step that places each play from the host's clock,
+have not run since the split.
+
+```sh
+make -C firmware route-reread RUN=target/tmp/route-measure/<run>
+```
+
+Reads one kept run's log through the measuring analysis, writes `reread.json`
+beside its `report.json` with each window's delays added, and fails unless
+the reading reproduces the kept report. Touches no device: writes nothing to
+the chip, opens no card and plays nothing. `RUN` is a run's directory,
+relative to `firmware/` or absolute.
+
+After a session, `xvf-route show` reads `8,0,1,0,1,2,7,3,1,1,1,3` when the
+board is back as found.
+
+After a session, `make -C firmware chip-hil` shows the routing the board
+holds; it reads the routing as found when the board is back.

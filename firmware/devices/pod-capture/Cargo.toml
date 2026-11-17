@@ -44,3 +44,6 @@ xvf3800-usb = { path = "../../crates/xvf3800-usb" }
 
 [dev-dependencies]
 tempfile = "3"
+# The routing writes of the routing hardware tests. A dev-dependency only: the
+# recorder's own build never links it, and tests/dep_graph.rs keeps it so.
+xvf-route = { path = "../../crates/xvf-route" }

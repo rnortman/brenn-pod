@@ -1,5 +1,5 @@
-//! The recorder links libasound and no other system library, and none of the
-//! voice pod's USB, TLS or bridge code.
+//! The recorder links libasound and no other system library, none of the
+//! voice pod's USB, TLS or bridge code, and nothing that can write to a chip.
 
 const FORBIDDEN: &[&str] = &[
     "rusb",
@@ -10,6 +10,7 @@ const FORBIDDEN: &[&str] = &[
     "psk-link",
     "brenn-bridge",
     "reachy-pod",
+    "xvf-route",
 ];
 
 #[test]

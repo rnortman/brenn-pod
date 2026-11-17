@@ -208,6 +208,75 @@ pub const AUDIO_MGR_OP_ALL_CMD: u8 = 23;
 /// `AUDIO_MGR_OP_ALL` payload length in bytes: six (category, source) pairs.
 pub const AUDIO_MGR_OP_ALL_READ_LEN: usize = 12;
 
+/// `AUDIO_MGR_OP_L_PK0` command ID (`uint8 × 2`) — (category, source) of the
+/// left output's first packed slot.
+pub const AUDIO_MGR_OP_L_PK0_CMD: u8 = 16;
+
+/// `AUDIO_MGR_OP_L_PK1` command ID (`uint8 × 2`) — the left output's second slot.
+pub const AUDIO_MGR_OP_L_PK1_CMD: u8 = 17;
+
+/// `AUDIO_MGR_OP_L_PK2` command ID (`uint8 × 2`) — the left output's third slot.
+pub const AUDIO_MGR_OP_L_PK2_CMD: u8 = 18;
+
+/// `AUDIO_MGR_OP_R_PK0` command ID (`uint8 × 2`) — the right output's first slot.
+pub const AUDIO_MGR_OP_R_PK0_CMD: u8 = 20;
+
+/// `AUDIO_MGR_OP_R_PK1` command ID (`uint8 × 2`) — the right output's second slot.
+pub const AUDIO_MGR_OP_R_PK1_CMD: u8 = 21;
+
+/// `AUDIO_MGR_OP_R_PK2` command ID (`uint8 × 2`) — the right output's third slot.
+pub const AUDIO_MGR_OP_R_PK2_CMD: u8 = 22;
+
+/// One (category, source) slot of [`AUDIO_MGR_OP_ALL_CMD`], which is also a
+/// register of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpSlot {
+    /// The register's name in the vendor's table.
+    pub name: &'static str,
+    /// Its own command id on [`AUDIO_MGR_RESID`]; a read of it is
+    /// [`AUDIO_MGR_OP_READ_LEN`] bytes.
+    pub cmd: u8,
+    /// Its label, as a reader names it.
+    pub label: &'static str,
+}
+
+/// The six slots of `AUDIO_MGR_OP_ALL` in the register's byte order: slot `i`
+/// is bytes `2 * i` (category) and `2 * i + 1` (source). The order is the
+/// vendor table's description of `OP_ALL` as the `PK` registers in successive
+/// pairs, left output then right.
+pub const OP_ALL_SLOTS: [OpSlot; 6] = [
+    OpSlot {
+        name: "AUDIO_MGR_OP_L_PK0",
+        cmd: AUDIO_MGR_OP_L_PK0_CMD,
+        label: AUDIO_MGR_OP_L_PK0_LABEL,
+    },
+    OpSlot {
+        name: "AUDIO_MGR_OP_L_PK1",
+        cmd: AUDIO_MGR_OP_L_PK1_CMD,
+        label: AUDIO_MGR_OP_L_PK1_LABEL,
+    },
+    OpSlot {
+        name: "AUDIO_MGR_OP_L_PK2",
+        cmd: AUDIO_MGR_OP_L_PK2_CMD,
+        label: AUDIO_MGR_OP_L_PK2_LABEL,
+    },
+    OpSlot {
+        name: "AUDIO_MGR_OP_R_PK0",
+        cmd: AUDIO_MGR_OP_R_PK0_CMD,
+        label: AUDIO_MGR_OP_R_PK0_LABEL,
+    },
+    OpSlot {
+        name: "AUDIO_MGR_OP_R_PK1",
+        cmd: AUDIO_MGR_OP_R_PK1_CMD,
+        label: AUDIO_MGR_OP_R_PK1_LABEL,
+    },
+    OpSlot {
+        name: "AUDIO_MGR_OP_R_PK2",
+        cmd: AUDIO_MGR_OP_R_PK2_CMD,
+        label: AUDIO_MGR_OP_R_PK2_LABEL,
+    },
+];
+
 /// `AUDIO_MGR_FAR_END_DSP_ENABLE` command ID (`uint8 × 1`) — whether the far-end
 /// DSP runs.
 pub const AUDIO_MGR_FAR_END_DSP_ENABLE_CMD: u8 = 25;
@@ -324,6 +393,24 @@ pub const AUDIO_MGR_OP_UPSAMPLE_LABEL: &str = "AUDIO_MGR_OP_UPSAMPLE (resid 35 c
 
 /// [`AUDIO_MGR_OP_ALL_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
 pub const AUDIO_MGR_OP_ALL_LABEL: &str = "AUDIO_MGR_OP_ALL (resid 35 cmd 23)";
+
+/// [`AUDIO_MGR_OP_L_PK0_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_L_PK0_LABEL: &str = "AUDIO_MGR_OP_L_PK0 (resid 35 cmd 16)";
+
+/// [`AUDIO_MGR_OP_L_PK1_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_L_PK1_LABEL: &str = "AUDIO_MGR_OP_L_PK1 (resid 35 cmd 17)";
+
+/// [`AUDIO_MGR_OP_L_PK2_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_L_PK2_LABEL: &str = "AUDIO_MGR_OP_L_PK2 (resid 35 cmd 18)";
+
+/// [`AUDIO_MGR_OP_R_PK0_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_R_PK0_LABEL: &str = "AUDIO_MGR_OP_R_PK0 (resid 35 cmd 20)";
+
+/// [`AUDIO_MGR_OP_R_PK1_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_R_PK1_LABEL: &str = "AUDIO_MGR_OP_R_PK1 (resid 35 cmd 21)";
+
+/// [`AUDIO_MGR_OP_R_PK2_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
+pub const AUDIO_MGR_OP_R_PK2_LABEL: &str = "AUDIO_MGR_OP_R_PK2 (resid 35 cmd 22)";
 
 /// [`AUDIO_MGR_FAR_END_DSP_ENABLE_CMD`] on [`AUDIO_MGR_RESID`], as a reader names it.
 pub const AUDIO_MGR_FAR_END_DSP_ENABLE_LABEL: &str =
@@ -790,6 +877,34 @@ mod tests {
             // sends them to the wrong register.
             assert_eq!(label, format!("{name} (resid {resid} cmd {cmd})"));
         }
+        for slot in OP_ALL_SLOTS {
+            assert_eq!(
+                slot.label,
+                format!("{} (resid {AUDIO_MGR_RESID} cmd {})", slot.name, slot.cmd)
+            );
+        }
+    }
+
+    /// The vendor's command ids for the six packed slots, left then right, in the
+    /// byte order of `AUDIO_MGR_OP_ALL`; 19 (`AUDIO_MGR_OP_R`) sits between the
+    /// two sides and is not a slot.
+    #[test]
+    fn op_all_slots_are_the_six_pk_registers_left_then_right() {
+        let ids: Vec<u8> = OP_ALL_SLOTS.iter().map(|s| s.cmd).collect();
+        assert_eq!(ids, [16, 17, 18, 20, 21, 22]);
+        let names: Vec<&str> = OP_ALL_SLOTS.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            [
+                "AUDIO_MGR_OP_L_PK0",
+                "AUDIO_MGR_OP_L_PK1",
+                "AUDIO_MGR_OP_L_PK2",
+                "AUDIO_MGR_OP_R_PK0",
+                "AUDIO_MGR_OP_R_PK1",
+                "AUDIO_MGR_OP_R_PK2",
+            ]
+        );
+        assert_eq!(OP_ALL_SLOTS.len() * 2, AUDIO_MGR_OP_ALL_READ_LEN);
     }
 
     // ── Scripted fake transport ──────────────────────────────────────────────
