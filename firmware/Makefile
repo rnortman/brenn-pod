@@ -187,8 +187,10 @@ chip-hil:
 # its output routing, AUDIO_MGR_OP_ALL, through xvf-route, and nothing else. Every
 # write is volatile, read back and restored; a writing test refuses to start unless
 # the board holds the bench routing, and names the `xvf-route set` command that puts
-# it back. PLAYS SOUND: about ten seconds of band-limited noise at -20 dBFS RMS,
-# in two-second plays, at the mixer's current volume, which nothing here changes.
+# it back. PLAYS SOUND: about fourteen seconds of band-limited noise at -20 dBFS RMS,
+# in two-second plays, at the mixer's current volume, which nothing here changes:
+# five with far-end categories routed to channel 1, one under the bench routing, and
+# one with the chip's reference on channel 0 and the ASR beam kept on channel 1.
 # About a minute. Needs the Flex attached, its capture and playback devices free
 # and its USB node openable by this account (docs/runbooks/pod-capture.md).
 # Fails on the_packed_slots_feed_capture_channels_2_to_5 until

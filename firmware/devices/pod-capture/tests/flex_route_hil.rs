@@ -7,8 +7,10 @@
 //! writes refuses to start unless the board reads the bench's routing, so a
 //! board left routed by a killed run is never taken as the state to restore.
 //! `the_reference_category_carries_what_the_device_plays` PLAYS band-limited
-//! noise at −20 dBFS RMS through the device, five plays of two seconds; the
-//! mixer is not touched. Not in `make check` or CI; run by
+//! noise at −20 dBFS RMS through the device, five plays of two seconds, and
+//! `the_reference_on_channel_0_leaves_the_asr_beam_on_channel_1` two more, one
+//! under the bench routing and one with the reference on channel 0; the mixer
+//! is not touched. Not in `make check` or CI; run by
 //! `make -C firmware route-hil` with the Flex attached and its capture and
 //! playback devices free.
 //!
@@ -451,13 +453,22 @@ fn capture_playing(routing: &OpAll, samples: &[i16]) -> [Vec<i16>; CHANNELS] {
     })
 }
 
-/// Route `pair` to capture channel 1 through `R_PK0`, record while two seconds
-/// of noise play, restore, and class channel 1 against the played noise and
-/// the raw microphones. Prints every channel's placement and figure.
-fn carries(writer: &mut ChipWriter, pair: [u8; 2]) -> Class {
+/// What one routed play showed: the routed channel's class, and every
+/// channel's placement against the played noise and its samples.
+struct Carried {
+    class: Class,
+    placed: Vec<Placed>,
+    channels: [Vec<i16>; CHANNELS],
+}
+
+/// Route `pair` to capture `channel` through the slot that feeds it, record
+/// while two seconds of noise play, restore, and class `channel` against the
+/// played noise and the raw microphones. Prints every channel's placement and
+/// figure.
+fn carries(writer: &mut ChipWriter, channel: usize, pair: [u8; 2]) -> Carried {
     let samples = noise(SEED, 2 * RATE_HZ as usize);
     let played = widen(&samples);
-    let slot = slot_of_channel(ROUTED);
+    let slot = slot_of_channel(channel);
     let routing = with_slot(&BASELINE, slot, pair);
     let (routed, written) = Routed::apply(writer, CARD, &routing).unwrap_or_else(|e| panic!("{e}"));
     println!(
@@ -473,25 +484,41 @@ fn carries(writer: &mut ChipWriter, pair: [u8; 2]) -> Class {
     assert!(restored.is_ok(), "restore after {pair:?}: {restored:?}");
     describe(&channels);
 
-    let placed: Vec<Placed> = channels.iter().map(|c| place(&played, c)).collect();
+    let placed = place_all(&played, &channels);
+    let reference = &placed[channel];
+    let microphones = microphone_figures(&placed);
+    let best = microphones.iter().copied().fold(0.0, f64::max);
+    let class = classify(reference.figure, &microphones);
+    println!(
+        "  ({}, {}) on channel {channel}: figure {:.3}, best microphone {best:.3}, margin {:.3}: \
+         {class:?}",
+        pair[0],
+        pair[1],
+        reference.figure,
+        reference.figure - best
+    );
+    Carried {
+        class,
+        placed,
+        channels,
+    }
+}
+
+/// Every channel of `channels` placed against `played`, each placement and
+/// figure printed.
+fn place_all(played: &[f64], channels: &[Vec<i16>; CHANNELS]) -> Vec<Placed> {
+    let placed: Vec<Placed> = channels.iter().map(|c| place(played, c)).collect();
     for (ch, p) in placed.iter().enumerate() {
         println!(
             "  channel {ch}: offset {} frames, figure {:.3}",
             p.offset, p.figure
         );
     }
-    let reference = &placed[ROUTED];
-    let microphones: Vec<f64> = MICROPHONES.iter().map(|&ch| placed[ch].figure).collect();
-    let best = microphones.iter().copied().fold(0.0, f64::max);
-    let class = classify(reference.figure, &microphones);
-    println!(
-        "  ({}, {}): figure {:.3}, best microphone {best:.3}, margin {:.3}: {class:?}",
-        pair[0],
-        pair[1],
-        reference.figure,
-        reference.figure - best
-    );
-    class
+    placed
+}
+
+fn microphone_figures(placed: &[Placed]) -> Vec<f64> {
+    MICROPHONES.iter().map(|&ch| placed[ch].figure).collect()
 }
 
 /// Routed to capture channel 1, the far-end category (12, 0) carries what the
@@ -506,7 +533,7 @@ fn the_reference_category_carries_what_the_device_plays() {
 
     let classes: Vec<([u8; 2], Class)> = FAR_END
         .iter()
-        .map(|&pair| (pair, carries(&mut writer, pair)))
+        .map(|&pair| (pair, carries(&mut writer, ROUTED, pair).class))
         .collect();
     require_baseline(&mut writer);
 
@@ -515,6 +542,87 @@ fn the_reference_category_carries_what_the_device_plays() {
         classes[0],
         ([12, 0], Class::Carries),
         "(12, 0) against the played signal"
+    );
+}
+
+/// The bench routing with the chip's reference, (12, 0), on `L_PK0`, capture
+/// channel 0, in place of the conference beam; `R_PK0` keeps the ASR beam, (7,
+/// 3), on channel 1.
+const REFERENCE_ON_CHANNEL_0: OpAll = [12, 0, 1, 0, 1, 2, 7, 3, 1, 1, 1, 3];
+
+/// The span of `samples` from `from` for `len` frames, clipped to the samples.
+fn span(samples: &[i16], from: isize, len: usize) -> &[i16] {
+    let start = usize::try_from(from.max(0)).unwrap().min(samples.len());
+    let end = (start + len).min(samples.len());
+    &samples[start..end]
+}
+
+/// Routed to capture channel 0 through `L_PK0`, (12, 0) carries what the
+/// device plays, and capture channel 1 is still live and does not: its figure,
+/// by the same classing against the same microphones, is not that of a channel
+/// that carries it. That channel 1 is still the ASR beam rests on the routing,
+/// not on its audio: the capture asserts that the chip read back the bytes
+/// written, whose `R_PK0` is (7, 3) as in the bench routing. The ASR and
+/// conference beams class and read alike, so no audio assertion here tells
+/// them apart. One play is captured first under the bench routing, with no
+/// write, for comparison; nothing is asserted on it. Writes; plays two seconds
+/// of noise twice.
+#[test]
+#[ignore = "writes the Flex's routing and plays through it; run by `make -C firmware route-hil`"]
+fn the_reference_on_channel_0_leaves_the_asr_beam_on_channel_1() {
+    let (mut writer, _) = open_flex();
+    require_baseline(&mut writer);
+
+    let samples = noise(SEED, 2 * RATE_HZ as usize);
+    println!("bench routing {}, no write", bytes(&BASELINE));
+    let found = capture_playing(&BASELINE, &samples);
+    describe(&found);
+    let found_placed = place_all(&widen(&samples), &found);
+    let found_class = classify(found_placed[1].figure, &microphone_figures(&found_placed));
+    println!(
+        "  channel 1 under the bench routing: figure {:.3}: {found_class:?}",
+        found_placed[1].figure
+    );
+
+    let routing = with_slot(&BASELINE, slot_of_channel(0), CHIP_REFERENCE);
+    assert_eq!(
+        routing,
+        REFERENCE_ON_CHANNEL_0,
+        "the routing written: {}",
+        bytes(&routing)
+    );
+    let routed = carries(&mut writer, 0, CHIP_REFERENCE);
+    require_baseline(&mut writer);
+
+    let rate = RATE_HZ as usize;
+    let at = routed.placed[0].offset;
+    let before = span(&routed.channels[0], at - rate as isize, rate);
+    let during = span(&routed.channels[0], at, 2 * rate);
+    println!(
+        "  channel 0: {} of the {} frames in the second before the play zero; peak {} over the play",
+        before.iter().filter(|&&s| s == 0).count(),
+        before.len(),
+        during.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0)
+    );
+    let asr = classify(routed.placed[1].figure, &microphone_figures(&routed.placed));
+    println!(
+        "  channel 1 with (12, 0) on channel 0: figure {:.3}: {asr:?}",
+        routed.placed[1].figure
+    );
+
+    assert_eq!(
+        routed.class,
+        Class::Carries,
+        "(12, 0) on channel 0 against the played signal"
+    );
+    assert_ne!(
+        asr,
+        Class::Carries,
+        "channel 1 carries the played signal as a copy of it, so it is not the ASR beam"
+    );
+    assert!(
+        !all_zero(&routed.channels).contains(&1),
+        "channel 1 is all zero with (12, 0) on channel 0"
     );
 }
 
@@ -1235,7 +1343,7 @@ fn the_other_far_end_taps_are_measured_against_the_reference() {
     require_baseline(&mut writer);
     let mut runs = Vec::new();
     for &pair in &FAR_END[1..] {
-        let class = carries(&mut writer, pair);
+        let class = carries(&mut writer, ROUTED, pair).class;
         if class != Class::Carries {
             println!("{}: {class:?}; not measured", label(pair));
             continue;

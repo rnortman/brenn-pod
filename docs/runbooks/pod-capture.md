@@ -143,7 +143,7 @@ section 9.
 ```sh
 cargo build --release -p xvf-route
 target/release/xvf-route show --card "Flex XVF3800"
-target/release/xvf-route set --card "Flex XVF3800" --op-all 8,0,1,0,1,2,12,0,1,1,1,3
+target/release/xvf-route set --card "Flex XVF3800" --op-all 12,0,1,0,1,2,7,3,1,1,1,3
 ```
 
 `show` reads only. `set` prints the routing before, writes all twelve bytes,
@@ -151,10 +151,14 @@ reads them back, and exits 1 unless the read-back matches. Both print one JSON
 object on stdout. It needs the board's USB node openable by this account, as
 the chip's state in the record does; nothing else.
 
-The routing above puts the chip's reference, (12, 0), on capture channel 1 in
-place of the ASR beam. Name it so in the capture's `--layout` (for example
-`conference_beam,far_end_reference,raw_mic_0,raw_mic_1,raw_mic_2,raw_mic_3`):
-the layout is the user's statement and is not read from the chip. The
+The routing above puts the chip's reference, (12, 0), on capture channel 0 in
+place of the conference beam, and leaves the ASR beam on channel 1. Use it for
+any capture meant for comparison with the chip: the ASR beam is the output a
+speech-recognition comparison is made against, so the reference gives up the
+conference beam and never the ASR beam. Name it so in the capture's
+`--layout` (for example
+`chip_reference,asr_beam,raw_mic_0,raw_mic_1,raw_mic_2,raw_mic_3`): the
+layout is the user's statement and is not read from the chip. The
 capture's header and `capture_started` line state the routing it was made
 under (`audio_mgr_op_all`).
 
@@ -185,13 +189,15 @@ openable by this account.
 make -C firmware route-hil
 ```
 
-About a minute; plays about ten seconds of band-limited noise at −20 dBFS
-RMS in two-second plays. Tests that `AUDIO_MGR_OP_ALL` is the six `PK`
+About a minute; plays about fourteen seconds of band-limited noise at −20
+dBFS RMS in two-second plays. Tests that `AUDIO_MGR_OP_ALL` is the six `PK`
 registers in order, that silence written into `L_PK0` and `R_PK0` zeroes
 channels 0 and 1, that silence written into each of the four other slots
 zeroes channels 2 to 5, and that the chip's reference, (12, 0), routed to
 channel 1 carries the played signal; four other far-end categories are routed
-the same way and measured. **The command exits non-zero today**, on
+the same way and measured. It also tests that (12, 0) routed to channel 0
+carries the played signal while channel 1, the ASR beam, stays live and does
+not, after one play under the found routing captured for comparison. **The command exits non-zero today**, on
 `the_packed_slots_feed_capture_channels_2_to_5` and on that only: none of the
 four slots zeroes any channel, and the tracker entry
 `usb-image-capture-channel-register-map-unknown` holds that reading for the

@@ -192,6 +192,19 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ### Changed
 
+- **The chip's echo reference goes on capture channel 0, and the ASR beam
+  stays.** The recommended routing for a Flex capture compared with the
+  chip's own processing is now `12,0,1,0,1,2,7,3,1,1,1,3`: the reference on
+  channel 0 in place of the conference beam, the ASR beam kept on channel 1.
+  Routing it to channel 1 gave up the ASR beam, the output a
+  speech-recognition comparison is made against. A capture under this
+  routing needs a `pod-capture` layout naming channel 0 as the reference. The
+  routing hardware tests (`make -C firmware route-hil`) gain one showing on
+  the board that channel 0 then carries what the device plays and channel 1
+  is still the live ASR beam; the run now plays about fourteen seconds of
+  noise rather than ten. `docs/reference/audio-and-channels.md` now states
+  the microphones' order and spacing: index order along the board, 33 mm
+  apart.
 - **Automatic volume follows the room, both up and down, and nothing else.**
   The automatic term is now `k_ambient` dB per dB the room is above
   `ambient_ref_dbfs`, and the same per dB *below* it, within the swing bounds:

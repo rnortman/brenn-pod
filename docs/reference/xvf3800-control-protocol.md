@@ -426,6 +426,20 @@ microphones' copies of the played signal arrive 26 to 38 frames after the
 routed channel's. The conference beam's figure in the same captures is 0.03 to
 0.04.
 
+**[measured]** On channel 0, 2026-11-18, same board, same noise, mixer's
+playback volume at 40, by
+`the_reference_on_channel_0_leaves_the_asr_beam_on_channel_1`: (12, 0) was
+routed to channel 0 through `L_PK0` with `R_PK0` left at (7, 3), the routing
+`12,0,1,0,1,2,7,3,1,1,1,3`, which the capture's header read back. Channel 0's
+figure was 1.000 and the best microphone's 0.389, so channel 0 carries the
+played signal. Channel 1, the ASR beam, stayed live (2 614 of 64 000 samples
+zero, peak 36) with a figure of 0.036: it does not carry a copy of the played
+signal. In a capture of the same play under the board's routing as found, made
+in the same session with no write, channel 1's figure was 0.037 and its peak
+39, and channel 0's (the conference beam) 0.039. In the routed capture,
+channel 0 was zero in all 16 000 frames of the second before the play, and
+peaked at 125 during it.
+
 ### 9.5 The measurement
 
 The routing: this board's routing with `R_PK0` set to (12, 0),
@@ -800,10 +814,12 @@ differences between runs.
   steps against the echo in most plays of 20 s; nothing on the host removes
   the steps, and the host's streams show only some of them.
 - **[inferred]** A host should use the chip's own reference on a capture
-  channel: (12, 0) on `R_PK0`, written with
-  `xvf-route set --card <NAME> --op-all 8,0,1,0,1,2,12,0,1,1,1,3`. It is then
-  in the same stream as the microphones, on one clock, and every slip the host
-  sees moves both together or neither. Its delay to a microphone held within
+  channel. A host whose captures are compared with the chip's own processing
+  routes it to channel 0 through `L_PK0`, written with
+  `xvf-route set --card <NAME> --op-all 12,0,1,0,1,2,7,3,1,1,1,3`
+  (**[measured]** to carry the played signal with the ASR beam kept, §9.4). It
+  is then in the same stream as the microphones, on one clock, and every slip
+  the host sees moves both together or neither. Its delay to a microphone held within
   one frame of a run's median, not at one frame: a host should not assume the
   delay is the same frame from one capture to the next, or from one play to
   the next (§9.5 gives differences of one frame between plays and inside
@@ -813,18 +829,26 @@ differences between runs.
     write to `L_PK0` or `R_PK0`; silence written into any of the other four
     slots changed no channel. **[inferred]** On that and the vendor table, no
     other channel can be given to another source while packing is off. The
-    reference therefore takes channel 1, the ASR beam; a second routed tap
-    would take channel 0, the conference beam, too.
+    reference therefore takes channel 0 or channel 1, and gives up the beam
+    that channel carries. On channel 0 it gives up the conference beam and
+    keeps the ASR beam on channel 1, the output a speech-recognition
+    comparison with the chip is made against. On channel 1 it keeps the
+    conference beam and gives up the ASR beam, so a capture routed that way
+    has nothing to compare with the chip's recognition output. A second
+    routed tap would take the other channel too.
+  - The measurements of §9.5 and §9.6 were made with the reference on channel
+    1. They were not repeated with it on channel 0.
   - The routing is the board's until a power cycle or another write. A
     capture states the routing it was made under (`audio_mgr_op_all` in its
     header and on `capture_started`), and that, not the board's usual
-    routing, says what channel 1 carries.
-  - `pod-capture`'s `--layout` names are the user's: a capture under this
-    routing must be given a layout naming channel 1 as the reference, not as
-    the ASR beam.
+    routing, says what channels 0 and 1 carry.
+  - `pod-capture`'s `--layout` names are the user's: a capture under the
+    routing above must be given a layout naming channel 0 as the reference,
+    not as the conference beam.
   - **[measured]** The reference's level: −40.45 dB below the host's copy at
     the mixer's volume of 40: played noise peaking near 13 000 peaks at 125
-    on channel 1.
+    on channel 1 (§9.5). On channel 0 the same noise at the same volume also
+    peaked at 125 (§9.4).
 
 ### 9.9 What remains unexplained
 

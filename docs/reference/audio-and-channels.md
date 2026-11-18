@@ -52,8 +52,20 @@ confirmed the map empirically by tap/speech RMS testing
 
 The signals are those of the board's routing as found; a write to `L_PK0` or
 `R_PK0` gives channel 0 or 1 to another source, among them the chip's own echo
-reference. How the map was found, and the routing that puts the reference on a
-capture channel: `docs/reference/xvf3800-control-protocol.md`, section 9.
+reference. A capture compared with the chip's processing puts the reference on
+channel 0, in place of the conference beam, and keeps the ASR beam on channel
+1. How the map was found, and that routing:
+`docs/reference/xvf3800-control-protocol.md`, section 9.
+
+**Microphone geometry.** The four raw microphones lie in index order along the
+board, 33 mm apart. The spacing is the vendor's
+(`firmware/vendor/xvf3800/docs/reSpeaker_Flex/README.md:4`, "4-mic linear
+array (33mm spacing)"). The order is measured: the routed reference's delay to
+channels 2, 3, 4 and 5 read 26, 25, 24 and 23 frames
+(`docs/reference/xvf3800-control-protocol.md`, section 9.5), and the delays of
+a played marker between the raw microphones, from five loudspeaker positions,
+order them the same way. Which end of the board holds microphone 0 is not
+recorded here.
 
 Empirical confirmation (audio-routing-investigation.md):
 - ch0↔ch1 correlation 0.91 (both beams from same look direction); ch0/ch1 ↔
@@ -160,11 +172,6 @@ runs no firmware that configures the XVF3800. -->
 
 ## 6. Open / deferred audio items
 
-- **Mic 0–3 → physical position** on the linear board (FPC-connector end vs far
-  end) is **[unknown]**; FPC pinout shows MIC_D1..D4 are positional but the
-  AUDIO_MGR mux index→data-line mapping is not documented. Confirmed empirically
-  during firmware bring-up: tap each mic, watch per-channel RMS (use
-  `wavstats.py`). (research-step0.md:204-213,329-339)
 - **`-spatial` firmware** would pan the *single* auto-select beam across L/R for
   a stereo cue — it is **not** tracker-A-on-L / tracker-B-on-R source
   separation, and Seeed publishes no Flex spatial build. Not relevant to the
